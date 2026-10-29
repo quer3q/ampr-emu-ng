@@ -1,0 +1,8 @@
+[package]
+name = "ampr-hook"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+
+[dependencies]
+iced-x86 = { version = "=1.21.0", default-features = false, features = ["no_std", "decoder", "no_evex", "no_xop", "no_d3now"] }

@@ -1,0 +1,12 @@
+[package]
+name = "ampr-zstd"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+rust-version = "1.99"
+
+[lib]
+name = "ampr_zstd"
+
+[dependencies]
+crc32fast = { version = "=1.5.3", default-features = false }

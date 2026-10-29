@@ -1,0 +1,19 @@
+[package]
+name = "ampr-sys"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+
+[lib]
+crate-type = ["staticlib"]
+
+[dependencies]
+ampr-command = { path = "../ampr-command" }
+ampr-codec = { path = "../ampr-codec" }
+ampr-format = { path = "../ampr-format" }
+ampr-hook = { path = "../ampr-hook" }
+ampr-lz4 = { path = "../ampr-lz4" }
+
+[features]
+# Debug: periodic internal-pool usage notifications.
+mem_report = []

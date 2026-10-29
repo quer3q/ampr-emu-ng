@@ -1,0 +1,15 @@
+[workspace]
+members = ["crates/ampr-sys", "crates/ampr-format", "crates/ampr-codec", "crates/ampr-command", "crates/ampr-hook", "crates/ampr-zstd", "crates/ampr-lz4"]
+resolver = "2"
+
+[profile.release]
+panic = "abort"
+codegen-units = 1
+lto = "fat"
+
+# Hook decoding runs once at module_start; favor size there.
+[profile.release.package.iced-x86]
+opt-level = "z"
+
+[profile.dev]
+panic = "abort"

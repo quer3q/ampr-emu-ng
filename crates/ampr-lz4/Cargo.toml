@@ -1,0 +1,13 @@
+[package]
+name = "ampr-lz4"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+
+[lib]
+name = "ampr_lz4"
+
+[dependencies]
+ampr-codec = { path = "../ampr-codec" }
+ampr-format = { path = "../ampr-format" }
+lz4_flex = { version = "=0.14.0", default-features = false, features = ["checked-decode"] }

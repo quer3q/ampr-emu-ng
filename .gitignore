@@ -1,0 +1,5 @@
+/target
+/out
+*.sprx
+.DS_Store
+__pycache__/

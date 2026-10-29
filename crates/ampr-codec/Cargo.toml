@@ -1,0 +1,10 @@
+[package]
+name = "ampr-codec"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+
+[dependencies]
+# Native C zstd (decode only is linked; the PS5 build cross-compiles it with
+# the SDK clang, see the Makefile).
+zstd-sys = { version = "=2.1.2", default-features = false }
