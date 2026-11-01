@@ -69,7 +69,7 @@ impl AprAioReactor {
         effectiveLimit: u32,
         snapshot: &AioAdmissionSnapshot,
     ) -> bool {
-        if !AMPR_EMU_APR_GROUP_SOFT_TARGETS || effectiveLimit <= 1 {
+        if effectiveLimit <= 1 {
             return true;
         }
         let active = A53ReadGroupCounts {
@@ -102,8 +102,8 @@ impl AprAioReactor {
         true
     }
 
-    pub(crate) const fn adaptive_read_hard_chunk_limit() -> u32 {
-        AMPR_EMU_APR_PER_READ_ACTIVE_CHUNKS
+    pub(crate) fn adaptive_read_hard_chunk_limit() -> u32 {
+        crate::rt::tune::per_read_active_chunks()
     }
 
     pub(crate) fn another_priority_has_waiting_read(
@@ -161,7 +161,7 @@ impl AprAioReactor {
             Self::adaptive_read_hard_chunk_limit(),
         );
         window.bytes = (window.chunks as u64 * Self::read_credit_bytes(kSoftwareReadChunkMax))
-            .min(AMPR_EMU_APR_PER_READ_ACTIVE_BYTES);
+            .min(crate::rt::tune::per_read_active_bytes());
         window
     }
 

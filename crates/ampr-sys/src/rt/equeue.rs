@@ -1,4 +1,4 @@
-//! APR-only fixed-storage equeue overlay (AMPR_EMU_APR_LOCAL_EQUEUE=1). Native AMM packets never route through here.
+//! APR-only fixed-storage equeue overlay, the only APR equeue path. Native AMM packets never route through here.
 //!
 //! Layout:
 //! 1. constants, fn types, slot ids, `SceKernelEvent`, records, state statics
@@ -60,7 +60,7 @@ const _: () = {
     assert!(REGISTRATION_CAPACITY <= u16::MAX as u32 - 1);
 };
 
-/// `AmprLibkernelHookId` equeue slots (AMPR_EMU_APR_LOCAL_EQUEUE=1 layout).
+/// `AmprLibkernelHookId` equeue slots.
 pub(crate) mod slot {
     pub const sceKernelCreateEqueue: usize = 50;
     pub const sceKernelWaitEqueue: usize = 51;
@@ -2016,7 +2016,7 @@ pub unsafe fn apr_equeue_try_publish(
     }
     let mut notify_local = false;
     let local_qi: u32;
-    loop {
+    {
         let mut wake_request = PrivateWakeRequest::DEFAULT;
         let mut control_promotion = QueuePromotion::default();
         let mut execute_wake = false;
@@ -2099,7 +2099,6 @@ pub unsafe fn apr_equeue_try_publish(
         if execute_wake && !execute_private_wake(&wake_request).publication_handled {
             return NativeFallback;
         }
-        break;
     }
     if notify_local {
         notify_local_waiters(local_qi);

@@ -7,6 +7,7 @@ pub(crate) mod exports;
 mod fd_cache;
 mod hook;
 mod index;
+mod libc_exports;
 pub(crate) mod pack;
 mod reactor;
 mod runtime_memory;

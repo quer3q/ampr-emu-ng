@@ -500,13 +500,6 @@ pub unsafe fn ampr_internal_amm_pool_free(ptr: *mut c_void, _tag: *const c_char)
     unsafe { pool() }.free(ptr.cast())
 }
 
-/// True if the pool is published and CPU/APR visible (exact-slab requireAprVisible).
-fn pool_apr_visible() -> bool {
-    let _g = POOL_LOCK.lock();
-    let p = unsafe { pool() };
-    p.ready && p.apr_visible
-}
-
 // ---- SDK CPU memory class (stats were log-only) ----------------------------
 
 pub unsafe fn ampr_sdk_cpu_memory_class_name(class: u8) -> *const c_char {
@@ -640,7 +633,6 @@ impl<const N: usize> ExactSlab<N> {
         align: usize,
         min_block: usize,
         may_create: bool,
-        require_apr_visible: bool,
     ) -> Option<(*mut u8, usize)> {
         let slot = align_up(size, align);
         if slot == usize::MAX || slot < 4 {
@@ -652,9 +644,7 @@ impl<const N: usize> ExactSlab<N> {
                 return Some(r);
             }
         }
-        let Some((block, bytes)) =
-            (unsafe { alloc_block(slot, min_block, may_create, require_apr_visible) })
-        else {
+        let Some((block, bytes)) = (unsafe { alloc_block(slot, min_block, may_create) }) else {
             let _g = self.lock.lock();
             return unsafe { self.take_locked(slot) };
         };
@@ -676,14 +666,9 @@ impl<const N: usize> ExactSlab<N> {
     }
 
     /// `ampr_exact_slab_free`: Some(slot size) if `ptr` was a live slot. A block
-    /// that becomes empty goes back to the pool if `release_always`, or (with
-    /// `release_redundant`) when another empty block of the same size exists.
-    pub unsafe fn free(
-        &self,
-        ptr: *mut u8,
-        release_redundant: bool,
-        release_always: bool,
-    ) -> Option<usize> {
+    /// that becomes empty goes back to the pool when another empty block of
+    /// the same size exists.
+    pub unsafe fn free(&self, ptr: *mut u8) -> Option<usize> {
         if ptr.is_null() {
             return None;
         }
@@ -713,11 +698,11 @@ impl<const N: usize> ExactSlab<N> {
             b.free_count += 1;
             let b = blocks[i];
             let mut release = null_mut();
-            if release_redundant && b.free_count == b.slot_count {
+            if b.free_count == b.slot_count {
                 let empty_twin = blocks.iter().enumerate().any(|(j, o)| {
                     j != i && o.active && o.slot_size == b.slot_size && o.free_count == o.slot_count
                 });
-                if release_always || empty_twin {
+                if empty_twin {
                     release = b.base;
                     blocks[i] = BLOCK0;
                 }
@@ -732,12 +717,7 @@ impl<const N: usize> ExactSlab<N> {
 }
 
 /// Pool-backed page-rounded block of at least max(slot, min_block) bytes.
-unsafe fn alloc_block(
-    slot: usize,
-    min_block: usize,
-    may_create: bool,
-    require_apr_visible: bool,
-) -> Option<(*mut u8, usize)> {
+unsafe fn alloc_block(slot: usize, min_block: usize, may_create: bool) -> Option<(*mut u8, usize)> {
     let bytes = align_up(slot.max(min_block), SCE_KERNEL_PAGE_SIZE);
     if bytes == 0 || bytes == usize::MAX {
         return None;
@@ -747,7 +727,7 @@ unsafe fn alloc_block(
     } else {
         unsafe { ampr_internal_amm_pool_ready_has_capacity(bytes, 16) }
     };
-    if !usable || (require_apr_visible && !pool_apr_visible()) {
+    if !usable {
         return None;
     }
     let mut got = 0usize;
@@ -792,7 +772,7 @@ pub unsafe fn ampr_small_slab_alloc(
     let Some(&slot) = SMALL_CLASSES.iter().find(|&&s| size <= s && align <= s) else {
         return null_mut();
     };
-    match unsafe { SMALL_SLAB.alloc(slot, slot, SCE_KERNEL_PAGE_SIZE, may_create, false) } {
+    match unsafe { SMALL_SLAB.alloc(slot, slot, SCE_KERNEL_PAGE_SIZE, may_create) } {
         Some((p, s)) => {
             if !out_slot.is_null() {
                 unsafe { *out_slot = s };
@@ -808,7 +788,7 @@ pub unsafe fn ampr_small_slab_free(
     _tag: *const c_char,
     out_slot: *mut usize,
 ) -> bool {
-    let r = unsafe { SMALL_SLAB.free(ptr.cast(), true, false) };
+    let r = unsafe { SMALL_SLAB.free(ptr.cast()) };
     if !out_slot.is_null() {
         unsafe { *out_slot = r.unwrap_or(0) };
     }

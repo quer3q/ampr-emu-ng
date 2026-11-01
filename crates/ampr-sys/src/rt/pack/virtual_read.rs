@@ -469,12 +469,16 @@ unsafe fn finish_virtual_read_native_io(
     // Only a refused reactor submit (every external slot still
     // published) leaves EAGAIN here; SubmitFailed never carries it.
     let submit_eagain = pipeline.native_io_error == SCE_KERNEL_ERROR_EAGAIN;
+    pipeline.fd_reopen_retry = false;
     let finish_rc = if pipeline.mandatory_plan_active && pipeline.mandatory_request_count != 0 {
         finish_mandatory_page_group(pipeline)
     } else {
         finish_pipeline_window_aio(pipeline)
     };
-    if submit_eagain && finish_rc == SCE_KERNEL_ERROR_EAGAIN {
+    // A stale pack fd (leases.rs PackFdReopen) also retries: the pages were
+    // dropped as transient and the next acquire_pack_fd reopens the volume.
+    let reopen_retry = core::mem::replace(&mut pipeline.fd_reopen_retry, false);
+    if (submit_eagain || reopen_retry) && finish_rc == SCE_KERNEL_ERROR_EAGAIN {
         // The pages were dropped as transient: retry the submit. The
         // reactor frees its slot right after the callback, and
         // reset_native_wait cleared the fd wait epochs, so worker.rs requeues

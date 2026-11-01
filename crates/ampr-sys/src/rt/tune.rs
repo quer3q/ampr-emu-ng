@@ -1,8 +1,9 @@
 //! Tuning knobs of the debug build (`make AMPR_MEM_REPORT=1`). Startup knobs
 //! (cache sizes, workers, pipelines, cache reserve) are read from TUNE_PATH
-//! when the pack state is created (pack/state.rs); live knobs (read-ahead, read
-//! extension and their disk gates, pread pool on/off) take effect on the next
-//! read.
+//! when the pack state is created (pack/state.rs); live knobs (read-ahead and
+//! its disk gate, pread pool on/off for pack and loose reads,
+//! the reactor's per-pass and per-read issue limits, lane EOP overlap) take
+//! effect on the next read or reactor pass.
 //! `GET /set?k=v&...` on the metrics port changes both and rewrites TUNE_PATH,
 //! so startup knobs apply on the next game launch; `profile=low|medium|high`
 //! sets all startup knobs. Release builds use the compile-time constants:
@@ -12,10 +13,14 @@ use super::pack::{
     AMPR_EMU_PACK_DECODED_CACHE_BYTES, AMPR_EMU_PACK_MEMORY_RESERVE_BYTES,
     AMPR_EMU_PACK_PHYSICAL_CACHE_BYTES, AMPR_EMU_PACK_PIPELINE_SLOTS,
     AMPR_EMU_PACK_READAHEAD_CHUNKS, AMPR_EMU_PACK_READAHEAD_MAX_DISK_INFLIGHT,
-    AMPR_EMU_PACK_READ_EXTEND_BYTES, AMPR_EMU_PACK_READ_EXTEND_MAX_DISK_INFLIGHT,
     AMPR_EMU_PACK_WORKERS, AMPR_EMU_PACK_WORKER_CAPACITY,
 };
-use super::reactor::AMPR_EMU_PACK_PREAD_WORKERS;
+use super::reactor::{
+    kSoftwareReadChunkMax, AMPR_EMU_APR_LANE_EOP_OVERLAP, AMPR_EMU_APR_LOOSE_PREAD,
+    AMPR_EMU_APR_LOOSE_PREAD_PART_KIB, AMPR_EMU_APR_PER_READ_ACTIVE_BYTES,
+    AMPR_EMU_APR_PER_READ_ACTIVE_CHUNKS, AMPR_EMU_APR_READ_CHUNK_QUANTUM,
+    AMPR_EMU_APR_READ_PASS_MAX_BYTES, AMPR_EMU_PACK_PREAD_WORKERS,
+};
 use super::sys::*;
 use core::ffi::{c_int, CStr};
 use core::sync::atomic::{AtomicU32, Ordering::Relaxed};
@@ -24,9 +29,11 @@ pub(crate) const ON: bool = cfg!(feature = "mem_report");
 pub(crate) const TUNE_PATH: &CStr = c"/data/ampr_emu_tune.txt";
 /// Pipelines a release build has; the debug build has room for 32.
 pub(crate) const RELEASE_PIPELINES: u32 = 16;
-/// Pread pool threads a release build starts: one per pipeline, so a
-/// pipeline's disk read never waits for a thread.
-pub(crate) const RELEASE_PREAD_THREADS: u32 = RELEASE_PIPELINES;
+/// Pread pool threads a release build starts: 32, more than the 16
+/// pipelines, because split loose reads (reactor/loose_pread.rs) use them too.
+/// A game, loose files, internal SSD, debug /metrics (2026-11-01): 16 threads split
+/// 73% of loose reads at 1.35 ms per read, 32 threads split 98% at 1.10 ms.
+pub(crate) const RELEASE_PREAD_THREADS: u32 = 32;
 /// Upper bound of `ra` (one u64 bitmask per read-ahead job, pack/readahead.rs).
 pub(crate) const RA_MAX: u32 = 64;
 
@@ -60,14 +67,27 @@ const PIPELINES: usize = 3;
 const RESERVE_MIB: usize = 4;
 const RA: usize = 5;
 const RA_GATE: usize = 6;
-const EXT_KIB: usize = 7;
-const EXT_GATE: usize = 8;
-const PREAD: usize = 9;
-const PREAD_THREADS: usize = 10;
+const PREAD: usize = 7;
+const PREAD_THREADS: usize = 8;
+const LOOSE_PREAD: usize = 9;
+const LOOSE_PREAD_PART_KIB: usize = 10;
+const READ_PASS_KIB: usize = 11;
+const READ_CHUNK_QUANTUM: usize = 12;
+const PER_READ_ACTIVE_KIB: usize = 13;
+const PER_READ_ACTIVE_CHUNKS: usize = 14;
+const LANE_EOP_OVERLAP: usize = 15;
+
+/// Smallest pass budget and per-read active window, in KiB: one full read
+/// slice (kSoftwareReadChunkMax, 512 KiB). A smaller value would leave a full
+/// slice unissuable forever (flush.rs submit_read_chain_slice), so the job
+/// would never finish.
+const READ_SLICE_KIB: u32 = (kSoftwareReadChunkMax / 1024) as u32;
+/// Largest pass budget and per-read active window, in KiB (16 MiB).
+const READ_LIMIT_MAX_KIB: u32 = 16 * 1024;
 
 /// Cache sizes: 0 turns a cache off (reads bypass it); otherwise the cache
 /// allocators' minimums apply (decoded 16, physical 8 MiB, pack/manifest.rs).
-pub(crate) static KNOBS: [Knob; 11] = [
+pub(crate) static KNOBS: [Knob; 16] = [
     knob(
         "decoded_mib",
         false,
@@ -111,20 +131,6 @@ pub(crate) static KNOBS: [Knob; 11] = [
         64,
         AMPR_EMU_PACK_READAHEAD_MAX_DISK_INFLIGHT,
     ),
-    knob(
-        "ext_kib",
-        true,
-        0,
-        2048,
-        (AMPR_EMU_PACK_READ_EXTEND_BYTES / 1024) as u32,
-    ),
-    knob(
-        "ext_gate",
-        true,
-        0,
-        64,
-        AMPR_EMU_PACK_READ_EXTEND_MAX_DISK_INFLIGHT,
-    ),
     knob("pread", true, 0, 1, 1),
     knob(
         "pread_threads",
@@ -132,6 +138,49 @@ pub(crate) static KNOBS: [Knob; 11] = [
         1,
         AMPR_EMU_PACK_PREAD_WORKERS as u32,
         RELEASE_PREAD_THREADS,
+    ),
+    knob("loose_pread", true, 0, 1, AMPR_EMU_APR_LOOSE_PREAD as u32),
+    knob(
+        "loose_pread_part_kib",
+        true,
+        0,
+        4096,
+        AMPR_EMU_APR_LOOSE_PREAD_PART_KIB,
+    ),
+    knob(
+        "read_pass_kib",
+        true,
+        READ_SLICE_KIB,
+        READ_LIMIT_MAX_KIB,
+        (AMPR_EMU_APR_READ_PASS_MAX_BYTES / 1024) as u32,
+    ),
+    knob(
+        "read_chunk_quantum",
+        true,
+        1,
+        64,
+        AMPR_EMU_APR_READ_CHUNK_QUANTUM,
+    ),
+    knob(
+        "per_read_active_kib",
+        true,
+        READ_SLICE_KIB,
+        READ_LIMIT_MAX_KIB,
+        (AMPR_EMU_APR_PER_READ_ACTIVE_BYTES / 1024) as u32,
+    ),
+    knob(
+        "per_read_active_chunks",
+        true,
+        1,
+        32,
+        AMPR_EMU_APR_PER_READ_ACTIVE_CHUNKS,
+    ),
+    knob(
+        "lane_eop_overlap",
+        true,
+        0,
+        1,
+        AMPR_EMU_APR_LANE_EOP_OVERLAP as u32,
     ),
 ];
 
@@ -197,19 +246,30 @@ pub(crate) fn ra_gate() -> u32 {
         AMPR_EMU_PACK_READAHEAD_MAX_DISK_INFLIGHT
     }
 }
-pub(crate) fn ext_bytes() -> usize {
-    if ON {
-        get(EXT_KIB) as usize * 1024
-    } else {
-        AMPR_EMU_PACK_READ_EXTEND_BYTES
-    }
-}
 /// 1: pack physical reads go to the pread pool (reactor/pread_pool.rs); 0: kernel AIO.
 pub(crate) fn pread() -> bool {
     if ON {
         get(PREAD) != 0
     } else {
         true
+    }
+}
+/// 1: the game's loose (real-fd) APR reads go to the pread pool first
+/// (reactor/loose_pread.rs); 0: kernel AIO only.
+pub(crate) fn loose_pread() -> bool {
+    if ON {
+        get(LOOSE_PREAD) != 0
+    } else {
+        AMPR_EMU_APR_LOOSE_PREAD
+    }
+}
+/// Part size of split loose reads in KiB (reactor/loose_pread.rs rounds it
+/// to a 4 KiB multiple, at least 16); 0: one pool task per read.
+pub(crate) fn loose_pread_part_kib() -> u32 {
+    if ON {
+        get(LOOSE_PREAD_PART_KIB)
+    } else {
+        AMPR_EMU_APR_LOOSE_PREAD_PART_KIB
     }
 }
 pub(crate) fn pread_threads() -> usize {
@@ -219,12 +279,90 @@ pub(crate) fn pread_threads() -> usize {
         AMPR_EMU_PACK_PREAD_WORKERS
     }
 }
-pub(crate) fn ext_gate() -> u32 {
+// ---- reactor issue limits (reactor/progress.rs, reactor/read_window.rs) ----
+// Sized for kernel AIO, which serves 1-2 requests at a time on BFS
+// (reactor/mod.rs); the debug build makes them live to A/B them against the
+// pread pool. Release returns the constants.
+
+/// Read bytes one priority lane may issue per reactor pass
+/// (ReadIssueBudget.bytesLeft), at least one 512 KiB slice.
+pub(crate) fn read_pass_bytes() -> u64 {
     if ON {
-        get(EXT_GATE)
+        get(READ_PASS_KIB) as u64 * 1024
     } else {
-        AMPR_EMU_PACK_READ_EXTEND_MAX_DISK_INFLIGHT
+        AMPR_EMU_APR_READ_PASS_MAX_BYTES
     }
+}
+/// Read requests one priority lane may issue per reactor pass
+/// (ReadIssueBudget.requestsLeft), at least 1.
+pub(crate) fn read_chunk_quantum() -> u32 {
+    if ON {
+        get(READ_CHUNK_QUANTUM)
+    } else {
+        AMPR_EMU_APR_READ_CHUNK_QUANTUM
+    }
+}
+/// Credit bytes one read (chain) may have in flight, at least one 512 KiB slice.
+pub(crate) fn per_read_active_bytes() -> u64 {
+    if ON {
+        get(PER_READ_ACTIVE_KIB) as u64 * 1024
+    } else {
+        AMPR_EMU_APR_PER_READ_ACTIVE_BYTES
+    }
+}
+/// Chunks one read (chain) may have in flight in the exclusive bulk window,
+/// at least 1; contended windows still use 1 or 2 (ampr_loose_chain_chunk_limit).
+pub(crate) fn per_read_active_chunks() -> u32 {
+    if ON {
+        get(PER_READ_ACTIVE_CHUNKS)
+    } else {
+        AMPR_EMU_APR_PER_READ_ACTIVE_CHUNKS
+    }
+}
+/// 1: a priority lane's next job may parse while the head job has only
+/// completion commands left (reactor/lane_overlap.rs); 0: one parsing job per
+/// lane, as in release.
+pub(crate) fn lane_eop_overlap() -> bool {
+    if ON {
+        get(LANE_EOP_OVERLAP) != 0
+    } else {
+        AMPR_EMU_APR_LANE_EOP_OVERLAP
+    }
+}
+
+#[cfg(any(test, feature = "mem_report"))]
+fn hex(c: u8) -> Option<u8> {
+    match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'a'..=b'f' => Some(c - b'a' + 10),
+        b'A'..=b'F' => Some(c - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// Percent-decodes `src` into `out` and NUL-terminates it. '+' stays
+/// literal: it is a valid path byte. None on a bad escape, %00, or when
+/// the result plus NUL does not fit. Used by /bench (rt/exports.rs).
+#[cfg(any(test, feature = "mem_report"))]
+pub(crate) fn url_decode(src: &[u8], out: &mut [u8]) -> Option<usize> {
+    let (mut i, mut n) = (0, 0);
+    while i < src.len() {
+        let c = if src[i] == b'%' {
+            let v = hex(*src.get(i + 1)?)? << 4 | hex(*src.get(i + 2)?)?;
+            i += 3;
+            v
+        } else {
+            i += 1;
+            src[i - 1]
+        };
+        if c == 0 || n + 1 >= out.len() {
+            return None;
+        }
+        out[n] = c;
+        n += 1;
+    }
+    *out.get_mut(n)? = 0;
+    Some(n)
 }
 
 fn trim(mut s: &[u8]) -> &[u8] {
@@ -298,7 +436,16 @@ pub(crate) unsafe fn load() {
     let n = unsafe { real_physical_pread(fd, buf.as_mut_ptr().cast(), buf.len(), 0) };
     let _ = unsafe { real_physical_close(fd) };
     if n > 0 {
-        let _ = apply(&buf[..n as usize]);
+        apply_file(&buf[..n as usize]);
+    }
+}
+
+/// Applies a tune file line by line. A bad or unknown line (e.g. the
+/// `app0_direct=` and `app0_backing=` lines older builds wrote) is skipped,
+/// so it does not drop the knobs on the lines after it.
+fn apply_file(s: &[u8]) {
+    for line in s.split(|&c| c == b'\n') {
+        let _ = apply(line);
     }
 }
 
@@ -337,4 +484,155 @@ pub(crate) unsafe fn save() -> bool {
 #[cfg(feature = "mem_report")]
 pub(crate) fn value(knob: &Knob) -> u32 {
     knob.v.load(Relaxed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn knob_value(i: usize) -> u32 {
+        KNOBS[i].v.load(Relaxed)
+    }
+
+    /// KNOBS is global and tests run in parallel: tests that set knobs or
+    /// expect their defaults hold this lock.
+    static KNOB_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn knob_lock() -> std::sync::MutexGuard<'static, ()> {
+        KNOB_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Defaults match the release constants, release getters return them,
+    /// and every range keeps a full 512 KiB slice issuable (a smaller budget
+    /// or window would never admit it).
+    #[test]
+    fn knobs_default_to_release_constants_and_keep_a_slice_issuable() {
+        let _lock = knob_lock();
+        let defaults = [
+            (
+                READ_PASS_KIB,
+                "read_pass_kib",
+                (AMPR_EMU_APR_READ_PASS_MAX_BYTES / 1024) as u32,
+            ),
+            (
+                READ_CHUNK_QUANTUM,
+                "read_chunk_quantum",
+                AMPR_EMU_APR_READ_CHUNK_QUANTUM,
+            ),
+            (
+                PER_READ_ACTIVE_KIB,
+                "per_read_active_kib",
+                (AMPR_EMU_APR_PER_READ_ACTIVE_BYTES / 1024) as u32,
+            ),
+            (
+                PER_READ_ACTIVE_CHUNKS,
+                "per_read_active_chunks",
+                AMPR_EMU_APR_PER_READ_ACTIVE_CHUNKS,
+            ),
+            (
+                LANE_EOP_OVERLAP,
+                "lane_eop_overlap",
+                AMPR_EMU_APR_LANE_EOP_OVERLAP as u32,
+            ),
+            (PREAD_THREADS, "pread_threads", RELEASE_PREAD_THREADS),
+        ];
+        for (i, name, v) in defaults {
+            assert_eq!((KNOBS[i].name, knob_value(i)), (name, v));
+        }
+        assert_eq!(READ_SLICE_KIB, 512);
+        for i in [READ_PASS_KIB, PER_READ_ACTIVE_KIB] {
+            assert_eq!((KNOBS[i].min, KNOBS[i].max), (READ_SLICE_KIB, 16 * 1024));
+        }
+        let range = |i: usize| (KNOBS[i].min, KNOBS[i].max);
+        assert_eq!(range(READ_CHUNK_QUANTUM), (1, 64));
+        assert_eq!(range(PER_READ_ACTIVE_CHUNKS), (1, 32));
+        assert_eq!(
+            KNOBS[PREAD_THREADS].max as usize,
+            AMPR_EMU_PACK_PREAD_WORKERS
+        );
+        assert_eq!(AMPR_EMU_PACK_PREAD_WORKERS, if ON { 64 } else { 32 });
+        if !ON {
+            assert_eq!(read_pass_bytes(), AMPR_EMU_APR_READ_PASS_MAX_BYTES);
+            assert_eq!(read_chunk_quantum(), AMPR_EMU_APR_READ_CHUNK_QUANTUM);
+            assert_eq!(per_read_active_bytes(), AMPR_EMU_APR_PER_READ_ACTIVE_BYTES);
+            assert_eq!(
+                per_read_active_chunks(),
+                AMPR_EMU_APR_PER_READ_ACTIVE_CHUNKS
+            );
+            assert_eq!(pread_threads(), RELEASE_PREAD_THREADS as usize);
+            assert!(!lane_eop_overlap());
+        }
+    }
+
+    /// `apply` rejects out-of-range pairs without storing them and stores
+    /// in-range ones; the test restores the defaults it changed.
+    #[test]
+    fn apply_checks_ranges_then_stores() {
+        let _lock = knob_lock();
+        for bad in [
+            &b"read_pass_kib=511"[..],
+            b"read_pass_kib=16385",
+            b"read_chunk_quantum=0",
+            b"read_chunk_quantum=65",
+            b"per_read_active_kib=0",
+            b"per_read_active_kib=16385",
+            b"per_read_active_chunks=0",
+            b"per_read_active_chunks=33",
+            b"lane_eop_overlap=2",
+        ] {
+            assert_eq!(
+                apply(bad),
+                Err(bad),
+                "{}",
+                core::str::from_utf8(bad).unwrap()
+            );
+        }
+        assert_eq!(
+            knob_value(READ_CHUNK_QUANTUM),
+            AMPR_EMU_APR_READ_CHUNK_QUANTUM
+        );
+        assert_eq!(knob_value(LANE_EOP_OVERLAP), 0);
+        assert_eq!(
+            apply(b"read_pass_kib=4096&read_chunk_quantum=32&per_read_active_kib=8192&per_read_active_chunks=16&lane_eop_overlap=1"),
+            Ok(())
+        );
+        assert_eq!(knob_value(READ_PASS_KIB), 4096);
+        assert_eq!(knob_value(READ_CHUNK_QUANTUM), 32);
+        assert_eq!(knob_value(PER_READ_ACTIVE_KIB), 8192);
+        assert_eq!(knob_value(PER_READ_ACTIVE_CHUNKS), 16);
+        // Release builds ignore the knob and use the constant (off).
+        assert_eq!(lane_eop_overlap(), ON);
+        assert_eq!(
+            apply(b"read_pass_kib=512\nread_chunk_quantum=8\nper_read_active_kib=2048\nper_read_active_chunks=4\nlane_eop_overlap=0"),
+            Ok(())
+        );
+        assert_eq!(knob_value(READ_PASS_KIB), 512);
+        assert_eq!(knob_value(PER_READ_ACTIVE_CHUNKS), 4);
+        assert!(!lane_eop_overlap());
+    }
+
+    /// The tune file may hold removed knobs and junk lines: they are skipped
+    /// and the known pairs still apply. save() writes `name=value\n` per knob
+    /// into 512 bytes, which fits every knob at its widest.
+    #[test]
+    fn tune_file_skips_unknown_lines_and_save_fits() {
+        let _lock = knob_lock();
+        let file = b"ra=8\napp0_direct=1\napp0_backing=/data/homebrew/%5BX%5D\r\n\
+            # comment\nnot a pair\nread_chunk_quantum=32\nlane_eop_overlap=0\n";
+        apply_file(file);
+        assert_eq!(knob_value(RA), 8);
+        assert_eq!(knob_value(READ_CHUNK_QUANTUM), 32);
+        assert_eq!(knob_value(LANE_EOP_OVERLAP), 0);
+        // /set queries still report the first bad pair.
+        assert_eq!(apply(b"app0_direct=1"), Err(&b"app0_direct=1"[..]));
+        KNOBS[RA].v.store(AMPR_EMU_PACK_READAHEAD_CHUNKS, Relaxed);
+        KNOBS[READ_CHUNK_QUANTUM]
+            .v
+            .store(AMPR_EMU_APR_READ_CHUNK_QUANTUM, Relaxed);
+        let widest: usize = KNOBS
+            .iter()
+            .map(|k| k.name.len() + 2 + k.max.to_string().len())
+            .sum();
+        assert!(widest <= 512, "{widest}");
+    }
 }

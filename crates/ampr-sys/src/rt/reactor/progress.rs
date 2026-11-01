@@ -31,12 +31,20 @@ impl AprAioReactor {
             let mut priorNativeBatchPending = false;
             let mut speculativeCommandUsed = false;
             let mut readIssueBudget = ReadIssueBudget {
-                requestsLeft: AMPR_EMU_APR_READ_CHUNK_QUANTUM,
-                bytesLeft: AMPR_EMU_APR_READ_PASS_MAX_BYTES,
+                requestsLeft: crate::rt::tune::read_chunk_quantum(),
+                bytesLeft: crate::rt::tune::read_pass_bytes(),
+                held: false,
             };
+            // Set once an earlier job of this lane was passed with completion
+            // commands left (lane_overlap.rs): later jobs keep the prior read
+            // fence and stay off the native batch and AMM engine.
+            let mut priorLaneOverlap = false;
             let mut job = laneHeads[lane];
             while !job.is_null() {
                 if self.native_batch_wait_pending(lane as u32) {
+                    if unsafe { !(*job).priorityNext.load(Ordering::Acquire).is_null() } {
+                        lane_overlap::note_lane_block(lane_overlap::LaneBlock::Wait);
+                    }
                     break;
                 }
                 let next = unsafe { (*job).priorityNext.load(Ordering::Acquire) };
@@ -44,27 +52,53 @@ impl AprAioReactor {
                     &mut job,
                     priorReadFencePending,
                     priorNativeBatchPending,
+                    priorLaneOverlap,
                     &mut speculativeCommandUsed,
                     &mut readIssueBudget,
                     &mut admission,
                 );
                 // A synchronously released/failed head is a pass boundary; a
-                // blocked or partially admitted head keeps the lane.
+                // blocked or partially admitted head keeps the lane. With
+                // lane_eop_overlap the released head's successor is the new
+                // head and runs in this pass (lane_overlap.rs
+                // lane_release_cascades): only the head is ever released, so
+                // the prior flags are still false here.
                 if job.is_null() {
+                    if lane_overlap::lane_release_cascades() && !next.is_null() {
+                        job = next;
+                        continue;
+                    }
                     break;
                 }
-                let j = unsafe { &*job };
-                if j.sourceOffset != j.sourceBytes {
-                    break;
-                }
+                let j = unsafe { &mut *job };
                 let nativeSubmitted = j.nativeSubmitted.load(Ordering::Acquire);
-                if !Self::job_allows_priority_successor(j, nativeSubmitted) {
+                let mut overlapped = false;
+                if j.sourceOffset != j.sourceBytes {
+                    overlapped = Self::lane_eop_overlap_allows(j, nativeSubmitted);
+                    if !overlapped {
+                        if !next.is_null() {
+                            Self::note_lane_successor_blocked(j);
+                        }
+                        break;
+                    }
+                } else if !Self::job_allows_priority_successor(j, nativeSubmitted) {
+                    if !next.is_null() {
+                        lane_overlap::note_lane_block(lane_overlap::LaneBlock::Other);
+                    }
                     break;
                 }
-                priorReadFencePending |= Self::job_has_outstanding_reads(j);
+                priorLaneOverlap |= overlapped;
+                priorReadFencePending = lane_overlap::lane_successor_prior_fence(
+                    priorReadFencePending,
+                    Self::job_has_outstanding_reads(j),
+                    overlapped,
+                );
                 priorNativeBatchPending |=
                     nativeSubmitted && j.nativeMicroEngine == NativeMicroEngine::AprBatch;
                 job = next;
+            }
+            if readIssueBudget.held {
+                stats::add(Stat::ReadBudgetHeld, 1);
             }
             if !self.seal_open_native_apr_batch_group(lane as u32) {
                 abort();

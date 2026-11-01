@@ -13,7 +13,10 @@ index, `AMPRZDT1` volumes), picked at load by whether
 ## Layout
 
 - `crates/ampr-sys`: PRX runtime (staticlib). Runtime code is in `src/rt/`
-  (pack, reactor, hooks, stats, tune, exports).
+  (pack, reactor, hooks, stats, tune, exports). The PRX exports 137 symbols:
+  118 sceAmpr* (`rt/exports.rs`, found by `EXPORT_RE`) and 19 libc/libc++
+  symbols that retail libSceAmpr re-exports (`rt/libc_exports.rs`, listed in
+  `EXTRA_EXPORTS` in `tools/generate_payload_exports.py`).
 - `crates/ampr-format`: shared index readers, byte helpers and overlay utilities.
 - `crates/ampr-codec`: zstd decode.
 - `crates/ampr-lz4`: AMPRPAK4 manifest, AMPRDAT3 header, read planning and LZ4 decode.
@@ -35,7 +38,7 @@ cargo test --workspace                         # host tests
 ```
 
 Knobs and their defaults are at the top of the `Makefile`
-(`AMPR_INTERNAL_POOL_SIZE`, `AMPR_PACK_WORKERS`, read-ahead, read extension,
+(`AMPR_INTERNAL_POOL_SIZE`, `AMPR_PACK_WORKERS`, read-ahead,
 `AMPR_ZSTD_LIBC_HOOKS`, `AMPR_MEM_REPORT`). A knob change rebuilds through
 `out/*/obj/build-config.txt`.
 CI (`.github/workflows/build.yml`) runs the same commands; a pushed `v*` tag creates a draft release with both `.sprx` and `SHA256SUMS`.
@@ -66,6 +69,21 @@ CI (`.github/workflows/build.yml`) runs the same commands; a pushed `v*` tag cre
 3. Runtime behavior changes need a run on a console with
    `libSceAmpr-debug.sprx`: read `http://<ps5-ip>:9090/metrics` before and
    after and compare game wait per read, pack job and disk read latency.
+
+## Debugging on a console
+
+- The debug build's `/fsfail` lists failed calls (path hooks, the runtime's
+  own loose opens `L`, APR resolves `R`, APR jobs `E`, module loads `K`,
+  gather/scatter retry mismatches `G`, the upstream #7 wrong-file class) and
+  `/modules` lists loaded modules; the op letters are documented at
+  `FsEvents` in `rt/stats.rs`. When one install of a game works and another
+  does not, run the same build on both and diff the two outputs.
+- Folder installs on the internal SSD are case-sensitive; retail pfs and
+  exFAT are not, and games depend on that (e.g. Wwise plugins loaded as
+  `AkSineTone.prx`, stored `aksinetone.prx`). Paths that reach the
+  filesystem without the index (unhooked libc calls) fail there only. The
+  system module loader opens files itself, so it is routed through the index
+  in `rt/hook.rs` (`sceKernelLoadStartModule_equeue_observer`).
 
 ## Benchmark data
 

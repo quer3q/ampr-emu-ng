@@ -1,9 +1,10 @@
 //! Blocking pread pool for the pack's physical reads (external AIO groups).
 //! Kernel AIO on BFS serves 1-2 requests at a time; a pool of threads each
 //! blocked in pread keeps many in flight. Pack reads land in the internal
-//! pool (CPU memory), so a CPU pread can fill them; the game's APR reads stay
-//! on kernel AIO because their buffers may be GPU-only (EFAULT from pread).
-//! Ported from test-crate-readwrite (image bypass), external path only.
+//! pool (CPU memory), so a CPU pread can fill them. The game's loose APR
+//! reads also come here (loose_pread.rs); their buffers may be GPU-only
+//! (EFAULT from pread), so a failed one falls back to kernel AIO.
+//! Ported from test-crate-readwrite (image bypass), external path.
 
 use super::*;
 use crate::rt::stats::{self, Stat};
@@ -70,45 +71,15 @@ impl AprAioReactor {
             stats::add(Stat::PreadQueueNs, queueNs);
             stats::max(Stat::PreadQueueNsMax, queueNs);
             let (result, bytesRead) = match unsafe { crate::rt::pack::real_pread() } {
-                Some(pread) => {
-                    let mut done = 0usize;
-                    let mut error = 0i64;
-                    while done < request.nbyte {
-                        let Some(offset) = off_t::try_from(done)
-                            .ok()
-                            .and_then(|n| request.offset.checked_add(n))
-                        else {
-                            error = SCE_KERNEL_ERROR_EINVAL as i64;
-                            break;
-                        };
-                        let rc = unsafe {
-                            pread(
-                                request.fd,
-                                request.buf.cast::<u8>().add(done).cast(),
-                                (request.nbyte - done)
-                                    .min(crate::rt::pack::AMPR_EMU_PACK_PREAD_MAX_BYTES as usize),
-                                offset,
-                            )
-                        };
-                        if rc == 0 {
-                            break;
-                        }
-                        if rc < 0 {
-                            let e = if rc == -1 { errno() } else { 0 };
-                            if e == EINTR {
-                                continue;
-                            }
-                            error = if rc == -1 {
-                                sce_errno_from_posix(e) as i64
-                            } else {
-                                rc as i64
-                            };
-                            break;
-                        }
-                        done += rc as usize;
-                    }
-                    (if error != 0 { error } else { done as i64 }, done as u64)
-                }
+                Some(pread) => pread_parts(
+                    request.nbyte,
+                    request.offset,
+                    crate::rt::pack::AMPR_EMU_PACK_PREAD_MAX_BYTES as usize,
+                    |done, len, offset| unsafe {
+                        pread(request.fd, request.buf.cast::<u8>().add(done).cast(), len, offset)
+                    },
+                    errno,
+                ),
                 None => (SCE_KERNEL_ERROR_EIO as i64, 0),
             };
             let readNs = stats::since(readStartNs);
@@ -116,14 +87,17 @@ impl AprAioReactor {
             stats::add(Stat::PreadBytes, bytesRead);
             stats::add(Stat::PreadReadNs, readNs);
             stats::max(Stat::PreadReadNsMax, readNs);
-            unsafe {
-                (*request.result).returnValue = result;
-                (*request.result).state = SCE_KERNEL_AIO_STATE_COMPLETED as u32;
+            if !request.result.is_null() {
+                unsafe {
+                    (*request.result).returnValue = result;
+                    (*request.result).state = SCE_KERNEL_AIO_STATE_COMPLETED as u32;
+                }
             }
+            // The task is RUNNING, so only this thread touches it until DONE.
+            let task = unsafe { addr_of_mut!((*this).preadTasks[slot]) };
             unsafe {
-                (*addr_of!((*this).preadTasks[slot]))
-                    .state
-                    .store(PREAD_DONE, Ordering::Release)
+                (*task).returnValue = result;
+                (*task).state.store(PREAD_DONE, Ordering::Release)
             };
             let _wakeGuard = unsafe { (&*addr_of!((*this).m)).lock() };
             unsafe { (*addr_of!((*this).reactorWakeEpoch)).fetch_add(1, Ordering::Release) };
@@ -131,7 +105,7 @@ impl AprAioReactor {
         }
     }
 
-    fn ensure_pread_workers(&mut self) -> bool {
+    pub(super) fn ensure_pread_workers(&mut self) -> bool {
         if self.preadThreadCount != 0 {
             return true;
         }
@@ -166,6 +140,20 @@ impl AprAioReactor {
         targetGeneration: u32,
         priority: c_int,
     ) -> c_int {
+        self.queue_pread_tasks(requests, targetSlot, targetGeneration, priority, false)
+    }
+
+    /// `queue_pread_requests` for either target kind; a loose read
+    /// (loose_pread.rs) queues its part requests (one when unsplit) aimed at
+    /// its ActiveRead slot, all or none; `requestIndex` is the part index.
+    pub(crate) fn queue_pread_tasks(
+        &mut self,
+        requests: &[SceKernelAioRWRequest],
+        targetSlot: u32,
+        targetGeneration: u32,
+        priority: c_int,
+        looseRead: bool,
+    ) -> c_int {
         if requests.is_empty() || requests.len() > kAprExternalAioGroupMaxRequests {
             return SCE_KERNEL_ERROR_EINVAL;
         }
@@ -193,6 +181,7 @@ impl AprAioReactor {
             task.targetSlot = targetSlot;
             task.targetGeneration = targetGeneration;
             task.requestIndex = requestIndex as u32;
+            task.looseRead = looseRead;
             task.priority = priority;
             task.sequence = self.preadNextSequence;
             self.preadNextSequence = self.preadNextSequence.wrapping_add(1);
@@ -217,6 +206,26 @@ impl AprAioReactor {
                 continue;
             }
             let task = &self.preadTasks[slot];
+            if task.looseRead {
+                let target = ActiveReadRef {
+                    slot: task.targetSlot,
+                    generation: task.targetGeneration,
+                };
+                let part = LoosePartDone {
+                    index: task.requestIndex,
+                    offset: task.request.offset,
+                    len: task.request.nbyte as u64,
+                    value: task.returnValue,
+                };
+                self.retire_pread_task(slot);
+                if self.preadLooseCount == 0 {
+                    abort();
+                }
+                self.preadLooseCount -= 1;
+                self.finish_loose_pread(target, part);
+                progressed = true;
+                continue;
+            }
             let reference = ExternalAioRef {
                 slot: task.targetSlot,
                 generation: task.targetGeneration,
@@ -249,16 +258,20 @@ impl AprAioReactor {
                 self.notify_external_aio(e, AprExternalAioEvent::Completed, completionState, false);
                 Self::release_external_aio_slot(e);
             }
-            self.preadTasks[slot]
-                .state
-                .store(PREAD_FREE, Ordering::Release);
-            if self.preadPendingCount == 0 {
-                abort();
-            }
-            self.preadPendingCount -= 1;
+            self.retire_pread_task(slot);
             progressed = true;
         }
         progressed
+    }
+
+    fn retire_pread_task(&mut self, slot: usize) {
+        self.preadTasks[slot]
+            .state
+            .store(PREAD_FREE, Ordering::Release);
+        if self.preadPendingCount == 0 {
+            abort();
+        }
+        self.preadPendingCount -= 1;
     }
 
     /// Joins the pool threads (reactor shutdown, after the worker loop ends).
@@ -276,5 +289,127 @@ impl AprAioReactor {
         }
         self.preadThreadCount = 0;
         0
+    }
+}
+
+// ---- pread loop ----
+
+/// One pool task's pread loop over `read(done, len, offset) -> rc` (libc
+/// pread semantics: -1 with `errno()`), in pieces of at most `max_request`
+/// bytes. Returns (result, bytes read): result is the byte count, or an SCE
+/// error. A short read continues at the new offset and EOF (0) ends the
+/// read short. EINTR retries up to `PREAD_EINTR_RETRIES` (16) times in a
+/// row, the bound the pack loader's `pread_loop` (pack/state.rs) and the
+/// index reader (rt/index.rs) use; past it the part fails with
+/// SCE_KERNEL_ERROR_EINTR, so a kernel returning EINTR forever no longer
+/// pins a pool thread. Progress resets the count.
+pub(super) fn pread_parts(
+    nbyte: usize,
+    offset: off_t,
+    max_request: usize,
+    mut read: impl FnMut(usize, usize, off_t) -> ssize_t,
+    errno: impl Fn() -> c_int,
+) -> (i64, u64) {
+    let mut done = 0usize;
+    let mut interrupted = 0u32;
+    let mut error = 0i64;
+    while done < nbyte {
+        let Some(at) = off_t::try_from(done)
+            .ok()
+            .and_then(|n| offset.checked_add(n))
+        else {
+            error = SCE_KERNEL_ERROR_EINVAL as i64;
+            break;
+        };
+        let rc = read(done, (nbyte - done).min(max_request.max(1)), at);
+        if rc == 0 {
+            break;
+        }
+        if rc < 0 {
+            let e = if rc == -1 { errno() } else { 0 };
+            if e == EINTR && interrupted < crate::rt::pack::PREAD_EINTR_RETRIES {
+                interrupted += 1;
+                continue;
+            }
+            error = if rc == -1 {
+                sce_errno_from_posix(e) as i64
+            } else {
+                rc as i64
+            };
+            break;
+        }
+        interrupted = 0;
+        done += rc as usize;
+    }
+    (if error != 0 { error } else { done as i64 }, done as u64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::rt::pack::PREAD_EINTR_RETRIES;
+
+    /// Runs `pread_parts` over a script of results (Some(n): n bytes;
+    /// None: -1 with EINTR); past the script every call is EIO.
+    fn run(nbyte: usize, script: &[Option<isize>]) -> (i64, u64, usize) {
+        let calls = core::cell::Cell::new(0usize);
+        let last = core::cell::Cell::new(0);
+        let (result, read) = pread_parts(
+            nbyte,
+            0,
+            4,
+            |_, len, _| {
+                let i = calls.get();
+                calls.set(i + 1);
+                match script.get(i) {
+                    Some(Some(n)) => (*n).min(len as isize),
+                    Some(None) => {
+                        last.set(EINTR);
+                        -1
+                    }
+                    None => {
+                        last.set(EINTR + 1);
+                        -1
+                    }
+                }
+            },
+            || last.get(),
+        );
+        (result, read, calls.get())
+    }
+
+    #[test]
+    fn eintr_is_bounded_and_reset_by_progress() {
+        let bound = PREAD_EINTR_RETRIES as usize;
+        // Endless EINTR: bound retries, then the part fails with EINTR.
+        let endless = vec![None; bound + 8];
+        let (rc, read, calls) = run(8, &endless);
+        assert_eq!(rc, SCE_KERNEL_ERROR_EINTR as i64);
+        assert_eq!((read, calls), (0, bound + 1));
+        // `bound` EINTRs, progress, `bound` again: the count resets.
+        let mut script = vec![None; bound];
+        script.push(Some(4));
+        script.extend(vec![None; bound]);
+        script.push(Some(4));
+        assert_eq!(run(8, &script), (8, 8, 2 * bound + 2));
+        // A short read continues; EOF ends short; other errors fail.
+        assert_eq!(run(7, &[Some(3), Some(4)]).0, 7);
+        assert_eq!(run(8, &[Some(3), Some(0)]).0, 3);
+        assert_eq!(run(8, &[Some(3)]).0, SCE_KERNEL_ERROR_EIO as i64);
+        // Each call resumes where the last short read ended, capped per request.
+        let mut seen = Vec::new();
+        let mut reads = [3, 2, 4, 1].into_iter();
+        let rc = pread_parts(
+            10,
+            100,
+            4,
+            |done, len, at| {
+                seen.push((done, len, at));
+                reads.next().unwrap()
+            },
+            || 0,
+        );
+        assert_eq!(rc, (10, 10));
+        assert_eq!(seen, [(0, 4, 100), (3, 4, 103), (5, 4, 105), (9, 1, 109)]);
     }
 }

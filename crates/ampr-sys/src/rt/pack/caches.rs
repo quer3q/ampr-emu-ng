@@ -65,8 +65,8 @@ pub(crate) unsafe fn cache_should_admit_locked(
     if file_flags & AMPR_PACK_FILE_HOT != 0 || chunk.flags & AMPR_PACK_CHUNK_SHARED != 0 {
         return true;
     }
-    let touch =
-        &mut (*state).touches[(key_hash & (AMPR_EMU_PACK_TOUCH_TABLE_SIZE as u64 - 1)) as usize];
+    let touch = &mut (*state).touches
+        [ampr_format::cache::bucket_index(key_hash, AMPR_EMU_PACK_TOUCH_TABLE_SIZE)];
     if touch.key_hash != key_hash {
         touch.key_hash = key_hash;
         touch.count = 1;
@@ -106,8 +106,7 @@ pub(crate) unsafe fn cache_acquire(
                         result.kind = CacheAcquireKind::Pending;
                         return result;
                     }
-                    CACHE_CVS[(key_hash & (PACK_CACHE_WAIT_BUCKET_COUNT as u64 - 1)) as usize]
-                        .wait(&mut lock);
+                    CACHE_CVS[cache_wait_bucket(key_hash) as usize].wait(&mut lock);
                     continue;
                 }
                 CacheEntryState::Ready => {
@@ -211,7 +210,7 @@ pub(crate) unsafe fn cache_publish(lease: &mut CacheLease, error: c_int) -> bool
         if entry.state != CacheEntryState::Loading || entry.pin_count == 0 {
             return false;
         }
-        wait_bucket = (entry.key_hash & (PACK_CACHE_WAIT_BUCKET_COUNT as u64 - 1)) as usize;
+        wait_bucket = cache_wait_bucket(entry.key_hash) as usize;
         waited = entry.error != 0;
         if error == 0 {
             entry.state = CacheEntryState::Ready;
@@ -350,7 +349,8 @@ pub(crate) unsafe fn physical_cache_find_locked(
     size: u32,
     key_hash: u64,
 ) -> u32 {
-    let bucket = (key_hash & (AMPR_EMU_PACK_PHYSICAL_CACHE_HASH_BUCKETS as u64 - 1)) as usize;
+    let bucket =
+        ampr_format::cache::bucket_index(key_hash, AMPR_EMU_PACK_PHYSICAL_CACHE_HASH_BUCKETS);
     let mut link = (*state).physical_cache_hash_heads[bucket];
     while link != 0 {
         let index = link - 1;
@@ -368,15 +368,18 @@ pub(crate) unsafe fn physical_cache_find_locked(
 
 pub(crate) unsafe fn physical_cache_hash_link_locked(state: *mut PackState, index: u32) {
     let entry = &mut (*state).physical_cache_entries[index as usize];
-    let bucket = (entry.key_hash & (AMPR_EMU_PACK_PHYSICAL_CACHE_HASH_BUCKETS as u64 - 1)) as usize;
+    let bucket =
+        ampr_format::cache::bucket_index(entry.key_hash, AMPR_EMU_PACK_PHYSICAL_CACHE_HASH_BUCKETS);
     entry.hash_next_plus_one = (*state).physical_cache_hash_heads[bucket];
     (*state).physical_cache_hash_heads[bucket] = index + 1;
 }
 
 pub(crate) unsafe fn physical_cache_hash_unlink_locked(state: *mut PackState, index: u32) {
     let i = index as usize;
-    let bucket = ((*state).physical_cache_entries[i].key_hash
-        & (AMPR_EMU_PACK_PHYSICAL_CACHE_HASH_BUCKETS as u64 - 1)) as usize;
+    let bucket = ampr_format::cache::bucket_index(
+        (*state).physical_cache_entries[i].key_hash,
+        AMPR_EMU_PACK_PHYSICAL_CACHE_HASH_BUCKETS,
+    );
     let next = (*state).physical_cache_entries[i].hash_next_plus_one;
     // `prev` is None while the link is the bucket head.
     let mut prev: Option<usize> = None;

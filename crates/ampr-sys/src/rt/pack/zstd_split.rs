@@ -313,6 +313,7 @@ mod tests {
 
     #[test]
     fn plan_covers_request_on_chunk_boundaries() {
+        // plan covers request on chunk boundaries.
         // ~250 KB read from the end of a chunk: 2 chunks -> 2 children.
         let (offset, length) = (C - 4096, 250_000);
         let r = plan(offset, length, 4);
@@ -335,36 +336,8 @@ mod tests {
         assert_eq!(r.len(), 4);
         assert!(r.iter().all(|c| c.nbyte == 2 * C));
         check_cover(0, 8 * C, &r);
-    }
 
-    #[test]
-    fn plan_caps_child_count_and_spreads_chunks() {
-        // 5 chunks over 4 children: 2, 1, 1, 1 chunks.
-        let r = plan(0, 5 * C, 4);
-        assert_eq!(r.len(), 4);
-        assert_eq!(r[0].nbyte, 2 * C);
-        assert!(r[1..].iter().all(|c| c.nbyte == C));
-        check_cover(0, 5 * C, &r);
-        // Never more than SPLIT_MAX_CHILDREN, whatever the caller asks.
-        let r = plan(7, 100 * C, usize::MAX);
-        assert_eq!(r.len(), SPLIT_MAX_CHILDREN);
-        check_cover(7, 100 * C, &r);
-        // A cap of 1 never splits.
-        assert_eq!(plan(0, 4 * C, 1).len(), 1);
-    }
-
-    #[test]
-    fn plan_does_not_split_one_chunk_or_empty_reads() {
-        assert_eq!(plan(0, C, 4).len(), 1);
-        assert_eq!(plan(C + 10, C - 10, 4).len(), 1);
-        assert_eq!(plan(3 * C, 1, 4).len(), 1);
-        assert_eq!(plan(3 * C, 0, 4).len(), 0);
-        assert_eq!(split_chunk_span(C - 1, 2, SHIFT), 2);
-        assert_eq!(split_chunk_span(C, C, SHIFT), 1);
-    }
-
-    #[test]
-    fn plan_of_eof_clamped_read() {
+        // plan of eof clamped read.
         // File of 2.5 chunks; a 4 MiB read from 1 KiB clamps to the file end.
         let size = 2 * C + C / 2;
         let length = clamp_read(1024, 4 << 20, size).unwrap();
@@ -385,6 +358,31 @@ mod tests {
         assert_eq!(clamp_read(size as off_t, 10, size).unwrap(), 0);
     }
 
+    #[test]
+    fn plan_caps_children_and_skips_single_chunks() {
+        // plan caps child count and spreads chunks.
+        // 5 chunks over 4 children: 2, 1, 1, 1 chunks.
+        let r = plan(0, 5 * C, 4);
+        assert_eq!(r.len(), 4);
+        assert_eq!(r[0].nbyte, 2 * C);
+        assert!(r[1..].iter().all(|c| c.nbyte == C));
+        check_cover(0, 5 * C, &r);
+        // Never more than SPLIT_MAX_CHILDREN, whatever the caller asks.
+        let r = plan(7, 100 * C, usize::MAX);
+        assert_eq!(r.len(), SPLIT_MAX_CHILDREN);
+        check_cover(7, 100 * C, &r);
+        // A cap of 1 never splits.
+        assert_eq!(plan(0, 4 * C, 1).len(), 1);
+
+        // plan does not split one chunk or empty reads.
+        assert_eq!(plan(0, C, 4).len(), 1);
+        assert_eq!(plan(C + 10, C - 10, 4).len(), 1);
+        assert_eq!(plan(3 * C, 1, 4).len(), 1);
+        assert_eq!(plan(3 * C, 0, 4).len(), 0);
+        assert_eq!(split_chunk_span(C - 1, 2, SHIFT), 2);
+        assert_eq!(split_chunk_span(C, C, SHIFT), 1);
+    }
+
     fn res(return_value: i64, state: c_int) -> SceKernelAioResult {
         SceKernelAioResult {
             return_value,
@@ -396,7 +394,8 @@ mod tests {
     const AB: c_int = SCE_KERNEL_AIO_STATE_ABORTED;
 
     #[test]
-    fn aggregate_totals_and_partial_reads() {
+    fn aggregate_totals_partials_and_aborts() {
+        // aggregate totals and partial reads.
         let want = [100, 200, 300];
         assert_eq!(
             aggregate_split(&[res(100, OK), res(200, OK), res(300, OK)], &want),
@@ -418,10 +417,8 @@ mod tests {
             aggregate_split(&[res(100, OK), res(50, OK), res(300, OK)], &want),
             (150, OK)
         );
-    }
 
-    #[test]
-    fn aggregate_reports_abort() {
+        // aggregate reports abort.
         let want = [100, 200];
         let canceled = SCE_KERNEL_ERROR_ECANCELED as i64;
         assert_eq!(

@@ -342,19 +342,7 @@ unsafe fn submit_pipeline_io_locked(
         };
         let (priority, work_class) = ((*job).priority, (*job).work_class);
         let aio_priority = native_pack_priority(priority);
-        // Classify on demand bytes: read-extension pages (page_plan.rs)
-        // must not move a Latency read to Balanced.
-        let extension_bytes: usize = if mandatory_group {
-            p.mandatory_pages[..p.mandatory_page_count]
-                .iter()
-                .filter(|pg| pg.extension && pg.acquired.kind == PhysicalCacheAcquireKind::Load)
-                .map(|pg| pg.size as usize)
-                .sum()
-        } else {
-            0
-        };
-        let io_class =
-            native_pack_io_class(work_class, physical_bytes.saturating_sub(extension_bytes));
+        let io_class = native_pack_io_class(work_class, physical_bytes);
         let ctx = p as *mut ReadPipelineContext as *mut c_void;
         let submit_rc = if mandatory_group && count > 1 {
             reactor::apr_reactor_submit_external_aio_read_group(

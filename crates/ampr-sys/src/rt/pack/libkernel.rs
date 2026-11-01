@@ -197,18 +197,6 @@ real_fn!(
     c"sceKernelAioWaitRequests"
 );
 real_fn!(
-    real_aio_cancel_single,
-    KernelAioCancelSingleFn,
-    g_real_aio_cancel_single,
-    c"sceKernelAioCancelRequest"
-);
-real_fn!(
-    real_aio_cancel,
-    KernelAioCancelFn,
-    g_real_aio_cancel,
-    c"sceKernelAioCancelRequests"
-);
-real_fn!(
     real_aio_delete_single,
     KernelAioDeleteSingleFn,
     g_real_aio_delete_single,

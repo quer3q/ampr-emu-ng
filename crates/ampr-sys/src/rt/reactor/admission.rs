@@ -429,13 +429,28 @@ impl AprAioReactor {
         {
             abort();
         }
-        let job = unsafe { &mut *active.job };
-        let chain = unsafe { &mut *active.chain };
         if active.submitAccounted && !active.awaitingResubmit {
             abort();
         }
         let accountSubmit = !active.submitAccounted;
         self.mark_active_read_submitted(active, aioId);
+        Self::account_active_read_accept(active, submitTimeNs, accountSubmit);
+        self.arm_active_read_poll_after_submit(active, submitTimeNs);
+    }
+
+    /// Submit bookkeeping shared by the kernel accept and the pread pool's
+    /// (loose_pread.rs): the first accept reserves the chain sequence and
+    /// moves the chain past this slice.
+    pub(crate) fn account_active_read_accept(
+        active: &mut ActiveRead,
+        submitTimeNs: u64,
+        accountSubmit: bool,
+    ) {
+        if active.job.is_null() || active.chain.is_null() {
+            abort();
+        }
+        let job = unsafe { &mut *active.job };
+        let chain = unsafe { &mut *active.chain };
         active.submitTimeNs = submitTimeNs;
         active.retryNotBeforeNs = 0;
         if accountSubmit {
@@ -445,6 +460,7 @@ impl AprAioReactor {
         active.aioDeleteFirstFailureNs = 0;
         if accountSubmit {
             Self::reserve_read_chain_sequence(job, chain);
+            job.stat_read_issued();
         }
         if active.seq != chain.seq {
             abort();
@@ -460,6 +476,5 @@ impl AprAioReactor {
             chain.nextOffset += issuedLength;
             active.submitAccounted = true;
         }
-        self.arm_active_read_poll_after_submit(active, submitTimeNs);
     }
 }

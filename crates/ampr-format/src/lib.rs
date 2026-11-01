@@ -167,7 +167,11 @@ pub fn crc32_parts(parts: &[&[u8]]) -> u32 {
 
 pub fn header_crc(bytes: &[u8], len: usize, zero_at: usize) -> Result<u32> {
     let h = range(bytes, 0, len)?;
-    Ok(crc32_parts(&[&h[..zero_at], &[0; 4], &h[zero_at + 4..]]))
+    let zero_end = zero_at.checked_add(4).ok_or(Error::Invalid)?;
+    if zero_end > len {
+        return Err(Error::Invalid);
+    }
+    Ok(crc32_parts(&[&h[..zero_at], &[0; 4], &h[zero_end..]]))
 }
 
 /// `strings[off..off + len]` followed by a NUL; the content is not scanned.
@@ -221,6 +225,16 @@ mod tests {
 
     #[test]
     fn borrowed_index_checks_record_and_hash_slot() {
+        assert_eq!(header_crc(&[0; 8], 8, 5), Err(Error::Invalid));
+        assert_eq!(header_crc(&[0; 8], 8, usize::MAX), Err(Error::Invalid));
+        let mut slots = [0u8; IDX_SLOT * 2];
+        let mut record = [0u8; IDX_RECORD];
+        put32(&mut record, 0, u32::MAX);
+        put32(&mut record, 4, u32::MAX);
+        assert_eq!(
+            index::fill_slots(&record, b"/app0/x\0", &mut slots),
+            Err(Error::Invalid)
+        );
         let path = b"/app0/One.bin";
         let slots_at = 96;
         let mut b = [0u8; 128];

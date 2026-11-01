@@ -1,7 +1,7 @@
 //! Inline detours into libkernel (and the
 //! external equeue producers), the original/fallback slot tables, and the
 //! memory-protection `_emul` hooks that promote AMPR-write mappings to CPU_RW.
-//! AMPR_EMU_APR_LOCAL_EQUEUE=1 layout only. Logging is dropped.
+//! APR equeue is always local (rt/equeue.rs). Logging is dropped.
 #![allow(non_snake_case, non_upper_case_globals)]
 
 use core::ffi::{c_char, c_int, c_void};
@@ -1559,7 +1559,14 @@ pub unsafe extern "C" fn sceKernelLoadStartModule_equeue_observer(
     else {
         return sys::SCE_KERNEL_ERROR_ENOSYS;
     };
-    let module = unsafe { orig(name, args, argp, flags, opt, result) };
+    // The loader opens the file itself, past the path hooks. Games load
+    // modules by names that differ in case from the dump (Wwise plugins as
+    // /app0/prx/AkSineTone.prx, stored aksinetone.prx): retail pfs and exFAT
+    // fold case, a folder install on the internal SSD does not and the load
+    // fails with ENOENT. An indexed /app0 path goes in as its stored path.
+    let path = unsafe { super::index::maybe_resolve_path(name) };
+    let module = unsafe { orig(path, args, argp, flags, opt, result) };
+    super::stats::fs_event(b'K', b'-', module as i64, name);
     if module < 0 {
         return module;
     }

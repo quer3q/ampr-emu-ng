@@ -9,7 +9,7 @@ use ampr_zstd as format;
 pub use format::{
     path_hash_bytes as path_hash, VolumeHeader, CHUNK_RECORD_SIZE, CHUNK_SHIFT, CHUNK_SIZE,
     FILE_RECORD_SIZE, FORMAT_VERSION, INDEX_HEADER_CRC_AT, INDEX_HEADER_SIZE, INDEX_MAGIC,
-    INDEX_NAME, INDEX_PAYLOAD_CRC_AT, MAX_VOLUMES, VOLUME_HEADER_SIZE, VOLUME_LIMIT, VOLUME_MAGIC,
+    INDEX_NAME, INDEX_PAYLOAD_CRC_AT, MAX_VOLUMES, VOLUME_HEADER_SIZE, VOLUME_LIMIT,
     VOLUME_PREFIX, VOLUME_RECORD_SIZE, VOLUME_SUFFIX, ZSTD_LEVELS,
 };
 
@@ -376,7 +376,7 @@ mod tests {
     }
 
     #[test]
-    fn index_reads_256_kib_chunks() {
+    fn index_reads_256_kib_chunks_and_rejects_others() {
         let bytes = image(CHUNK_SHIFT, 1);
         let index = Index::open(&bytes).unwrap();
         let file = index.file(0).unwrap();
@@ -389,10 +389,6 @@ mod tests {
             (tail.offset, tail.stored_size, tail.codec),
             (64 + (1 << 18), 9, 1)
         );
-    }
-
-    #[test]
-    fn index_rejects_other_shift_and_codecs() {
         // A 64 KiB (shift 16) index fails cleanly.
         assert_eq!(Index::open(&image(16, 1)).err(), Some(Error::Invalid));
         for codec in [2, 3] {
@@ -401,14 +397,11 @@ mod tests {
                 Some(Error::Invalid)
             );
         }
-    }
-
-    #[test]
-    fn volume_name_pads_to_three_digits() {
         let mut buf = [0u8; 32];
-        assert_eq!(super::volume_name(0, &mut buf).unwrap(), "ampr_zstd-000.pak");
-        assert_eq!(super::volume_name(1, &mut buf).unwrap(), "ampr_zstd-001.pak");
-        assert_eq!(super::volume_name(999, &mut buf).unwrap(), "ampr_zstd-999.pak");
-        assert_eq!(super::volume_name(1000, &mut buf).unwrap(), "ampr_zstd-1000.pak");
+        assert_eq!(volume_name(7, &mut buf).unwrap(), "ampr_zstd-007.pak");
+        assert_eq!(
+            volume_name(MAX_VOLUMES as u32, &mut buf).err(),
+            Some(Error::OutOfRange)
+        );
     }
 }

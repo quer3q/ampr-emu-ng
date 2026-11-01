@@ -369,7 +369,7 @@ pub(crate) use super::pack::sceKernelClose;
 
 // ---- hook slots (rt/hook.rs) -----------------------------------------------
 
-/// `AmprLibkernelHookId` values (AMPR_EMU_APR_LOCAL_EQUEUE=1 layout).
+/// `AmprLibkernelHookId` values.
 pub mod hook {
     pub const open: usize = 0;
     pub const stat: usize = 1;

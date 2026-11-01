@@ -427,6 +427,7 @@ impl AprAioReactor {
         job: &mut JobPtr,
         priorReadFencePending: bool,
         priorNativeBatchPending: bool,
+        priorLaneOverlap: bool,
         _speculativeCommandUsed: &mut bool,
         readIssueBudget: &mut ReadIssueBudget,
         admission: &mut AioAdmissionContext,
@@ -473,6 +474,7 @@ impl AprAioReactor {
                 if !self.release_deferred_native_eop(jb, false) {
                     abort();
                 }
+                jb.stat_notified();
                 Self::advance_job_source(jb, completedOpBytes);
                 progressed = true;
             } else {
@@ -499,6 +501,7 @@ impl AprAioReactor {
             gs,
             priorReadFencePending,
             priorNativeBatchPending,
+            priorLaneOverlap,
             readIssueBudget,
             admission,
         ) {
@@ -539,6 +542,7 @@ impl AprAioReactor {
         gs: *mut GatherScatterState,
         priorReadFencePending: bool,
         priorNativeBatchPending: bool,
+        priorLaneOverlap: bool,
         readIssueBudget: &mut ReadIssueBudget,
         admission: &mut AioAdmissionContext,
     ) -> bool {
@@ -562,7 +566,7 @@ impl AprAioReactor {
             };
             let op = &op;
 
-            if AMPR_EMU_APR_LOCAL_EQUEUE && continueWithAdjacentEqueue {
+            if continueWithAdjacentEqueue {
                 continueWithAdjacentEqueue = false;
                 if op.op_type != WRITE_EQUEUE {
                     Self::cache_decoded_op(jb, op, opBytes);
@@ -577,6 +581,7 @@ impl AprAioReactor {
             }
             continueReadGrouping = false;
 
+            let offsetBefore = jb.sourceOffset;
             let flow = if cb_op_is_apr_read(op.op_type) {
                 self.progress_software_read_command(
                     job,
@@ -603,12 +608,18 @@ impl AprAioReactor {
                     opBytes,
                     priorReadFencePending,
                     priorNativeBatchPending,
+                    priorLaneOverlap,
                     readIssueBudget,
                     &mut progressed,
                 )
             };
             match flow {
-                CommandFlow::Stop => break,
+                CommandFlow::Stop => {
+                    let jb = j!(job);
+                    if !Self::lane_tail_runs_on(jb, op, jb.sourceOffset != offsetBefore) {
+                        break;
+                    }
+                }
                 CommandFlow::GroupReads => continueReadGrouping = true,
                 CommandFlow::AdjacentEqueue => continueWithAdjacentEqueue = true,
             }
@@ -706,6 +717,13 @@ impl AprAioReactor {
             read.offset = d.offset;
         } else {
             readRc = Self::resolve_software_read(gs, op, &mut read);
+            // Debug only: the first resolution of a gather/scatter command is
+            // its prepare record; a re-resolution here (no retained chain) is
+            // compared with it (job_state.rs stat_gs_resolved, issue #7). An
+            // empty inline in release builds, like the other stat_* helpers.
+            if readRc == 0 && Self::software_read_op_is_stateful(op) {
+                jb.stat_gs_resolved(op.buf_offset_bytes, read.fileId, read.offset);
+            }
         }
         if readRc != 0 {
             self.set_command_error(
@@ -754,8 +772,53 @@ impl AprAioReactor {
     /// Any command other than an APR read, gather-scatter reset or marker:
     /// gated by the read fence and pending native batches, then run as a map
     /// end, software address op, local equeue write or native micro op.
+    /// Also: while an earlier job of the lane is overlapped
+    /// (`priorLaneOverlap`, lane_overlap.rs), parks every command that could
+    /// touch the lane's native batch, AMM engine or map state. Ends
+    /// job_notify_ns only when a command reached with the fence clear was
+    /// consumed: a write that hits equeue backpressure or a full native batch
+    /// stays parked and keeps its read-done timestamp for the retry.
     #[allow(clippy::too_many_arguments)]
     fn progress_native_or_address_command(
+        &mut self,
+        jb: &mut JobState,
+        op: &Op,
+        opBytes: u32,
+        priorReadFencePending: bool,
+        priorNativeBatchPending: bool,
+        priorLaneOverlap: bool,
+        readIssueBudget: &ReadIssueBudget,
+        progressed: &mut bool,
+    ) -> CommandFlow {
+        if priorLaneOverlap && !lane_overlap::overlap_successor_op_allowed(op.op_type) {
+            Self::cache_decoded_op(jb, op, opBytes);
+            return CommandFlow::Stop;
+        }
+        let fenceClear = !priorReadFencePending && jb.completedReadSeq >= jb.latestSubmittedReadSeq;
+        let sourceOffsetBefore = jb.sourceOffset;
+        let flow = self.run_native_or_address_command(
+            jb,
+            op,
+            opBytes,
+            priorReadFencePending,
+            priorNativeBatchPending,
+            readIssueBudget,
+            progressed,
+        );
+        // Only a completion write that ran notifies the game; a satisfied wait
+        // or a native batch append before its packet runs does not.
+        if fenceClear
+            && jb.sourceOffset != sourceOffsetBefore
+            && lane_overlap::lane_completion_signals(op)
+            && !Self::software_op_uses_native_apr_batch(op.op_type)
+        {
+            jb.stat_notified();
+        }
+        flow
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_native_or_address_command(
         &mut self,
         jb: &mut JobState,
         op: &Op,
@@ -825,7 +888,7 @@ impl AprAioReactor {
         {
             return flow;
         }
-        if AMPR_EMU_APR_LOCAL_EQUEUE && op.op_type == WRITE_EQUEUE {
+        if op.op_type == WRITE_EQUEUE {
             self.progress_local_equeue_command(jb, op, opBytes, packedSource, progressed);
             return CommandFlow::Stop;
         }
@@ -870,10 +933,7 @@ impl AprAioReactor {
             // Reads right behind a satisfied wait may use the remaining quantum.
             return Some(CommandFlow::GroupReads);
         }
-        if AMPR_EMU_APR_LOCAL_EQUEUE
-            && op.op_type == WRITE_ADDRESS
-            && jb.sourceOffset < jb.sourceBytes
-        {
+        if op.op_type == WRITE_ADDRESS && jb.sourceOffset < jb.sourceBytes {
             // Decode the one permitted adjacent local-equeue candidate.
             return Some(CommandFlow::AdjacentEqueue);
         }

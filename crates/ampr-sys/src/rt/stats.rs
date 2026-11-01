@@ -56,16 +56,13 @@ stats! {
     /// cached, random-access file, no free slot or worker).
     PrefetchChunks = "prefetch_chunks",
     PrefetchSkipped = "prefetch_skipped",
-    /// Read extension: bytes added past a read's own pages in the same backing
-    /// request, and physical page cache lookups (hits = no disk read needed).
-    ReadExtendBytes = "read_extend_bytes",
+    /// Physical page cache lookups (hits = no disk read needed).
     PhysHits = "phys_hits",
     PhysMisses = "phys_misses",
-    /// Read plans that skipped extension because the disk was busy.
-    ReadExtendGated = "read_extend_gated",
-    /// Pack reads served by the blocking pread pool (reactor/pread_pool.rs): calls and
+    /// Reads served by the blocking pread pool (reactor/pread_pool.rs): calls and
     /// bytes, time queued for a pool thread, time in pread, and the peak
-    /// number of queued + running reads since the last scrape.
+    /// number of queued + running reads since the last scrape. Pack reads
+    /// and, with `loose_pread` on, loose reads (the loose_pread_* subset).
     PreadReads = "pread_reads",
     PreadBytes = "pread_bytes",
     PreadQueueNs = "pread_queue_ns",
@@ -73,11 +70,38 @@ stats! {
     PreadReadNs = "pread_read_ns",
     PreadReadNsMax = "pread_read_ns_max",
     PreadPendingMax = "pread_pending_max",
+    /// Loose APR reads (real fds) through the pread pool (reactor/loose_pread.rs):
+    /// full reads and their bytes; pool reads that got EFAULT and went to
+    /// kernel AIO; pool reads that failed otherwise or came back short and went
+    /// to kernel AIO; reads sent straight to kernel AIO because their
+    /// destination faulted before. apr_reads/apr_read_ns cover loose reads on
+    /// either path, so runs with the knob on and off compare.
+    LoosePreadReads = "loose_pread_reads",
+    LoosePreadBytes = "loose_pread_bytes",
+    LoosePreadEfault = "loose_pread_efault",
+    LoosePreadRetry = "loose_pread_retry",
+    LoosePreadSkipped = "loose_pread_skipped",
+    /// Split loose reads (`loose_pread_part_kib`, reactor/loose_pread.rs):
+    /// reads queued as more than one part task, and the part tasks they
+    /// queued. Unsplit reads count in neither; loose_pread_reads and
+    /// apr_reads still count each read once.
+    LoosePreadSplitReads = "loose_pread_split_reads",
+    LoosePreadParts = "loose_pread_parts",
     /// Highest number of reactor AIO reads in flight since the last scrape.
     AprInflightMax = "apr_inflight_max",
     /// Failures: pack virtual reads completed with an error, chunk decodes that failed.
     PackJobErrors = "pack_job_errors",
     DecodeErrors = "decode_errors",
+    /// Software WaitOnAddress / WriteAddress commands failed with an APR
+    /// error because sceKernelQueryMemoryProtection found the target
+    /// unmapped or without CPU read (wait) or write (write) protection
+    /// (reactor/software.rs address_target_check). Each one would otherwise
+    /// have faulted in the reactor thread.
+    AprAddressFaults = "apr_address_faults",
+    /// Pack volume fds closed for a reopen after a read failed with EBADF,
+    /// EIO or ENXIO (pack/leases.rs PackFdReopen; e.g. a USB image remounted
+    /// after rest mode).
+    PackFdReopens = "pack_fd_reopens",
     /// libc `open` hook (index.rs open_impl) by resident-lookup outcome, and
     /// /app0 opens it routed to a virtual pack fd or to the real open.
     OpenNotApp0 = "open_not_app0",
@@ -115,6 +139,69 @@ stats! {
     /// zstd: physical pages another job was loading, read privately by this
     /// job (its own disk read into its I/O window) instead of waiting.
     PrivatePageReads = "private_page_reads",
+    /// Reactor issue limits (reactor/progress.rs, reactor/flush.rs; live knobs
+    /// read_pass_kib, read_chunk_quantum, per_read_active_kib,
+    /// per_read_active_chunks in rt/tune.rs). read_budget_held: lane passes
+    /// that left a read slice unissued because the pass budget
+    /// (ReadIssueBudget) ran out, counted once per lane pass. read_active_held:
+    /// slice attempts refused by the per-read active window (chunks or bytes
+    /// in flight on one read chain), counted per attempt, so a read waiting
+    /// several passes counts several times.
+    ReadBudgetHeld = "read_budget_held",
+    ReadActiveHeld = "read_active_held",
+    /// APR jobs (command buffers) the reactor finished. job_first_issue_*:
+    /// submit accepted (AprAioReactor::submit, reactor/submit.rs) -> the job's
+    /// first read slice issued to kernel AIO or the pread pool
+    /// (account_active_read_accept, reactor/admission.rs), once per job with
+    /// such a read; job_first_issues is its count. job_notify_*: the
+    /// reactor observing a job's read chain complete (mark_seq_complete,
+    /// reactor/backoff.rs) -> the next point that tells the game: a non-read
+    /// command reached with the read fence clear (address write, counter,
+    /// equeue, native op; reactor/native.rs), a deferred native EOP released
+    /// to the kernel, or the job result published on release
+    /// (maybe_release_reactor_job, reactor/worker.rs); job_notifies is its count.
+    JobCount = "job_count",
+    JobFirstIssues = "job_first_issues",
+    JobFirstIssueNs = "job_first_issue_ns",
+    JobFirstIssueNsMax = "job_first_issue_ns_max",
+    JobNotifies = "job_notifies",
+    JobNotifyNs = "job_notify_ns",
+    JobNotifyNsMax = "job_notify_ns_max",
+    /// The part of job_notify_ns spent waiting on an earlier job of the
+    /// lane: when a lane head is released (reactor/worker.rs
+    /// maybe_release_reactor_job) and its successor's reads are all done with
+    /// its cursor on a completion command, its read-done time -> this
+    /// release. N before N+1 forces this wait; job_notify_ns minus it is the
+    /// reactor's own share (reactor/lane_overlap.rs note_successor_order_wait).
+    JobOrderWaits = "job_order_waits",
+    JobOrderWaitNs = "job_order_wait_ns",
+    /// Lane loop (reactor/progress.rs) stops before a job that has a
+    /// successor queued in its priority lane, so the successor does not parse
+    /// in this pass. Counted once per stop (per lane pass), by what the head
+    /// is parked on (reactor/lane_overlap.rs lane_block_kind):
+    /// lane_successor_blocked_fence: a completion command (EOP write, counter,
+    /// equeue) waiting on the head's own read fence or deferred native EOP;
+    /// lane_successor_blocked_wait: a WaitOnAddress/WaitOnCounter, or a
+    /// native batch wait; lane_successor_blocked_other: anything else (a read
+    /// held by budget or window, a native/AMM op, a failed head).
+    LaneSuccessorBlockedFence = "lane_successor_blocked_fence",
+    LaneSuccessorBlockedWait = "lane_successor_blocked_wait",
+    LaneSuccessorBlockedOther = "lane_successor_blocked_other",
+    /// Completion commands (not nops/markers) in head jobs whose tail the
+    /// live knob lane_eop_overlap let the successor run past, counted once
+    /// per job when its tail is first verified (reactor/lane_overlap.rs).
+    EopDeferred = "eop_deferred",
+    /// Gather/scatter re-resolves from the lane cursor
+    /// (`gatherScatterStates[prioIndex]`) after a first resolution of the
+    /// same command did not issue, counted per retry (a command parked and
+    /// retried n times counts n), and those whose file id or offset differed
+    /// from that first resolution (job_state.rs `GsPrepRecord`). A mismatch is
+    /// upstream issue #7: another job advanced the shared lane cursor and the
+    /// retry would read another file's bytes. Each is also logged as a 'G'
+    /// event in /fsfail (`gs_retry_mismatch`). Release can reach neither
+    /// while cross-EOP read-ahead is stubbed and lane overlap is off.
+    GsRetryChecks = "gs_retry_checks",
+    GsRetryMismatches = "gs_retry_mismatches",
 }
 
 const N: usize = Stat::Count as usize;
@@ -130,6 +217,8 @@ fn resets_on_read(s: usize) -> bool {
         || s == Stat::PreadQueueNsMax as usize
         || s == Stat::PreadReadNsMax as usize
         || s == Stat::PreadPendingMax as usize
+        || s == Stat::JobFirstIssueNsMax as usize
+        || s == Stat::JobNotifyNsMax as usize
 }
 
 /// Chunks read so far (decoded-cache loads), as a 2^23-bit hash set; a false
@@ -163,9 +252,15 @@ pub(crate) fn now() -> u64 {
     }
 }
 
-/// Path hook calls (open/stat/reachability), newest last, debug only: op
-/// (b'o', b's', b'r'), resident lookup (b'h' hit, b'm' miss, b'd' directory,
-/// b'n' index not ready, b'x' not /app0), result, path.
+/// Path hook calls, newest last, debug only. Op: b'o' open, b's' stat,
+/// b'l' lstat, b'a' access, b'r' reachability, b'O'/b'A' libc _open/_openat;
+/// and from the runtime itself b'L' its open of an indexed loose file, b'R'
+/// an APR path that did not resolve, b'E' a failed APR job (path = reason),
+/// b'K' a module load, b'G' a gather/scatter retry that re-resolved to
+/// another file id or offset than its first resolution (path = both pairs,
+/// see `gs_retry_mismatch`). Resident lookup: b'h' hit, b'm' miss the index
+/// answers, b'M' miss sent to the FS, b'd' directory, b'n' index not ready,
+/// b'x' not /app0, b'-' none. Then result and path.
 #[cfg(feature = "mem_report")]
 pub(crate) struct FsEvents {
     pub next: usize,
@@ -187,9 +282,91 @@ pub(crate) static FS_LOG: super::sync::SyncCell<FsEvents> = super::sync::SyncCel
     path: [[0; 160]; FS_EVENTS],
 });
 
+/// Failed path hook calls (rc < 0), one slot per distinct (op, path), the
+/// first FS_FAILS kept: boot-time failures outlive the 32-entry FS_LOG ring.
+/// 96 x ~150 B of text fits the 16 KiB response of `GET /fsfail`; the table
+/// is ~14 KiB of .bss outside the pool.
+#[cfg(feature = "mem_report")]
+pub(crate) struct FsFails {
+    pub count: usize,
+    pub dropped: core::sync::atomic::AtomicU64,
+    pub op: [u8; FS_FAILS],
+    pub how: [u8; FS_FAILS],
+    pub rc: [i64; FS_FAILS],
+    pub hits: [u32; FS_FAILS],
+    pub len: [usize; FS_FAILS],
+    pub path: [[u8; 128]; FS_FAILS],
+}
+#[cfg(feature = "mem_report")]
+pub(crate) const FS_FAILS: usize = 96;
+#[cfg(feature = "mem_report")]
+pub(crate) static FS_FAIL_LOG: super::sync::SyncCell<FsFails> =
+    super::sync::SyncCell::new(FsFails {
+        count: 0,
+        dropped: core::sync::atomic::AtomicU64::new(0),
+        op: [0; FS_FAILS],
+        how: [0; FS_FAILS],
+        rc: [0; FS_FAILS],
+        hits: [0; FS_FAILS],
+        len: [0; FS_FAILS],
+        path: [[0; 128]; FS_FAILS],
+    });
+
+/// Counts a failed call in FS_FAIL_LOG. Paths are kept and deduplicated by
+/// their first 128 bytes, so longer paths that differ only past that share
+/// an entry.
+#[cfg(feature = "mem_report")]
+unsafe fn fs_fail(op: u8, how: u8, rc: i64, path: *const core::ffi::c_char) {
+    use core::sync::atomic::{AtomicBool, Ordering};
+    // One writer at a time; a hook never waits for it: a busy log drops.
+    static BUSY: AtomicBool = AtomicBool::new(false);
+    if BUSY.swap(true, Ordering::Acquire) {
+        unsafe { (*FS_FAIL_LOG.get()).dropped.fetch_add(1, Ordering::Relaxed) };
+        return;
+    }
+    unsafe { fs_fail_locked(op, how, rc, path) };
+    BUSY.store(false, Ordering::Release);
+}
+
+#[cfg(feature = "mem_report")]
+unsafe fn fs_fail_locked(op: u8, how: u8, rc: i64, path: *const core::ffi::c_char) {
+    let log = unsafe { &mut *FS_FAIL_LOG.get() };
+    let mut name = [0u8; 128];
+    let mut n = 0;
+    while n < name.len() && !path.is_null() && unsafe { *path.add(n) } != 0 {
+        name[n] = unsafe { *path.add(n) } as u8;
+        n += 1;
+    }
+    // UE probes many optional user configs there; they always miss.
+    if name[..n].starts_with(b"/download0/") {
+        return;
+    }
+    for i in 0..log.count.min(FS_FAILS) {
+        if log.op[i] == op && log.path[i][..log.len[i]] == name[..n] {
+            log.hits[i] = log.hits[i].saturating_add(1);
+            return;
+        }
+    }
+    if log.count >= FS_FAILS {
+        log.dropped.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        return;
+    }
+    let i = log.count;
+    (log.op[i], log.how[i], log.rc[i], log.hits[i], log.len[i]) = (op, how, rc, 1, n);
+    log.path[i] = name;
+    log.count += 1;
+}
+
 /// Records one path hook call (racy by design: a debug trace).
 #[inline(always)]
 pub(crate) fn fs_event(op: u8, how: u8, rc: i64, path: *const core::ffi::c_char) {
+    // Authoritative misses ('m') of the path hooks are answered by the index
+    // alone, the same on every filesystem, so they are left out of the
+    // failure log. 'R' events carry no lookup letter and are always logged.
+    #[cfg(feature = "mem_report")]
+    if rc < 0 && how != b'm' {
+        unsafe { fs_fail(op, how, rc, path) };
+    }
     #[cfg(feature = "mem_report")]
     unsafe {
         let log = &mut *FS_LOG.get();
@@ -204,6 +381,37 @@ pub(crate) fn fs_event(op: u8, how: u8, rc: i64, path: *const core::ffi::c_char)
     }
     #[cfg(not(feature = "mem_report"))]
     let _ = (op, how, rc, path);
+}
+
+/// Logs a gather/scatter retry that re-resolved to `got` instead of the
+/// `prep` (file id, offset) of its first resolution, as a 'G' event with path
+/// "gs-retry fid=<hex> off=<hex> got fid=<hex> off=<hex>" (at most 80 bytes,
+/// within FsFails' 128). Debug only; the caller counts GsRetryMismatches.
+#[cfg(feature = "mem_report")]
+pub(crate) fn gs_retry_mismatch(rc: i64, prep: (u32, u64), got: (u32, u64)) {
+    fn hex(buf: &mut [u8; 128], n: &mut usize, v: u64) {
+        let digits = (64 - (v | 1).leading_zeros()).div_ceil(4);
+        for i in (0..digits).rev() {
+            buf[*n] = b"0123456789abcdef"[((v >> (i * 4)) & 0xf) as usize];
+            *n += 1;
+        }
+    }
+    fn text(buf: &mut [u8; 128], n: &mut usize, s: &[u8]) {
+        buf[*n..*n + s.len()].copy_from_slice(s);
+        *n += s.len();
+    }
+    let mut buf = [0u8; 128];
+    let mut n = 0;
+    text(&mut buf, &mut n, b"gs-retry fid=");
+    hex(&mut buf, &mut n, prep.0 as u64);
+    text(&mut buf, &mut n, b" off=");
+    hex(&mut buf, &mut n, prep.1);
+    text(&mut buf, &mut n, b" got fid=");
+    hex(&mut buf, &mut n, got.0 as u64);
+    text(&mut buf, &mut n, b" off=");
+    hex(&mut buf, &mut n, got.1);
+    // buf[n] is still 0: the path is NUL-terminated.
+    fs_event(b'G', b'-', rc, buf.as_ptr().cast());
 }
 
 #[inline(always)]
@@ -227,6 +435,18 @@ pub(crate) fn since(start: u64) -> u64 {
         now().saturating_sub(start)
     } else {
         0
+    }
+}
+
+/// Records one span that started at `start` (from `now()`; 0 = no span):
+/// +1 to `count`, the elapsed ns to `sum`, and the scrape maximum to `max_ns`.
+#[inline(always)]
+pub(crate) fn span(start: u64, count: Stat, sum: Stat, max_ns: Stat) {
+    if ON && start != 0 {
+        let ns = since(start);
+        add(count, 1);
+        add(sum, ns);
+        max(max_ns, ns);
     }
 }
 

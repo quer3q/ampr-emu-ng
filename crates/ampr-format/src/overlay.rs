@@ -4,7 +4,6 @@
 //! Uses caller-owned buffers; no alloc.
 use core::cmp::Ordering;
 
-
 /// `SCE_KERNEL_PATH_MAX`.
 pub const PATH_MAX: usize = 1024;
 /// `AMPR_EMU_PACK_LOGICAL_ROOT_PATH`.
@@ -91,24 +90,6 @@ pub fn joined_matches(directory: &[u8], name: &[u8], target: &[u8]) -> bool {
         at += 1;
     }
     folded_equal(name, &target[at..])
-}
-
-/// Writes NUL-terminated `directory/name`.
-pub fn join_child(directory: &[u8], name: &[u8], out: &mut [u8]) -> bool {
-    let slash = directory.last() != Some(&b'/');
-    let needed = directory.len() + usize::from(slash) + name.len() + 1;
-    if needed > out.len() {
-        return false;
-    }
-    out[..directory.len()].copy_from_slice(directory);
-    let mut at = directory.len();
-    if slash {
-        out[at] = b'/';
-        at += 1;
-    }
-    out[at..at + name.len()].copy_from_slice(name);
-    out[at + name.len()] = 0;
-    true
 }
 
 /// One `next_virtual_child` result: `name[..len]` plus NUL in the caller's
@@ -248,4 +229,3 @@ pub fn advance_offset(base: i64, bytes: i32) -> i64 {
         base.saturating_add(i64::from(bytes))
     }
 }
-

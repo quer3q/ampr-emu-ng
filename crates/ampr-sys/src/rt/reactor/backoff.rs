@@ -156,7 +156,7 @@ impl AprAioReactor {
     pub(crate) fn set_fail(
         &mut self,
         job: &mut JobState,
-        _reason: *const c_char,
+        reason: *const c_char,
         rc: c_int,
         errorOffset: u32,
         _backendRc: c_int,
@@ -166,6 +166,8 @@ impl AprAioReactor {
         }
         job.result.rc = if rc != 0 { rc } else { SCE_KERNEL_ERROR_EIO };
         job.result.errorOffset = errorOffset;
+        // 'E': a failed APR job, logged with its reason (debug trace).
+        crate::rt::stats::fs_event(b'E', b'-', job.result.rc as i64, reason);
         self.clear_cursor_read_wait_hint(job.prioIndex as usize);
         Self::finish_job_processing(job);
         self.abandon_job_cursor_read_chains(job);
@@ -235,6 +237,7 @@ impl AprAioReactor {
         if seq < nextSeq {
             return;
         }
+        job.stat_read_done();
         if seq == nextSeq {
             job.completedReadSeq = seq;
             loop {

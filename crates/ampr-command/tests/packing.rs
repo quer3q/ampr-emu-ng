@@ -12,8 +12,9 @@ fn words(bytes: &[u8]) -> impl Iterator<Item = u32> + '_ {
         .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
 }
 
+/// Expected words are fixed reference encodings.
 #[test]
-fn apr_read_file_and_gather_match_reference_words() {
+fn encodings_match_reference_words() {
     let mut storage = Aligned([0xcc; 64]);
     let mut cb = CommandBuffer::new(&mut storage.0).unwrap();
     let read = Command::ReadFile {
@@ -44,83 +45,7 @@ fn apr_read_file_and_gather_match_reference_words() {
         words(&cb.encoded()[20..]).collect::<Vec<_>>(),
         [0x229, 0, 1]
     );
-}
-
-#[test]
-fn high_offset_and_capacity_boundaries() {
-    let mut storage = Aligned([0xcc; 28]);
-    let mut cb = CommandBuffer::new(&mut storage.0).unwrap();
-    let read = Command::ReadFile {
-        file_id: 1,
-        address: 0,
-        length: 1,
-        offset: 0x1_0000_0000,
-    };
-    assert_eq!(read.measure(), Ok(24));
-    cb.append(read).unwrap();
-    assert_eq!(
-        words(cb.encoded()).collect::<Vec<_>>(),
-        [0x528, 0, 1, 0, 0, 1]
-    );
-    let before = *cb.header();
-    assert_eq!(
-        cb.append(Command::ReadGather {
-            length: 1,
-            offset: 0
-        }),
-        Err(Error::Full)
-    );
-    assert_eq!(cb.header().offset, before.offset);
-    assert_eq!(cb.header().num, before.num);
-    assert_eq!(cb.encoded().len(), 24);
-    assert_eq!(storage.0[24..], [0xcc; 4]);
-}
-
-#[test]
-fn validation_and_gather_state() {
-    let mut storage = Aligned([0; 32]);
-    let mut cb = CommandBuffer::new(&mut storage.0).unwrap();
-    assert_eq!(
-        cb.append(Command::ReadGather {
-            length: 1,
-            offset: 0
-        }),
-        Err(Error::NoGatherState)
-    );
-    assert_eq!(
-        Command::ReadFile {
-            file_id: 0,
-            address: 0,
-            length: 0,
-            offset: 0
-        }
-        .measure(),
-        Err(Error::InvalidArgument)
-    );
-    assert_eq!(
-        Command::ReadFile {
-            file_id: 0,
-            address: 0xf000_0000_0000,
-            length: 1,
-            offset: 0
-        }
-        .measure(),
-        Err(Error::InvalidArgument)
-    );
-    assert_eq!(
-        Command::ReadGather {
-            length: 1,
-            offset: 0x100_0000_0000
-        }
-        .measure(),
-        Err(Error::InvalidArgument)
-    );
-    assert_eq!(cb.header().offset, 0);
-    assert_eq!(cb.header().num, 0);
-}
-
-#[test]
-fn map_state_uses_header_bit_positions() {
+    // AprMapState packs fields at the header bit positions.
     let state = AprMapState::new(true, 0x1f_ffff, 0x3_ffff_ffff).unwrap();
     assert_eq!(state.raw(), 0x00ff_ffff_ffff_ffff);
     let raw = |b, n, va| AprMapState::new(b, n, va).unwrap().raw();
@@ -131,11 +56,7 @@ fn map_state_uses_header_bit_positions() {
     assert_eq!(raw(false, 0, 0x3_ffff_ffff), 0x3_ffff_ffff << 22);
     assert!(AprMapState::new(false, 0x20_0000, 0).is_none());
     assert!(AprMapState::new(false, 0, 0x4_0000_0000).is_none());
-}
-
-/// Expected words are fixed reference encodings.
-#[test]
-fn op_record_encodings_match_reference_words() {
+    // Op records.
     let fixed = |op: OpRecord, expected: &[u32]| {
         let bytes = expected.len() as u32 * 4;
         assert_eq!(
@@ -229,4 +150,74 @@ fn op_record_encodings_match_reference_words() {
         decode_packed_op(&bytes[..12], 0),
         Err(DecodeError::InvalidAt)
     );
+}
+
+#[test]
+fn validation_capacity_and_gather_state() {
+    let mut storage = Aligned([0; 32]);
+    let mut cb = CommandBuffer::new(&mut storage.0).unwrap();
+    assert_eq!(
+        cb.append(Command::ReadGather {
+            length: 1,
+            offset: 0
+        }),
+        Err(Error::NoGatherState)
+    );
+    assert_eq!(
+        Command::ReadFile {
+            file_id: 0,
+            address: 0,
+            length: 0,
+            offset: 0
+        }
+        .measure(),
+        Err(Error::InvalidArgument)
+    );
+    assert_eq!(
+        Command::ReadFile {
+            file_id: 0,
+            address: 0xf000_0000_0000,
+            length: 1,
+            offset: 0
+        }
+        .measure(),
+        Err(Error::InvalidArgument)
+    );
+    assert_eq!(
+        Command::ReadGather {
+            length: 1,
+            offset: 0x100_0000_0000
+        }
+        .measure(),
+        Err(Error::InvalidArgument)
+    );
+    assert_eq!(cb.header().offset, 0);
+    assert_eq!(cb.header().num, 0);
+    // High offsets encode; capacity limits reject without writing past the buffer.
+    let mut storage = Aligned([0xcc; 28]);
+    let mut cb = CommandBuffer::new(&mut storage.0).unwrap();
+    let read = Command::ReadFile {
+        file_id: 1,
+        address: 0,
+        length: 1,
+        offset: 0x1_0000_0000,
+    };
+    assert_eq!(read.measure(), Ok(24));
+    cb.append(read).unwrap();
+    assert_eq!(
+        words(cb.encoded()).collect::<Vec<_>>(),
+        [0x528, 0, 1, 0, 0, 1]
+    );
+    let before = *cb.header();
+    assert_eq!(
+        cb.append(Command::ReadGather {
+            length: 1,
+            offset: 0
+        }),
+        Err(Error::Full)
+    );
+    assert_eq!(cb.header().offset, before.offset);
+    assert_eq!(cb.header().num, before.num);
+    assert_eq!(cb.encoded().len(), 24);
+    assert_eq!(storage.0[24..], [0xcc; 4]);
 }

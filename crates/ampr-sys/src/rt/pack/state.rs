@@ -223,24 +223,47 @@ pub(crate) unsafe fn pread_exact(
     let Some(f) = (unsafe { real_pread() }) else {
         return false;
     };
-    if offset > off_t::MAX as u64 {
+    let out = destination as *mut u8;
+    pread_loop(
+        size,
+        offset,
+        AMPR_EMU_PACK_PREAD_MAX_BYTES as usize,
+        |done, request, at| unsafe { f(fd, out.add(done) as *mut c_void, request, at) },
+        errno,
+    )
+}
+
+/// Consecutive EINTR results `pread_loop` retries before it gives up.
+pub(crate) const PREAD_EINTR_RETRIES: u32 = 16;
+
+/// The `pread_exact` loop over `read(done, request, offset) -> rc` (libc
+/// pread semantics: -1 with `errno()`). A short read continues from where it
+/// stopped: a USB (exFAT, bfs) pread may return fewer bytes than asked before
+/// EOF. EINTR is retried (a signal is not an I/O error; the old loop failed
+/// the manifest load or pack open on it); EOF (0) or any other error fails.
+pub(crate) fn pread_loop(
+    size: usize,
+    offset: u64,
+    max_request: usize,
+    mut read: impl FnMut(usize, usize, off_t) -> ssize_t,
+    errno: impl Fn() -> c_int,
+) -> bool {
+    if offset > off_t::MAX as u64 || size as u64 > off_t::MAX as u64 - offset {
         return false;
     }
-    let out = destination as *mut u8;
     let mut done = 0usize;
+    let mut interrupted = 0u32;
     while done < size {
-        let request = (size - done).min(AMPR_EMU_PACK_PREAD_MAX_BYTES as usize);
-        let rc = unsafe {
-            f(
-                fd,
-                out.add(done) as *mut c_void,
-                request,
-                (offset + done as u64) as off_t,
-            )
-        };
-        if rc <= 0 {
+        let request = (size - done).min(max_request.max(1));
+        let rc = read(done, request, (offset + done as u64) as off_t);
+        if rc < 0 && errno() == EINTR && interrupted < PREAD_EINTR_RETRIES {
+            interrupted += 1;
+            continue;
+        }
+        if rc <= 0 || rc as usize > request {
             return false;
         }
+        interrupted = 0;
         done += rc as usize;
     }
     true
@@ -628,4 +651,55 @@ pub(crate) unsafe fn join_directory_child(
         *output.add(cursor + name_length) = 0;
     }
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+
+    /// Serves `data` from `offset`, with the per-call results in `script`
+    /// (Some(n): at most n bytes; None: -1 with EINTR), then whole requests.
+    fn run(data: &[u8], offset: u64, size: usize, script: &[Option<usize>]) -> (bool, Vec<u8>) {
+        let mut out = vec![0u8; size];
+        let calls = Cell::new(0usize);
+        let ok = pread_loop(
+            size,
+            offset,
+            4,
+            |done, request, at| {
+                let step = calls.get();
+                calls.set(step + 1);
+                let limit = match script.get(step) {
+                    Some(None) => return -1,
+                    Some(Some(n)) => *n,
+                    None => request,
+                };
+                let at = at as usize;
+                let n = request.min(limit).min(data.len().saturating_sub(at));
+                out[done..done + n].copy_from_slice(&data[at..at + n]);
+                n as ssize_t
+            },
+            || EINTR,
+        );
+        (ok, out)
+    }
+
+    #[test]
+    fn pread_loop_handles_short_reads_eintr_eof_and_errors() {
+        // pread loop continues short reads and retries eintr.
+        let data: Vec<u8> = (0..32u8).collect();
+        let (ok, out) = run(&data, 3, 10, &[Some(1), None, Some(2), None, None]);
+        assert!(ok);
+        assert_eq!(out, data[3..13]);
+
+        // pread loop fails on eof errors and endless eintr.
+        let data: Vec<u8> = (0..8u8).collect();
+        assert!(!run(&data, 4, 8, &[]).0, "EOF before size");
+        let endless = vec![None; PREAD_EINTR_RETRIES as usize + 1];
+        assert!(!run(&data, 0, 4, &endless).0);
+        assert!(!pread_loop(1, 0, 4, |_, _, _| -1, || EINTR + 1), "EIO");
+        assert!(!pread_loop(1, off_t::MAX as u64, 4, |_, _, _| 1, || 0));
+        assert!(!pread_loop(2, 0, 4, |_, _, _| 3, || 0), "rc above request");
+    }
 }

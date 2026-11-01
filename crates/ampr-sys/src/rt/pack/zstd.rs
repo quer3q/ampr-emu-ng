@@ -1002,16 +1002,64 @@ mod tests {
     }
 
     #[test]
-    fn relative_path_strips_folded_app0_root() {
+    fn path_helpers_strip_roots_and_hide_pack_files() {
+        // relative path strips folded app0 root.
         assert_eq!(ampr_relative_path(b"/app0/a/B.bin"), Some(&b"a/B.bin"[..]));
         assert_eq!(ampr_relative_path(b"/APP0/x"), Some(&b"x"[..]));
         assert_eq!(ampr_relative_path(b"/app0/"), None);
         assert_eq!(ampr_relative_path(b"/app1/x"), None);
         assert_eq!(ampr_relative_path(b"app0/xy"), None);
+
+        // relative dir strips logical root.
+        assert_eq!(zstd_relative_dir(b"/app0"), Some(&b""[..]));
+        assert_eq!(zstd_relative_dir(b"/APP0/a/B"), Some(&b"a/B"[..]));
+        assert_eq!(zstd_relative_dir(b"/app0x"), None);
+        assert_eq!(zstd_relative_dir(b"/app"), None);
+
+        // hides zstd index and mounted volumes only.
+        let hidden = |dir: &[u8], name: &[u8]| zstd_service_name_hidden(2, dir, name);
+        for name in [
+            &b"ampr_zstd.index"[..],
+            b"AMPR_ZSTD.INDEX",
+            b"ampr_zstd-000.pak",
+            b"Ampr_Zstd-001.PAK",
+        ] {
+            assert!(hidden(b"/app0", name), "{:?}", name);
+        }
+        assert!(hidden(b"/app0/", b"ampr_zstd-000.pak"));
+        // Unmounted, non-canonical, or outside /app0: still listed.
+        for name in [
+            &b"ampr_zstd-002.pak"[..],
+            b"ampr_zstd-0.pak",
+            b"ampr_zstd-01.pak",
+            b"ampr_zstd-0001.pak",
+            b"ampr_zstd-00x.pak",
+            b"ampr_zstd-000.pa",
+            b"ampr_zstdx.pak",
+            b"game.index",
+            b"data-01.pak",
+            b"data.bin",
+        ] {
+            assert!(!hidden(b"/app0", name), "{:?}", name);
+        }
+        assert!(!hidden(b"/app0/sub", b"ampr_zstd-000.pak"));
+        assert!(!hidden(b"/app0/sub", b"ampr_zstd.index"));
+        assert!(!zstd_service_name_hidden(0, b"/app0", b"ampr_zstd-000.pak"));
+        assert!(zstd_service_name_hidden(
+            1001,
+            b"/app0",
+            b"ampr_zstd-1000.pak"
+        ));
+        assert!(!zstd_service_name_hidden(
+            1000,
+            b"/app0",
+            b"ampr_zstd-1000.pak"
+        ));
     }
 
     #[test]
-    fn projects_every_ampr_id_onto_zstd_records() {
+    fn projection_maps_ids_and_rejects_mismatches() {
+        // projects every ampr id onto zstd records.
         let image = build_index(ZSTD_FILES, ("Data/B.bin", 1));
         let index = Index::open(&image).expect("test image validates");
         assert_eq!(index.volume_count(), 2);
@@ -1052,10 +1100,8 @@ mod tests {
             (0, ZSTD_VOLUME_NONE)
         );
         assert_eq!(out[7].chunk_count, 1);
-    }
 
-    #[test]
-    fn size_mismatch_or_missing_view_invalidates() {
+        // size mismatch or missing view invalidates.
         let image = build_index(ZSTD_FILES, ("Data/B.bin", 1));
         let index = Index::open(&image).unwrap();
         let mut entries = ampr_entries();
@@ -1072,6 +1118,26 @@ mod tests {
             Err(2)
         );
         assert_eq!(project_ids(&index, &mut [], |_| None), Ok(0));
+
+        // logical file matches ampr path and size.
+        let image = task_image();
+        let index = Index::open(&image).unwrap();
+        let entry = project_entry(&index, b"/APP0/Data/B.bin", 300_000).unwrap();
+        assert!(entry.is_packed());
+        assert_eq!(
+            zstd_validate_logical(&index, &entry, b"/app0/Data/B.bin", 300_000),
+            Ok(())
+        );
+        for (path, size) in [
+            (&b"/app0/Data/B.bin"[..], 299_999),
+            (b"/app0/data/b.bin", 300_000),
+            (b"/app0/data/a.bin", 300_000),
+        ] {
+            assert_eq!(
+                zstd_validate_logical(&index, &entry, path, size),
+                Err(CoreError::ChecksumMismatch)
+            );
+        }
     }
 
     /// `Data/B.bin` (300 000 bytes): chunk 0 raw in volume 0, chunk 1 zstd
@@ -1088,7 +1154,8 @@ mod tests {
     }
 
     #[test]
-    fn tasks_use_fixed_256k_chunks_and_carry_volume_and_codec() {
+    fn tasks_split_reads_into_fixed_256k_chunks() {
+        // tasks use fixed 256k chunks and carry volume and codec.
         let image = task_image();
         let index = Index::open(&image).expect("test image validates");
         let f = file(&index, "Data/B.bin");
@@ -1144,10 +1211,8 @@ mod tests {
             zstd_read_task(&index, &f, 0, 300_000, 2).err(),
             Some(CoreError::OutOfRange)
         );
-    }
 
-    #[test]
-    fn partial_reads_split_at_chunk_boundaries() {
+        // partial reads split at chunk boundaries.
         let image = task_image();
         let index = Index::open(&image).unwrap();
         let f = file(&index, "Data/B.bin");
@@ -1187,10 +1252,8 @@ mod tests {
                 .raw_size,
             262_144
         );
-    }
 
-    #[test]
-    fn empty_file_has_no_tasks() {
+        // empty file has no tasks.
         let image = task_image();
         let index = Index::open(&image).unwrap();
         let f = file(&index, "data/empty");
@@ -1198,28 +1261,18 @@ mod tests {
         assert_eq!(zstd_task_count(&f, 0, 0), 0);
         assert_eq!(zstd_task_count(&f, 0, 1), 0);
         assert!(zstd_read_task(&index, &f, 0, 1, 0).is_err());
-    }
 
-    #[test]
-    fn logical_file_matches_ampr_path_and_size() {
-        let image = task_image();
-        let index = Index::open(&image).unwrap();
-        let entry = project_entry(&index, b"/APP0/Data/B.bin", 300_000).unwrap();
-        assert!(entry.is_packed());
-        assert_eq!(
-            zstd_validate_logical(&index, &entry, b"/app0/Data/B.bin", 300_000),
-            Ok(())
-        );
-        for (path, size) in [
-            (&b"/app0/Data/B.bin"[..], 299_999),
-            (b"/app0/data/b.bin", 300_000),
-            (b"/app0/data/a.bin", 300_000),
-        ] {
-            assert_eq!(
-                zstd_validate_logical(&index, &entry, path, size),
-                Err(CoreError::ChecksumMismatch)
-            );
-        }
+        // task exports reject foreign file pointers.
+        // No projection is mounted in host tests: every pointer is foreign.
+        let record = [0u8; 48];
+        assert!(zstd_task_file(1).is_null());
+        assert_eq!(zstd_core_task_count(record.as_ptr(), 0, 1), 0);
+        let mut task = AmprPackBlockReadTask {
+            chunk_index: 7,
+            ..Default::default()
+        };
+        let rc = unsafe { zstd_core_make_task(record.as_ptr(), 0, 1, 0, &mut task) };
+        assert_eq!((rc, task.chunk_index), (-1, 0));
     }
 
     const TREE: &[(&str, u64)] = &[
@@ -1310,69 +1363,5 @@ mod tests {
             [s("a.bin", r), s("B.bin", r), s("empty", r), s("sub", d)]
         );
         assert_eq!(children(&index, &order, b"/app0/data/sub"), [s("d.bin", r)]);
-    }
-
-    #[test]
-    fn relative_dir_strips_logical_root() {
-        assert_eq!(zstd_relative_dir(b"/app0"), Some(&b""[..]));
-        assert_eq!(zstd_relative_dir(b"/APP0/a/B"), Some(&b"a/B"[..]));
-        assert_eq!(zstd_relative_dir(b"/app0x"), None);
-        assert_eq!(zstd_relative_dir(b"/app"), None);
-    }
-
-    #[test]
-    fn hides_zstd_index_and_mounted_volumes_only() {
-        let hidden = |dir: &[u8], name: &[u8]| zstd_service_name_hidden(2, dir, name);
-        for name in [
-            &b"ampr_zstd.index"[..],
-            b"AMPR_ZSTD.INDEX",
-            b"ampr_zstd-000.pak",
-            b"Ampr_Zstd-001.PAK",
-        ] {
-            assert!(hidden(b"/app0", name), "{:?}", name);
-        }
-        assert!(hidden(b"/app0/", b"ampr_zstd-000.pak"));
-        // Unmounted, non-canonical, or outside /app0: still listed.
-        for name in [
-            &b"ampr_zstd-002.pak"[..],
-            b"ampr_zstd-0.pak",
-            b"ampr_zstd-01.pak",
-            b"ampr_zstd-0001.pak",
-            b"ampr_zstd-00x.pak",
-            b"ampr_zstd-000.pa",
-            b"ampr_zstdx.pak",
-            b"game.index",
-            b"data-01.pak",
-            b"data.bin",
-        ] {
-            assert!(!hidden(b"/app0", name), "{:?}", name);
-        }
-        assert!(!hidden(b"/app0/sub", b"ampr_zstd-000.pak"));
-        assert!(!hidden(b"/app0/sub", b"ampr_zstd.index"));
-        assert!(!zstd_service_name_hidden(0, b"/app0", b"ampr_zstd-000.pak"));
-        assert!(zstd_service_name_hidden(
-            1001,
-            b"/app0",
-            b"ampr_zstd-1000.pak"
-        ));
-        assert!(!zstd_service_name_hidden(
-            1000,
-            b"/app0",
-            b"ampr_zstd-1000.pak"
-        ));
-    }
-
-    #[test]
-    fn task_exports_reject_foreign_file_pointers() {
-        // No projection is mounted in host tests: every pointer is foreign.
-        let record = [0u8; 48];
-        assert!(zstd_task_file(1).is_null());
-        assert_eq!(zstd_core_task_count(record.as_ptr(), 0, 1), 0);
-        let mut task = AmprPackBlockReadTask {
-            chunk_index: 7,
-            ..Default::default()
-        };
-        let rc = unsafe { zstd_core_make_task(record.as_ptr(), 0, 1, 0, &mut task) };
-        assert_eq!((rc, task.chunk_index), (-1, 0));
     }
 }

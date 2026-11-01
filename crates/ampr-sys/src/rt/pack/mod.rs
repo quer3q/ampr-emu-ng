@@ -476,25 +476,6 @@ pub(crate) const AMPR_EMU_PACK_READAHEAD_MAX_DISK_INFLIGHT: u32 =
         Some(s) => super::runtime_memory::parse_size(s.as_bytes()) as u32,
         None => 2,
     };
-/// Read extension, from the Makefile's `AMPR_PACK_READ_EXTEND_BYTES` (default
-/// 1 MiB): a backing request for cold physical pages also reads the following
-/// uncached pages of the volume into the physical cache, up to this total
-/// request size (page_plan.rs); 0 disables it.
-pub(crate) const AMPR_EMU_PACK_READ_EXTEND_BYTES: usize =
-    match option_env!("AMPR_PACK_READ_EXTEND_BYTES") {
-        Some(s) if s.len() == 1 && s.as_bytes()[0] == b'0' => 0,
-        Some(s) => super::runtime_memory::parse_size(s.as_bytes()),
-        None => 1024 * 1024,
-    };
-/// Read extension runs only while fewer than this many pack disk reads are in
-/// flight (Makefile `AMPR_PACK_READ_EXTEND_MAX_DISK_INFLIGHT`, default 2). Console
-/// metrics: unconditional 1 MiB extension doubled throughput but raised busy-time
-/// read latency (ShadowMount serializes requests).
-pub(crate) const AMPR_EMU_PACK_READ_EXTEND_MAX_DISK_INFLIGHT: u32 =
-    match option_env!("AMPR_PACK_READ_EXTEND_MAX_DISK_INFLIGHT") {
-        Some(s) => super::runtime_memory::parse_size(s.as_bytes()) as u32,
-        None => 2,
-    };
 pub(crate) const AMPR_EMU_PACK_DECODED_CACHE_MAX_BYTES: u64 = 512 * 1024 * 1024;
 pub(crate) const AMPR_EMU_PACK_PHYSICAL_CACHE_MAX_BYTES: u64 = 128 * 1024 * 1024;
 /// 16 in release: each pipeline keeps a 2 MiB I/O window once used and the
@@ -598,6 +579,8 @@ const _: () = {
     assert!(PACK_CACHE_BITMAP_WORDS == 512 && PACK_PHYSICAL_CACHE_BITMAP_WORDS == 128);
     assert!(AMPR_EMU_PACK_PHYSICAL_CACHE_BYTES <= AMPR_EMU_PACK_PHYSICAL_CACHE_MAX_BYTES);
     assert!(AMPR_EMU_PACK_PHYSICAL_CACHE_HASH_BUCKETS.is_power_of_two());
+    assert!(AMPR_EMU_PACK_CACHE_HASH_BUCKETS.is_power_of_two());
+    assert!(AMPR_EMU_PACK_TOUCH_TABLE_SIZE.is_power_of_two());
     assert!(AMPR_EMU_PACK_PIPELINE_SLOTS <= SCE_KERNEL_AIO_REQUEST_NUM_MAX);
     assert!(AMPR_EMU_PACK_IO_STAGING_BYTES >= 2 * (1 << AMPR_PACK_BLOCK_SHIFT_MAX));
 };
@@ -633,12 +616,6 @@ pub(crate) type KernelAioWaitFn = unsafe extern "C" fn(
     u32,
     *mut SceKernelUseconds,
 ) -> c_int;
-#[allow(dead_code)]
-pub(crate) type KernelAioCancelSingleFn =
-    unsafe extern "C" fn(SceKernelAioSubmitId, *mut c_int) -> c_int;
-#[allow(dead_code)]
-pub(crate) type KernelAioCancelFn =
-    unsafe extern "C" fn(*mut SceKernelAioSubmitId, c_int, *mut c_int) -> c_int;
 pub(crate) type KernelAioDeleteSingleFn =
     unsafe extern "C" fn(SceKernelAioSubmitId, *mut c_int) -> c_int;
 pub(crate) type KernelAioDeleteFn =
@@ -663,10 +640,6 @@ pub(crate) static g_real_aio_poll: AtomicPtr<c_void> = AtomicPtr::new(null_mut()
 #[allow(dead_code)]
 pub(crate) static g_real_aio_wait_single: AtomicPtr<c_void> = AtomicPtr::new(null_mut());
 pub(crate) static g_real_aio_wait: AtomicPtr<c_void> = AtomicPtr::new(null_mut());
-#[allow(dead_code)]
-pub(crate) static g_real_aio_cancel_single: AtomicPtr<c_void> = AtomicPtr::new(null_mut());
-#[allow(dead_code)]
-pub(crate) static g_real_aio_cancel: AtomicPtr<c_void> = AtomicPtr::new(null_mut());
 pub(crate) static g_real_aio_delete_single: AtomicPtr<c_void> = AtomicPtr::new(null_mut());
 pub(crate) static g_real_aio_delete: AtomicPtr<c_void> = AtomicPtr::new(null_mut());
 
@@ -810,7 +783,6 @@ pub(crate) struct VirtualAioGroupSlot {
     pub delete_result: c_int,
     pub active: bool,
     pub wait_notified: bool,
-    pub has_native_children: bool,
     /// zstd: split-read state; `split.count == 0` for a plain group.
     pub split: SplitGroup,
 }
@@ -822,7 +794,6 @@ impl VirtualAioGroupSlot {
         delete_result: 0,
         active: false,
         wait_notified: false,
-        has_native_children: false,
         split: SplitGroup::EMPTY,
     };
 }
@@ -835,6 +806,9 @@ pub(crate) struct PackHandle {
     pub payload_begin: u64,
     pub payload_end: u64,
     pub opening: bool,
+    /// Stale-fd reopen state (leases.rs `PackFdReopen`). Kept across
+    /// eviction so a reopened fd keeps its one-retry bound.
+    pub reopen: PackFdReopen,
 }
 impl PackHandle {
     pub(crate) const EMPTY: Self = Self {
@@ -844,6 +818,7 @@ impl PackHandle {
         payload_begin: 0,
         payload_end: 0,
         opening: false,
+        reopen: PackFdReopen::Clean,
     };
 }
 
@@ -1012,8 +987,6 @@ pub(crate) struct PipelineMandatoryPage {
     pub request_index: u32,
     pub staging_offset: u32,
     pub pack_id: u16,
-    /// Read-extension page (page_plan.rs): cache fill only, no task reads it.
-    pub extension: bool,
 }
 impl PipelineMandatoryPage {
     pub(crate) const EMPTY: Self = Self {
@@ -1023,7 +996,6 @@ impl PipelineMandatoryPage {
         request_index: INVALID_INDEX,
         staging_offset: INVALID_INDEX,
         pack_id: u16::MAX,
-        extension: false,
     };
 }
 
@@ -1162,6 +1134,9 @@ pub(crate) struct ReadPipelineContext {
     pub fd_budget_wait_epoch: u64,
     pub native_io_error: c_int,
     pub native_completion_ready: bool,
+    /// The finished read got EAGAIN from a stale pack fd marked for reopen
+    /// (`release_pack_fd_after_read`): retry the job, do not fail it.
+    pub fd_reopen_retry: bool,
     pub native_accepted: bool,
     pub native_submitted: bool,
     /// Physical backing reads this pipeline added to PACK_DISK_INFLIGHT (readahead.rs).
@@ -1207,6 +1182,7 @@ impl ReadPipelineContext {
         fd_budget_wait_epoch: 0,
         native_io_error: 0,
         native_completion_ready: false,
+        fd_reopen_retry: false,
         native_accepted: false,
         native_submitted: false,
         disk_inflight: 0,

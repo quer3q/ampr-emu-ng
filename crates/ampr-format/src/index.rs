@@ -114,10 +114,11 @@ pub fn fill_slots(records: &[u8], paths: &[u8], slots: &mut [u8]) -> Result<(u64
     for i in 0..records.len() / IDX_RECORD {
         let off = u32_at(records, i * IDX_RECORD)? as usize;
         let len = u32_at(records, i * IDX_RECORD + 4)? as usize;
-        if paths.get(off + len) != Some(&0) {
+        let end = off.checked_add(len).ok_or(Error::Invalid)?;
+        if paths.get(end) != Some(&0) {
             return Err(Error::Invalid);
         }
-        let hash = idx_path_hash(&paths[off..off + len]);
+        let hash = idx_path_hash(paths.get(off..end).ok_or(Error::Invalid)?);
         let mut pos = hash as usize & mask;
         let mut duplicate = false;
         let mut probe = 0u64;

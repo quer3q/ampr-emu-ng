@@ -292,6 +292,8 @@ impl AprAioReactor {
             // Batches live in `self`; the flush callees never touch `aioSubmitRound`.
             let batch = unsafe { &mut *addr_of_mut!(self.aioSubmitRound.batches[i]) };
             let grouped = unsafe { &mut *addr_of_mut!(self.aioSubmitRound.groupedExternal[i]) };
+            // Loose first submits leave for the pread pool (loose_pread.rs).
+            progressedAny |= self.route_loose_reads_to_pread(batch);
             progressedAny |= self.flush_aio_priority_submits(batch, grouped, admission);
         }
         progressedAny
@@ -325,6 +327,7 @@ impl AprAioReactor {
             );
         }
         if !issueBudget.can_admit(sliceCreditBytes) {
+            issueBudget.held = true;
             return PENDING;
         }
         let nowNs = Self::aio_admission_lane_now(admission);
@@ -343,6 +346,7 @@ impl AprAioReactor {
             || chain.activeBytes > readWindow.bytes - sliceCreditBytes
         {
             self.note_adaptive_read_window_blocked(readWindow.mode);
+            stats::add(Stat::ReadActiveHeld, 1);
             return PENDING;
         }
         if !self.direct_read_admission_available(

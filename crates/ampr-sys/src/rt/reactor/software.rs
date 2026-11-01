@@ -37,15 +37,14 @@ impl AprAioReactor {
     }
 
     pub(crate) fn software_op_uses_native_apr_batch(t: OpType) -> bool {
-        match t {
+        matches!(
+            t,
             WAIT_ON_COUNTER
-            | WRITE_COUNTER
-            | WRITE_ADDRESS_FROM_TIME_COUNTER
-            | WRITE_ADDRESS_FROM_COUNTER
-            | WRITE_ADDRESS_FROM_COUNTER_PAIR => true,
-            WRITE_EQUEUE => !AMPR_EMU_APR_LOCAL_EQUEUE,
-            _ => false,
-        }
+                | WRITE_COUNTER
+                | WRITE_ADDRESS_FROM_TIME_COUNTER
+                | WRITE_ADDRESS_FROM_COUNTER
+                | WRITE_ADDRESS_FROM_COUNTER_PAIR
+        )
     }
 
     pub(crate) fn software_op_is_native_apr_eop(op: &Op) -> bool {
@@ -112,6 +111,23 @@ impl AprAioReactor {
             unsafe { *outHandled = true };
             return false;
         }
+        if !Self::address_target_check(addr, wait) {
+            let (reason, rc) = if wait {
+                (
+                    c"software-wait-address-fault",
+                    SCE_AMPR_ERROR_APR_INVALIDWAITONADDRESSADDRESS,
+                )
+            } else {
+                (
+                    c"software-write-address-fault",
+                    SCE_AMPR_ERROR_APR_MEMORYFAULTWRITEBUFFERADDRESS,
+                )
+            };
+            crate::rt::stats::add(crate::rt::stats::Stat::AprAddressFaults, 1);
+            self.set_command_error(job, reason.as_ptr(), rc, op.buf_offset_bytes, 0);
+            unsafe { *outHandled = true };
+            return false;
+        }
         let address = unsafe { AtomicU64::from_ptr(addr as *mut u64) };
         unsafe { *outHandled = true };
         if !wait {
@@ -122,6 +138,79 @@ impl AprAioReactor {
         let observed = address.load(Ordering::Acquire);
         unsafe { *outComplete = Self::software_wait_compare(observed, op.u64a, op.u32a) };
         true
+    }
+
+    /// Whether CPU protection `prot` (SCE_KERNEL_PROT_CPU_*) lets the reactor
+    /// load (wait) or store (write) the target. CPU_RW implies read.
+    pub(crate) fn address_prot_allows(prot: c_int, write: bool) -> bool {
+        let need = if write {
+            SCE_KERNEL_PROT_CPU_RW
+        } else {
+            SCE_KERNEL_PROT_CPU_READ | SCE_KERNEL_PROT_CPU_RW
+        };
+        prot & need != 0
+    }
+
+    /// Checks that the 8-byte-aligned target at `addr` is mapped with the CPU
+    /// protection the op needs, so an unmapped or freed target (the
+    /// upstream save-time MEMORYFAULTREADWAITONADDRESS crash class) becomes an
+    /// APR error instead of a fault in the reactor thread. One
+    /// sceKernelQueryMemoryProtection call per evaluation, every poll of a
+    /// pending wait included: a target freed while the wait polls is caught
+    /// on the next poll (only the gap between query and load remains). An
+    /// aligned u64 never crosses a page, so the query of `addr` covers all 8
+    /// bytes. Without the symbol the check passes, as before it existed.
+    fn address_target_check(addr: usize, wait: bool) -> bool {
+        type QueryProt = unsafe extern "C" fn(
+            *mut c_void,
+            *mut *mut c_void,
+            *mut *mut c_void,
+            *mut c_int,
+        ) -> c_int;
+        static QUERY_PROT: LazySym = LazySym::new(c"sceKernelQueryMemoryProtection");
+        let Some(query) = (unsafe { QUERY_PROT.get::<QueryProt>() }) else {
+            return true;
+        };
+        let mut start = null_mut();
+        let mut end = null_mut();
+        let mut prot: c_int = 0;
+        let rc = unsafe { query(addr as *mut c_void, &mut start, &mut end, &mut prot) };
+        // The entry must contain `addr`: a query that returned a neighbouring
+        // mapping would otherwise pass for an unmapped target.
+        rc == 0
+            && (start as usize) <= addr
+            && addr < end as usize
+            && Self::address_prot_allows(prot, !wait)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn address_prot_allows_by_op() {
+        let r = SCE_KERNEL_PROT_CPU_READ;
+        let rw = SCE_KERNEL_PROT_CPU_READ | SCE_KERNEL_PROT_CPU_RW;
+        let gpu_only = 0x30;
+        // Wait (load): readable or writable CPU mappings.
+        assert!(AprAioReactor::address_prot_allows(r, false));
+        assert!(AprAioReactor::address_prot_allows(rw, false));
+        assert!(AprAioReactor::address_prot_allows(
+            SCE_KERNEL_PROT_CPU_RW,
+            false
+        ));
+        assert!(!AprAioReactor::address_prot_allows(0, false));
+        assert!(!AprAioReactor::address_prot_allows(gpu_only, false));
+        assert!(!AprAioReactor::address_prot_allows(
+            SCE_KERNEL_PROT_CPU_EXEC,
+            false
+        ));
+        // Write (store): CPU write only.
+        assert!(AprAioReactor::address_prot_allows(rw, true));
+        assert!(!AprAioReactor::address_prot_allows(r, true));
+        assert!(!AprAioReactor::address_prot_allows(0, true));
+        assert!(!AprAioReactor::address_prot_allows(gpu_only | r, true));
     }
 }
 
@@ -342,6 +431,7 @@ impl AprAioReactor {
         if !issueBudget.is_null()
             && unsafe { (*issueBudget).requestsLeft == 0 || (*issueBudget).bytesLeft == 0 }
         {
+            unsafe { (*issueBudget).held = true };
             return false;
         }
         let effectiveRead = *read;
@@ -396,6 +486,7 @@ impl AprAioReactor {
         let mut singleRequestBudget = ReadIssueBudget {
             requestsLeft: 1,
             bytesLeft: kSoftwareReadChunkMax,
+            held: false,
         };
         let budget: &mut ReadIssueBudget = if issueBudget.is_null() {
             &mut singleRequestBudget

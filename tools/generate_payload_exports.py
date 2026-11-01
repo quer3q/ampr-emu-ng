@@ -14,6 +14,38 @@ from pathlib import Path
 NID_SALT = bytes.fromhex("518D64A635DED8C1E6B039B1C3E55230")
 EXPORT_RE = re.compile(r"sceAmpr[A-Za-z0-9_]+\Z")
 
+# Retail libSceAmpr.sprx also exports 19 libc/libc++ symbols that it links
+# statically, and titles can import them from libSceAmpr (list taken from
+# AnyPS5 core/libs/prx/libSceAmpr/Export.cpp). The Rust symbol cannot reuse
+# the libc name, so each is defined under its own name in
+# crates/ampr-sys/src/rt/libc_exports.rs and exported under the libc NID.
+# Rust symbol -> exported (NID source) name.
+EXTRA_EXPORTS = {
+    "ampr_libc_localeconv": "localeconv",
+    "ampr_libc_udivti3": "__udivti3",
+    "ampr_libc_sinh": "_Sinh",
+    "ampr_libc_strtok_s": "strtok_s",
+    "ampr_libc_ctime_s": "ctime_s",
+    "ampr_libc_wcscpy_s": "wcscpy_s",
+    "ampr_libc_set_constraint_handler_s": "set_constraint_handler_s",
+    "ampr_libc_fltrounds": "_Fltrounds",
+    "ampr_libc_ignore_handler_s": "ignore_handler_s",
+    "ampr_libc_wcstombs_s": "wcstombs_s",
+    "ampr_libc_mbstowcs": "mbstowcs",
+    "ampr_libc_asctime_s": "asctime_s",
+    "ampr_libc_fpclassifyd": "__fpclassifyd",
+    "ampr_libc_lock_shared_ptr_spin_lock": "_Lock_shared_ptr_spin_lock",
+    "ampr_libc_unlock_shared_ptr_spin_lock": "_Unlock_shared_ptr_spin_lock",
+    "ampr_libc_cnd_init_with_name": "_Cnd_init_with_name",
+    "ampr_libc_time_get_get":
+        "_ZNKSt8time_getIcSt19istreambuf_iteratorIcSt11char_traitsIcEEE3get"
+        "ES3_S3_RSt8ios_baseRNSt5_IosbIiE8_IostateEP2tmPKcSE_",
+    "ampr_libc_time_get_getcat":
+        "_ZNSt8time_getIcSt19istreambuf_iteratorIcSt11char_traitsIcEEE7_Getcat"
+        "EPPKNSt6locale5facetEPKS5_",
+    "ampr_libc_cxa_call_unexpected": "__cxa_call_unexpected",
+}
+
 LIBC_IMPORTS = {
     "__cxa_atexit",
     "__cxa_finalize",
@@ -83,15 +115,27 @@ def is_libc_import(name: str) -> bool:
     raise ValueError(f"unclassified PRX import: {name}")
 
 
-def defined_exports(path: Path) -> list[str]:
-    """Read names reported by nm for the combined Rust object."""
-    names = sorted({
-        name for line in path.read_text(encoding="utf-8").splitlines()
-        if EXPORT_RE.fullmatch(name := line.strip())
-    })
-    if not names:
+def defined_export_symbols(path: Path) -> dict[str, str]:
+    """Map exported name -> Rust symbol for the nm list of the combined object."""
+    defined = {
+        line.strip()
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    }
+    exports = {name: name for name in defined if EXPORT_RE.fullmatch(name)}
+    if not exports:
         raise ValueError(f"no AMPR exports defined in {path}")
-    return names
+    missing = sorted(set(EXTRA_EXPORTS) - defined)
+    if missing:
+        raise ValueError(f"extra exports not defined in {path}: {missing}")
+    for symbol, name in EXTRA_EXPORTS.items():
+        exports[name] = symbol
+    return dict(sorted(exports.items()))
+
+
+def defined_exports(path: Path) -> list[str]:
+    """Exported names (the NID sources) defined by the combined Rust object."""
+    return list(defined_export_symbols(path))
 
 
 def render_response(names: list[str]) -> str:
@@ -114,10 +158,10 @@ def render_version_script(names: list[str]) -> str:
     return "{\n  global:\n" + globals_ + "  local: *;\n};\n"
 
 
-def render_rename_map(exports: list[str], imports: list[str]) -> str:
+def render_rename_map(exports: dict[str, str], imports: list[str]) -> str:
     lines = [
-        f'"--redefine-sym={name}={name_to_nid(name)}#D#A"'
-        for name in exports
+        f'"--redefine-sym={symbol}={name_to_nid(name)}#D#A"'
+        for name, symbol in exports.items()
     ]
     for name in imports:
         suffix = "#A#B" if is_libc_import(name) else "#B#C"
@@ -180,14 +224,15 @@ def main() -> int:
     parser.add_argument("--metadata-asm", type=Path, required=True)
     args = parser.parse_args()
 
-    names = defined_exports(args.defined)
+    export_symbols = defined_export_symbols(args.defined)
+    names = list(export_symbols)
     undefined_names = {
         line.strip()
         for line in args.undefined.read_text(encoding="utf-8").splitlines()
         if line.strip()
     }
     imports = sorted(
-        (undefined_names - set(names) - CRT_PROVIDED_SYMBOLS)
+        (undefined_names - set(export_symbols.values()) - CRT_PROVIDED_SYMBOLS)
         | {"__cxa_finalize"}
     )
     if not imports:
@@ -198,7 +243,7 @@ def main() -> int:
         (libc_imports if is_libc_import(name) else kernel_imports).append(name)
     write_if_changed(args.response, render_response(names))
     write_if_changed(args.version_script, render_version_script(names))
-    write_if_changed(args.rename_map, render_rename_map(names, imports))
+    write_if_changed(args.rename_map, render_rename_map(export_symbols, imports))
     write_if_changed(args.libc_asm, render_stub_assembly(libc_imports, "#A#B"))
     write_if_changed(args.libc_list, "\n".join(libc_imports) + "\n")
     write_if_changed(args.kernel_asm, render_stub_assembly(kernel_imports, "#B#C"))

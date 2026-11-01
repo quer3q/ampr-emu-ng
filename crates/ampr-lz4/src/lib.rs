@@ -136,39 +136,3 @@ mod tests {
         );
     }
 }
-
-#[cfg(test)]
-mod manifest_tests {
-    use super::*;
-
-    fn put32(b: &mut [u8], at: usize, value: u32) {
-        b[at..at + 4].copy_from_slice(&value.to_le_bytes());
-    }
-
-    fn put64(b: &mut [u8], at: usize, value: u64) {
-        b[at..at + 8].copy_from_slice(&value.to_le_bytes());
-    }
-
-    #[test]
-    fn empty_manifest_checks_both_crc_ranges() {
-        assert_eq!(crc32(b"123456789"), 0xcbf4_3926);
-        assert_eq!(crc32_parts(&[b"1234", b"56789"]), 0xcbf4_3926);
-        let mut b = [0u8; PAK_HEADER];
-        b[..8].copy_from_slice(PAK_MAGIC);
-        put32(&mut b, 8, 4);
-        put32(&mut b, 12, PAK_HEADER as u32);
-        put32(&mut b, 20, ENDIAN_MARKER);
-        put32(&mut b, 60, FILE_RECORD as u32);
-        put32(&mut b, 64, CHUNK_RECORD as u32);
-        put32(&mut b, 68, PACK_RECORD as u32);
-        for at in [72, 80, 88, 96] {
-            put64(&mut b, at, PAK_HEADER as u64);
-        }
-        put32(&mut b, PAK_PAYLOAD_CRC_AT, crc32(&[]));
-        let crc = header_crc(&b, PAK_HEADER, PAK_HEADER_CRC_AT).unwrap();
-        put32(&mut b, PAK_HEADER_CRC_AT, crc);
-        assert_eq!(manifest::Manifest::open(&b).unwrap().file_count(), 0);
-        b[24] ^= 1;
-        assert_eq!(manifest::Manifest::open(&b).err(), Some(Error::Checksum));
-    }
-}

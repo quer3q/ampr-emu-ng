@@ -29,7 +29,7 @@ use super::sys::*;
 use ampr_format::index::Index;
 use core::ffi::{c_char, c_int, c_void, CStr};
 use core::ptr::{null, null_mut};
-use core::sync::atomic::{AtomicU8, Ordering::*};
+use core::sync::atomic::{AtomicU32, AtomicU8, Ordering::*};
 
 // ---- constants -------------------------------------------------------------
 
@@ -96,6 +96,29 @@ pub(crate) enum LoadResult {
     Missing,
     Invalid,
     Memory,
+    /// The index file exists but an open or read failed with an I/O error
+    /// (a USB hiccup, EINTR past the retry bound). Not a reason to rebuild:
+    /// a rebuild would replace a shipped index whose file IDs packs and
+    /// traces depend on. The load is retried on the next ensure_ready that
+    /// may build (`allow_build` and autobuild on); other calls return
+    /// unavailable. Without packs, after `UNREADABLE_LOAD_LIMIT` in a row it is
+    /// built in memory, never installed; with packs it is only retried.
+    Unreadable,
+}
+
+/// Consecutive Unreadable loads before a build replaces the index in memory.
+/// Three retries ride out a USB hiccup without retrying I/O forever.
+const UNREADABLE_LOAD_LIMIT: u32 = 3;
+/// Unreadable loads in a row; only the single `loading` thread touches it.
+static UNREADABLE_LOADS: AtomicU32 = AtomicU32::new(0);
+
+/// The Unreadable run length after a load with `result`.
+fn next_unreadable_loads(count: u32, result: LoadResult) -> u32 {
+    if result == LoadResult::Unreadable {
+        count.saturating_add(1)
+    } else {
+        0
+    }
 }
 
 // ---- global state ----------------------------------------------------------
@@ -113,6 +136,10 @@ pub(crate) struct Compact {
     pub path_blob_size: usize,
     pub sorted: bool,
     pub available: bool,
+    /// The build walk saw a symlink and did not index it, so misses are not
+    /// authoritative (see `miss_is_authoritative`). Only a runtime build sets
+    /// it; a loaded index file carries no such flag.
+    pub links: bool,
 }
 
 impl Compact {
@@ -127,6 +154,7 @@ impl Compact {
         path_blob_size: 0,
         sorted: false,
         available: false,
+        links: false,
     };
 }
 
@@ -506,12 +534,26 @@ impl Compact {
 
 /// `ampr_sce_write_all`.
 pub(crate) unsafe fn write_all(fd: c_int, data: &[u8]) -> bool {
-    let mut done = 0usize;
+    write_all_with(data, |chunk| unsafe {
+        sceKernelWrite(fd, chunk.as_ptr().cast(), chunk.len()) as isize
+    })
+}
+
+/// `write_all` over `write(chunk) -> n` (sceKernelWrite: bytes or an SCE
+/// error). Short writes continue and SCE EINTR retries up to
+/// `EINTR_RETRY_MAX` times in a row; 0 or any other error fails.
+fn write_all_with(data: &[u8], mut write: impl FnMut(&[u8]) -> isize) -> bool {
+    let (mut done, mut eintr) = (0usize, 0u32);
     while done < data.len() {
-        let n = unsafe { sceKernelWrite(fd, data.as_ptr().add(done).cast(), data.len() - done) };
-        if n <= 0 {
+        let n = write(&data[done..]);
+        if n == SCE_KERNEL_ERROR_EINTR as isize && eintr < EINTR_RETRY_MAX {
+            eintr += 1;
+            continue;
+        }
+        if n <= 0 || n as usize > data.len() - done {
             return false;
         }
+        eintr = 0;
         done += n as usize;
     }
     true
@@ -603,9 +645,11 @@ const S_IRWU: SceKernelMode = 0o600; // SCE_KERNEL_S_IRWU
 const S_IFMT: u16 = 0o170000;
 const S_IFDIR: u16 = 0o040000;
 const S_IFREG: u16 = 0o100000;
+const S_IFLNK: u16 = 0o120000;
 const DT_UNKNOWN: u8 = 0;
 const DT_DIR: u8 = 4;
 const DT_REG: u8 = 8;
+const DT_LNK: u8 = 10;
 /// AMPR_EMU_COMMAND_LOG_PATH / AMPR_EMU_DEBUG_LOG_PATH (excluded from the index).
 const COMMAND_LOG_PATH: &CStr = c"/app0/ampr_commands.bin";
 const DEBUG_LOG_PATH: &CStr = c"/app0/ampr_emu.log";
@@ -648,6 +692,9 @@ impl Stat {
     fn is_reg(&self) -> bool {
         self.st_mode & S_IFMT == S_IFREG
     }
+    fn is_lnk(&self) -> bool {
+        self.st_mode & S_IFMT == S_IFLNK
+    }
 }
 
 /// FreeBSD 11 `struct dirent` header; `d_name` follows at offset 8.
@@ -673,6 +720,8 @@ pub(crate) struct RuntimeBuilder {
     entry_count: u64,
     path_bytes: u64,
     failed: bool,
+    /// A symlink was skipped (see `Compact::links`).
+    links: bool,
 }
 
 impl RuntimeBuilder {
@@ -686,6 +735,7 @@ impl RuntimeBuilder {
             entry_count: 0,
             path_bytes: 0,
             failed: false,
+            links: false,
         }
     }
 
@@ -811,9 +861,10 @@ impl Drop for RuntimeBuilder {
 impl RuntimeBuilder {
     /// `save_final`: sort, hash, write the temp image, install it; always
     /// releases the record/path buffers. True only when INDEX_PATH was
-    /// installed; a built image that cannot be installed is adopted into `idx`.
-    pub fn save_final(&mut self, idx: &mut FileIndexState) -> bool {
-        let ok = !self.failed && self.entry_count != 0 && unsafe { self.save_image(idx) };
+    /// installed; a built image that cannot (or, `!install`, must not) be
+    /// installed is adopted into `idx`.
+    pub fn save_final(&mut self, idx: &mut FileIndexState, install: bool) -> bool {
+        let ok = !self.failed && self.entry_count != 0 && unsafe { self.save_image(idx, install) };
         self.release_buffers();
         ok
     }
@@ -821,7 +872,7 @@ impl RuntimeBuilder {
     /// Builds the image in transient memory, writes it to INDEX_TEMP_PATH and
     /// installs it. If the write or install fails (read-only /app0), the image
     /// is adopted into `idx` in memory so the scan is not lost.
-    unsafe fn save_image(&mut self, idx: &mut FileIndexState) -> bool {
+    unsafe fn save_image(&mut self, idx: &mut FileIndexState, install: bool) -> bool {
         let count = self.entry_count as usize;
         let records = unsafe { core::slice::from_raw_parts_mut(self.records, count) };
         let paths = self.paths;
@@ -894,7 +945,10 @@ impl RuntimeBuilder {
         };
         self.release_buffers();
         let file = unsafe { core::slice::from_raw_parts(image, file_bytes as usize) };
-        let ok = built && unsafe { write_temp_index(file) } && unsafe { install_temp_index() };
+        let ok = built
+            && install
+            && unsafe { write_temp_index(file) }
+            && unsafe { install_temp_index() };
         if built && !ok {
             unsafe { adopt_compact_index(idx, file) };
         }
@@ -1041,8 +1095,8 @@ fn join_dirent_path(dir: &[u8], name: &[u8], out: &mut [u8]) -> Option<usize> {
 
 /// `build_app0_index_locked`: depth-first scan of /app0 into a fresh index
 /// file, then reload it into `idx` (or keep it in memory when it cannot be
-/// installed). Runs only as the single `loading` builder.
-pub(crate) unsafe fn build_app0_index(idx: &mut FileIndexState) {
+/// installed, or when `!install`). Runs only as the single `loading` builder.
+pub(crate) unsafe fn build_app0_index(idx: &mut FileIndexState, install: bool) {
     idx.available = false;
     if !unsafe {
         super::runtime_memory::ampr_internal_amm_pool_prepare_static_storage(
@@ -1073,9 +1127,15 @@ pub(crate) unsafe fn build_app0_index(idx: &mut FileIndexState) {
             return;
         }
     }
-    if builder.save_final(idx) && unsafe { load_compact_index(idx) } != LoadResult::Loaded {
+    // An index file has no field for `links`, so an image built past a
+    // link stays in memory: the next boot walks again and sees it.
+    let links = builder.links;
+    if builder.save_final(idx, install && !links)
+        && unsafe { load_compact_index(idx) } != LoadResult::Loaded
+    {
         idx.available = false;
     }
+    idx.compact.links = links;
 }
 
 /// Scans `ws.dir`; false when the scan is incomplete. An unreadable entry
@@ -1177,10 +1237,25 @@ unsafe fn add_dirent(
     if d_type == DT_DIR {
         return dirs.push(path);
     }
-    if d_type != DT_REG && d_type != DT_UNKNOWN {
+    // Links are not indexed (retail pfs has none): an indexed link would
+    // lstat as its target, and a dangling or looping one has nothing to
+    // index. The flag sends every miss to the FS, which answers links right.
+    if d_type == DT_LNK {
+        builder.links = true;
+        return true;
+    }
+    if !matches!(d_type, DT_REG | DT_UNKNOWN) {
         return true;
     }
     let mut st = Stat::default();
+    // DT_UNKNOWN may be a link: lstat tells (if it fails, stat decides).
+    if d_type == DT_UNKNOWN
+        && unsafe { real_lstat(path_ptr, (&raw mut st).cast()) } == 0
+        && st.is_lnk()
+    {
+        builder.links = true;
+        return true;
+    }
     if unsafe { real_posix_stat(path_ptr, (&raw mut st).cast()) } != 0 {
         return false;
     }
@@ -1194,17 +1269,42 @@ unsafe fn add_dirent(
 
 /// `pread_exact_logged`: reads `size` bytes at `offset` in 1 MiB chunks.
 unsafe fn pread_exact(fd: c_int, dst: *mut u8, size: usize, offset: off_t) -> bool {
-    let mut done = 0usize;
-    while done < size {
-        let want = (1024 * 1024).min(size - done);
-        let n =
-            unsafe { real_physical_pread(fd, dst.add(done).cast(), want, offset + done as off_t) };
-        if n <= 0 {
-            return false;
-        }
-        done += n as usize;
+    unsafe {
+        pread_exact_with(dst, size, offset, |p, want, at| {
+            let n = real_physical_pread(fd, p.cast(), want, at);
+            (n, if n < 0 { errno() } else { 0 })
+        })
     }
-    true
+}
+
+/// Bound on back-to-back EINTR retries of one index write call.
+const EINTR_RETRY_MAX: u32 = 64;
+
+/// `pread_exact` over `read(dst, want, offset) -> (n, errno)`, a thin adapter
+/// over the pack loader's `pread_loop`: short reads continue at the new
+/// offset and EINTR retries, so a USB-backed /app0 that returns partial
+/// reads or a signal-interrupted call still loads the index; 0 (EOF before
+/// `size`) and any other error fail. EINTR uses the shared bound
+/// (`PREAD_EINTR_RETRIES`, 16 in a row), not this file's `EINTR_RETRY_MAX`.
+unsafe fn pread_exact_with(
+    dst: *mut u8,
+    size: usize,
+    offset: off_t,
+    mut read: impl FnMut(*mut u8, usize, off_t) -> (isize, c_int),
+) -> bool {
+    let last_errno = core::cell::Cell::new(0);
+    offset >= 0
+        && super::pack::pread_loop(
+            size,
+            offset as u64,
+            1024 * 1024,
+            |done, want, at| {
+                let (n, err) = read(unsafe { dst.add(done) }, want, at);
+                last_errno.set(err);
+                n as ssize_t
+            },
+            || last_errno.get(),
+        )
 }
 
 /// `load_compact_app0_index_locked`: reads INDEX_PATH into one persistent SDK
@@ -1214,10 +1314,12 @@ pub(crate) unsafe fn load_compact_index(idx: &mut FileIndexState) -> LoadResult 
     unsafe { idx.compact.clear() };
     let fd = unsafe { real_posix_open(INDEX_PATH.as_ptr(), O_RDONLY, 0) };
     if fd < 0 {
-        return LoadResult::Missing;
+        return open_failure_result(errno());
     }
     let mut st = Stat::default();
-    let read = if unsafe { real_physical_fstat(fd, (&raw mut st).cast()) } != 0 || st.st_size < 0 {
+    let read = if unsafe { real_physical_fstat(fd, (&raw mut st).cast()) } != 0 {
+        Err(LoadResult::Unreadable)
+    } else if st.st_size < 0 {
         Err(LoadResult::Invalid)
     } else {
         unsafe {
@@ -1228,6 +1330,16 @@ pub(crate) unsafe fn load_compact_index(idx: &mut FileIndexState) -> LoadResult 
     };
     unsafe { real_physical_close(fd) };
     unsafe { finish_compact(idx, read) }
+}
+
+/// Only ENOENT means there is no index to load; any other open error
+/// (EIO, EMFILE, EINTR) leaves an existing index in place.
+fn open_failure_result(err: c_int) -> LoadResult {
+    if err == ENOENT {
+        LoadResult::Missing
+    } else {
+        LoadResult::Unreadable
+    }
 }
 
 /// Adopts a built `image` (header first) into `idx` in memory, validated
@@ -1286,8 +1398,11 @@ unsafe fn read_compact(
 ) -> Result<[u8; ampr_format::IDX_HEADER], LoadResult> {
     const HDR: usize = ampr_format::IDX_HEADER;
     let mut header = [0u8; HDR];
-    if file_len < HDR as u64 || !read(header.as_mut_ptr(), HDR, 0) {
+    if file_len < HDR as u64 {
         return Err(LoadResult::Invalid);
+    }
+    if !read(header.as_mut_ptr(), HDR, 0) {
+        return Err(LoadResult::Unreadable);
     }
     let l = ampr_format::index::Layout::parse(&header)
         .ok()
@@ -1314,8 +1429,38 @@ unsafe fn read_compact(
     if ok {
         Ok(header)
     } else {
-        Err(LoadResult::Invalid)
+        Err(LoadResult::Unreadable)
     }
+}
+
+// ---- pack manifest probe -----------------------------------------------------------
+
+/// True when /app0 has an LZ4 or zstd pack manifest.
+/// Only ENOENT means no manifest: an I/O error on a present manifest must not
+/// let a walk build replace the shipped index (its file IDs belong to packs).
+unsafe fn pack_manifest_present() -> bool {
+    let mut st = Stat::default();
+    zstd_mode()
+        || unsafe {
+            real_posix_stat(
+                super::pack::AMPR_EMU_PACK_INDEX_PATH.as_ptr(),
+                (&raw mut st).cast(),
+            )
+        } == 0
+        || errno() != ENOENT
+}
+
+/// For the load notice only: an LZ4 pack manifest is in /app0. Any stat
+/// error reads as absent (the notice then says "plain").
+pub(crate) unsafe fn lz4_manifest_present() -> bool {
+    let mut st = Stat::default();
+    let rc = unsafe {
+        real_posix_stat(
+            super::pack::AMPR_EMU_PACK_INDEX_PATH.as_ptr(),
+            (&raw mut st).cast(),
+        )
+    };
+    rc == 0
 }
 
 // ---- ensure ready (slow path) --------------------------------------------------------
@@ -1352,14 +1497,31 @@ pub(crate) unsafe fn ensure_ready_slow(allow_build: bool) -> bool {
             available: false,
             compact: Compact::EMPTY,
         };
-        let final_loaded = match unsafe { load_compact_index(&mut work) } {
+        // With packs deployed the shipped index is the file-ID namespace of
+        // the manifest (one record per AMPRIDX3 id) and packed originals are
+        // gone from /app0, so it is never replaced; a fallback build stays
+        // in memory.
+        let packs = unsafe { pack_manifest_present() };
+        let build = allow_build && APP0_INDEX_AUTOBUILD;
+        let result = unsafe { load_compact_index(&mut work) };
+        let unreadable = next_unreadable_loads(UNREADABLE_LOADS.load(Relaxed), result);
+        UNREADABLE_LOADS.store(unreadable, Relaxed);
+        let final_loaded = match result {
             LoadResult::Loaded => true,
             LoadResult::Memory => {
                 work.available = false;
                 true
             }
-            _ if allow_build && APP0_INDEX_AUTOBUILD => {
-                unsafe { build_app0_index(&mut work) };
+            // With packs the shipped index is the only file-ID namespace (a
+            // walk lacks the packed originals), so it is retried, never
+            // replaced.
+            LoadResult::Unreadable if build && !packs && unreadable >= UNREADABLE_LOAD_LIMIT => {
+                unsafe { build_app0_index(&mut work, false) };
+                true
+            }
+            LoadResult::Unreadable => false,
+            LoadResult::Missing | LoadResult::Invalid if build => {
+                unsafe { build_app0_index(&mut work, !packs) };
                 true
             }
             _ => false,
@@ -1489,6 +1651,31 @@ struct Lookup {
     entry: FileEntryView,
     file_id: u32,
     expected_miss: bool,
+    /// A `Miss` the index can answer (see `miss_is_authoritative`); a
+    /// non-authoritative miss goes to the real call.
+    authoritative: bool,
+}
+
+/// The walk indexes every regular file of /app0 under a key that folds ASCII
+/// case, so a miss is authoritative on case-sensitive (bfs, ext) and
+/// case-insensitive (exFAT, pfs) trees alike, except for paths the walk can
+/// never list: names with tab/LF/CR (`has_unsupported_index_char`), the
+/// runtime's own files it skips, and non-ASCII names, which exFAT folds by
+/// its Unicode upcase table while keys fold ASCII only. Those go to the FS.
+/// With `links` (the walk skipped a symlink) no miss is authoritative: the
+/// link and anything under it are absent from the index.
+fn miss_is_authoritative(raw: &[u8], key: &[u8], links: bool) -> bool {
+    let skipped = [
+        INDEX_PATH,
+        INDEX_TEMP_PATH,
+        INDEX_BACKUP_PATH,
+        COMMAND_LOG_PATH,
+        DEBUG_LOG_PATH,
+    ];
+    !links
+        && !raw.iter().any(|&b| b >= 0x80)
+        && !has_unsupported_index_char(raw)
+        && !skipped.iter().any(|p| p.to_bytes() == key)
 }
 
 /// `lookup_resident_app0_path`: consumes only the immutable published image;
@@ -1500,6 +1687,7 @@ unsafe fn lookup_resident_path(path: *const c_char) -> Lookup {
         entry: empty_view(),
         file_id: 0,
         expected_miss: false,
+        authoritative: false,
     };
     if !unsafe { has_app0_root(path) } {
         return r;
@@ -1530,12 +1718,14 @@ unsafe fn lookup_resident_path(path: *const c_char) -> Lookup {
         return r;
     }
     r.expected_miss = true;
+    let links = published().is_some_and(|c| c.links);
+    r.authoritative = miss_is_authoritative(unsafe { cstr_bytes(path) }, key, links);
     r
 }
 
 /// `maybe_resolve_app0_path_arg`: the indexed path for a resident hit.
 #[inline(never)]
-unsafe fn maybe_resolve_path(path: *const c_char) -> *const c_char {
+pub(crate) unsafe fn maybe_resolve_path(path: *const c_char) -> *const c_char {
     let l = unsafe { lookup_resident_path(path) };
     if l.state == Resident::Hit {
         l.entry.path
@@ -1660,8 +1850,9 @@ unsafe fn copy_dir_path(l: &Lookup, out: &mut [u8]) -> bool {
     true
 }
 
-/// `posix_open_impl`: the published index is authoritative for /app0; a miss
-/// returns at once and only an indexed loose file reaches the physical open.
+/// `posix_open_impl`: the published index answers /app0; an authoritative
+/// miss returns at once (see `miss_is_authoritative`), other misses and
+/// indexed loose files reach the physical open.
 unsafe fn open_impl(path: *const c_char, flags: c_int, mode: SceKernelMode) -> c_int {
     unsafe { open_with(path, flags, mode, real_posix_open, b'o') }
 }
@@ -1688,6 +1879,8 @@ unsafe fn open_with(
 fn how(l: &Lookup) -> u8 {
     match l.state {
         Resident::Hit => b'h',
+        // 'M': a miss the index cannot answer, sent to the FS.
+        Resident::Miss if !l.authoritative => b'M',
         Resident::Miss => b'm',
         Resident::Directory => b'd',
         Resident::IndexNotReady => b'n',
@@ -1760,6 +1953,9 @@ unsafe fn open_resolved(
                     return posix_return_from_sce(rc);
                 }
             }
+            if !l.authoritative {
+                return unsafe { real(path, flags, mode) };
+            }
             index_miss()
         }
         Resident::NotApp0 | Resident::IndexNotReady => {
@@ -1816,6 +2012,9 @@ unsafe fn stat_resolved(l: &Lookup, path: *const c_char, sb: *mut Stat, real: Re
                     return posix_return_from_sce(rc);
                 }
             }
+            if !l.authoritative {
+                return unsafe { real(path, sb.cast()) };
+            }
             return index_miss();
         }
         _ => return unsafe { real(path, sb.cast()) },
@@ -1841,6 +2040,9 @@ unsafe fn reachability_resolved(l: &Lookup, path: *const c_char) -> c_int {
                 if handled {
                     return rc;
                 }
+            }
+            if !l.authoritative {
+                return unsafe { real_check_reachability(path) };
             }
             SCE_KERNEL_ERROR_ENOENT
         }
@@ -1993,8 +2195,9 @@ pub unsafe extern "C" fn posix_lstat_emul(path: *const c_char, sb: *mut Stat) ->
     unsafe { stat_with(path, sb, real_lstat, b'l') }
 }
 
-/// `access`: an indexed /app0 file or directory exists (read-only); a miss
-/// takes the stat routing (pack overlay, else ENOENT); others the original.
+/// `access`: an indexed /app0 file or directory exists (read-only); an
+/// authoritative miss takes the stat routing (pack overlay, else ENOENT);
+/// others the original.
 pub unsafe extern "C" fn posix_access_emul(path: *const c_char, mode: c_int) -> c_int {
     let l = unsafe { lookup_resident_path(path) };
     let rc = match l.state {
@@ -2008,6 +2211,21 @@ pub unsafe extern "C" fn posix_access_emul(path: *const c_char, mode: c_int) -> 
             -1
         }
         Resident::Hit | Resident::Directory => 0,
+        // The pack overlay first (packed-only directories), then the FS.
+        Resident::Miss if !l.authoritative => {
+            let mut st = core::mem::MaybeUninit::<Stat>::uninit();
+            let mut handled = false;
+            let rc = if unsafe { ampr_pack_manifest_is_resident_ready() } {
+                unsafe { ampr_pack_try_stat_path(path, st.as_mut_ptr(), &mut handled) }
+            } else {
+                0
+            };
+            if handled {
+                posix_return_from_sce(rc)
+            } else {
+                unsafe { real_access(path, mode) }
+            }
+        }
         Resident::Miss => {
             let mut st = core::mem::MaybeUninit::<Stat>::uninit();
             unsafe { stat_resolved(&l, path, st.as_mut_ptr(), real_lstat) }
@@ -2330,11 +2548,13 @@ pub unsafe fn ampr_pack_core_make_task(
 }
 
 #[cfg(test)]
-mod zstd_service_path_tests {
-    use super::is_zstd_service_path;
+mod tests {
+    use super::*;
 
+    /// Runtime files bypass the index, and only misses the /app0 walk can
+    /// answer are final; the rest go to the filesystem.
     #[test]
-    fn runtime_files_bypass_the_index() {
+    fn path_routing_runtime_files_and_authoritative_misses() {
         for yes in [
             c"/app0/ampr_zstd.index",
             c"/app0/ampr_zstd-000.pak",
@@ -2346,11 +2566,117 @@ mod zstd_service_path_tests {
         for no in [
             c"/app0/ampr_zstd-000.pak.tmp",
             c"/app0/game.index",
-            c"/app0/smg029ue5/smg029ue5.uproject",
+            c"/app0/game/game.uproject",
             c"/app0/uecommandline.txt",
         ] {
             assert!(!is_zstd_service_path(no.as_ptr()), "{no:?}");
         }
         assert!(!is_zstd_service_path(core::ptr::null()));
+
+        let miss_with = |raw: &CStr, links: bool| {
+            let mut key = [0u8; RUNTIME_PATH_CAPACITY];
+            let len = unsafe { normalize_key(raw.as_ptr(), &mut key) }.unwrap();
+            miss_is_authoritative(raw.to_bytes(), &key[..len], links)
+        };
+        let miss = |raw: &CStr| miss_with(raw, false);
+        // ASCII case variants fold to the indexed key: the miss holds on exFAT too.
+        assert!(miss(c"/app0/Data/Missing.BIN"));
+        assert!(miss(c"/APP0/data//missing.bin"));
+        // exFAT folds non-ASCII case; keys do not.
+        assert!(!miss(c"/app0/Donn\xc3\xa9es/x.bin"));
+        assert!(!miss(c"/app0/a\tb.bin"));
+        for own in [
+            c"/app0/ampr_emu.index",
+            c"/app0/AMPR_EMU.LOG",
+            c"/app0/ampr_commands.bin",
+        ] {
+            assert!(!miss(own), "{own:?}");
+        }
+        // A skipped directory link hides a subtree: no ASCII miss holds.
+        assert!(!miss_with(c"/app0/Data/Missing.BIN", true));
+        assert!(!miss_with(c"/app0/linked/x.bin", true));
+    }
+
+    /// USB index I/O: pread and write loops continue short transfers and
+    /// retry EINTR, and fail on EOF, errors and endless EINTR.
+    #[test]
+    fn io_loops_continue_short_transfers_and_retry_eintr() {
+        let src: std::vec::Vec<u8> = (0..=255u8).cycle().take(3000).collect();
+        let mut dst = std::vec![0u8; 2000];
+        let mut calls = 0;
+        let ok = unsafe {
+            pread_exact_with(dst.as_mut_ptr(), dst.len(), 100, |p, want, at| {
+                calls += 1;
+                if calls % 2 == 1 {
+                    return (-1, EINTR);
+                }
+                let n = want.min(300);
+                core::ptr::copy_nonoverlapping(src.as_ptr().add(at as usize), p, n);
+                (n as isize, 0)
+            })
+        };
+        assert!(ok);
+        assert_eq!(&dst[..], &src[100..2100]);
+        let p = dst.as_mut_ptr();
+        assert!(!unsafe { pread_exact_with(p, 16, 0, |_, _, _| (0, 0)) });
+        assert!(!unsafe { pread_exact_with(p, 16, 0, |_, _, _| (-1, EIO)) });
+        assert!(!unsafe { pread_exact_with(p, 16, 0, |_, _, _| (-1, EINTR)) });
+
+        let data: std::vec::Vec<u8> = (0..1000u32).map(|i| i as u8).collect();
+        let mut out = std::vec::Vec::new();
+        let mut calls = 0;
+        assert!(write_all_with(&data, |chunk| {
+            calls += 1;
+            if calls % 3 == 0 {
+                return SCE_KERNEL_ERROR_EINTR as isize;
+            }
+            let n = chunk.len().min(77);
+            out.extend_from_slice(&chunk[..n]);
+            n as isize
+        }));
+        assert_eq!(out, data);
+        assert!(!write_all_with(&data, |_| SCE_KERNEL_ERROR_EIO as isize));
+        assert!(!write_all_with(&data, |_| SCE_KERNEL_ERROR_EINTR as isize));
+    }
+
+    #[test]
+    fn index_stat_keeps_64_bit_sizes() {
+        let l = Lookup {
+            state: Resident::Hit,
+            entry: FileEntryView {
+                path: c"/app0/Big.pak".as_ptr(),
+                path_length: 13,
+                size: 8_130_000_000,
+                mtime: 1,
+            },
+            file_id: 2,
+            expected_miss: false,
+            authoritative: false,
+        };
+        let st = file_stat(&l);
+        assert_eq!(st.st_size, 8_130_000_000);
+        assert_eq!(st.st_blocks, 8_130_000_000 / 512 + 1);
+    }
+
+    /// Only ENOENT means the index is missing; unreadable loads count only
+    /// in a row, saturating.
+    #[test]
+    fn load_results_missing_vs_unreadable() {
+        assert!(open_failure_result(ENOENT) == LoadResult::Missing);
+        for e in [EIO, EINTR, EMFILE, EACCES] {
+            assert!(open_failure_result(e) == LoadResult::Unreadable, "{e}");
+        }
+        let mut n = 0;
+        for _ in 0..UNREADABLE_LOAD_LIMIT {
+            assert!(n < UNREADABLE_LOAD_LIMIT);
+            n = next_unreadable_loads(n, LoadResult::Unreadable);
+        }
+        assert_eq!(n, UNREADABLE_LOAD_LIMIT);
+        assert_eq!(next_unreadable_loads(n, LoadResult::Missing), 0);
+        assert_eq!(next_unreadable_loads(2, LoadResult::Loaded), 0);
+        assert_eq!(
+            next_unreadable_loads(u32::MAX, LoadResult::Unreadable),
+            u32::MAX
+        );
     }
 }
