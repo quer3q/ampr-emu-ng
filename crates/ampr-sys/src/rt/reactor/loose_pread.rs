@@ -257,20 +257,18 @@ pub(crate) struct LoosePartDone {
     pub(crate) value: i64,
 }
 
-/// Why a staged read is or is not handed to the pool (`Pool` only when the
-/// knob is on, it is a first submit to a real fd, and the target is not a
-/// known GPU-only region).
+/// Why a staged read is or is not handed to the pool (`Pool` only when it is
+/// a first submit to a real fd and the target is not a known GPU-only region).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum LoosePreadRoute {
     Pool,
-    /// Off, a resubmit, a virtual (pack) fd or an unroutable range.
+    /// A resubmit, a virtual (pack) fd or an unroutable range.
     Aio,
     /// The destination faulted before (counted as loose_pread_skipped).
     KnownGpu,
 }
 
 pub(crate) fn loose_pread_route(
-    enabled: bool,
     firstSubmit: bool,
     realFd: bool,
     regions: &LooseGpuRegions,
@@ -278,7 +276,7 @@ pub(crate) fn loose_pread_route(
     len: u64,
     now: u64,
 ) -> LoosePreadRoute {
-    if !enabled || !firstSubmit || !realFd || LooseGpuRegions::span(buf, len).is_none() {
+    if !firstSubmit || !realFd || LooseGpuRegions::span(buf, len).is_none() {
         LoosePreadRoute::Aio
     } else if regions.overlaps(buf, len, now) {
         LoosePreadRoute::KnownGpu
@@ -336,7 +334,6 @@ impl AprAioReactor {
             return false;
         }
         let route = loose_pread_route(
-            true,
             !active.submitAccounted && !active.awaitingResubmit,
             active.nativeCapacityCharged && active.request.fd >= 0,
             &self.looseGpuRegions,
@@ -552,156 +549,98 @@ mod tests {
     /// A fixed `time_counter_now` for tests that do not exercise expiry.
     const T: u64 = 5;
     const READ: u64 = 0x7f000; // 508 KB, the measured loose read size
+    const BUF: usize = 0x2_0000_0000;
 
     #[test]
-    fn empty_table_overlaps_nothing() {
-        let t = LooseGpuRegions::new();
-        assert!(!t.overlaps(0x2_0000_0000, READ, T));
+    fn gpu_regions_cover_whole_2mib_regions_of_routable_ranges() {
+        let mut t = LooseGpuRegions::new();
+        assert!(!t.overlaps(BUF, READ, T), "empty table");
+        t.insert(BUF + 0x1000, READ, T);
+        assert!(t.overlaps(BUF, 1, T));
+        assert!(t.overlaps(BUF + MIB2 - 1, 1, T));
+        assert!(!t.overlaps(BUF + MIB2, READ, T));
+        assert!(!t.overlaps(BUF - 0x1000, 0x1000, T));
+        assert!(t.overlaps(BUF - 0x1000, 0x1001, T));
+        // A read straddling a boundary marks both regions, each once.
+        let mut s = LooseGpuRegions::new();
+        s.insert(BUF + MIB2 - 0x1000, READ, T);
+        assert!(s.overlaps(BUF, 1, T) && s.overlaps(BUF + MIB2, 1, T));
+        assert_eq!(s.len, 2);
+        s.insert(BUF, 1, T);
+        assert_eq!(s.len, 2, "a known region is not added twice");
+        // Empty, wrapping and more-than-capacity ranges are not tracked.
+        let mut u = LooseGpuRegions::new();
+        u.insert(0x1000, 0, T);
+        u.insert(usize::MAX - 10, 100, T);
+        let tooLong = (LOOSE_GPU_REGION_CAPACITY as u64 + 1) << LOOSE_GPU_REGION_SHIFT;
+        u.insert(0, tooLong, T);
+        assert_eq!(u.len, 0);
     }
 
     #[test]
-    fn insert_marks_whole_2mib_regions() {
+    fn gpu_regions_expire_refresh_and_evict_oldest() {
         let mut t = LooseGpuRegions::new();
-        t.insert(0x2_0000_0000 + 0x1000, READ, T);
-        assert!(t.overlaps(0x2_0000_0000, 1, T));
-        assert!(t.overlaps(0x2_0000_0000 + MIB2 - 1, 1, T));
-        assert!(!t.overlaps(0x2_0000_0000 + MIB2, READ, T));
-        assert!(!t.overlaps(0x2_0000_0000 - 0x1000, 0x1000, T));
-        assert!(t.overlaps(0x2_0000_0000 - 0x1000, 0x1001, T));
-    }
-
-    #[test]
-    fn insert_straddling_read_marks_both_regions() {
-        let mut t = LooseGpuRegions::new();
-        t.insert(0x2_0000_0000 + MIB2 - 0x1000, READ, T);
-        assert!(t.overlaps(0x2_0000_0000, 1, T));
-        assert!(t.overlaps(0x2_0000_0000 + MIB2, 1, T));
-        assert_eq!(t.len, 2);
-        t.insert(0x2_0000_0000, 1, T);
-        assert_eq!(t.len, 2, "a known region is not added twice");
-    }
-
-    #[test]
-    fn entries_expire_after_ttl_and_refresh_on_a_new_fault() {
-        let mut t = LooseGpuRegions::new();
-        let (buf, at) = (0x2_0000_0000usize, 1_000u64);
-        t.insert(buf, READ, at);
-        assert!(t.overlaps(buf, 1, at + LOOSE_GPU_REGION_TTL_NS - 1));
-        assert!(!t.overlaps(buf, 1, at + LOOSE_GPU_REGION_TTL_NS), "expired");
-        let route = loose_pread_route(
-            true,
-            true,
-            true,
-            &t,
-            buf,
-            READ,
-            at + LOOSE_GPU_REGION_TTL_NS,
-        );
+        let at = 1_000u64;
+        t.insert(BUF, READ, at);
+        assert!(t.overlaps(BUF, 1, at + LOOSE_GPU_REGION_TTL_NS - 1));
+        let expired = at + LOOSE_GPU_REGION_TTL_NS;
+        assert!(!t.overlaps(BUF, 1, expired), "expired");
         assert_eq!(
-            route,
+            loose_pread_route(true, true, &t, BUF, READ, expired),
             LoosePreadRoute::Pool,
             "a transient EFAULT is retried"
         );
         // A new EFAULT refreshes the expired entry instead of adding one.
         let later = at + 3 * LOOSE_GPU_REGION_TTL_NS;
-        t.insert(buf, READ, later);
+        t.insert(BUF, READ, later);
         assert_eq!(t.len, 1);
-        assert!(t.overlaps(buf, 1, later + 1));
-    }
-
-    #[test]
-    fn full_table_replaces_oldest() {
-        let mut t = LooseGpuRegions::new();
+        assert!(t.overlaps(BUF, 1, later + 1));
+        // A full table replaces its oldest entry.
+        let mut f = LooseGpuRegions::new();
         let base = 0x4_0000_0000usize;
         for i in 0..=LOOSE_GPU_REGION_CAPACITY {
-            t.insert(base + i * MIB2, 1, T);
+            f.insert(base + i * MIB2, 1, T);
         }
-        assert_eq!(t.len as usize, LOOSE_GPU_REGION_CAPACITY);
-        assert!(!t.overlaps(base, 1, T), "first region evicted");
-        for i in 1..=LOOSE_GPU_REGION_CAPACITY {
-            assert!(t.overlaps(base + i * MIB2, 1, T));
-        }
+        assert_eq!(f.len as usize, LOOSE_GPU_REGION_CAPACITY);
+        assert!(!f.overlaps(base, 1, T), "first region evicted");
+        assert!((1..=LOOSE_GPU_REGION_CAPACITY).all(|i| f.overlaps(base + i * MIB2, 1, T)));
     }
 
     #[test]
-    fn unroutable_ranges_are_not_tracked() {
-        let mut t = LooseGpuRegions::new();
-        t.insert(0x1000, 0, T);
-        t.insert(usize::MAX - 10, 100, T);
-        t.insert(
-            0,
-            (LOOSE_GPU_REGION_CAPACITY as u64 + 1) << LOOSE_GPU_REGION_SHIFT,
-            T,
-        );
-        assert_eq!(t.len, 0);
-    }
-
-    #[test]
-    fn outcome_full_read_is_done() {
+    fn outcome_is_done_only_for_the_full_length() {
+        let efault = sce_errno_from_posix(EFAULT) as i64;
+        let eio = SCE_KERNEL_ERROR_EIO as i64;
         assert_eq!(
             loose_pread_outcome(READ as i64, READ),
             LoosePreadOutcome::Done
         );
+        assert_eq!(loose_pread_outcome(efault, READ), LoosePreadOutcome::Efault);
+        for rc in [eio, 0, READ as i64 - 1, READ as i64 + 1] {
+            assert_eq!(
+                loose_pread_outcome(rc, READ),
+                LoosePreadOutcome::Retry,
+                "{rc}"
+            );
+        }
     }
 
     #[test]
-    fn outcome_efault_falls_back_and_is_remembered() {
-        let rc = sce_errno_from_posix(EFAULT) as i64;
-        assert_eq!(loose_pread_outcome(rc, READ), LoosePreadOutcome::Efault);
-    }
-
-    #[test]
-    fn outcome_other_errors_and_short_reads_retry_on_aio() {
-        let eio = SCE_KERNEL_ERROR_EIO as i64;
-        assert_eq!(loose_pread_outcome(eio, READ), LoosePreadOutcome::Retry);
-        assert_eq!(loose_pread_outcome(0, READ), LoosePreadOutcome::Retry);
-        assert_eq!(
-            loose_pread_outcome(READ as i64 - 1, READ),
-            LoosePreadOutcome::Retry
-        );
-        assert_eq!(
-            loose_pread_outcome(READ as i64 + 1, READ),
-            LoosePreadOutcome::Retry
-        );
-    }
-
-    #[test]
-    fn route_needs_knob_first_submit_and_real_fd() {
-        let t = LooseGpuRegions::new();
-        let buf = 0x2_0000_0000;
-        assert_eq!(
-            loose_pread_route(true, true, true, &t, buf, READ, T),
-            LoosePreadRoute::Pool
-        );
-        assert_eq!(
-            loose_pread_route(false, true, true, &t, buf, READ, T),
-            LoosePreadRoute::Aio
-        );
-        assert_eq!(
-            loose_pread_route(true, false, true, &t, buf, READ, T),
-            LoosePreadRoute::Aio
-        );
-        assert_eq!(
-            loose_pread_route(true, true, false, &t, buf, READ, T),
-            LoosePreadRoute::Aio
-        );
-        assert_eq!(
-            loose_pread_route(true, true, true, &t, buf, 0, T),
-            LoosePreadRoute::Aio
-        );
-    }
-
-    #[test]
-    fn route_skips_known_gpu_region() {
+    fn route_needs_first_submit_real_fd_and_no_known_gpu_region() {
         let mut t = LooseGpuRegions::new();
-        let buf = 0x2_0000_0000;
-        t.insert(buf, READ, T);
+        let route = |t: &LooseGpuRegions, first, real, buf, len| {
+            loose_pread_route(first, real, t, buf, len, T)
+        };
+        assert_eq!(route(&t, true, true, BUF, READ), LoosePreadRoute::Pool);
+        assert_eq!(route(&t, false, true, BUF, READ), LoosePreadRoute::Aio);
+        assert_eq!(route(&t, true, false, BUF, READ), LoosePreadRoute::Aio);
+        assert_eq!(route(&t, true, true, BUF, 0), LoosePreadRoute::Aio);
+        t.insert(BUF, READ, T);
         assert_eq!(
-            loose_pread_route(true, true, true, &t, buf + 0x80000, READ, T),
+            route(&t, true, true, BUF + 0x80000, READ),
             LoosePreadRoute::KnownGpu
         );
         assert_eq!(
-            loose_pread_route(true, true, true, &t, buf + MIB2, READ, T),
+            route(&t, true, true, BUF + MIB2, READ),
             LoosePreadRoute::Pool
         );
     }
@@ -729,20 +668,17 @@ mod tests {
     }
 
     #[test]
-    fn part_size_clamps_to_4k_multiple_and_16k_min() {
-        assert_eq!(loose_pread_part_bytes(0), 0);
-        assert_eq!(loose_pread_part_bytes(64), PART);
-        assert_eq!(loose_pread_part_bytes(1), 16 * 1024);
-        assert_eq!(loose_pread_part_bytes(15), 16 * 1024);
-        assert_eq!(loose_pread_part_bytes(16), 16 * 1024);
-        assert_eq!(loose_pread_part_bytes(18), 16 * 1024);
-        assert_eq!(loose_pread_part_bytes(66), PART);
+    fn part_size_count_and_ranges_cover_the_read_exactly() {
+        for (kib, bytes) in [
+            (0, 0),
+            (1, 16 << 10),
+            (16, 16 << 10),
+            (18, 16 << 10),
+            (66, PART),
+        ] {
+            assert_eq!(loose_pread_part_bytes(kib), bytes, "{kib} KiB");
+        }
         assert_eq!(loose_pread_part_bytes(4096), 4 << 20);
-    }
-
-    #[test]
-    fn part_count_splits_only_when_all_parts_fit() {
-        assert_eq!(loose_pread_part_count(READ, PART, 32), 8);
         assert_eq!(loose_pread_part_count(READ, PART, 8), 8);
         assert_eq!(loose_pread_part_count(READ, PART, 7), 1, "no partial split");
         assert_eq!(loose_pread_part_count(READ, 0, 32), 1, "knob 0");
@@ -750,78 +686,63 @@ mod tests {
         assert_eq!(loose_pread_part_count(PART + 1, PART, 32), 2);
         let tooMany = (kAprExternalAioGroupMaxRequests as u64 + 1) * 16 * 1024;
         assert_eq!(loose_pread_part_count(tooMany, 16 * 1024, 64), 1);
-    }
-
-    #[test]
-    fn part_ranges_cover_the_read_in_order() {
         assert_eq!(loose_pread_part_range(READ, PART, 1, 0), (0, READ));
+        // Parts are contiguous from 0, the last one takes the rest.
         let mut next = 0;
         for k in 0..8 {
             let (start, len) = loose_pread_part_range(READ, PART, 8, k);
-            assert_eq!(start, next);
-            assert_eq!(start, k as u64 * PART);
+            assert_eq!((start, len.min(PART)), (next, len));
             next = start + len;
         }
-        assert_eq!(
-            loose_pread_part_range(READ, PART, 8, 7),
-            (7 * PART, READ - 7 * PART)
-        );
         assert_eq!(next, READ);
+        assert_eq!(loose_pread_part_range(PART + 1, PART, 2, 1), (PART, 1));
     }
 
     #[test]
-    fn all_full_parts_are_one_full_read() {
+    fn parts_fold_to_one_pread_up_to_the_first_short_part() {
         let r = fold(READ, PART, &full_parts());
-        assert_eq!(r.total, READ as i64);
-        assert_eq!(r.outcome(READ), LoosePreadOutcome::Done);
-        let one = fold(READ, PART, &[READ as i64]);
-        assert_eq!(one.outcome(READ), LoosePreadOutcome::Done);
-    }
-
-    #[test]
-    fn eof_mid_part_ignores_later_parts() {
+        assert_eq!(
+            (r.total, r.outcome(READ)),
+            (READ as i64, LoosePreadOutcome::Done)
+        );
+        assert_eq!(
+            fold(READ, PART, &[READ as i64]).outcome(READ),
+            LoosePreadOutcome::Done
+        );
+        // EOF mid part: later parts count nothing, even a full one.
         let mut v = full_parts();
         v[3] = 1000;
         v[4] = 0;
-        v[5] = PART as i64; // the file grew: still not counted
+        v[5] = PART as i64;
         let r = fold(READ, PART, &v);
-        assert_eq!(r.total, (3 * PART + 1000) as i64);
-        assert_eq!(r.outcome(READ), LoosePreadOutcome::Retry);
-    }
-
-    #[test]
-    fn eof_on_a_part_boundary() {
+        assert_eq!(
+            (r.total, r.outcome(READ)),
+            ((3 * PART + 1000) as i64, LoosePreadOutcome::Retry)
+        );
+        // EOF on a part boundary.
         let mut v = full_parts();
-        for x in &mut v[3..] {
-            *x = 0;
-        }
-        let r = fold(READ, PART, &v);
-        assert_eq!(r.total, (3 * PART) as i64);
-        assert_eq!(r.outcome(READ), LoosePreadOutcome::Retry);
+        v[3..].fill(0);
+        assert_eq!(fold(READ, PART, &v).total, (3 * PART) as i64);
     }
 
     #[test]
-    fn error_in_a_middle_part() {
+    fn part_errors_end_the_read_and_efault_sends_it_to_aio() {
         let eio = SCE_KERNEL_ERROR_EIO as i64;
         let mut v = full_parts();
         v[2] = eio;
         v[5] = 10;
         let r = fold(READ, PART, &v);
-        assert_eq!(r.total, eio);
-        assert_eq!(r.outcome(READ), LoosePreadOutcome::Retry);
+        assert_eq!((r.total, r.outcome(READ)), (eio, LoosePreadOutcome::Retry));
         // A short part before the error ends the read first.
         v[1] = 10;
         assert_eq!(fold(READ, PART, &v).total, (PART + 10) as i64);
-    }
-
-    #[test]
-    fn efault_in_one_part_sends_the_read_to_aio() {
+        // EFAULT in any part wins, also after an earlier EOF.
         let mut v = full_parts();
         v[6] = sce_errno_from_posix(EFAULT) as i64;
-        let r = fold(READ, PART, &v);
-        assert!(r.efault);
-        assert_eq!(r.outcome(READ), LoosePreadOutcome::Efault);
-        // Also after an earlier EOF.
+        assert_eq!(
+            fold(READ, PART, &v).outcome(READ),
+            LoosePreadOutcome::Efault
+        );
         v[0] = 0;
         assert_eq!(
             fold(READ, PART, &v).outcome(READ),

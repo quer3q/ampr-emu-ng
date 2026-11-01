@@ -1,7 +1,7 @@
 //! Tuning knobs of the debug build (`make AMPR_MEM_REPORT=1`). Startup knobs
 //! (cache sizes, workers, pipelines, cache reserve) are read from TUNE_PATH
-//! when the pack state is created (pack/state.rs); live knobs (read-ahead, read
-//! extension and their disk gates, pread pool on/off for pack and loose reads,
+//! when the pack state is created (pack/state.rs); live knobs (read-ahead and
+//! its disk gate, pread pool on/off for pack and loose reads,
 //! the reactor's per-pass and per-read issue limits, lane EOP overlap) take
 //! effect on the next read or reactor pass.
 //! `GET /set?k=v&...` on the metrics port changes both and rewrites TUNE_PATH,
@@ -13,7 +13,6 @@ use super::pack::{
     AMPR_EMU_PACK_DECODED_CACHE_BYTES, AMPR_EMU_PACK_MEMORY_RESERVE_BYTES,
     AMPR_EMU_PACK_PHYSICAL_CACHE_BYTES, AMPR_EMU_PACK_PIPELINE_SLOTS,
     AMPR_EMU_PACK_READAHEAD_CHUNKS, AMPR_EMU_PACK_READAHEAD_MAX_DISK_INFLIGHT,
-    AMPR_EMU_PACK_READ_EXTEND_BYTES, AMPR_EMU_PACK_READ_EXTEND_MAX_DISK_INFLIGHT,
     AMPR_EMU_PACK_WORKERS, AMPR_EMU_PACK_WORKER_CAPACITY,
 };
 use super::reactor::{
@@ -68,17 +67,15 @@ const PIPELINES: usize = 3;
 const RESERVE_MIB: usize = 4;
 const RA: usize = 5;
 const RA_GATE: usize = 6;
-const EXT_KIB: usize = 7;
-const EXT_GATE: usize = 8;
-const PREAD: usize = 9;
-const PREAD_THREADS: usize = 10;
-const LOOSE_PREAD: usize = 11;
-const LOOSE_PREAD_PART_KIB: usize = 12;
-const READ_PASS_KIB: usize = 13;
-const READ_CHUNK_QUANTUM: usize = 14;
-const PER_READ_ACTIVE_KIB: usize = 15;
-const PER_READ_ACTIVE_CHUNKS: usize = 16;
-const LANE_EOP_OVERLAP: usize = 17;
+const PREAD: usize = 7;
+const PREAD_THREADS: usize = 8;
+const LOOSE_PREAD: usize = 9;
+const LOOSE_PREAD_PART_KIB: usize = 10;
+const READ_PASS_KIB: usize = 11;
+const READ_CHUNK_QUANTUM: usize = 12;
+const PER_READ_ACTIVE_KIB: usize = 13;
+const PER_READ_ACTIVE_CHUNKS: usize = 14;
+const LANE_EOP_OVERLAP: usize = 15;
 
 /// Smallest pass budget and per-read active window, in KiB: one full read
 /// slice (kSoftwareReadChunkMax, 512 KiB). A smaller value would leave a full
@@ -90,7 +87,7 @@ const READ_LIMIT_MAX_KIB: u32 = 16 * 1024;
 
 /// Cache sizes: 0 turns a cache off (reads bypass it); otherwise the cache
 /// allocators' minimums apply (decoded 16, physical 8 MiB, pack/manifest.rs).
-pub(crate) static KNOBS: [Knob; 18] = [
+pub(crate) static KNOBS: [Knob; 16] = [
     knob(
         "decoded_mib",
         false,
@@ -133,20 +130,6 @@ pub(crate) static KNOBS: [Knob; 18] = [
         0,
         64,
         AMPR_EMU_PACK_READAHEAD_MAX_DISK_INFLIGHT,
-    ),
-    knob(
-        "ext_kib",
-        true,
-        0,
-        2048,
-        (AMPR_EMU_PACK_READ_EXTEND_BYTES / 1024) as u32,
-    ),
-    knob(
-        "ext_gate",
-        true,
-        0,
-        64,
-        AMPR_EMU_PACK_READ_EXTEND_MAX_DISK_INFLIGHT,
     ),
     knob("pread", true, 0, 1, 1),
     knob(
@@ -261,13 +244,6 @@ pub(crate) fn ra_gate() -> u32 {
         get(RA_GATE)
     } else {
         AMPR_EMU_PACK_READAHEAD_MAX_DISK_INFLIGHT
-    }
-}
-pub(crate) fn ext_bytes() -> usize {
-    if ON {
-        get(EXT_KIB) as usize * 1024
-    } else {
-        AMPR_EMU_PACK_READ_EXTEND_BYTES
     }
 }
 /// 1: pack physical reads go to the pread pool (reactor/pread_pool.rs); 0: kernel AIO.
@@ -387,14 +363,6 @@ pub(crate) fn url_decode(src: &[u8], out: &mut [u8]) -> Option<usize> {
     }
     *out.get_mut(n)? = 0;
     Some(n)
-}
-
-pub(crate) fn ext_gate() -> u32 {
-    if ON {
-        get(EXT_GATE)
-    } else {
-        AMPR_EMU_PACK_READ_EXTEND_MAX_DISK_INFLIGHT
-    }
 }
 
 fn trim(mut s: &[u8]) -> &[u8] {
@@ -534,54 +502,72 @@ mod tests {
         KNOB_LOCK.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// Defaults match the release constants, release getters return them,
+    /// and every range keeps a full 512 KiB slice issuable (a smaller budget
+    /// or window would never admit it).
     #[test]
-    fn issue_limit_knobs_default_to_release_constants() {
+    fn knobs_default_to_release_constants_and_keep_a_slice_issuable() {
         let _lock = knob_lock();
-        assert_eq!(
-            knob_value(READ_PASS_KIB) as u64 * 1024,
-            AMPR_EMU_APR_READ_PASS_MAX_BYTES
-        );
-        assert_eq!(
-            knob_value(READ_CHUNK_QUANTUM),
-            AMPR_EMU_APR_READ_CHUNK_QUANTUM
-        );
-        assert_eq!(
-            knob_value(PER_READ_ACTIVE_KIB) as u64 * 1024,
-            AMPR_EMU_APR_PER_READ_ACTIVE_BYTES
-        );
-        assert_eq!(
-            knob_value(PER_READ_ACTIVE_CHUNKS),
-            AMPR_EMU_APR_PER_READ_ACTIVE_CHUNKS
-        );
-        assert_eq!(KNOBS[READ_PASS_KIB].name, "read_pass_kib");
-        assert_eq!(KNOBS[READ_CHUNK_QUANTUM].name, "read_chunk_quantum");
-        assert_eq!(KNOBS[PER_READ_ACTIVE_KIB].name, "per_read_active_kib");
-        assert_eq!(KNOBS[PER_READ_ACTIVE_CHUNKS].name, "per_read_active_chunks");
-    }
-
-    #[test]
-    fn issue_limit_knob_ranges_keep_a_full_slice_issuable() {
-        // A budget or window below one 512 KiB slice would never admit it.
+        let defaults = [
+            (
+                READ_PASS_KIB,
+                "read_pass_kib",
+                (AMPR_EMU_APR_READ_PASS_MAX_BYTES / 1024) as u32,
+            ),
+            (
+                READ_CHUNK_QUANTUM,
+                "read_chunk_quantum",
+                AMPR_EMU_APR_READ_CHUNK_QUANTUM,
+            ),
+            (
+                PER_READ_ACTIVE_KIB,
+                "per_read_active_kib",
+                (AMPR_EMU_APR_PER_READ_ACTIVE_BYTES / 1024) as u32,
+            ),
+            (
+                PER_READ_ACTIVE_CHUNKS,
+                "per_read_active_chunks",
+                AMPR_EMU_APR_PER_READ_ACTIVE_CHUNKS,
+            ),
+            (
+                LANE_EOP_OVERLAP,
+                "lane_eop_overlap",
+                AMPR_EMU_APR_LANE_EOP_OVERLAP as u32,
+            ),
+            (PREAD_THREADS, "pread_threads", RELEASE_PREAD_THREADS),
+        ];
+        for (i, name, v) in defaults {
+            assert_eq!((KNOBS[i].name, knob_value(i)), (name, v));
+        }
         assert_eq!(READ_SLICE_KIB, 512);
         for i in [READ_PASS_KIB, PER_READ_ACTIVE_KIB] {
-            assert_eq!(KNOBS[i].min, READ_SLICE_KIB);
-            assert_eq!(KNOBS[i].max, 16 * 1024);
+            assert_eq!((KNOBS[i].min, KNOBS[i].max), (READ_SLICE_KIB, 16 * 1024));
         }
+        let range = |i: usize| (KNOBS[i].min, KNOBS[i].max);
+        assert_eq!(range(READ_CHUNK_QUANTUM), (1, 64));
+        assert_eq!(range(PER_READ_ACTIVE_CHUNKS), (1, 32));
         assert_eq!(
-            (KNOBS[READ_CHUNK_QUANTUM].min, KNOBS[READ_CHUNK_QUANTUM].max),
-            (1, 64)
+            KNOBS[PREAD_THREADS].max as usize,
+            AMPR_EMU_PACK_PREAD_WORKERS
         );
-        assert_eq!(
-            (
-                KNOBS[PER_READ_ACTIVE_CHUNKS].min,
-                KNOBS[PER_READ_ACTIVE_CHUNKS].max
-            ),
-            (1, 32)
-        );
+        assert_eq!(AMPR_EMU_PACK_PREAD_WORKERS, if ON { 64 } else { 32 });
+        if !ON {
+            assert_eq!(read_pass_bytes(), AMPR_EMU_APR_READ_PASS_MAX_BYTES);
+            assert_eq!(read_chunk_quantum(), AMPR_EMU_APR_READ_CHUNK_QUANTUM);
+            assert_eq!(per_read_active_bytes(), AMPR_EMU_APR_PER_READ_ACTIVE_BYTES);
+            assert_eq!(
+                per_read_active_chunks(),
+                AMPR_EMU_APR_PER_READ_ACTIVE_CHUNKS
+            );
+            assert_eq!(pread_threads(), RELEASE_PREAD_THREADS as usize);
+            assert!(!lane_eop_overlap());
+        }
     }
 
+    /// `apply` rejects out-of-range pairs without storing them and stores
+    /// in-range ones; the test restores the defaults it changed.
     #[test]
-    fn apply_rejects_issue_limits_out_of_range() {
+    fn apply_checks_ranges_then_stores() {
         let _lock = knob_lock();
         for bad in [
             &b"read_pass_kib=511"[..],
@@ -592,6 +578,7 @@ mod tests {
             b"per_read_active_kib=16385",
             b"per_read_active_chunks=0",
             b"per_read_active_chunks=33",
+            b"lane_eop_overlap=2",
         ] {
             assert_eq!(
                 apply(bad),
@@ -600,84 +587,36 @@ mod tests {
                 core::str::from_utf8(bad).unwrap()
             );
         }
-        // Rejected pairs leave the defaults in place.
         assert_eq!(
             knob_value(READ_CHUNK_QUANTUM),
             AMPR_EMU_APR_READ_CHUNK_QUANTUM
         );
-    }
-
-    #[test]
-    fn apply_sets_issue_limits_in_range_then_restores() {
-        let _lock = knob_lock();
+        assert_eq!(knob_value(LANE_EOP_OVERLAP), 0);
         assert_eq!(
-            apply(b"read_pass_kib=4096&read_chunk_quantum=32&per_read_active_kib=8192&per_read_active_chunks=16"),
+            apply(b"read_pass_kib=4096&read_chunk_quantum=32&per_read_active_kib=8192&per_read_active_chunks=16&lane_eop_overlap=1"),
             Ok(())
         );
         assert_eq!(knob_value(READ_PASS_KIB), 4096);
         assert_eq!(knob_value(READ_CHUNK_QUANTUM), 32);
         assert_eq!(knob_value(PER_READ_ACTIVE_KIB), 8192);
         assert_eq!(knob_value(PER_READ_ACTIVE_CHUNKS), 16);
+        // Release builds ignore the knob and use the constant (off).
+        assert_eq!(lane_eop_overlap(), ON);
         assert_eq!(
-            apply(b"read_pass_kib=512\nread_chunk_quantum=8\nper_read_active_kib=2048\nper_read_active_chunks=4"),
+            apply(b"read_pass_kib=512\nread_chunk_quantum=8\nper_read_active_kib=2048\nper_read_active_chunks=4\nlane_eop_overlap=0"),
             Ok(())
         );
         assert_eq!(knob_value(READ_PASS_KIB), 512);
         assert_eq!(knob_value(PER_READ_ACTIVE_CHUNKS), 4);
-    }
-
-    #[test]
-    fn release_getters_return_constants() {
-        if ON {
-            return;
-        }
-        assert_eq!(read_pass_bytes(), AMPR_EMU_APR_READ_PASS_MAX_BYTES);
-        assert_eq!(read_chunk_quantum(), AMPR_EMU_APR_READ_CHUNK_QUANTUM);
-        assert_eq!(per_read_active_bytes(), AMPR_EMU_APR_PER_READ_ACTIVE_BYTES);
-        assert_eq!(
-            per_read_active_chunks(),
-            AMPR_EMU_APR_PER_READ_ACTIVE_CHUNKS
-        );
-        assert_eq!(pread_threads(), RELEASE_PREAD_THREADS as usize);
-    }
-
-    #[test]
-    fn pread_threads_range_reaches_the_debug_ceiling() {
-        let _lock = knob_lock();
-        let knob = &KNOBS[PREAD_THREADS];
-        assert_eq!(knob.max as usize, AMPR_EMU_PACK_PREAD_WORKERS);
-        assert_eq!(knob_value(PREAD_THREADS), RELEASE_PREAD_THREADS);
-        if ON {
-            assert_eq!(AMPR_EMU_PACK_PREAD_WORKERS, 64);
-        } else {
-            assert_eq!(AMPR_EMU_PACK_PREAD_WORKERS, 32);
-        }
-    }
-
-    #[test]
-    fn lane_eop_overlap_defaults_off_and_applies() {
-        let _lock = knob_lock();
-        assert_eq!(KNOBS[LANE_EOP_OVERLAP].name, "lane_eop_overlap");
-        assert_eq!(knob_value(LANE_EOP_OVERLAP), 0);
-        assert!(!AMPR_EMU_APR_LANE_EOP_OVERLAP);
-        assert_eq!(
-            apply(b"lane_eop_overlap=2"),
-            Err(&b"lane_eop_overlap=2"[..])
-        );
-        assert_eq!(knob_value(LANE_EOP_OVERLAP), 0);
-        assert_eq!(apply(b"lane_eop_overlap=1"), Ok(()));
-        assert_eq!(knob_value(LANE_EOP_OVERLAP), 1);
-        // Release builds ignore the knob and use the constant (off).
-        assert_eq!(lane_eop_overlap(), ON);
-        assert_eq!(apply(b"lane_eop_overlap=0"), Ok(()));
         assert!(!lane_eop_overlap());
     }
 
+    /// The tune file may hold removed knobs and junk lines: they are skipped
+    /// and the known pairs still apply. save() writes `name=value\n` per knob
+    /// into 512 bytes, which fits every knob at its widest.
     #[test]
-    fn tune_file_skips_unknown_lines_and_applies_the_rest() {
+    fn tune_file_skips_unknown_lines_and_save_fits() {
         let _lock = knob_lock();
-        // The console's /data/ampr_emu_tune.txt still has the removed
-        // app0_direct knob and app0_backing folder between known knobs.
         let file = b"ra=8\napp0_direct=1\napp0_backing=/data/homebrew/%5BX%5D\r\n\
             # comment\nnot a pair\nread_chunk_quantum=32\nlane_eop_overlap=0\n";
         apply_file(file);
@@ -690,14 +629,6 @@ mod tests {
         KNOBS[READ_CHUNK_QUANTUM]
             .v
             .store(AMPR_EMU_APR_READ_CHUNK_QUANTUM, Relaxed);
-        KNOBS[LANE_EOP_OVERLAP]
-            .v
-            .store(AMPR_EMU_APR_LANE_EOP_OVERLAP as u32, Relaxed);
-    }
-
-    #[test]
-    fn save_buffer_fits_every_knob_at_its_widest() {
-        // save() writes `name=value\n` per knob into 512 bytes.
         let widest: usize = KNOBS
             .iter()
             .map(|k| k.name.len() + 2 + k.max.to_string().len())

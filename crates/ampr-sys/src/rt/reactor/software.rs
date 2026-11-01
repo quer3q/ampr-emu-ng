@@ -37,15 +37,14 @@ impl AprAioReactor {
     }
 
     pub(crate) fn software_op_uses_native_apr_batch(t: OpType) -> bool {
-        match t {
+        matches!(
+            t,
             WAIT_ON_COUNTER
-            | WRITE_COUNTER
-            | WRITE_ADDRESS_FROM_TIME_COUNTER
-            | WRITE_ADDRESS_FROM_COUNTER
-            | WRITE_ADDRESS_FROM_COUNTER_PAIR => true,
-            WRITE_EQUEUE => !AMPR_EMU_APR_LOCAL_EQUEUE,
-            _ => false,
-        }
+                | WRITE_COUNTER
+                | WRITE_ADDRESS_FROM_TIME_COUNTER
+                | WRITE_ADDRESS_FROM_COUNTER
+                | WRITE_ADDRESS_FROM_COUNTER_PAIR
+        )
     }
 
     pub(crate) fn software_op_is_native_apr_eop(op: &Op) -> bool {

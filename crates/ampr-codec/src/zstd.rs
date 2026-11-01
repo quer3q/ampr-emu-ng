@@ -21,16 +21,6 @@ const WARM_UP_FRAME: [u8; 29] = [
     18, 247, 254, 55,
 ];
 
-/// Decode exactly one zstd chunk with a one-off decoder; see `ZstdDecoder`.
-pub fn decode_zstd_chunk(
-    codec: u8,
-    raw_size: usize,
-    stored: &[u8],
-    output: &mut [u8],
-) -> Result<(), Error> {
-    ZstdDecoder::new().decode(codec, raw_size, stored, output)
-}
-
 /// A reusable zstd chunk decoder over one libzstd `ZSTD_DCtx` (native C
 /// zstd: ~10x ruzstd's speed on the console). Its buffers are allocated by
 /// the first zstd chunk and reused by every later one, so a long-lived

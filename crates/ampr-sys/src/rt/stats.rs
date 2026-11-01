@@ -56,13 +56,9 @@ stats! {
     /// cached, random-access file, no free slot or worker).
     PrefetchChunks = "prefetch_chunks",
     PrefetchSkipped = "prefetch_skipped",
-    /// Read extension: bytes added past a read's own pages in the same backing
-    /// request, and physical page cache lookups (hits = no disk read needed).
-    ReadExtendBytes = "read_extend_bytes",
+    /// Physical page cache lookups (hits = no disk read needed).
     PhysHits = "phys_hits",
     PhysMisses = "phys_misses",
-    /// Read plans that skipped extension because the disk was busy.
-    ReadExtendGated = "read_extend_gated",
     /// Reads served by the blocking pread pool (reactor/pread_pool.rs): calls and
     /// bytes, time queued for a pool thread, time in pread, and the peak
     /// number of queued + running reads since the last scrape. Pack reads

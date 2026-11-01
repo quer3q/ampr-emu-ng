@@ -453,7 +453,7 @@ pub(crate) unsafe fn cache_find_locked(
     chunk: &AmprPackChunkView,
     key_hash: u64,
 ) -> u32 {
-    let bucket = (key_hash & (AMPR_EMU_PACK_CACHE_HASH_BUCKETS as u64 - 1)) as usize;
+    let bucket = ampr_format::cache::bucket_index(key_hash, AMPR_EMU_PACK_CACHE_HASH_BUCKETS);
     let mut link = (*state).cache_hash_heads[bucket];
     while link != 0 {
         let index = link - 1;
@@ -471,14 +471,16 @@ pub(crate) unsafe fn cache_find_locked(
 
 pub(crate) unsafe fn cache_hash_link_locked(state: *mut PackState, index: u32) {
     let entry = &mut (*state).cache_entries[index as usize];
-    let bucket = (entry.key_hash & (AMPR_EMU_PACK_CACHE_HASH_BUCKETS as u64 - 1)) as usize;
+    let bucket = ampr_format::cache::bucket_index(entry.key_hash, AMPR_EMU_PACK_CACHE_HASH_BUCKETS);
     entry.hash_next_plus_one = (*state).cache_hash_heads[bucket];
     (*state).cache_hash_heads[bucket] = index + 1;
 }
 
 pub(crate) unsafe fn cache_hash_unlink_locked(state: *mut PackState, index: u32) {
-    let bucket = ((*state).cache_entries[index as usize].key_hash
-        & (AMPR_EMU_PACK_CACHE_HASH_BUCKETS as u64 - 1)) as usize;
+    let bucket = ampr_format::cache::bucket_index(
+        (*state).cache_entries[index as usize].key_hash,
+        AMPR_EMU_PACK_CACHE_HASH_BUCKETS,
+    );
     let next = (*state).cache_entries[index as usize].hash_next_plus_one;
     // `prev` is None while the link is the bucket head.
     let mut prev: Option<usize> = None;

@@ -2533,11 +2533,13 @@ pub unsafe fn ampr_pack_core_make_task(
 }
 
 #[cfg(test)]
-mod zstd_service_path_tests {
-    use super::is_zstd_service_path;
+mod tests {
+    use super::*;
 
+    /// Runtime files bypass the index, and only misses the /app0 walk can
+    /// answer are final; the rest go to the filesystem.
     #[test]
-    fn runtime_files_bypass_the_index() {
+    fn path_routing_runtime_files_and_authoritative_misses() {
         for yes in [
             c"/app0/ampr_zstd.index",
             c"/app0/ampr_zstd-000.pak",
@@ -2555,15 +2557,35 @@ mod zstd_service_path_tests {
             assert!(!is_zstd_service_path(no.as_ptr()), "{no:?}");
         }
         assert!(!is_zstd_service_path(core::ptr::null()));
+
+        let miss_with = |raw: &CStr, links: bool| {
+            let mut key = [0u8; RUNTIME_PATH_CAPACITY];
+            let len = unsafe { normalize_key(raw.as_ptr(), &mut key) }.unwrap();
+            miss_is_authoritative(raw.to_bytes(), &key[..len], links)
+        };
+        let miss = |raw: &CStr| miss_with(raw, false);
+        // ASCII case variants fold to the indexed key: the miss holds on exFAT too.
+        assert!(miss(c"/app0/Data/Missing.BIN"));
+        assert!(miss(c"/APP0/data//missing.bin"));
+        // exFAT folds non-ASCII case; keys do not.
+        assert!(!miss(c"/app0/Donn\xc3\xa9es/x.bin"));
+        assert!(!miss(c"/app0/a\tb.bin"));
+        for own in [
+            c"/app0/ampr_emu.index",
+            c"/app0/AMPR_EMU.LOG",
+            c"/app0/ampr_commands.bin",
+        ] {
+            assert!(!miss(own), "{own:?}");
+        }
+        // A skipped directory link hides a subtree: no ASCII miss holds.
+        assert!(!miss_with(c"/app0/Data/Missing.BIN", true));
+        assert!(!miss_with(c"/app0/linked/x.bin", true));
     }
-}
 
-#[cfg(test)]
-mod usb_index_io_tests {
-    use super::*;
-
+    /// USB index I/O: pread and write loops continue short transfers and
+    /// retry EINTR, and fail on EOF, errors and endless EINTR.
     #[test]
-    fn pread_continues_short_reads_and_retries_eintr() {
+    fn io_loops_continue_short_transfers_and_retry_eintr() {
         let src: std::vec::Vec<u8> = (0..=255u8).cycle().take(3000).collect();
         let mut dst = std::vec![0u8; 2000];
         let mut calls = 0;
@@ -2580,19 +2602,11 @@ mod usb_index_io_tests {
         };
         assert!(ok);
         assert_eq!(&dst[..], &src[100..2100]);
-    }
-
-    #[test]
-    fn pread_fails_on_eof_errors_and_endless_eintr() {
-        let mut dst = [0u8; 16];
         let p = dst.as_mut_ptr();
         assert!(!unsafe { pread_exact_with(p, 16, 0, |_, _, _| (0, 0)) });
         assert!(!unsafe { pread_exact_with(p, 16, 0, |_, _, _| (-1, EIO)) });
         assert!(!unsafe { pread_exact_with(p, 16, 0, |_, _, _| (-1, EINTR)) });
-    }
 
-    #[test]
-    fn write_continues_short_writes_and_retries_eintr() {
         let data: std::vec::Vec<u8> = (0..1000u32).map(|i| i as u8).collect();
         let mut out = std::vec::Vec::new();
         let mut calls = 0;
@@ -2629,34 +2643,14 @@ mod usb_index_io_tests {
         assert_eq!(st.st_blocks, 8_130_000_000 / 512 + 1);
     }
 
+    /// Only ENOENT means the index is missing; unreadable loads count only
+    /// in a row, saturating.
     #[test]
-    fn misses_the_walk_cannot_answer_go_to_the_fs() {
-        let miss_with = |raw: &CStr, links: bool| {
-            let mut key = [0u8; RUNTIME_PATH_CAPACITY];
-            let len = unsafe { normalize_key(raw.as_ptr(), &mut key) }.unwrap();
-            miss_is_authoritative(raw.to_bytes(), &key[..len], links)
-        };
-        let miss = |raw: &CStr| miss_with(raw, false);
-        // ASCII case variants fold to the indexed key: the miss holds on exFAT too.
-        assert!(miss(c"/app0/Data/Missing.BIN"));
-        assert!(miss(c"/APP0/data//missing.bin"));
-        // exFAT folds non-ASCII case; keys do not.
-        assert!(!miss(c"/app0/Donn\xc3\xa9es/x.bin"));
-        assert!(!miss(c"/app0/a\tb.bin"));
-        for own in [
-            c"/app0/ampr_emu.index",
-            c"/app0/AMPR_EMU.LOG",
-            c"/app0/ampr_commands.bin",
-        ] {
-            assert!(!miss(own), "{own:?}");
+    fn load_results_missing_vs_unreadable() {
+        assert!(open_failure_result(ENOENT) == LoadResult::Missing);
+        for e in [EIO, EINTR, EMFILE, EACCES] {
+            assert!(open_failure_result(e) == LoadResult::Unreadable, "{e}");
         }
-        // A skipped directory link hides a subtree: no ASCII miss holds.
-        assert!(!miss_with(c"/app0/Data/Missing.BIN", true));
-        assert!(!miss_with(c"/app0/linked/x.bin", true));
-    }
-
-    #[test]
-    fn unreadable_loads_count_only_in_a_row() {
         let mut n = 0;
         for _ in 0..UNREADABLE_LOAD_LIMIT {
             assert!(n < UNREADABLE_LOAD_LIMIT);
@@ -2669,13 +2663,5 @@ mod usb_index_io_tests {
             next_unreadable_loads(u32::MAX, LoadResult::Unreadable),
             u32::MAX
         );
-    }
-
-    #[test]
-    fn only_enoent_means_the_index_is_missing() {
-        assert!(open_failure_result(ENOENT) == LoadResult::Missing);
-        for e in [EIO, EINTR, EMFILE, EACCES] {
-            assert!(open_failure_result(e) == LoadResult::Unreadable, "{e}");
-        }
     }
 }

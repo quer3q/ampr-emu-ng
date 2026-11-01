@@ -631,27 +631,21 @@ mod tests {
         unsafe { ampr_libc_set_constraint_handler_s(ampr_libc_ignore_handler_s as *mut c_void) };
     }
 
+    /// udivti3 matches u128 division, fpclassifyd uses Dinkumware codes, and
+    /// sinh scales by `y` and matches std.
     #[test]
-    fn udivti3_matches_u128_division() {
+    fn math_helpers_match_reference() {
         let a = (0x1234_5678_9abc_def0u128 << 64) | 0xfedc_ba98_7654_3210;
         assert_eq!(ampr_libc_udivti3(a, 3), a / 3);
         assert_eq!(ampr_libc_udivti3(a, a), 1);
         assert_eq!(ampr_libc_udivti3(7, u128::MAX), 0);
         assert_eq!(ampr_libc_udivti3(u128::MAX, 1 << 64), u64::MAX as u128);
-    }
-
-    #[test]
-    fn fpclassifyd_uses_dinkumware_codes() {
         assert_eq!(ampr_libc_fpclassifyd(f64::NAN), 2);
         assert_eq!(ampr_libc_fpclassifyd(f64::NEG_INFINITY), 1);
         assert_eq!(ampr_libc_fpclassifyd(-0.0), 0);
         assert_eq!(ampr_libc_fpclassifyd(f64::MIN_POSITIVE / 4.0), -2);
         assert_eq!(ampr_libc_fpclassifyd(1.5), -1);
         assert_eq!(ampr_libc_fltrounds(), 1);
-    }
-
-    #[test]
-    fn sinh_scales_by_y_and_matches_std() {
         for &x in &[
             0.0f64, 1e-300, 1e-8, 0.3, -0.99, 1.0, -2.5, 10.0, 21.9, 22.5, -300.0, 709.0, 710.4,
         ] {
@@ -668,8 +662,11 @@ mod tests {
         assert!(ampr_libc_sinh(f64::NAN, 1.0).is_nan());
     }
 
+    /// strtok_s keeps its context; wcscpy_s, asctime_s and wcstombs_s copy,
+    /// format and reject bad sizes, null pointers and overlap.
     #[test]
-    fn strtok_s_splits_and_keeps_context() {
+    fn bounds_checked_string_functions() {
+        quiet_handler();
         let mut buf = *b",,ab,c;;d\0";
         let delim = c",;".as_ptr();
         let mut ctx = null_mut();
@@ -692,11 +689,6 @@ mod tests {
         assert!(
             unsafe { ampr_libc_strtok_s(buf.as_mut_ptr().cast(), delim, null_mut()) }.is_null()
         );
-    }
-
-    #[test]
-    fn wcscpy_s_copies_and_rejects() {
-        quiet_handler();
         let src = wide("hello");
         let mut dst = [0xffffu16; 8];
         assert_eq!(
@@ -729,11 +721,6 @@ mod tests {
         let mut empty = wide("");
         let e = empty.as_mut_ptr();
         assert_eq!(unsafe { ampr_libc_wcscpy_s(e, 8, e) }, EINVAL);
-    }
-
-    #[test]
-    fn asctime_s_and_wcstombs_s_format() {
-        quiet_handler();
         let t = Tm {
             tm_sec: 5,
             tm_min: 4,

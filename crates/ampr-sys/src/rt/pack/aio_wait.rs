@@ -79,17 +79,10 @@ pub unsafe fn sceKernelAioWaitRequests(
         let timeout = if usec.is_null() { 0 } else { *usec as u64 };
         let start = pack_monotonic_usecs();
         let pack = pack_state();
-        let mut observed_epoch;
-        {
+        let mut observed_epoch = {
             let _lock = PACK_M.lock();
-            observed_epoch = (*pack).aio_completion_epoch;
-            for i in 0..count as usize {
-                let group = lookup_virtual_aio_group_locked(pack, *ids.add(i), null_mut());
-                if !group.is_null() && (*group).has_native_children {
-                    needs_native_polling = true;
-                }
-            }
-        }
+            (*pack).aio_completion_epoch
+        };
 
         loop {
             let poll_rc = sceKernelAioPollRequests(ids, count, states);
@@ -331,87 +324,6 @@ pub unsafe fn sceKernelAioPollRequest(id: SceKernelAioSubmitId, state_out: *mut 
         } else {
             SCE_KERNEL_AIO_STATE_COMPLETED
         };
-        0
-    }
-}
-
-#[allow(dead_code)]
-pub unsafe fn sceKernelAioWaitRequest(
-    id: SceKernelAioSubmitId,
-    state_out: *mut c_int,
-    usec: *mut SceKernelUseconds,
-) -> c_int {
-    unsafe {
-        if state_out.is_null() {
-            return SCE_KERNEL_ERROR_EINVAL;
-        }
-        let mut id = id;
-        if !decode_virtual_aio(id, null_mut(), null_mut())
-            && !decode_virtual_aio_group(id, null_mut(), null_mut())
-        {
-            return match real_aio_wait_single() {
-                Some(f) => f(id, state_out, usec),
-                None => SCE_KERNEL_ERROR_EIO,
-            };
-        }
-        sceKernelAioWaitRequests(&mut id, 1, state_out, SCE_KERNEL_AIO_WAIT_AND, usec)
-    }
-}
-
-#[allow(dead_code)]
-pub unsafe fn sceKernelAioCancelRequest(id: SceKernelAioSubmitId, state_out: *mut c_int) -> c_int {
-    unsafe {
-        if state_out.is_null() {
-            return SCE_KERNEL_ERROR_EINVAL;
-        }
-        let mut id = id;
-        if decode_virtual_aio(id, null_mut(), null_mut()) {
-            return sceKernelAioCancelRequests(&mut id, 1, state_out);
-        }
-        if !decode_virtual_aio_group(id, null_mut(), null_mut()) {
-            return match real_aio_cancel_single() {
-                Some(f) => f(id, state_out),
-                None => SCE_KERNEL_ERROR_EIO,
-            };
-        }
-        let mut children = [0 as SceKernelAioSubmitId; SCE_KERNEL_AIO_REQUEST_NUM_MAX];
-        let child_count = match copy_group_children(id, &mut children) {
-            Err(rc) => return rc,
-            Ok(None) => {
-                *state_out = SCE_KERNEL_ERROR_ESRCH;
-                return 0;
-            }
-            Ok(Some((n, _))) => n,
-        };
-        let mut child_states = [0 as c_int; SCE_KERNEL_AIO_REQUEST_NUM_MAX];
-        let cancel_rc = sceKernelAioCancelRequests(
-            children.as_mut_ptr(),
-            child_count as c_int,
-            child_states.as_mut_ptr(),
-        );
-        if cancel_rc != 0 {
-            return cancel_rc;
-        }
-        let mut aggregate = SCE_KERNEL_AIO_STATE_COMPLETED;
-        for &cs in &child_states[..child_count] {
-            if cs < 0 {
-                aggregate = cs;
-                break;
-            }
-            let child = cs & !SCE_KERNEL_AIO_STATE_NOTIFIED;
-            if child == SCE_KERNEL_AIO_STATE_ABORTED {
-                aggregate = SCE_KERNEL_AIO_STATE_ABORTED;
-            } else if child == SCE_KERNEL_AIO_STATE_PROCESSING
-                && aggregate != SCE_KERNEL_AIO_STATE_ABORTED
-            {
-                aggregate = SCE_KERNEL_AIO_STATE_PROCESSING;
-            } else if child == SCE_KERNEL_AIO_STATE_SUBMITTED
-                && aggregate == SCE_KERNEL_AIO_STATE_COMPLETED
-            {
-                aggregate = SCE_KERNEL_AIO_STATE_SUBMITTED;
-            }
-        }
-        *state_out = aggregate;
         0
     }
 }

@@ -89,15 +89,34 @@ pub(crate) unsafe fn physical_cache_acquire_locked(
     result
 }
 
+/// `through_pending`: see physical_cache_acquire_batch_locked. Only the
+/// single-chunk window (window_aio.rs) passes it: a mandatory group that meets
+/// a Pending page waits or requeues, so Loads past it would be freed unread.
 pub(crate) unsafe fn physical_cache_acquire_batch(
     items: *const PhysicalCacheAcquireBatchItem,
     item_count: usize,
+    through_pending: bool,
 ) -> usize {
     if items.is_null() || item_count == 0 {
         return 0;
     }
     let state = pack_state();
     let _lock = PHYSICAL_CACHE_MUTEX.lock();
+    physical_cache_acquire_batch_locked(state, items, item_count, through_pending)
+}
+
+/// Acquires `items` in order and returns how many were processed. The batch
+/// stops after the first page that is not Ready or Load, except that
+/// `through_pending` (zstd) acquires past a Pending page: a shared
+/// chunk-boundary page another job is loading would otherwise leave every
+/// later page unacquired (Bypass), and window_aio.rs then re-read the whole
+/// window privately, Ready pages included, and cached none of it.
+pub(crate) unsafe fn physical_cache_acquire_batch_locked(
+    state: *mut PackState,
+    items: *const PhysicalCacheAcquireBatchItem,
+    item_count: usize,
+    through_pending: bool,
+) -> usize {
     let mut processed = 0;
     while processed < item_count {
         let item = *items.add(processed);
@@ -115,50 +134,15 @@ pub(crate) unsafe fn physical_cache_acquire_batch(
             );
         }
         let kind = (*item.result).kind;
-        if kind != PhysicalCacheAcquireKind::Ready && kind != PhysicalCacheAcquireKind::Load {
+        let pass = kind == PhysicalCacheAcquireKind::Ready
+            || kind == PhysicalCacheAcquireKind::Load
+            || (through_pending && kind == PhysicalCacheAcquireKind::Pending);
+        if !pass {
             return processed + 1;
         }
         processed += 1;
     }
     processed
-}
-
-/// Read extension (page_plan.rs): Load leases for consecutive `size` pages from
-/// `offset` into `pages`, stopping at the first page already in the cache (any
-/// state) or without a Load lease. Never waits. Returns the pages taken.
-pub(crate) unsafe fn physical_cache_acquire_extension(
-    pack_id: u16,
-    offset: u64,
-    size: u32,
-    pages: &mut [PipelineMandatoryPage],
-) -> usize {
-    let state = pack_state();
-    let _lock = PHYSICAL_CACHE_MUTEX.lock();
-    let mut count = 0;
-    while count < pages.len() {
-        let page_offset = offset + count as u64 * size as u64;
-        let key_hash = physical_cache_key_hash(pack_id, page_offset, size);
-        if !physical_cache_request_valid(state, page_offset, size)
-            || physical_cache_find_locked(state, pack_id, page_offset, size, key_hash)
-                != INVALID_INDEX
-        {
-            break;
-        }
-        let acquired = physical_cache_acquire_locked(state, pack_id, page_offset, size, key_hash);
-        if acquired.kind != PhysicalCacheAcquireKind::Load {
-            break;
-        }
-        pages[count] = PipelineMandatoryPage {
-            acquired,
-            offset: page_offset,
-            size,
-            pack_id,
-            extension: true,
-            ..PipelineMandatoryPage::EMPTY
-        };
-        count += 1;
-    }
-    count
 }
 
 pub(crate) unsafe fn physical_cache_publish_batch(
@@ -259,8 +243,22 @@ pub(crate) unsafe fn physical_cache_invalidate(pack_id: u16, offset: u64, size: 
         return;
     }
     let state = pack_state();
-    let key_hash = physical_cache_key_hash(pack_id, offset, size);
     let _lock = PHYSICAL_CACHE_MUTEX.lock();
+    physical_cache_invalidate_locked(state, pack_id, offset, size);
+}
+
+/// Drops the entry of a page whose bytes failed to decode. A pinned Ready
+/// page (an LZ4 direct-cache window keeps its pins) leaves the hash, so the
+/// next reader loads the page again from disk, and turns Failed with a
+/// transient error, so the last release frees it. Its pages stay allocated
+/// until then: readers that hold it keep their bytes.
+pub(crate) unsafe fn physical_cache_invalidate_locked(
+    state: *mut PackState,
+    pack_id: u16,
+    offset: u64,
+    size: u32,
+) {
+    let key_hash = physical_cache_key_hash(pack_id, offset, size);
     let found = physical_cache_find_locked(state, pack_id, offset, size, key_hash);
     if found == INVALID_INDEX {
         return;
@@ -270,7 +268,8 @@ pub(crate) unsafe fn physical_cache_invalidate(pack_id: u16, offset: u64, size: 
         physical_cache_release_entry_locked(state, found);
     } else if entry.state == PhysicalCacheEntryState::Ready {
         entry.state = PhysicalCacheEntryState::Failed;
-        entry.error = SCE_KERNEL_ERROR_EIO;
+        entry.error = SCE_KERNEL_ERROR_EAGAIN;
+        physical_cache_hash_unlink_locked(state, found);
     }
 }
 
@@ -693,4 +692,96 @@ pub(crate) unsafe fn acquire_pack_fd(pack_id: u16, open_only: bool) -> c_int {
         QUEUE_CV.notify_all();
     }
     result
+}
+
+#[cfg(test)]
+mod physical_cache_tests {
+    use super::*;
+    use std::alloc::{alloc_zeroed, Layout};
+
+    const PAGE: u32 = PACK_CACHE_PAGE_BYTES as u32;
+
+    /// A zeroed PackState (leaked) with an 8-page physical cache, set up as
+    /// `initialize_physical_cache` (manifest.rs) does. The `_locked` paths
+    /// run without PHYSICAL_CACHE_MUTEX: the host has no scePthreadMutex*.
+    fn cache_state() -> *mut PackState {
+        unsafe {
+            let state = alloc_zeroed(Layout::new::<PackState>()) as *mut PackState;
+            assert!(!state.is_null());
+            let memory = Vec::leak(vec![0u8; 8 * PACK_CACHE_PAGE_BYTES]);
+            (*state).physical_cache_base = memory.as_mut_ptr();
+            (*state).physical_cache_bytes = memory.len();
+            (*state).physical_cache_page_count = 8;
+            (*state).physical_cache_free_head = 0;
+            for (i, entry) in (*state).physical_cache_entries.iter_mut().enumerate() {
+                *entry = PhysicalCacheEntry::EMPTY;
+                entry.free_next = if i + 1 < AMPR_EMU_PACK_PHYSICAL_CACHE_ENTRY_CAP {
+                    i as u32 + 1
+                } else {
+                    INVALID_INDEX
+                };
+            }
+            state
+        }
+    }
+
+    fn acquire(state: *mut PackState, page: u64) -> PhysicalCacheAcquireResult {
+        let offset = page * PAGE as u64;
+        let key_hash = physical_cache_key_hash(0, offset, PAGE);
+        unsafe { physical_cache_acquire_locked(state, 0, offset, PAGE, key_hash) }
+    }
+
+    #[test]
+    fn zstd_batch_acquires_past_a_pending_page() {
+        let state = cache_state();
+        // Another job loads page 0 (a shared chunk-boundary page).
+        assert!(acquire(state, 0).kind == PhysicalCacheAcquireKind::Load);
+        let mut results = [PhysicalCacheAcquireResult::EMPTY; 3];
+        let items: Vec<_> = (0..3)
+            .map(|p| PhysicalCacheAcquireBatchItem {
+                result: unsafe { results.as_mut_ptr().add(p) },
+                offset: p as u64 * PAGE as u64,
+                size: PAGE,
+                pack_id: 0,
+            })
+            .collect();
+        let batch = |through_pending| unsafe {
+            physical_cache_acquire_batch_locked(state, items.as_ptr(), 3, through_pending)
+        };
+        // LZ4 keeps stopping at the Pending page.
+        assert_eq!(batch(false), 1);
+        assert!(results[0].kind == PhysicalCacheAcquireKind::Pending);
+        assert!(results[1].kind == PhysicalCacheAcquireKind::Bypass);
+        // zstd acquires the later pages, so the window caches them.
+        assert_eq!(batch(true), 3);
+        let kinds = results.map(|r| r.kind);
+        assert!(kinds[0] == PhysicalCacheAcquireKind::Pending);
+        assert!(kinds[1] == PhysicalCacheAcquireKind::Load);
+        assert!(kinds[2] == PhysicalCacheAcquireKind::Load);
+    }
+
+    #[test]
+    fn invalidated_pinned_page_reloads_and_frees_on_release() {
+        let state = cache_state();
+        let mut held = acquire(state, 2);
+        let index = held.lease.entry;
+        unsafe {
+            // Published Ready, still pinned by a direct-cache window.
+            (*state).physical_cache_entries[index as usize].state = PhysicalCacheEntryState::Ready;
+            held.lease.data.write_bytes(0x5a, PACK_CACHE_PAGE_BYTES);
+            physical_cache_invalidate_locked(state, 0, 2 * PAGE as u64, PAGE);
+        }
+        // The next reader loads the page again, not a sticky Failed/EIO.
+        let again = acquire(state, 2);
+        assert!(again.kind == PhysicalCacheAcquireKind::Load);
+        assert!(again.lease.entry != index && again.lease.data != held.lease.data);
+        // The holder keeps its bytes until it releases the pin.
+        assert_eq!(
+            unsafe { *held.lease.data.add(PACK_CACHE_PAGE_BYTES - 1) },
+            0x5a
+        );
+        unsafe { physical_cache_release_locked(state, &mut held.lease) };
+        let entry = unsafe { &(*state).physical_cache_entries[index as usize] };
+        assert!(entry.state == PhysicalCacheEntryState::Free);
+    }
 }

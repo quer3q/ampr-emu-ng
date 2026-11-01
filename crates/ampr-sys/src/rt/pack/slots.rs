@@ -236,6 +236,10 @@ pub(crate) unsafe fn allocate_virtual_directory_locked(
                     None => continue,
                 }
             } else {
+                // Blocking on purpose: try_lock here would make pass 1 a
+                // copy of pass 0 and turn contention into EMFILE. No path
+                // takes a slot mutex and then DIRECTORY_TABLE_MUTEX, so this
+                // can wait but not deadlock.
                 DIRECTORY_MUTEXES[index as usize].lock()
             };
             let slot = &mut (*state).virtual_directories[index as usize];

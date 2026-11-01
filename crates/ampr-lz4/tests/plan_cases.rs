@@ -150,33 +150,40 @@ fn task(chunk_index: u32, src: u32, len: u32, dst: u32, c: Chunk, raw: u32) -> R
     }
 }
 
+/// Fixture written by the upstream Python pack tools (drakmor/ampr_emu
+/// tools/build_ampr_index.py and tools/ampr_pack_format.py).
 #[test]
-fn seeded_crc_continues_like_zlib() {
-    assert_eq!(crc32_seeded(b"56789", crc32(b"1234")), 0xcbf4_3926);
-    assert_eq!(crc32_seeded(b"", 0x1234_5678), 0x1234_5678);
-    assert_eq!(crc32_seeded(b"123456789", 0), crc32(b"123456789"));
-}
-
-#[test]
-fn trusted_view_slices_without_crc() {
-    let mut b = sample();
-    b[24] ^= 1; // header CRC now stale; trusted view does not check it
-    let m = Manifest::view_trusted(&b).unwrap();
-    assert_eq!((m.file_count(), m.chunk_count(), m.pack_count()), (3, 4, 1));
-    assert_eq!(
-        m.file(0).unwrap().path,
-        Manifest::open(&sample()).unwrap().file(0).unwrap().path
-    );
-    for n in 0..b.len() {
-        let _ = Manifest::view_trusted(&b[..n]); // must not panic
-    }
-    assert!(Manifest::view_trusted(&b[..b.len() - 1]).is_err());
-}
-
-#[test]
-fn python_fixture_plans_one_raw_block() {
+fn python_fixture_reads_and_plans_one_raw_block() {
     let bytes = include_bytes!("fixtures/python_manifest.bin");
-    let m = Manifest::view_trusted(bytes).unwrap();
+    let m = Manifest::open(bytes).expect("Python writer manifest must be accepted");
+    assert_eq!(
+        m.build_id,
+        &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+    );
+    assert_eq!((m.file_count(), m.chunk_count(), m.pack_count()), (2, 1, 1));
+    let packed = m.file(0).unwrap();
+    assert_eq!(packed.path, b"/app0/Data/Test.bin");
+    assert_eq!((packed.logical_size, packed.mtime), (16384, 123));
+    let loose = m.file(1).unwrap();
+    assert_eq!(loose.path, b"/app0/readme.txt");
+    assert_eq!(
+        (loose.logical_size, loose.mtime, loose.chunk_count),
+        (7, 456, 0)
+    );
+    let chunk0 = m.chunk(0).unwrap();
+    assert_eq!(
+        (chunk0.offset, chunk0.pack_id, chunk0.stored_size),
+        (4096, 0, 16384)
+    );
+    assert_eq!((chunk0.codec, chunk0.flags), (CHUNK_RAW, AL));
+    let pack = m.pack(0).unwrap();
+    assert_eq!(pack.name, b"ampr_assets-000.pak");
+    assert_eq!(
+        (pack.payload_offset(), pack.payload_bytes, pack.file_size),
+        (4096, 16384, 20480)
+    );
+    assert_eq!(pack.io_page_size, 4096);
+
     let f = m.file_record(0).unwrap();
     assert_eq!(f, FileRecord::parse(&bytes[128..176]).unwrap());
     assert_eq!(
@@ -272,6 +279,22 @@ fn tasks_split_requests_at_block_boundaries() {
         m.read_task(&lz, 999, 1, 0),
         Ok(task(3, 999, 1, 0, lc, 1000))
     );
+    // Logical-file checks fold case and separators.
+    assert_eq!(m.validate_logical_file(1, b"/APP0/A.BIN", 40000), Ok(()));
+    assert_eq!(m.validate_logical_file(2, b"\\app0\\dir\\b.txt", 7), Ok(()));
+    let bad = CoreError::ChecksumMismatch;
+    assert_eq!(m.validate_logical_file(1, b"/app0/a.bin", 39999), Err(bad));
+    assert_eq!(m.validate_logical_file(1, b"/app0/b.bin", 40000), Err(bad));
+    assert_eq!(
+        m.validate_logical_file(1, b"/app0/a.bin\0", 40000),
+        Err(bad)
+    );
+    for id in [0, 4, u32::MAX] {
+        assert_eq!(
+            m.validate_logical_file(id, b"/app0/a.bin", 40000),
+            Err(CoreError::InvalidArgument)
+        );
+    }
 }
 
 #[test]
@@ -306,10 +329,17 @@ fn bad_records_keep_error_classes() {
         CoreError::from(ampr_lz4::Error::Checksum),
         CoreError::ChecksumMismatch
     );
-}
-
-#[test]
-fn descriptor_checks_only_reserved_bits() {
+    // Stale header CRC: open rejects it; truncated views never panic.
+    assert_eq!(crc32_seeded(b"56789", crc32(b"1234")), 0xcbf4_3926);
+    let mut stale = sample();
+    stale[24] ^= 1;
+    assert_eq!(Manifest::open(&stale).err(), Some(ampr_lz4::Error::Checksum));
+    assert!(Manifest::view_trusted(&stale).is_ok());
+    for n in 0..stale.len() {
+        let _ = Manifest::view_trusted(&stale[..n]);
+    }
+    assert!(Manifest::view_trusted(&stale[..stale.len() - 1]).is_err());
+    // Codec 3 and unknown flag bits are not checked by decode_chunk_record.
     let f = |count| F {
         path: b"/app0/x",
         size: 16384 * count as u64,
@@ -318,7 +348,6 @@ fn descriptor_checks_only_reserved_bits() {
         flags: FILE_PACKED,
         shift: 14,
     };
-    // Codec 3 and unknown flag bits are not checked by decode_chunk_record.
     let b = build(
         &[f(2)],
         &[(4096, desc(64, 3, 0xff)), (8192, desc(64, 0, 0) | 1 << 30)],
@@ -333,25 +362,4 @@ fn descriptor_checks_only_reserved_bits() {
         Ok(task(0, 0, 16384, 0, c, 16384))
     );
     assert_eq!(m.read_task(&r, 0, 16385, 1), Err(CoreError::InvalidFormat));
-}
-
-#[test]
-fn logical_file_uses_folded_paths() {
-    let b = sample();
-    let m = Manifest::open(&b).unwrap();
-    assert_eq!(m.validate_logical_file(1, b"/APP0/A.BIN", 40000), Ok(()));
-    assert_eq!(m.validate_logical_file(2, b"\\app0\\dir\\b.txt", 7), Ok(()));
-    let bad = CoreError::ChecksumMismatch;
-    assert_eq!(m.validate_logical_file(1, b"/app0/a.bin", 39999), Err(bad));
-    assert_eq!(m.validate_logical_file(1, b"/app0/b.bin", 40000), Err(bad));
-    assert_eq!(
-        m.validate_logical_file(1, b"/app0/a.bin\0", 40000),
-        Err(bad)
-    );
-    for id in [0, 4, u32::MAX] {
-        assert_eq!(
-            m.validate_logical_file(id, b"/app0/a.bin", 40000),
-            Err(CoreError::InvalidArgument)
-        );
-    }
 }

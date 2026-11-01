@@ -31,9 +31,17 @@ pub fn physical_key_hash(pack_id: u16, offset: u64, size: u32) -> u64 {
     mix64(offset ^ (u64::from(pack_id) << 48) ^ (u64::from(size) << 17)) | 1
 }
 
+/// Bucket or slot index of a key hash in a table of `buckets` entries
+/// (a power of two). Bit 0 of every key hash is forced on, so the index
+/// starts at bit 1; masking bit 0 in would leave every even bucket empty.
+pub fn bucket_index(key_hash: u64, buckets: usize) -> usize {
+    debug_assert!(buckets.is_power_of_two());
+    ((key_hash >> 1) as usize) & (buckets - 1)
+}
+
 /// Wait bucket of a key hash.
 pub fn wait_bucket(key_hash: u64) -> u32 {
-    (key_hash & u64::from(WAIT_BUCKETS - 1)) as u32
+    bucket_index(key_hash, WAIT_BUCKETS as usize) as u32
 }
 
 /// First free run of `count` pages starting
@@ -127,20 +135,32 @@ mod tests {
     use super::*;
 
     #[test]
-    fn next_fit_scans_from_cursor_then_wraps_across_it() {
-        let mut bitmap = [0u64; 2];
-        mark_pages(&mut bitmap, 0, 128, true);
-        mark_pages(&mut bitmap, 62, 4, false);
-        assert_eq!(bitmap, [0x3fff_ffff_ffff_ffff, !0x3]);
-        // Run 62..66 spans the cursor at 64: the suffix scan fails, the wrap
-        // scan reaches up to cursor + count - 1 = 67 and finds it.
-        assert_eq!(find_run_next_fit(&bitmap, 100, 64, 4), 62);
-        assert_eq!(find_run_next_fit(&bitmap, 100, 64, 5), INVALID);
-        assert_eq!(find_run_next_fit(&bitmap, 100, 63, 3), 63);
-        assert_eq!(find_run_next_fit(&bitmap, 100, 500, 2), 62);
-        assert_eq!(find_run_next_fit(&bitmap, 64, 0, 2), 62);
-        assert_eq!(physical_key_hash(1, 2, 3) & 1, 1);
-        assert_eq!(mix64(1), 0x5692_161d_100b_05e5);
+    fn bucket_index_uses_even_and_odd_buckets() {
+        for buckets in [WAIT_BUCKETS as usize, 8192, 16384] {
+            let (mut even, mut odd) = (false, false);
+            for i in 0..256u64 {
+                for hash in [
+                    chunk_key_hash(i * 0x1_0000, 1, 0x8000, 0x1_0000),
+                    physical_key_hash(1, i * 0x1_0000, 0x1_0000),
+                ] {
+                    let index = bucket_index(hash, buckets);
+                    assert!(index < buckets);
+                    if index % 2 == 0 {
+                        even = true;
+                    } else {
+                        odd = true;
+                    }
+                }
+            }
+            assert!(even && odd, "buckets={buckets}");
+        }
+        let (mut even, mut odd) = (false, false);
+        for i in 0..256u64 {
+            let bucket = wait_bucket(chunk_key_hash(i * 0x1_0000, 1, 0x8000, 0x1_0000));
+            even |= bucket % 2 == 0;
+            odd |= bucket % 2 == 1;
+        }
+        assert!(even && odd);
     }
 
     /// Whether `page` is used; pages beyond the bitmap count as used.
@@ -170,7 +190,20 @@ mod tests {
     }
 
     #[test]
-    fn word_skipping_scan_matches_bit_by_bit_reference() {
+    fn word_scan_and_mark_match_bit_by_bit_reference() {
+        let mut bitmap = [0u64; 2];
+        mark_pages(&mut bitmap, 0, 128, true);
+        mark_pages(&mut bitmap, 62, 4, false);
+        assert_eq!(bitmap, [0x3fff_ffff_ffff_ffff, !0x3]);
+        // Run 62..66 spans the cursor at 64: the suffix scan fails, the wrap
+        // scan reaches up to cursor + count - 1 = 67 and finds it.
+        assert_eq!(find_run_next_fit(&bitmap, 100, 64, 4), 62);
+        assert_eq!(find_run_next_fit(&bitmap, 100, 64, 5), INVALID);
+        assert_eq!(find_run_next_fit(&bitmap, 100, 63, 3), 63);
+        assert_eq!(find_run_next_fit(&bitmap, 100, 500, 2), 62);
+        assert_eq!(find_run_next_fit(&bitmap, 64, 0, 2), 62);
+        assert_eq!(physical_key_hash(1, 2, 3) & 1, 1);
+        assert_eq!(mix64(1), 0x5692_161d_100b_05e5);
         let mut seed = 0x9e37_79b9_7f4a_7c15u64;
         let mut patterns = [[0u64; 4]; 16];
         patterns[1] = [!0u64; 4];
@@ -213,24 +246,7 @@ mod tests {
                 }
             }
         }
-    }
-    /// The former bit-by-bit `mark_pages`.
-    fn reference_mark(bitmap: &mut [u64], start: u32, count: u32, used: bool) {
-        for page in start..start.wrapping_add(count) {
-            let Some(word) = bitmap.get_mut((page / 64) as usize) else {
-                return;
-            };
-            let mask = 1u64 << (page & 63);
-            if used {
-                *word |= mask;
-            } else {
-                *word &= !mask;
-            }
-        }
-    }
-
-    #[test]
-    fn word_mask_mark_matches_bit_by_bit_reference() {
+        // Word-mask mark_pages against the bit-by-bit reference.
         let starts = [
             0u32, 1, 31, 62, 63, 64, 65, 127, 128, 129, 191, 200, 255, 256, 300,
         ];
@@ -263,6 +279,21 @@ mod tests {
                     reference_mark(&mut want, start, count, used);
                     assert_eq!(got, want, "{base:x?} {start} {count} {used}");
                 }
+            }
+        }
+    }
+
+    /// The former bit-by-bit `mark_pages`.
+    fn reference_mark(bitmap: &mut [u64], start: u32, count: u32, used: bool) {
+        for page in start..start.wrapping_add(count) {
+            let Some(word) = bitmap.get_mut((page / 64) as usize) else {
+                return;
+            };
+            let mask = 1u64 << (page & 63);
+            if used {
+                *word |= mask;
+            } else {
+                *word &= !mask;
             }
         }
     }

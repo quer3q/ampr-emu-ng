@@ -69,7 +69,7 @@ impl AprAioReactor {
         effectiveLimit: u32,
         snapshot: &AioAdmissionSnapshot,
     ) -> bool {
-        if !AMPR_EMU_APR_GROUP_SOFT_TARGETS || effectiveLimit <= 1 {
+        if effectiveLimit <= 1 {
             return true;
         }
         let active = A53ReadGroupCounts {

@@ -249,8 +249,10 @@ mod bench_args {
     mod tests {
         use super::*;
 
+        /// Request target and query parsing, percent-decoding, bench region
+        /// layout and queue-depth fitting.
         #[test]
-        fn query_params() {
+        fn bench_request_helpers() {
             let req = b"GET /bench?path=%2Fapp0%2Fdata.bin&backing=/x HTTP/1.1\r\nHost: a\r\n";
             let q = query(target(req));
             assert_eq!(q, b"path=%2Fapp0%2Fdata.bin&backing=/x");
@@ -262,10 +264,6 @@ mod bench_args {
             assert!(
                 is_app0_file(b"/app0/a") && !is_app0_file(b"/app0/") && !is_app0_file(b"/app0x")
             );
-        }
-
-        #[test]
-        fn decode() {
             let mut out = [0xffu8; 32];
             let n = url_decode(b"%2Fapp0%2fa+b%20c", &mut out).unwrap();
             assert_eq!(&out[..n], b"/app0/a+b c");
@@ -275,10 +273,6 @@ mod bench_args {
             assert_eq!(url_decode(b"a%00", &mut out), None);
             assert_eq!(url_decode(b"abcd", &mut [0u8; 4]), None);
             assert_eq!(url_decode(b"abc", &mut [0u8; 4]), Some(3));
-        }
-
-        #[test]
-        fn regions() {
             assert_eq!(region_stride(MIN_FILE - 1), None);
             let s = region_stride(MIN_FILE).unwrap();
             assert_eq!(s % 0x10000, 0);
@@ -291,10 +285,6 @@ mod bench_args {
             assert!(s - REGION >= GAP && (SLOTS - 1) * s + REGION <= big);
             assert!(app0_first(0) && !app0_first(1) && app0_first(2));
             assert_eq!(MIN_FILE, 736 << 20);
-        }
-
-        #[test]
-        fn queue_fit() {
             const K: usize = 1024;
             // 8 MiB buffer: every test runs at the depth it names.
             assert_eq!(fit(256 * K, 32, 8192 * K), (256 * K, 32));

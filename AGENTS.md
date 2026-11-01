@@ -38,7 +38,7 @@ cargo test --workspace                         # host tests
 ```
 
 Knobs and their defaults are at the top of the `Makefile`
-(`AMPR_INTERNAL_POOL_SIZE`, `AMPR_PACK_WORKERS`, read-ahead, read extension,
+(`AMPR_INTERNAL_POOL_SIZE`, `AMPR_PACK_WORKERS`, read-ahead,
 `AMPR_ZSTD_LIBC_HOOKS`, `AMPR_MEM_REPORT`). A knob change rebuilds through
 `out/*/obj/build-config.txt`.
 CI (`.github/workflows/build.yml`) runs the same commands; a pushed `v*` tag creates a draft release with both `.sprx` and `SHA256SUMS`.

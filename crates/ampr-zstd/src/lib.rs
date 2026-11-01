@@ -166,7 +166,7 @@ mod tests {
     type Case<T> = (&'static str, fn(&mut T));
 
     #[test]
-    fn chunk_record_layout() {
+    fn chunk_records_and_volume_headers_round_trip_and_reject() {
         let chunk = Chunk {
             offset: 0x1234_5678,
             volume_id: 0xabc,
@@ -185,10 +185,8 @@ mod tests {
             ..chunk
         };
         assert_eq!(Chunk::unpack(raw.pack().unwrap()).unwrap(), raw);
-    }
 
-    #[test]
-    fn chunk_record_rejects() {
+        // Unknown codecs and oversized chunks are rejected.
         let base = Chunk {
             offset: VOLUME_HEADER_SIZE as u32,
             volume_id: 0,
@@ -208,10 +206,8 @@ mod tests {
             codec: Codec::Raw,
         };
         assert!(oversized.pack().is_err());
-    }
 
-    #[test]
-    fn volume_limit_is_4_gib_less_64_kib() {
+        // VOLUME_LIMIT is 4 GiB less 64 KiB.
         assert_eq!(VOLUME_LIMIT, 4_294_901_760);
         // The last chunk may end exactly at the limit; its offset fits u32.
         let size = CHUNK_SIZE as u32;
@@ -225,10 +221,8 @@ mod tests {
         let word = last(at_end).pack().unwrap();
         assert_eq!(Chunk::unpack(word).unwrap().offset as u64, at_end);
         assert!(last(at_end + 1).pack().is_err());
-    }
 
-    #[test]
-    fn written_volume_name_matches_volume_name() {
+        // Volume names and headers.
         let mut buf = [0u8; 24];
         for (id, name) in [
             (0, "ampr_zstd-000.pak"),
@@ -242,10 +236,6 @@ mod tests {
             assert_eq!(write_volume_name(id, &mut buf).unwrap(), name);
         }
         assert!(write_volume_name(7, &mut [0u8; 16]).is_err());
-    }
-
-    #[test]
-    fn volume_header_round_trip_and_rejects() {
         let header = VolumeHeader {
             id: 2,
             count: 3,

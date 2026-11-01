@@ -64,7 +64,7 @@ time:
 
 - `curl http://<ps5-ip>:9090/metrics`: pool usage and the `rt/stats.rs`
   counters since load (disk reads, pack jobs, decodes, cache hits and misses,
-  read-ahead, read extension, errors). `*_max` values reset on each scrape.
+  read-ahead, errors). `*_max` values reset on each scrape.
 - `curl http://<ps5-ip>:9090/bench`: raw read speed of pack volume 0; run it
   while the game is idle.
 - `curl 'http://<ps5-ip>:9090/set?k=v'`: change `rt/tune.rs` knobs (no

@@ -566,7 +566,7 @@ impl AprAioReactor {
             };
             let op = &op;
 
-            if AMPR_EMU_APR_LOCAL_EQUEUE && continueWithAdjacentEqueue {
+            if continueWithAdjacentEqueue {
                 continueWithAdjacentEqueue = false;
                 if op.op_type != WRITE_EQUEUE {
                     Self::cache_decoded_op(jb, op, opBytes);
@@ -881,7 +881,7 @@ impl AprAioReactor {
         {
             return flow;
         }
-        if AMPR_EMU_APR_LOCAL_EQUEUE && op.op_type == WRITE_EQUEUE {
+        if op.op_type == WRITE_EQUEUE {
             self.progress_local_equeue_command(jb, op, opBytes, packedSource, progressed);
             return CommandFlow::Stop;
         }
@@ -926,10 +926,7 @@ impl AprAioReactor {
             // Reads right behind a satisfied wait may use the remaining quantum.
             return Some(CommandFlow::GroupReads);
         }
-        if AMPR_EMU_APR_LOCAL_EQUEUE
-            && op.op_type == WRITE_ADDRESS
-            && jb.sourceOffset < jb.sourceBytes
-        {
+        if op.op_type == WRITE_ADDRESS && jb.sourceOffset < jb.sourceBytes {
             // Decode the one permitted adjacent local-equeue candidate.
             return Some(CommandFlow::AdjacentEqueue);
         }

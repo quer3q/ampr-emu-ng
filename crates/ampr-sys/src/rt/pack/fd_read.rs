@@ -1120,7 +1120,8 @@ mod tests {
     };
 
     #[test]
-    fn iov_total_sums_and_rejects_bad_vectors() {
+    fn iov_vectors_are_validated() {
+        // iov total sums and rejects bad vectors.
         let (mut a, mut b) = ([0u8; 3], [0u8; 5]);
         assert_eq!(iov_total(&[iov(&mut a), NULL_IOV, iov(&mut b)]), Ok(8));
         assert_eq!(iov_total(&[]), Ok(0));
@@ -1138,10 +1139,8 @@ mod tests {
         let many = [NULL_IOV; VIRTUAL_READ_IOV_MAX + 1];
         assert_eq!(iov_total(&many), Err(SCE_KERNEL_ERROR_EINVAL));
         assert_eq!(iov_total(&many[..VIRTUAL_READ_IOV_MAX]), Ok(0));
-    }
 
-    #[test]
-    fn iov_slice_checks_count_and_array() {
+        // iov slice checks count and array.
         let mut a = [0u8; 2];
         let v = [iov(&mut a)];
         unsafe {
@@ -1164,7 +1163,8 @@ mod tests {
     }
 
     #[test]
-    fn clamp_read_stops_at_eof() {
+    fn offsets_clamp_at_eof_and_seek_by_whence() {
+        // clamp read stops at eof.
         assert_eq!(clamp_read(0, 10, 100), Ok(10));
         assert_eq!(clamp_read(95, 10, 100), Ok(5));
         assert_eq!(clamp_read(100, 10, 100), Ok(0));
@@ -1173,6 +1173,31 @@ mod tests {
         assert_eq!(clamp_read(0, 10, 0), Ok(0));
         assert_eq!(clamp_read(-1, 10, 100), Err(SCE_KERNEL_ERROR_EINVAL));
         assert_eq!(clamp_read(0, usize::MAX, 7), Ok(7));
+
+        // seek target follows whence.
+        assert_eq!(seek_target(40, 100, 7, SEEK_SET), Ok(7));
+        assert_eq!(seek_target(40, 100, -10, SEEK_CUR), Ok(30));
+        assert_eq!(seek_target(40, 100, 0, SEEK_CUR), Ok(40));
+        assert_eq!(seek_target(40, 100, -1, SEEK_END), Ok(99));
+        // Past EOF is allowed; a read there returns 0.
+        assert_eq!(seek_target(40, 100, 50, SEEK_END), Ok(150));
+        assert_eq!(
+            seek_target(40, 100, -1, SEEK_SET),
+            Err(SCE_KERNEL_ERROR_EINVAL)
+        );
+        assert_eq!(
+            seek_target(40, 100, -41, SEEK_CUR),
+            Err(SCE_KERNEL_ERROR_EINVAL)
+        );
+        assert_eq!(
+            seek_target(40, 100, -101, SEEK_END),
+            Err(SCE_KERNEL_ERROR_EINVAL)
+        );
+        assert_eq!(
+            seek_target(1, 0, off_t::MAX, SEEK_CUR),
+            Err(SCE_KERNEL_ERROR_EINVAL)
+        );
+        assert_eq!(seek_target(0, 0, 0, 3), Err(SCE_KERNEL_ERROR_EINVAL));
     }
 
     #[test]
@@ -1210,34 +1235,8 @@ mod tests {
     }
 
     #[test]
-    fn seek_target_follows_whence() {
-        assert_eq!(seek_target(40, 100, 7, SEEK_SET), Ok(7));
-        assert_eq!(seek_target(40, 100, -10, SEEK_CUR), Ok(30));
-        assert_eq!(seek_target(40, 100, 0, SEEK_CUR), Ok(40));
-        assert_eq!(seek_target(40, 100, -1, SEEK_END), Ok(99));
-        // Past EOF is allowed; a read there returns 0.
-        assert_eq!(seek_target(40, 100, 50, SEEK_END), Ok(150));
-        assert_eq!(
-            seek_target(40, 100, -1, SEEK_SET),
-            Err(SCE_KERNEL_ERROR_EINVAL)
-        );
-        assert_eq!(
-            seek_target(40, 100, -41, SEEK_CUR),
-            Err(SCE_KERNEL_ERROR_EINVAL)
-        );
-        assert_eq!(
-            seek_target(40, 100, -101, SEEK_END),
-            Err(SCE_KERNEL_ERROR_EINVAL)
-        );
-        assert_eq!(
-            seek_target(1, 0, off_t::MAX, SEEK_CUR),
-            Err(SCE_KERNEL_ERROR_EINVAL)
-        );
-        assert_eq!(seek_target(0, 0, 0, 3), Err(SCE_KERNEL_ERROR_EINVAL));
-    }
-
-    #[test]
-    fn segment_plan_matches_posix_vector_semantics() {
+    fn segment_plan_follows_posix_vectors_and_resumes() {
+        // segment plan matches posix vector semantics.
         // A readv of [3, 0, 4] bytes at offset 6 of a 10-byte file reads 4
         // bytes: 3 into a, 1 into the start of b.
         let (mut a, mut b) = ([0u8; 3], [0u8; 4]);
@@ -1247,10 +1246,8 @@ mod tests {
         let mut out = [(0u64, core::ptr::null_mut::<u8>(), 0usize); 4];
         assert_eq!(plan_segment_reads(&v, 6, length, 0, &mut out), 2);
         assert_eq!(out[..2], [(6, a.as_mut_ptr(), 3), (9, b.as_mut_ptr(), 1)]);
-    }
 
-    #[test]
-    fn segment_plan_resumes_mid_vector_and_caps_batch() {
+        // segment plan resumes mid vector and caps batch.
         let (mut a, mut b, mut c) = ([0u8; 3], [0u8; 4], [0u8; 2]);
         let v = [iov(&mut a), iov(&mut b), iov(&mut c)];
         let mut out = [(0u64, core::ptr::null_mut::<u8>(), 0usize); 1];

@@ -1,7 +1,7 @@
 //! Inline detours into libkernel (and the
 //! external equeue producers), the original/fallback slot tables, and the
 //! memory-protection `_emul` hooks that promote AMPR-write mappings to CPU_RW.
-//! AMPR_EMU_APR_LOCAL_EQUEUE=1 layout only. Logging is dropped.
+//! APR equeue is always local (rt/equeue.rs). Logging is dropped.
 #![allow(non_snake_case, non_upper_case_globals)]
 
 use core::ffi::{c_char, c_int, c_void};

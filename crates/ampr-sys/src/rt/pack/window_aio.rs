@@ -82,14 +82,9 @@ pub(crate) unsafe fn prepare_pipeline_window_aio(
             // Do not retain a loader lease while waiting for another page: that
             // could form a cycle between two exact windows. EAGAIN is transient
             // and release removes the temporary failed entry once unpinned.
-            abandon_pipeline_page_plan(
-                pipeline,
-                if error != 0 {
-                    error
-                } else {
-                    SCE_KERNEL_ERROR_EAGAIN
-                },
-            );
+            // A Failed page also publishes EAGAIN: this job never read its
+            // Load pages, so the page's error must not stick to them.
+            abandon_pipeline_page_plan(pipeline, SCE_KERNEL_ERROR_EAGAIN);
             pipeline.io_range = PipelineIoRange::EMPTY;
             if error != 0 {
                 set_err(error);
@@ -163,7 +158,7 @@ unsafe fn acquire_window_pages(
             pack_id: range.pack_id,
         });
     }
-    let acquired_count = physical_cache_acquire_batch(acquire_items.as_ptr().cast(), page_count);
+    let acquired_count = physical_cache_acquire_batch(acquire_items.as_ptr().cast(), page_count, zstd_mode());
     if acquired_count == 0 {
         return false;
     }
@@ -479,16 +474,9 @@ pub(crate) unsafe fn finish_mandatory_page_group(pipeline: &mut ReadPipelineCont
                     );
                 }
             }
-            // A failed read-extension page (page_plan.rs) is dropped as transient: no
-            // task needs it, and a later read must not see it Failed.
-            let publish_error = if page.extension && page_error != 0 {
-                SCE_KERNEL_ERROR_EAGAIN
-            } else {
-                page_error
-            };
             publications[publication_count] = PhysicalCachePublication {
                 lease: &mut page.acquired.lease,
-                error: publish_error,
+                error: page_error,
             };
             publication_count += 1;
             page.acquired.kind = if page_error == 0 {
@@ -496,7 +484,7 @@ pub(crate) unsafe fn finish_mandatory_page_group(pipeline: &mut ReadPipelineCont
             } else {
                 PhysicalCacheAcquireKind::Failed
             };
-            if group_error == 0 && page_error != 0 && !page.extension {
+            if group_error == 0 && page_error != 0 {
                 group_error = page_error;
             }
         }

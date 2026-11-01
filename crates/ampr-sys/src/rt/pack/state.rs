@@ -686,15 +686,14 @@ mod tests {
     }
 
     #[test]
-    fn pread_loop_continues_short_reads_and_retries_eintr() {
+    fn pread_loop_handles_short_reads_eintr_eof_and_errors() {
+        // pread loop continues short reads and retries eintr.
         let data: Vec<u8> = (0..32u8).collect();
         let (ok, out) = run(&data, 3, 10, &[Some(1), None, Some(2), None, None]);
         assert!(ok);
         assert_eq!(out, data[3..13]);
-    }
 
-    #[test]
-    fn pread_loop_fails_on_eof_errors_and_endless_eintr() {
+        // pread loop fails on eof errors and endless eintr.
         let data: Vec<u8> = (0..8u8).collect();
         assert!(!run(&data, 4, 8, &[]).0, "EOF before size");
         let endless = vec![None; PREAD_EINTR_RETRIES as usize + 1];

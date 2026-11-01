@@ -472,10 +472,13 @@ pub unsafe fn ampr_pack_try_close_fd(fd: c_int, handled: *mut bool) -> c_int {
             }
             let real_fd;
             {
+                // No WORKER_STOP_REQUESTED early return here: the slot array
+                // lives in PackState, which shutdown never frees, and an EBADF
+                // would leak `real_fd` when shutdown stops before its sweep
+                // (`close_pack_and_directory_fds`, after the worker joins).
+                // The slot mutex orders this close against that sweep, so
+                // each real fd is closed exactly once.
                 let _lock = DIRECTORY_MUTEXES[index as usize].lock();
-                if WORKER_STOP_REQUESTED.load(Ordering::Acquire) {
-                    return SCE_KERNEL_ERROR_EBADF;
-                }
                 let slot = &mut (*state).virtual_directories[index as usize];
                 if !slot.active || slot.generation != generation {
                     return SCE_KERNEL_ERROR_EBADF;
@@ -628,6 +631,26 @@ unsafe fn zstd_fstat_virtual_fd(
     0
 }
 
+/// `(d_reclen, d_namlen)` of the kernel dirent at the start of `rest`, or
+/// None when the header, the name or its NUL would run past `rest`. The
+/// header length is checked before `d_reclen` and `d_namlen` are read, so a
+/// tail shorter than `DIRENT_NAME_OFFSET` (8 bytes) is never overread.
+fn physical_dirent_bounds(rest: &[u8]) -> Option<(usize, usize)> {
+    if rest.len() < DIRENT_NAME_OFFSET {
+        return None;
+    }
+    let reclen_at = core::mem::offset_of!(Dirent, d_reclen);
+    let record_size = usize::from(u16::from_ne_bytes([rest[reclen_at], rest[reclen_at + 1]]));
+    let name_length = usize::from(rest[core::mem::offset_of!(Dirent, d_namlen)]);
+    if record_size < DIRENT_NAME_OFFSET + 1
+        || record_size > rest.len()
+        || name_length + 1 > record_size - DIRENT_NAME_OFFSET
+    {
+        return None;
+    }
+    Some((record_size, name_length))
+}
+
 /// `finishSynthetic` lambda.
 fn finish_synthetic(
     slot: &mut VirtualDirectorySlot,
@@ -751,15 +774,11 @@ pub(crate) unsafe fn ampr_pack_try_directory_read_fd(
             let mut input = 0usize;
             let mut output = 0usize;
             while input < total {
-                let entry = buffer.add(input) as *mut Dirent;
-                let record_size = (&raw const (*entry).d_reclen).read_unaligned() as usize;
-                let name_length = (*entry).d_namlen as usize;
-                if record_size < DIRENT_NAME_OFFSET + 1
-                    || record_size > total - input
-                    || name_length + 1 > record_size - DIRENT_NAME_OFFSET
-                {
+                let rest =
+                    core::slice::from_raw_parts(buffer.add(input) as *const u8, total - input);
+                let Some((record_size, name_length)) = physical_dirent_bounds(rest) else {
                     return SCE_KERNEL_ERROR_EIO;
-                }
+                };
                 let d_name = buffer.add(input + DIRENT_NAME_OFFSET) as *const c_char;
                 let hidden = service_name_hidden(
                     state,
@@ -868,5 +887,31 @@ pub(crate) unsafe fn ampr_pack_try_directory_read_fd(
             slot.virtual_cursor = next_cursor;
         }
         finish_synthetic(slot, basep, synthetic_base, output as c_int)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn record(reclen: u16, namlen: u8, len: usize) -> Vec<u8> {
+        let mut bytes = vec![0u8; len];
+        bytes[4..6].copy_from_slice(&reclen.to_ne_bytes());
+        bytes[7] = namlen;
+        bytes
+    }
+
+    #[test]
+    fn physical_dirent_bounds_rejects_short_and_bad_records() {
+        // A tail shorter than the 8-byte header is rejected before any read.
+        for len in 0..DIRENT_NAME_OFFSET {
+            assert_eq!(physical_dirent_bounds(&vec![0xff; len]), None);
+        }
+        assert_eq!(physical_dirent_bounds(&record(16, 3, 16)), Some((16, 3)));
+        assert_eq!(physical_dirent_bounds(&record(16, 7, 16)), Some((16, 7)));
+        // Name plus NUL past the record, record past the input, tiny record.
+        assert_eq!(physical_dirent_bounds(&record(16, 8, 16)), None);
+        assert_eq!(physical_dirent_bounds(&record(24, 3, 16)), None);
+        assert_eq!(physical_dirent_bounds(&record(8, 0, 16)), None);
     }
 }

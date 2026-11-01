@@ -327,7 +327,7 @@ mod tests {
     }
 
     #[test]
-    fn completion_ops_are_eop_writes_nops_and_markers() {
+    fn completion_ops_are_eop_writes_nops_and_markers_also_after_decode() {
         for t in WRITES {
             assert!(lane_completion_op(&write(t, false)), "{t}");
             assert!(lane_completion_signals(&write(t, false)), "{t}");
@@ -351,10 +351,7 @@ mod tests {
         ] {
             assert!(!lane_completion_op(&op(t)), "{t}");
         }
-    }
-
-    #[test]
-    fn packed_ops_keep_their_class_after_decode() {
+        // Packed and decoded again, every op keeps its class.
         let mut ops: Vec<Op> = WRITES.iter().map(|&t| write(t, false)).collect();
         ops.extend(WRITES.iter().map(|&t| write(t, true)));
         ops.extend([
@@ -427,7 +424,7 @@ mod tests {
     }
 
     #[test]
-    fn block_kind_names_what_the_head_waits_on() {
+    fn block_kind_and_successor_rules() {
         let eop = write(WRITE_ADDRESS, false);
         assert_eq!(lane_block_kind(Some(&eop), true), LaneBlock::Fence);
         assert_eq!(lane_block_kind(Some(&eop), false), LaneBlock::Other);
@@ -442,10 +439,7 @@ mod tests {
         assert_eq!(lane_block_kind(Some(&read_file()), true), LaneBlock::Other);
         assert_eq!(lane_block_kind(Some(&nop()), true), LaneBlock::Other);
         assert_eq!(lane_block_kind(None, true), LaneBlock::Other);
-    }
-
-    #[test]
-    fn overlapped_successor_stays_off_native_amm_and_map_state() {
+        // An overlapped successor stays off native, AMM and map state.
         assert!(overlap_successor_op_allowed(WRITE_ADDRESS));
         assert!(overlap_successor_op_allowed(WAIT_ON_ADDRESS));
         for t in [
@@ -581,9 +575,10 @@ mod tests {
     /// Successors' reads finish first (the model completes newest first), so
     /// their EOPs wait on lane order. Without the cascade each later job
     /// publishes one pass after its predecessor's release; with it every job
-    /// whose reads are done publishes in the head's pass, still in order.
+    /// whose reads are done publishes in the head's pass, still in order,
+    /// up to the first successor still reading.
     #[test]
-    fn release_cascade_publishes_ready_successors_in_the_head_pass() {
+    fn release_cascade_publishes_ready_successors_in_order() {
         let a = [read_file(), eop(1), eop(2)];
         let b = [read_file(), eop(3)];
         let c = [read_file(), eop(4), nop(), eop(5)];
@@ -602,24 +597,17 @@ mod tests {
         let (serial, _) = run_lane_passes(&jobs, false, false);
         let (serialCascade, _) = run_lane_passes(&jobs, false, true);
         assert_eq!(values(&serial), values(&serialCascade));
-    }
 
-    /// The cascade stops at the first successor whose own reads are still
-    /// in flight: its EOP waits for its reads, and a later job never
-    /// publishes before it.
-    #[test]
-    fn release_cascade_stops_at_a_successor_still_reading() {
-        // b issues its second read only after eop(2), so the cascade from a
-        // reaches b while that read is in flight.
+        // The cascade stops at the first successor whose own reads are
+        // still in flight: its EOP waits for its reads, and a later job
+        // never publishes before it. b issues its second read only after
+        // eop(2), so the cascade from a reaches b while that read is in flight.
         let a = [read_file(), eop(1)];
         let b = [read_file(), eop(2), read_file(), eop(3)];
         let c = [read_file(), eop(4)];
         let jobs: [&[Op]; 3] = [&a, &b, &c];
         let (cascaded, _) = run_lane_passes(&jobs, true, true);
-        assert_eq!(
-            cascaded.iter().map(|e| e.0).collect::<Vec<_>>(),
-            [1, 2, 3, 4]
-        );
+        assert_eq!(values(&cascaded), [1, 2, 3, 4]);
         let pass = |v: u64| cascaded.iter().find(|e| e.0 == v).unwrap().1;
         assert_eq!(pass(2), pass(1), "b's first EOP rides the cascade");
         assert!(pass(3) > pass(2), "b's second EOP waits for its own read");
