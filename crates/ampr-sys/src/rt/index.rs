@@ -1450,6 +1450,19 @@ unsafe fn pack_manifest_present() -> bool {
         || errno() != ENOENT
 }
 
+/// For the load notice only: an LZ4 pack manifest is in /app0. Any stat
+/// error reads as absent (the notice then says "plain").
+pub(crate) unsafe fn lz4_manifest_present() -> bool {
+    let mut st = Stat::default();
+    let rc = unsafe {
+        real_posix_stat(
+            super::pack::AMPR_EMU_PACK_INDEX_PATH.as_ptr(),
+            (&raw mut st).cast(),
+        )
+    };
+    rc == 0
+}
+
 // ---- ensure ready (slow path) --------------------------------------------------------
 
 use super::pack::ampr_pack_ensure_manifest_ready_safe;
@@ -1712,7 +1725,7 @@ unsafe fn lookup_resident_path(path: *const c_char) -> Lookup {
 
 /// `maybe_resolve_app0_path_arg`: the indexed path for a resident hit.
 #[inline(never)]
-unsafe fn maybe_resolve_path(path: *const c_char) -> *const c_char {
+pub(crate) unsafe fn maybe_resolve_path(path: *const c_char) -> *const c_char {
     let l = unsafe { lookup_resident_path(path) };
     if l.state == Resident::Hit {
         l.entry.path
@@ -1866,6 +1879,8 @@ unsafe fn open_with(
 fn how(l: &Lookup) -> u8 {
     match l.state {
         Resident::Hit => b'h',
+        // 'M': a miss the index cannot answer, sent to the FS.
+        Resident::Miss if !l.authoritative => b'M',
         Resident::Miss => b'm',
         Resident::Directory => b'd',
         Resident::IndexNotReady => b'n',

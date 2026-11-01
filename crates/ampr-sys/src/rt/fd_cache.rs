@@ -783,6 +783,8 @@ unsafe fn open_indexed_or_real(
     if fd >= 0 {
         return Some(fd);
     }
+    // 'L': the runtime's own open of an indexed loose file, by its stored path.
+    super::stats::fs_event(b'L', b'h', fd as i64, (*entry).path);
     Some(if fd == -1 {
         sce_errno_from_posix(errno())
     } else {

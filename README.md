@@ -33,7 +33,9 @@ runs per runtime, launch to level loaded. Original is the C++ ampr_emu.
 ### Use
 
 Copy `libSceAmpr.sprx` into the game's `fakelib/` and mount the game with
-ShadowMountPlus. Disable fakelib update in settings.
+ShadowMountPlus. Disable fakelib update in settings. At launch the console
+shows `ampr-emu-ng: vx.x.x (zstd) running`; the mode is `zstd` (zstd packs),
+`lz4` (LZ4 packs) or `plain` (no packs, loose files only).
 
 ### Make packs
 
@@ -59,6 +61,9 @@ the project root:
 
 ### Debug build metrics
 
+`/metrics` starts with a `build` line naming the git revision and flavor of
+the running PRX (`build ampr-emu-ng x.x.x f3494d4-dirty debug`).
+
 `libSceAmpr-debug.sprx` serves plain text on TCP port 9090, one client at a
 time:
 
@@ -70,6 +75,14 @@ time:
 - `curl 'http://<ps5-ip>:9090/set?k=v'`: change `rt/tune.rs` knobs (no
   arguments lists them). Saved to `/data/ampr_emu_tune.txt`; startup knobs
   apply on the next launch. Release builds ignore this file.
+- `curl http://<ps5-ip>:9090/fsfail`: every distinct failed call since load,
+  with result and count: path hooks, the runtime's own opens of loose files,
+  APR path resolves, failed APR jobs, module loads and gather/scatter
+  retries that re-resolved to another file or offset. Misses the index
+  answers by itself and `/download0` probes are left out.
+- `curl http://<ps5-ip>:9090/modules`: modules the game loaded (name,
+  segment size, fingerprint). Run the same build on two installs and diff
+  the lists to find a module that failed to load.
 
 ## Thanks
 

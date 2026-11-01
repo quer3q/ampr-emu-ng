@@ -469,3 +469,180 @@ impl JobState {
         );
     }
 }
+
+// ---- debug gather/scatter retry check (stats.rs gs_retry_*) ----
+// Upstream issue #7 (CONTROL, drakmor/ampr_emu): a retry re-resolved a
+// gather/scatter read from the per-lane cursor after another job had advanced
+// it, and read another file. The same shape is here: one GatherScatterState per
+// priority lane (mod.rs gatherScatterStates), and native.rs
+// progress_software_read_command re-resolves from it whenever no retained read
+// chain matches. Debug builds compare each re-resolution with the first one.
+
+/// The first lane-cursor resolution of one gather/scatter command of a job.
+#[cfg(any(test, feature = "mem_report"))]
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub(crate) struct GsPrepRecord {
+    /// Source offset + 1 of the command (0: nothing recorded).
+    pub(crate) mark: u32,
+    pub(crate) commandIndex: u32,
+    pub(crate) fileId: u32,
+    pub(crate) offset: u64,
+    /// A mismatch of this command was already logged (counted every time).
+    pub(crate) logged: bool,
+}
+
+/// What `GsPrepRecord::check` found.
+#[cfg(any(test, feature = "mem_report"))]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum GsCheck {
+    /// First resolution of this command: recorded, nothing to compare.
+    Prepared,
+    /// A re-resolution with the recorded file id and offset.
+    Match,
+    /// A re-resolution with another file id or offset; `first` is true once
+    /// per command, for the log entry.
+    Mismatch { first: bool },
+}
+
+#[cfg(any(test, feature = "mem_report"))]
+impl GsPrepRecord {
+    /// Records or compares one resolution of the command at `bufOffset`
+    /// (`commandIndex` in the job's command order). A command other than the
+    /// recorded one starts a new record. `bufOffset` is below the job's u32
+    /// `sourceBytes`, so `bufOffset + 1` does not wrap.
+    pub(crate) fn check(
+        &mut self,
+        commandIndex: u32,
+        bufOffset: u32,
+        fileId: u32,
+        offset: u64,
+    ) -> GsCheck {
+        let mark = bufOffset.wrapping_add(1);
+        if self.mark != mark || self.commandIndex != commandIndex {
+            *self = Self {
+                mark,
+                commandIndex,
+                fileId,
+                offset,
+                logged: false,
+            };
+            return GsCheck::Prepared;
+        }
+        if self.fileId == fileId && self.offset == offset {
+            return GsCheck::Match;
+        }
+        let first = !self.logged;
+        self.logged = true;
+        GsCheck::Mismatch { first }
+    }
+}
+
+impl JobState {
+    /// A gather/scatter read at the cursor resolved from the lane cursor
+    /// (native.rs progress_software_read_command) to `fileId`/`offset`. The
+    /// first resolution of a command is its prepare record; a later one is a
+    /// retry and counts gs_retry_checks, and gs_retry_mismatches plus a 'G'
+    /// event when it differs. Never fails the read: the check only reports.
+    #[inline(always)]
+    pub(crate) fn stat_gs_resolved(&mut self, bufOffset: u32, fileId: u32, offset: u64) {
+        #[cfg(feature = "mem_report")]
+        let (retry, mismatch) = {
+            let prep = (self.gsPrep.fileId, self.gsPrep.offset);
+            let commandIndex = self.sourceCommandIndex;
+            match self.gsPrep.check(commandIndex, bufOffset, fileId, offset) {
+                GsCheck::Prepared => (false, false),
+                GsCheck::Match => (true, false),
+                GsCheck::Mismatch { first } => {
+                    if first {
+                        stats::gs_retry_mismatch(
+                            SCE_AMPR_ERROR_APR_INVALIDGATHERSCATTERSTATE as i64,
+                            prep,
+                            (fileId, offset),
+                        );
+                    }
+                    (true, true)
+                }
+            }
+        };
+        #[cfg(not(feature = "mem_report"))]
+        let (retry, mismatch) = {
+            let _ = (bufOffset, fileId, offset);
+            (false, false)
+        };
+        if retry {
+            stats::add(Stat::GsRetryChecks, 1);
+        }
+        if mismatch {
+            stats::add(Stat::GsRetryMismatches, 1);
+        }
+    }
+}
+
+#[cfg(test)]
+mod gs_retry_tests {
+    use super::*;
+
+    fn read_op(op_type: OpType, fileId: u32, buffer: u64, length: u64, offset: u64) -> Op {
+        Op {
+            op_type,
+            u32a: fileId,
+            ptra: buffer,
+            u64a: length,
+            u64b: offset,
+            ..Op::default()
+        }
+    }
+
+    fn resolve(gs: &GatherScatterState, op: &Op) -> SoftwareRead {
+        let mut read = SoftwareRead {
+            fileId: 0,
+            buffer: null_mut(),
+            length: 0,
+            offset: 0,
+        };
+        assert_eq!(AprAioReactor::resolve_software_read(gs, op, &mut read), 0);
+        read
+    }
+
+    /// Two jobs on one lane cursor, job A's scatter read prepared and then
+    /// retried (not issued, so the lane cursor did not advance for it), the
+    /// way native.rs progress_software_read_command re-resolves it when no
+    /// read chain is retained.
+    #[test]
+    fn retry_of_prepared_scatter_read_on_shared_lane() {
+        let mut lane = GatherScatterState::default();
+        // Job A: an explicit file read (fid 7) sets the lane cursor.
+        let a0 = read_op(APR_READ_FILE, 7, 0x10000, 0x100, 0x1000);
+        let r = resolve(&lane, &a0);
+        AprAioReactor::update_software_gs_cursor(&mut lane, &r);
+
+        // Job A, command 1: a scatter read takes fid and offset from the lane.
+        let mut a = GsPrepRecord::default();
+        let a1 = read_op(APR_READ_SCATTER, 0, 0x20000, 0x200, 0);
+        let prep = resolve(&lane, &a1);
+        assert_eq!((prep.fileId, prep.offset), (7, 0x1100));
+        let c = a.check(1, 0x40, prep.fileId, prep.offset);
+        assert_eq!(c, GsCheck::Prepared);
+
+        // Forced retry with the lane untouched: the prepared fid is read.
+        let retry = resolve(&lane, &a1);
+        assert_eq!(retry.fileId, prep.fileId);
+        assert_eq!(a.check(1, 0x40, retry.fileId, retry.offset), GsCheck::Match);
+
+        // Job B advances the same lane (cross-EOP read-ahead or lane overlap,
+        // both off in release): the retry now resolves to B's file, issue #7.
+        let b0 = read_op(APR_READ_FILE, 9, 0x30000, 0x40, 0x5000);
+        let r = resolve(&lane, &b0);
+        AprAioReactor::update_software_gs_cursor(&mut lane, &r);
+        let retry = resolve(&lane, &a1);
+        assert_eq!((retry.fileId, retry.offset), (9, 0x5040));
+        let c = a.check(1, 0x40, retry.fileId, retry.offset);
+        assert_eq!(c, GsCheck::Mismatch { first: true });
+        let c = a.check(1, 0x40, retry.fileId, retry.offset);
+        assert_eq!(c, GsCheck::Mismatch { first: false });
+        assert_eq!((a.fileId, a.offset), (7, 0x1100));
+
+        // Job A's next command starts a new record.
+        assert_eq!(a.check(2, 0x80, 9, 0x5040), GsCheck::Prepared);
+    }
+}

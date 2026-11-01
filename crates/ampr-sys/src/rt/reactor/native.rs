@@ -717,6 +717,13 @@ impl AprAioReactor {
             read.offset = d.offset;
         } else {
             readRc = Self::resolve_software_read(gs, op, &mut read);
+            // Debug only: the first resolution of a gather/scatter command is
+            // its prepare record; a re-resolution here (no retained chain) is
+            // compared with it (job_state.rs stat_gs_resolved, issue #7). An
+            // empty inline in release builds, like the other stat_* helpers.
+            if readRc == 0 && Self::software_read_op_is_stateful(op) {
+                jb.stat_gs_resolved(op.buf_offset_bytes, read.fileId, read.offset);
+            }
         }
         if readRc != 0 {
             self.set_command_error(

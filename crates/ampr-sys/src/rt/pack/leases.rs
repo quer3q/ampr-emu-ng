@@ -535,6 +535,85 @@ unsafe fn validate_data_header_lz4(
     ) != 0
 }
 
+// ---- stale pack fd reopen ----
+
+/// Reopen state of a pack handle. ShadowMountPlus releases USB-backed images
+/// in rest mode and remounts them on resume, so a volume fd opened before
+/// suspend can fail every read. A job whose read fails on a `StaleRetry` fd
+/// retries once on a reopened fd; `StaleRetry` is entered only from `Clean`,
+/// and `Clean` only after a good read on a reopened fd, so a dead device
+/// costs one retry per failure burst and never loops. A flapping device
+/// (good reads in between) can re-arm the retry.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum PackFdReopen {
+    Clean,
+    /// First stale-fd error: reads on this fd retry; no new pins.
+    StaleRetry,
+    /// The fd was reopened after a stale-fd error; no good read yet.
+    Reopened,
+    /// Stale-fd error after a reopen: reads on this fd fail; no new pins.
+    StaleReport,
+}
+
+impl PackFdReopen {
+    pub(crate) fn is_stale(self) -> bool {
+        matches!(self, Self::StaleRetry | Self::StaleReport)
+    }
+
+    /// State once the handle's fd is closed (stale close or eviction).
+    pub(crate) fn after_close(self) -> Self {
+        if self.is_stale() {
+            Self::Reopened
+        } else {
+            self
+        }
+    }
+
+    /// A finished read on this handle's fd: (error for the job, new state).
+    /// EAGAIN means retry the job through the transient-error path.
+    pub(crate) fn after_read(self, error: c_int) -> (c_int, Self) {
+        match self {
+            _ if error == 0 && self == Self::Reopened => (0, Self::Clean),
+            _ if !pack_fd_error_wants_reopen(error) => (error, self),
+            Self::Clean | Self::StaleRetry => (SCE_KERNEL_ERROR_EAGAIN, Self::StaleRetry),
+            Self::Reopened | Self::StaleReport => (error, Self::StaleReport),
+        }
+    }
+}
+
+/// Read errors that may mean a stale pack fd: EBADF (fd invalidated), EIO
+/// and ENXIO (backing device released or replaced). Other errors keep the fd.
+pub(crate) fn pack_fd_error_wants_reopen(error: c_int) -> bool {
+    error == SCE_KERNEL_ERROR_EBADF
+        || error == SCE_KERNEL_ERROR_EIO
+        || error == SCE_KERNEL_ERROR_ENXIO
+}
+
+/// `release_pack_fd` for a finished read on `fd`: applies `after_read` while
+/// the pin still holds the handle on `fd`, and returns the job's error.
+/// `read_ran`: the kernel accepted the AIO. A refused or failed submit says
+/// nothing about the fd, so it keeps its state and the job its error.
+pub(crate) unsafe fn release_pack_fd_after_read(
+    pack_id: u16,
+    fd: c_int,
+    error: c_int,
+    read_ran: bool,
+) -> c_int {
+    let state = pack_state();
+    let mut result = error;
+    if read_ran {
+        let _lock = PACK_M.lock();
+        if (pack_id as u32) < pack_volume_count(state) {
+            let handle = &mut (*state).pack_handles[pack_id as usize];
+            if handle.fd == fd && handle.pins != 0 {
+                (result, handle.reopen) = handle.reopen.after_read(error);
+            }
+        }
+    }
+    release_pack_fd(pack_id);
+    result
+}
+
 /// `open_only` (read-ahead, readahead.rs): use only an already-open handle; return
 /// EAGAIN instead of evicting another handle or opening this one.
 pub(crate) unsafe fn acquire_pack_fd(pack_id: u16, open_only: bool) -> c_int {
@@ -544,6 +623,35 @@ pub(crate) unsafe fn acquire_pack_fd(pack_id: u16, open_only: bool) -> c_int {
         return SCE_KERNEL_ERROR_EIO;
     };
     let id = pack_id as usize;
+    let stale_fd = {
+        let _lock = PACK_M.lock();
+        if pack_id as u32 >= pack_volume_count(state) {
+            return SCE_KERNEL_ERROR_EINVAL;
+        }
+        let handle = &mut (*state).pack_handles[id];
+        if handle.fd >= 0 && handle.reopen.is_stale() {
+            // No new pins on a stale fd; the last unpin bumps
+            // PACK_FD_PROGRESS_EPOCH and wakes this job to reopen it.
+            if open_only || handle.pins != 0 {
+                return SCE_KERNEL_ERROR_EAGAIN;
+            }
+            let fd = handle.fd;
+            *handle = PackHandle {
+                reopen: handle.reopen.after_close(),
+                ..PackHandle::EMPTY
+            };
+            if (*state).open_pack_count == 0 {
+                abort();
+            }
+            (*state).open_pack_count -= 1;
+            stats::add(stats::Stat::PackFdReopens, 1);
+            fd
+        } else {
+            -1
+        }
+    };
+    // Closed outside PACK_M: a close on a released USB device may block.
+    close_physical_pack_fd(stale_fd);
     let mut victim_fd = -1;
     {
         let _lock = PACK_M.lock();
@@ -553,6 +661,11 @@ pub(crate) unsafe fn acquire_pack_fd(pack_id: u16, open_only: bool) -> c_int {
             return SCE_KERNEL_ERROR_EINVAL;
         }
         if (*state).pack_handles[id].fd >= 0 {
+            // Marked stale since the check above: no new pin, so the last
+            // unpin can close it; the next attempt reopens (see above).
+            if (*state).pack_handles[id].reopen.is_stale() {
+                return SCE_KERNEL_ERROR_EAGAIN;
+            }
             if (*state).pack_handles[id].pins == u32::MAX {
                 return SCE_KERNEL_ERROR_EBUSY;
             }
@@ -581,8 +694,12 @@ pub(crate) unsafe fn acquire_pack_fd(pack_id: u16, open_only: bool) -> c_int {
             if victim == INVALID_INDEX {
                 return SCE_KERNEL_ERROR_EAGAIN;
             }
-            victim_fd = (*state).pack_handles[victim as usize].fd;
-            (*state).pack_handles[victim as usize] = PackHandle::EMPTY;
+            let evicted = &mut (*state).pack_handles[victim as usize];
+            victim_fd = evicted.fd;
+            *evicted = PackHandle {
+                reopen: evicted.reopen.after_close(),
+                ..PackHandle::EMPTY
+            };
             if (*state).open_pack_count == 0 {
                 abort();
             }
@@ -783,5 +900,52 @@ mod physical_cache_tests {
         unsafe { physical_cache_release_locked(state, &mut held.lease) };
         let entry = unsafe { &(*state).physical_cache_entries[index as usize] };
         assert!(entry.state == PhysicalCacheEntryState::Free);
+    }
+
+    #[test]
+    fn stale_pack_fd_retries_once_per_burst() {
+        use PackFdReopen::*;
+        // Trigger errors: EBADF, EIO, ENXIO. Others never reopen.
+        for e in [
+            SCE_KERNEL_ERROR_EBADF,
+            SCE_KERNEL_ERROR_EIO,
+            SCE_KERNEL_ERROR_ENXIO,
+        ] {
+            assert!(pack_fd_error_wants_reopen(e));
+        }
+        for e in [
+            0,
+            SCE_KERNEL_ERROR_EAGAIN,
+            SCE_KERNEL_ERROR_ENOMEM,
+            SCE_KERNEL_ERROR_EINVAL,
+        ] {
+            assert!(!pack_fd_error_wants_reopen(e));
+            assert_eq!(Clean.after_read(e), (e, Clean));
+        }
+        let ebadf = SCE_KERNEL_ERROR_EBADF;
+        // First failure: retry; other reads still on the old fd retry too.
+        assert_eq!(
+            Clean.after_read(ebadf),
+            (SCE_KERNEL_ERROR_EAGAIN, StaleRetry)
+        );
+        assert_eq!(
+            StaleRetry.after_read(ebadf),
+            (SCE_KERNEL_ERROR_EAGAIN, StaleRetry)
+        );
+        assert_eq!(StaleRetry.after_read(0), (0, StaleRetry));
+        assert_eq!(StaleRetry.after_close(), Reopened);
+        // Failure on the reopened fd goes to the game; the fd is still
+        // replaced, so a device that comes back later recovers.
+        assert_eq!(Reopened.after_read(ebadf), (ebadf, StaleReport));
+        assert_eq!(
+            StaleReport.after_read(SCE_KERNEL_ERROR_EIO),
+            (SCE_KERNEL_ERROR_EIO, StaleReport)
+        );
+        assert_eq!(StaleReport.after_close(), Reopened);
+        // Only a good read on a reopened fd re-arms the retry.
+        assert_eq!(Reopened.after_read(0), (0, Clean));
+        assert_eq!(Reopened.after_close(), Reopened);
+        assert!(StaleRetry.is_stale() && StaleReport.is_stale());
+        assert!(!Clean.is_stale() && !Reopened.is_stale());
     }
 }

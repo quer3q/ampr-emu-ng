@@ -88,6 +88,27 @@ pub(crate) unsafe fn release_mandatory_fds(pipeline: &mut ReadPipelineContext) {
     pipeline.mandatory_fd_count = 0;
 }
 
+/// `release_mandatory_fds` after a finished group: `errors[i]` is the read
+/// error seen on fd `i`; returns each fd's error for the job (EAGAIN: retry
+/// on a reopened fd, leases.rs `release_pack_fd_after_read`).
+pub(crate) unsafe fn release_mandatory_fds_after_read(
+    pipeline: &mut ReadPipelineContext,
+    errors: &mut [c_int; PACK_MANDATORY_GROUP_MAX_REQUESTS],
+    read_ran: bool,
+) {
+    for fd_index in 0..pipeline.mandatory_fd_count {
+        errors[fd_index] = release_pack_fd_after_read(
+            pipeline.mandatory_fd_pack_ids[fd_index],
+            pipeline.mandatory_fds[fd_index],
+            errors[fd_index],
+            read_ran,
+        );
+        pipeline.mandatory_fd_pack_ids[fd_index] = u16::MAX;
+        pipeline.mandatory_fds[fd_index] = -1;
+    }
+    pipeline.mandatory_fd_count = 0;
+}
+
 pub(crate) fn clear_mandatory_requests(pipeline: &mut ReadPipelineContext) {
     for i in 0..pipeline.mandatory_request_count {
         pipeline.mandatory_requests[i] = SceKernelAioRWRequest::EMPTY;

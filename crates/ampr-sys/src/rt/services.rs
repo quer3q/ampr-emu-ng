@@ -139,6 +139,8 @@ unsafe fn resolve_one(
     let rc =
         ampr_index_resolve_path_to_id(p, &mut id, if want_size { &mut size } else { null_mut() });
     if rc != 0 {
+        // 'R': an APR path that did not resolve (debug trace).
+        super::stats::fs_event(b'R', b'-', index_rc_to_sce(rc) as i64, p);
         return Err(index_rc_to_sce(rc));
     }
     Ok((id, size))

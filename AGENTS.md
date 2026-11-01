@@ -70,6 +70,21 @@ CI (`.github/workflows/build.yml`) runs the same commands; a pushed `v*` tag cre
    `libSceAmpr-debug.sprx`: read `http://<ps5-ip>:9090/metrics` before and
    after and compare game wait per read, pack job and disk read latency.
 
+## Debugging on a console
+
+- The debug build's `/fsfail` lists failed calls (path hooks, the runtime's
+  own loose opens `L`, APR resolves `R`, APR jobs `E`, module loads `K`,
+  gather/scatter retry mismatches `G`, the upstream #7 wrong-file class) and
+  `/modules` lists loaded modules; the op letters are documented at
+  `FsEvents` in `rt/stats.rs`. When one install of a game works and another
+  does not, run the same build on both and diff the two outputs.
+- Folder installs on the internal SSD are case-sensitive; retail pfs and
+  exFAT are not, and games depend on that (e.g. Wwise plugins loaded as
+  `AkSineTone.prx`, stored `aksinetone.prx`). Paths that reach the
+  filesystem without the index (unhooked libc calls) fail there only. The
+  system module loader opens files itself, so it is routed through the index
+  in `rt/hook.rs` (`sceKernelLoadStartModule_equeue_observer`).
+
 ## Benchmark data
 
 Performance numbers in `README.md` and the Makefile comments come from

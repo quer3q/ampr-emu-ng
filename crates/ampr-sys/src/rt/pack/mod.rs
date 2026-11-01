@@ -806,6 +806,9 @@ pub(crate) struct PackHandle {
     pub payload_begin: u64,
     pub payload_end: u64,
     pub opening: bool,
+    /// Stale-fd reopen state (leases.rs `PackFdReopen`). Kept across
+    /// eviction so a reopened fd keeps its one-retry bound.
+    pub reopen: PackFdReopen,
 }
 impl PackHandle {
     pub(crate) const EMPTY: Self = Self {
@@ -815,6 +818,7 @@ impl PackHandle {
         payload_begin: 0,
         payload_end: 0,
         opening: false,
+        reopen: PackFdReopen::Clean,
     };
 }
 
@@ -1130,6 +1134,9 @@ pub(crate) struct ReadPipelineContext {
     pub fd_budget_wait_epoch: u64,
     pub native_io_error: c_int,
     pub native_completion_ready: bool,
+    /// The finished read got EAGAIN from a stale pack fd marked for reopen
+    /// (`release_pack_fd_after_read`): retry the job, do not fail it.
+    pub fd_reopen_retry: bool,
     pub native_accepted: bool,
     pub native_submitted: bool,
     /// Physical backing reads this pipeline added to PACK_DISK_INFLIGHT (readahead.rs).
@@ -1175,6 +1182,7 @@ impl ReadPipelineContext {
         fd_budget_wait_epoch: 0,
         native_io_error: 0,
         native_completion_ready: false,
+        fd_reopen_retry: false,
         native_accepted: false,
         native_submitted: false,
         disk_inflight: 0,

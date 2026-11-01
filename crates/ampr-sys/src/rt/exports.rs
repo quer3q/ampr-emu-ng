@@ -119,9 +119,23 @@ unsafe fn notify(text: &[u8]) {
     let _ = unsafe { sceKernelSendNotificationRequest(0, &mut req, size_of::<NotifyRequest>(), 0) };
 }
 
-/// "ampr-emu-ng: v0.1.0 (zstd) running" into `out`; its length.
-fn load_notice(zstd: bool, out: &mut [u8; 64]) -> usize {
-    let mode: &[u8] = if zstd { b"zstd" } else { b"lz4" };
+/// Git revision the PRX was built from: short hash, "-dirty" when tracked
+/// files had changes. ps5/build-docker.sh computes it on the host (the
+/// Docker image has no git) and the Makefile passes it as AMPR_GIT_REV;
+/// host builds and tests without it say "unknown". Debug `/metrics` only.
+#[cfg(feature = "mem_report")]
+const BUILD_REV: &str = match option_env!("AMPR_GIT_REV") {
+    Some(v) => v,
+    None => "unknown",
+};
+/// Build flavor: only the debug build serves `/metrics`.
+#[cfg(feature = "mem_report")]
+const BUILD_FLAVOR: &str = "debug";
+
+/// "ampr-emu-ng: v0.1.0 (<mode>) running" into `out`; its length. Mode:
+/// "zstd" (ampr_zstd.index), "lz4" (ampr_assets.index) or "plain" (no
+/// packs, loose files only).
+fn load_notice(mode: &[u8], out: &mut [u8; 64]) -> usize {
     let mut n = 0;
     for part in [
         b"ampr-emu-ng: v" as &[u8],
@@ -140,7 +154,14 @@ fn load_notice(zstd: bool, out: &mut [u8; 64]) -> usize {
 unsafe fn notify_loaded() {
     let _ = unsafe { core::ptr::read_volatile(&raw const AMPR_EMU_VERSION) };
     let mut text = [0u8; 64];
-    let n = load_notice(super::pack::zstd_mode(), &mut text);
+    let mode: &[u8] = if super::pack::zstd_mode() {
+        b"zstd"
+    } else if unsafe { super::index::lz4_manifest_present() } {
+        b"lz4"
+    } else {
+        b"plain"
+    };
+    let n = load_notice(mode, &mut text);
     unsafe { notify(&text[..n]) };
 }
 
@@ -149,10 +170,12 @@ mod notice_tests {
     #[test]
     fn notice_names_version_and_format() {
         let mut out = [0u8; 64];
-        let n = super::load_notice(true, &mut out);
+        let n = super::load_notice(b"zstd", &mut out);
         assert_eq!(&out[..n], b"ampr-emu-ng: v0.1.0 (zstd) running");
-        let n = super::load_notice(false, &mut out);
+        let n = super::load_notice(b"lz4", &mut out);
         assert_eq!(&out[..n], b"ampr-emu-ng: v0.1.0 (lz4) running");
+        let n = super::load_notice(b"plain", &mut out);
+        assert_eq!(&out[..n], b"ampr-emu-ng: v0.1.0 (plain) running");
         assert_eq!(&super::IDENTITY, b"ampr-emu-ng 0.1.0\0");
     }
 }
@@ -918,8 +941,68 @@ mod mem_report {
         let _ = unsafe { ampr_internal_amm_pool_free(buf, c"bench".as_ptr()) };
     }
 
+    /// `GET /fsfail`: every distinct failed path hook call since load (op,
+    /// lookup, result, count, path), first stats::FS_FAILS kept.
+    fn fsfail(out: &mut Text) {
+        use super::super::stats::{FS_FAILS, FS_FAIL_LOG};
+        let log = unsafe { &*FS_FAIL_LOG.get() };
+        out.kv("fsfail_distinct", log.count as u64)
+            .kv("fsfail_dropped", log.dropped.load(core::sync::atomic::Ordering::Relaxed));
+        for i in 0..log.count.min(FS_FAILS) {
+            out.s(b"fsfail ")
+                .s(&[log.op[i], b' ', log.how[i], b' '])
+                .x(log.rc[i] as u32)
+                .s(b" ")
+                .u(log.hits[i] as u64)
+                .s(b" ")
+                .s(&log.path[i][..log.len[i]])
+                .s(b"\n");
+        }
+    }
+
+    /// `GET /modules`: loaded modules as name, segment count, first segment
+    /// size and fingerprint, to tell a backport fakelib from the system copy
+    /// of the same library. SceKernelModuleInfo is the PS4/OpenOrbis layout
+    /// (0x160 bytes: name +0x08, segments +0x108, count +0x148, fp +0x14C).
+    unsafe fn modules(out: &mut Text) {
+        type ListFn = unsafe extern "C" fn(*mut c_int, usize, *mut usize) -> c_int;
+        type InfoFn = unsafe extern "C" fn(c_int, *mut u8) -> c_int;
+        let list = unsafe { crate::rt::sys::resolve_kernel::<ListFn>(c"sceKernelGetModuleList") };
+        let info = unsafe { crate::rt::sys::resolve_kernel::<InfoFn>(c"sceKernelGetModuleInfo") };
+        let (Some(list), Some(info)) = (list, info) else {
+            out.s(b"modules unavailable\n");
+            return;
+        };
+        let mut mods = [0 as c_int; 256];
+        let mut n = 0usize;
+        let rc = unsafe { list(mods.as_mut_ptr(), mods.len(), &mut n) };
+        out.kv("modules_rc", rc as u32 as u64).kv("modules_count", n as u64);
+        for &m in &mods[..n.min(mods.len())] {
+            let mut buf = [0u8; 0x160];
+            buf[..8].copy_from_slice(&0x160u64.to_ne_bytes());
+            let rc = unsafe { info(m, buf.as_mut_ptr()) };
+            let name = &buf[8..0x108];
+            let name = &name[..name.iter().position(|&b| b == 0).unwrap_or(name.len())];
+            let seg0 = u32::from_ne_bytes(buf[0x110..0x114].try_into().unwrap_or([0; 4]));
+            out.s(b"module ").x(m as u32).s(b" ").x(rc as u32).s(b" ").s(name);
+            out.s(b" segs=").u(buf[0x148] as u64).s(b" seg0=").u(seg0 as u64).s(b" fp=");
+            for &b in &buf[0x14C..0x160] {
+                out.s(&[b"0123456789abcdef"[(b >> 4) as usize], b"0123456789abcdef"[(b & 15) as usize]]);
+            }
+            out.s(b"\n");
+        }
+    }
+
     fn body(start_ns: u64, out: &mut Text) {
         let (used, peak, size) = pool_usage();
+        // Which PRX answered: a stale debug build looks like the new one.
+        out.s(b"build ampr-emu-ng ")
+            .s(super::VERSION.as_bytes())
+            .s(b" ")
+            .s(super::BUILD_REV.as_bytes())
+            .s(b" ")
+            .s(super::BUILD_FLAVOR.as_bytes())
+            .s(b"\n");
         out.kv("uptime_ns", monotonic_ns().saturating_sub(start_ns))
             .kv("pool_used_bytes", used as u64)
             .kv("pool_peak_bytes", peak as u64)
@@ -1065,6 +1148,10 @@ mod mem_report {
                 unsafe { bench(&req[..n as usize], metrics) };
             } else if n > 0 && req[..n as usize].starts_with(b"GET /set") {
                 unsafe { set(&req[..n as usize], metrics) };
+            } else if n > 0 && req[..n as usize].starts_with(b"GET /fsfail") {
+                fsfail(metrics);
+            } else if n > 0 && req[..n as usize].starts_with(b"GET /modules") {
+                unsafe { modules(metrics) };
             } else {
                 body(start_ns, metrics);
             }

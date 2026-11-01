@@ -25,7 +25,10 @@ AMPR_DEBUG_POOL_SIZE ?= $(AMPR_INTERNAL_POOL_SIZE)
 # stacks outside the pool and were not measured. Static reactor storage, also
 # outside the pool (host size_of vs commit 52ef644): AprAioReactor
 # 1985736 -> 1988440 B release (+2.6 KiB), 1985864 -> 2054232 B debug
-# (+66.8 KiB); ActiveRead 264 -> 280 B.
+# (+66.8 KiB); ActiveRead 264 -> 280 B. Debug only since (host size_of,
+# 2026-11-01): the gather/scatter retry record grows JobState 408 -> 432 B
+# and AprAioReactor 2054232 -> 2152536 B (+96 KiB, 4096 slots), and the
+# /fsfail table adds ~14 KiB of .bss; release sizes unchanged.
 # One runtime reads LZ4 (AMPRPAK4) and zstd (AMPRZPK1) packs, picked at load.
 # The pool fits the larger of the two: LZ4 above (peak 79.9 MiB); zstd peaks
 # at 73.3 MiB (reserve 40 + cache 32 + ampr_zstd.index 1.3).
@@ -36,6 +39,9 @@ AMPR_PACK_WORKERS ?= 4
 # zstd: libkernel internal-entry hooks to install, bit i = hook id 84 + i
 # (rt/sys.rs). Off: the full set crashed a UE5 title at startup,
 # and zstd packs only what LZ4 packs, so plain libc I/O never needs them.
+# Split on a UE5 title (debug, 2026-11-01): bit 0 (_open) crashes it at
+# startup with the index routing, but not as a pass-through detour; bit 1
+# (_openat) and bits 7+8 (access, lstat) load and change nothing.
 AMPR_ZSTD_LIBC_HOOKS ?= 0
 # Sequential read-ahead window in chunks (0 = off), read by rt/pack.
 # 0: with the pread pool (reactor/pread_pool) read-ahead no longer cut load latency
@@ -44,6 +50,10 @@ AMPR_ZSTD_LIBC_HOOKS ?= 0
 # the worst read (13.4 vs 5.6 ms). Its decoded cache is gone too.
 AMPR_PACK_READAHEAD_CHUNKS ?= 0
 AMPR_PACK_READAHEAD_MAX_DISK_INFLIGHT ?= 2
+# Git revision in the debug build's /metrics (rt/exports.rs BUILD_REV):
+# short hash, "-dirty" with uncommitted tracked changes. ps5/build-docker.sh
+# sets it from the host, since the Docker image has no git.
+AMPR_GIT_REV ?= unknown
 
 include $(PS5_PAYLOAD_SDK)/toolchain/prospero.mk
 
@@ -106,6 +116,7 @@ $(BUILD_CONFIG): FORCE
 	  printf '%s\n' 'AMPR_ZSTD_LIBC_HOOKS=$(AMPR_ZSTD_LIBC_HOOKS)'; \
 	  printf '%s\n' 'AMPR_PACK_READAHEAD_CHUNKS=$(AMPR_PACK_READAHEAD_CHUNKS)'; \
 	  printf '%s\n' 'AMPR_PACK_READAHEAD_MAX_DISK_INFLIGHT=$(AMPR_PACK_READAHEAD_MAX_DISK_INFLIGHT)'; \
+	  printf '%s\n' 'AMPR_GIT_REV=$(AMPR_GIT_REV)'; \
 	  printf '%s\n' 'PRX_LDFLAGS=$(PRX_LDFLAGS)'; \
 	  printf '%s\n' 'PROSPERO_200_FSELF_VERSION=$(PROSPERO_200_FSELF_VERSION)'; \
 	} > $@.tmp
@@ -121,7 +132,7 @@ RUST_SOURCES := $(wildcard crates/*/src/*.rs crates/*/src/*/*.rs crates/*/src/*/
 
 $(RUST_STATICLIB): Cargo.toml Cargo.lock $(RUST_SOURCES) $(RUST_TARGET) $(BUILD_MAKEFILE) $(BUILD_CONFIG)
 	CC_x86_64_ps5_freebsd=$(PS5_PAYLOAD_SDK)/bin/prospero-clang AR_x86_64_ps5_freebsd=$(PS5_PAYLOAD_SDK)/bin/prospero-ar CRATE_CC_NO_DEFAULTS=1 CFLAGS_x86_64_ps5_freebsd="$(ZSTD_CFLAGS)" \
-	RUSTC_BOOTSTRAP=1 AMPR_INTERNAL_POOL_SIZE=$(AMPR_INTERNAL_POOL_SIZE) AMPR_PACK_WORKERS=$(AMPR_PACK_WORKERS) AMPR_ZSTD_LIBC_HOOKS=$(AMPR_ZSTD_LIBC_HOOKS) AMPR_PACK_READAHEAD_CHUNKS=$(AMPR_PACK_READAHEAD_CHUNKS) AMPR_PACK_READAHEAD_MAX_DISK_INFLIGHT=$(AMPR_PACK_READAHEAD_MAX_DISK_INFLIGHT) CARGO_TARGET_DIR=$(abspath $(OUT)/cargo) \
+	RUSTC_BOOTSTRAP=1 AMPR_INTERNAL_POOL_SIZE=$(AMPR_INTERNAL_POOL_SIZE) AMPR_PACK_WORKERS=$(AMPR_PACK_WORKERS) AMPR_ZSTD_LIBC_HOOKS=$(AMPR_ZSTD_LIBC_HOOKS) AMPR_PACK_READAHEAD_CHUNKS=$(AMPR_PACK_READAHEAD_CHUNKS) AMPR_PACK_READAHEAD_MAX_DISK_INFLIGHT=$(AMPR_PACK_READAHEAD_MAX_DISK_INFLIGHT) AMPR_GIT_REV=$(AMPR_GIT_REV) CARGO_TARGET_DIR=$(abspath $(OUT)/cargo) \
 	  $(RUST_CARGO) build -Z build-std=core,alloc -Z json-target-spec \
 	    --release --target $(RUST_TARGET) -p ampr-sys $(if $(filter 1,$(AMPR_MEM_REPORT)),--features mem_report)
 

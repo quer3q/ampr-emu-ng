@@ -1156,6 +1156,13 @@ pub(crate) struct JobState {
     pub(crate) laneTailMark: u32,
     #[cfg(feature = "mem_report")]
     pub(crate) laneTailCompletionOnly: bool,
+    /// Debug only (job_state.rs `stat_gs_resolved`, stats.rs gs_retry_*): the
+    /// file id and offset the gather/scatter read at the cursor first resolved
+    /// to from the lane cursor, compared when a retry re-resolves it. Zeroed
+    /// by `init_in_place`, which reads as "nothing prepared". +24 B per
+    /// JobState, +96 KiB of static reactor storage (Makefile).
+    #[cfg(feature = "mem_report")]
+    pub(crate) gsPrep: job_state::GsPrepRecord,
 }
 impl JobState {
     /// Initializes a fresh `JobState` in place at `p` (pool slot storage).

@@ -92,6 +92,16 @@ stats! {
     /// Failures: pack virtual reads completed with an error, chunk decodes that failed.
     PackJobErrors = "pack_job_errors",
     DecodeErrors = "decode_errors",
+    /// Software WaitOnAddress / WriteAddress commands failed with an APR
+    /// error because sceKernelQueryMemoryProtection found the target
+    /// unmapped or without CPU read (wait) or write (write) protection
+    /// (reactor/software.rs address_target_check). Each one would otherwise
+    /// have faulted in the reactor thread.
+    AprAddressFaults = "apr_address_faults",
+    /// Pack volume fds closed for a reopen after a read failed with EBADF,
+    /// EIO or ENXIO (pack/leases.rs PackFdReopen; e.g. a USB image remounted
+    /// after rest mode).
+    PackFdReopens = "pack_fd_reopens",
     /// libc `open` hook (index.rs open_impl) by resident-lookup outcome, and
     /// /app0 opens it routed to a virtual pack fd or to the real open.
     OpenNotApp0 = "open_not_app0",
@@ -181,6 +191,17 @@ stats! {
     /// live knob lane_eop_overlap let the successor run past, counted once
     /// per job when its tail is first verified (reactor/lane_overlap.rs).
     EopDeferred = "eop_deferred",
+    /// Gather/scatter re-resolves from the lane cursor
+    /// (`gatherScatterStates[prioIndex]`) after a first resolution of the
+    /// same command did not issue, counted per retry (a command parked and
+    /// retried n times counts n), and those whose file id or offset differed
+    /// from that first resolution (job_state.rs `GsPrepRecord`). A mismatch is
+    /// upstream issue #7: another job advanced the shared lane cursor and the
+    /// retry would read another file's bytes. Each is also logged as a 'G'
+    /// event in /fsfail (`gs_retry_mismatch`). Release can reach neither
+    /// while cross-EOP read-ahead is stubbed and lane overlap is off.
+    GsRetryChecks = "gs_retry_checks",
+    GsRetryMismatches = "gs_retry_mismatches",
 }
 
 const N: usize = Stat::Count as usize;
@@ -231,9 +252,15 @@ pub(crate) fn now() -> u64 {
     }
 }
 
-/// Path hook calls (open/stat/reachability), newest last, debug only: op
-/// (b'o', b's', b'r'), resident lookup (b'h' hit, b'm' miss, b'd' directory,
-/// b'n' index not ready, b'x' not /app0), result, path.
+/// Path hook calls, newest last, debug only. Op: b'o' open, b's' stat,
+/// b'l' lstat, b'a' access, b'r' reachability, b'O'/b'A' libc _open/_openat;
+/// and from the runtime itself b'L' its open of an indexed loose file, b'R'
+/// an APR path that did not resolve, b'E' a failed APR job (path = reason),
+/// b'K' a module load, b'G' a gather/scatter retry that re-resolved to
+/// another file id or offset than its first resolution (path = both pairs,
+/// see `gs_retry_mismatch`). Resident lookup: b'h' hit, b'm' miss the index
+/// answers, b'M' miss sent to the FS, b'd' directory, b'n' index not ready,
+/// b'x' not /app0, b'-' none. Then result and path.
 #[cfg(feature = "mem_report")]
 pub(crate) struct FsEvents {
     pub next: usize,
@@ -255,9 +282,91 @@ pub(crate) static FS_LOG: super::sync::SyncCell<FsEvents> = super::sync::SyncCel
     path: [[0; 160]; FS_EVENTS],
 });
 
+/// Failed path hook calls (rc < 0), one slot per distinct (op, path), the
+/// first FS_FAILS kept: boot-time failures outlive the 32-entry FS_LOG ring.
+/// 96 x ~150 B of text fits the 16 KiB response of `GET /fsfail`; the table
+/// is ~14 KiB of .bss outside the pool.
+#[cfg(feature = "mem_report")]
+pub(crate) struct FsFails {
+    pub count: usize,
+    pub dropped: core::sync::atomic::AtomicU64,
+    pub op: [u8; FS_FAILS],
+    pub how: [u8; FS_FAILS],
+    pub rc: [i64; FS_FAILS],
+    pub hits: [u32; FS_FAILS],
+    pub len: [usize; FS_FAILS],
+    pub path: [[u8; 128]; FS_FAILS],
+}
+#[cfg(feature = "mem_report")]
+pub(crate) const FS_FAILS: usize = 96;
+#[cfg(feature = "mem_report")]
+pub(crate) static FS_FAIL_LOG: super::sync::SyncCell<FsFails> =
+    super::sync::SyncCell::new(FsFails {
+        count: 0,
+        dropped: core::sync::atomic::AtomicU64::new(0),
+        op: [0; FS_FAILS],
+        how: [0; FS_FAILS],
+        rc: [0; FS_FAILS],
+        hits: [0; FS_FAILS],
+        len: [0; FS_FAILS],
+        path: [[0; 128]; FS_FAILS],
+    });
+
+/// Counts a failed call in FS_FAIL_LOG. Paths are kept and deduplicated by
+/// their first 128 bytes, so longer paths that differ only past that share
+/// an entry.
+#[cfg(feature = "mem_report")]
+unsafe fn fs_fail(op: u8, how: u8, rc: i64, path: *const core::ffi::c_char) {
+    use core::sync::atomic::{AtomicBool, Ordering};
+    // One writer at a time; a hook never waits for it: a busy log drops.
+    static BUSY: AtomicBool = AtomicBool::new(false);
+    if BUSY.swap(true, Ordering::Acquire) {
+        unsafe { (*FS_FAIL_LOG.get()).dropped.fetch_add(1, Ordering::Relaxed) };
+        return;
+    }
+    unsafe { fs_fail_locked(op, how, rc, path) };
+    BUSY.store(false, Ordering::Release);
+}
+
+#[cfg(feature = "mem_report")]
+unsafe fn fs_fail_locked(op: u8, how: u8, rc: i64, path: *const core::ffi::c_char) {
+    let log = unsafe { &mut *FS_FAIL_LOG.get() };
+    let mut name = [0u8; 128];
+    let mut n = 0;
+    while n < name.len() && !path.is_null() && unsafe { *path.add(n) } != 0 {
+        name[n] = unsafe { *path.add(n) } as u8;
+        n += 1;
+    }
+    // UE probes many optional user configs there; they always miss.
+    if name[..n].starts_with(b"/download0/") {
+        return;
+    }
+    for i in 0..log.count.min(FS_FAILS) {
+        if log.op[i] == op && log.path[i][..log.len[i]] == name[..n] {
+            log.hits[i] = log.hits[i].saturating_add(1);
+            return;
+        }
+    }
+    if log.count >= FS_FAILS {
+        log.dropped.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        return;
+    }
+    let i = log.count;
+    (log.op[i], log.how[i], log.rc[i], log.hits[i], log.len[i]) = (op, how, rc, 1, n);
+    log.path[i] = name;
+    log.count += 1;
+}
+
 /// Records one path hook call (racy by design: a debug trace).
 #[inline(always)]
 pub(crate) fn fs_event(op: u8, how: u8, rc: i64, path: *const core::ffi::c_char) {
+    // Authoritative misses ('m') of the path hooks are answered by the index
+    // alone, the same on every filesystem, so they are left out of the
+    // failure log. 'R' events carry no lookup letter and are always logged.
+    #[cfg(feature = "mem_report")]
+    if rc < 0 && how != b'm' {
+        unsafe { fs_fail(op, how, rc, path) };
+    }
     #[cfg(feature = "mem_report")]
     unsafe {
         let log = &mut *FS_LOG.get();
@@ -272,6 +381,37 @@ pub(crate) fn fs_event(op: u8, how: u8, rc: i64, path: *const core::ffi::c_char)
     }
     #[cfg(not(feature = "mem_report"))]
     let _ = (op, how, rc, path);
+}
+
+/// Logs a gather/scatter retry that re-resolved to `got` instead of the
+/// `prep` (file id, offset) of its first resolution, as a 'G' event with path
+/// "gs-retry fid=<hex> off=<hex> got fid=<hex> off=<hex>" (at most 80 bytes,
+/// within FsFails' 128). Debug only; the caller counts GsRetryMismatches.
+#[cfg(feature = "mem_report")]
+pub(crate) fn gs_retry_mismatch(rc: i64, prep: (u32, u64), got: (u32, u64)) {
+    fn hex(buf: &mut [u8; 128], n: &mut usize, v: u64) {
+        let digits = (64 - (v | 1).leading_zeros()).div_ceil(4);
+        for i in (0..digits).rev() {
+            buf[*n] = b"0123456789abcdef"[((v >> (i * 4)) & 0xf) as usize];
+            *n += 1;
+        }
+    }
+    fn text(buf: &mut [u8; 128], n: &mut usize, s: &[u8]) {
+        buf[*n..*n + s.len()].copy_from_slice(s);
+        *n += s.len();
+    }
+    let mut buf = [0u8; 128];
+    let mut n = 0;
+    text(&mut buf, &mut n, b"gs-retry fid=");
+    hex(&mut buf, &mut n, prep.0 as u64);
+    text(&mut buf, &mut n, b" off=");
+    hex(&mut buf, &mut n, prep.1);
+    text(&mut buf, &mut n, b" got fid=");
+    hex(&mut buf, &mut n, got.0 as u64);
+    text(&mut buf, &mut n, b" off=");
+    hex(&mut buf, &mut n, got.1);
+    // buf[n] is still 0: the path is NUL-terminated.
+    fs_event(b'G', b'-', rc, buf.as_ptr().cast());
 }
 
 #[inline(always)]

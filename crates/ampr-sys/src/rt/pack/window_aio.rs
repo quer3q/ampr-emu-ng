@@ -428,13 +428,14 @@ unsafe fn reset_native_wait(pipeline: &mut ReadPipelineContext) {
 pub(crate) unsafe fn finish_mandatory_page_group(pipeline: &mut ReadPipelineContext) -> c_int {
     unsafe {
         let completion_error = pipeline.native_io_error;
-        let mut group_error = completion_error;
         if zstd_mode() && completion_error == 0 {
             zstd_complete_mandatory_eof_reads(pipeline);
         }
-        release_mandatory_fds(pipeline);
         let mut publications = [PhysicalCachePublication::EMPTY; PACK_MANDATORY_GROUP_MAX_PAGES];
         let mut publication_count = 0usize;
+        // Per backing fd: the read error, a stale-fd one first (leases.rs).
+        let mut fd_errors = [0 as c_int; PACK_MANDATORY_GROUP_MAX_REQUESTS];
+        let mut page_fds = [usize::MAX; PACK_MANDATORY_GROUP_MAX_PAGES];
         for page_index in 0..pipeline.mandatory_page_count {
             let page = &mut pipeline.mandatory_pages[page_index];
             if page.acquired.kind != PhysicalCacheAcquireKind::Load {
@@ -474,18 +475,57 @@ pub(crate) unsafe fn finish_mandatory_page_group(pipeline: &mut ReadPipelineCont
                     );
                 }
             }
+            let fd_index = pipeline.mandatory_fd_pack_ids[..pipeline.mandatory_fd_count]
+                .iter()
+                .position(|&id| id == page.pack_id);
+            if let (Some(i), true) = (fd_index, page_error != 0) {
+                let seen = fd_errors[i];
+                if seen == 0
+                    || (!pack_fd_error_wants_reopen(seen) && pack_fd_error_wants_reopen(page_error))
+                {
+                    fd_errors[i] = page_error;
+                }
+            }
+            page_fds[page_index] = fd_index.unwrap_or(usize::MAX);
             publications[publication_count] = PhysicalCachePublication {
                 lease: &mut page.acquired.lease,
                 error: page_error,
             };
             publication_count += 1;
-            page.acquired.kind = if page_error == 0 {
+        }
+        let raw_fd_errors = fd_errors;
+        let read_ran = AtomicBool::from_ptr(&mut pipeline.native_submitted).load(Ordering::Acquire);
+        release_mandatory_fds_after_read(pipeline, &mut fd_errors, read_ran);
+        pipeline.fd_reopen_retry = false;
+        let mut group_error = if publication_count == 0 {
+            completion_error
+        } else {
+            0
+        };
+        let mut publication = 0usize;
+        for page_index in 0..pipeline.mandatory_page_count {
+            let page = &mut pipeline.mandatory_pages[page_index];
+            if page.acquired.kind != PhysicalCacheAcquireKind::Load {
+                continue;
+            }
+            let entry = &mut publications[publication];
+            publication += 1;
+            let i = page_fds[page_index];
+            if i != usize::MAX
+                && pack_fd_error_wants_reopen(entry.error)
+                && fd_errors[i] == SCE_KERNEL_ERROR_EAGAIN
+                && pack_fd_error_wants_reopen(raw_fd_errors[i])
+            {
+                entry.error = SCE_KERNEL_ERROR_EAGAIN;
+                pipeline.fd_reopen_retry = true;
+            }
+            page.acquired.kind = if entry.error == 0 {
                 PhysicalCacheAcquireKind::Ready
             } else {
                 PhysicalCacheAcquireKind::Failed
             };
-            if group_error == 0 && page_error != 0 {
-                group_error = page_error;
+            if group_error == 0 && entry.error != 0 {
+                group_error = entry.error;
             }
         }
         physical_cache_publish_batch(publications.as_ptr(), publication_count);
@@ -531,7 +571,15 @@ pub(crate) unsafe fn finish_pipeline_window_aio(pipeline: &mut ReadPipelineConte
             };
         }
         if pipeline.pack_fd >= 0 {
-            release_pack_fd(range.pack_id);
+            // A stale-fd error becomes EAGAIN once: the pages are dropped as
+            // transient and the job retries on a reopened fd (leases.rs).
+            let read_error = error;
+            let read_ran =
+                AtomicBool::from_ptr(&mut pipeline.native_submitted).load(Ordering::Acquire);
+            error =
+                release_pack_fd_after_read(range.pack_id, pipeline.pack_fd, read_error, read_ran);
+            pipeline.fd_reopen_retry =
+                pack_fd_error_wants_reopen(read_error) && error == SCE_KERNEL_ERROR_EAGAIN;
             pipeline.pack_fd = -1;
         }
         let mut publications = [PhysicalCachePublication::EMPTY; PACK_PIPELINE_MAX_IO_PAGES];
