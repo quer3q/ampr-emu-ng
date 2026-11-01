@@ -235,6 +235,7 @@ impl AprAioReactor {
         if seq < nextSeq {
             return;
         }
+        job.stat_read_done();
         if seq == nextSeq {
             job.completedReadSeq = seq;
             loop {

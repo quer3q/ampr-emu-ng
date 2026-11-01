@@ -409,3 +409,63 @@ fn cb_view() -> SceAmprCommandBuffer {
         buffer: null_mut(),
     }
 }
+
+// ---- debug job timing (stats.rs job_*) ----
+// Every helper compiles to nothing in release builds (no fields, no clock call).
+
+use crate::rt::stats::{self, Stat};
+
+impl JobState {
+    /// Submit accepted (submit.rs): starts job_first_issue_ns.
+    #[inline(always)]
+    pub(crate) fn stat_accepted(&mut self) {
+        #[cfg(feature = "mem_report")]
+        {
+            self.statAcceptNs = crate::rt::stats::now();
+        }
+    }
+
+    /// A read slice was accepted by kernel AIO or the pread pool
+    /// (admission.rs account_active_read_accept); the first one per job ends
+    /// job_first_issue_ns.
+    #[inline(always)]
+    pub(crate) fn stat_read_issued(&mut self) {
+        #[cfg(feature = "mem_report")]
+        let start = core::mem::take(&mut self.statAcceptNs);
+        #[cfg(not(feature = "mem_report"))]
+        let start = 0;
+        stats::span(
+            start,
+            Stat::JobFirstIssues,
+            Stat::JobFirstIssueNs,
+            Stat::JobFirstIssueNsMax,
+        );
+    }
+
+    /// The reactor saw one of the job's read chains complete
+    /// (backoff.rs mark_seq_complete): starts or restarts job_notify_ns.
+    #[inline(always)]
+    pub(crate) fn stat_read_done(&mut self) {
+        #[cfg(feature = "mem_report")]
+        {
+            self.statReadDoneNs = crate::rt::stats::now();
+        }
+    }
+
+    /// The job told the game something after its reads (native.rs fence-clear
+    /// command or deferred EOP release, worker.rs result publish): ends
+    /// job_notify_ns if a read completed since the last notify.
+    #[inline(always)]
+    pub(crate) fn stat_notified(&mut self) {
+        #[cfg(feature = "mem_report")]
+        let start = core::mem::take(&mut self.statReadDoneNs);
+        #[cfg(not(feature = "mem_report"))]
+        let start = 0;
+        stats::span(
+            start,
+            Stat::JobNotifies,
+            Stat::JobNotifyNs,
+            Stat::JobNotifyNsMax,
+        );
+    }
+}

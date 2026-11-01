@@ -13,7 +13,10 @@ index, `AMPRZDT1` volumes), picked at load by whether
 ## Layout
 
 - `crates/ampr-sys`: PRX runtime (staticlib). Runtime code is in `src/rt/`
-  (pack, reactor, hooks, stats, tune, exports).
+  (pack, reactor, hooks, stats, tune, exports). The PRX exports 137 symbols:
+  118 sceAmpr* (`rt/exports.rs`, found by `EXPORT_RE`) and 19 libc/libc++
+  symbols that retail libSceAmpr re-exports (`rt/libc_exports.rs`, listed in
+  `EXTRA_EXPORTS` in `tools/generate_payload_exports.py`).
 - `crates/ampr-format`: shared index readers, byte helpers and overlay utilities.
 - `crates/ampr-codec`: zstd decode.
 - `crates/ampr-lz4`: AMPRPAK4 manifest, AMPRDAT3 header, read planning and LZ4 decode.

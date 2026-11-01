@@ -1,9 +1,10 @@
 //! Blocking pread pool for the pack's physical reads (external AIO groups).
 //! Kernel AIO on BFS serves 1-2 requests at a time; a pool of threads each
 //! blocked in pread keeps many in flight. Pack reads land in the internal
-//! pool (CPU memory), so a CPU pread can fill them; the game's APR reads stay
-//! on kernel AIO because their buffers may be GPU-only (EFAULT from pread).
-//! Ported from test-crate-readwrite (image bypass), external path only.
+//! pool (CPU memory), so a CPU pread can fill them. The game's loose APR
+//! reads also come here (loose_pread.rs); their buffers may be GPU-only
+//! (EFAULT from pread), so a failed one falls back to kernel AIO.
+//! Ported from test-crate-readwrite (image bypass), external path.
 
 use super::*;
 use crate::rt::stats::{self, Stat};
@@ -116,14 +117,17 @@ impl AprAioReactor {
             stats::add(Stat::PreadBytes, bytesRead);
             stats::add(Stat::PreadReadNs, readNs);
             stats::max(Stat::PreadReadNsMax, readNs);
-            unsafe {
-                (*request.result).returnValue = result;
-                (*request.result).state = SCE_KERNEL_AIO_STATE_COMPLETED as u32;
+            if !request.result.is_null() {
+                unsafe {
+                    (*request.result).returnValue = result;
+                    (*request.result).state = SCE_KERNEL_AIO_STATE_COMPLETED as u32;
+                }
             }
+            // The task is RUNNING, so only this thread touches it until DONE.
+            let task = unsafe { addr_of_mut!((*this).preadTasks[slot]) };
             unsafe {
-                (*addr_of!((*this).preadTasks[slot]))
-                    .state
-                    .store(PREAD_DONE, Ordering::Release)
+                (*task).returnValue = result;
+                (*task).state.store(PREAD_DONE, Ordering::Release)
             };
             let _wakeGuard = unsafe { (&*addr_of!((*this).m)).lock() };
             unsafe { (*addr_of!((*this).reactorWakeEpoch)).fetch_add(1, Ordering::Release) };
@@ -131,7 +135,7 @@ impl AprAioReactor {
         }
     }
 
-    fn ensure_pread_workers(&mut self) -> bool {
+    pub(super) fn ensure_pread_workers(&mut self) -> bool {
         if self.preadThreadCount != 0 {
             return true;
         }
@@ -166,6 +170,20 @@ impl AprAioReactor {
         targetGeneration: u32,
         priority: c_int,
     ) -> c_int {
+        self.queue_pread_tasks(requests, targetSlot, targetGeneration, priority, false)
+    }
+
+    /// `queue_pread_requests` for either target kind; a loose read
+    /// (loose_pread.rs) queues its part requests (one when unsplit) aimed at
+    /// its ActiveRead slot, all or none; `requestIndex` is the part index.
+    pub(crate) fn queue_pread_tasks(
+        &mut self,
+        requests: &[SceKernelAioRWRequest],
+        targetSlot: u32,
+        targetGeneration: u32,
+        priority: c_int,
+        looseRead: bool,
+    ) -> c_int {
         if requests.is_empty() || requests.len() > kAprExternalAioGroupMaxRequests {
             return SCE_KERNEL_ERROR_EINVAL;
         }
@@ -193,6 +211,7 @@ impl AprAioReactor {
             task.targetSlot = targetSlot;
             task.targetGeneration = targetGeneration;
             task.requestIndex = requestIndex as u32;
+            task.looseRead = looseRead;
             task.priority = priority;
             task.sequence = self.preadNextSequence;
             self.preadNextSequence = self.preadNextSequence.wrapping_add(1);
@@ -217,6 +236,26 @@ impl AprAioReactor {
                 continue;
             }
             let task = &self.preadTasks[slot];
+            if task.looseRead {
+                let target = ActiveReadRef {
+                    slot: task.targetSlot,
+                    generation: task.targetGeneration,
+                };
+                let part = LoosePartDone {
+                    index: task.requestIndex,
+                    offset: task.request.offset,
+                    len: task.request.nbyte as u64,
+                    value: task.returnValue,
+                };
+                self.retire_pread_task(slot);
+                if self.preadLooseCount == 0 {
+                    abort();
+                }
+                self.preadLooseCount -= 1;
+                self.finish_loose_pread(target, part);
+                progressed = true;
+                continue;
+            }
             let reference = ExternalAioRef {
                 slot: task.targetSlot,
                 generation: task.targetGeneration,
@@ -249,16 +288,20 @@ impl AprAioReactor {
                 self.notify_external_aio(e, AprExternalAioEvent::Completed, completionState, false);
                 Self::release_external_aio_slot(e);
             }
-            self.preadTasks[slot]
-                .state
-                .store(PREAD_FREE, Ordering::Release);
-            if self.preadPendingCount == 0 {
-                abort();
-            }
-            self.preadPendingCount -= 1;
+            self.retire_pread_task(slot);
             progressed = true;
         }
         progressed
+    }
+
+    fn retire_pread_task(&mut self, slot: usize) {
+        self.preadTasks[slot]
+            .state
+            .store(PREAD_FREE, Ordering::Release);
+        if self.preadPendingCount == 0 {
+            abort();
+        }
+        self.preadPendingCount -= 1;
     }
 
     /// Joins the pool threads (reactor shutdown, after the worker loop ends).

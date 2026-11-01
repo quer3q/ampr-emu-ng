@@ -63,9 +63,10 @@ stats! {
     PhysMisses = "phys_misses",
     /// Read plans that skipped extension because the disk was busy.
     ReadExtendGated = "read_extend_gated",
-    /// Pack reads served by the blocking pread pool (reactor/pread_pool.rs): calls and
+    /// Reads served by the blocking pread pool (reactor/pread_pool.rs): calls and
     /// bytes, time queued for a pool thread, time in pread, and the peak
-    /// number of queued + running reads since the last scrape.
+    /// number of queued + running reads since the last scrape. Pack reads
+    /// and, with `loose_pread` on, loose reads (the loose_pread_* subset).
     PreadReads = "pread_reads",
     PreadBytes = "pread_bytes",
     PreadQueueNs = "pread_queue_ns",
@@ -73,6 +74,23 @@ stats! {
     PreadReadNs = "pread_read_ns",
     PreadReadNsMax = "pread_read_ns_max",
     PreadPendingMax = "pread_pending_max",
+    /// Loose APR reads (real fds) through the pread pool (reactor/loose_pread.rs):
+    /// full reads and their bytes; pool reads that got EFAULT and went to
+    /// kernel AIO; pool reads that failed otherwise or came back short and went
+    /// to kernel AIO; reads sent straight to kernel AIO because their
+    /// destination faulted before. apr_reads/apr_read_ns cover loose reads on
+    /// either path, so runs with the knob on and off compare.
+    LoosePreadReads = "loose_pread_reads",
+    LoosePreadBytes = "loose_pread_bytes",
+    LoosePreadEfault = "loose_pread_efault",
+    LoosePreadRetry = "loose_pread_retry",
+    LoosePreadSkipped = "loose_pread_skipped",
+    /// Split loose reads (`loose_pread_part_kib`, reactor/loose_pread.rs):
+    /// reads queued as more than one part task, and the part tasks they
+    /// queued. Unsplit reads count in neither; loose_pread_reads and
+    /// apr_reads still count each read once.
+    LoosePreadSplitReads = "loose_pread_split_reads",
+    LoosePreadParts = "loose_pread_parts",
     /// Highest number of reactor AIO reads in flight since the last scrape.
     AprInflightMax = "apr_inflight_max",
     /// Failures: pack virtual reads completed with an error, chunk decodes that failed.
@@ -115,6 +133,58 @@ stats! {
     /// zstd: physical pages another job was loading, read privately by this
     /// job (its own disk read into its I/O window) instead of waiting.
     PrivatePageReads = "private_page_reads",
+    /// Reactor issue limits (reactor/progress.rs, reactor/flush.rs; live knobs
+    /// read_pass_kib, read_chunk_quantum, per_read_active_kib,
+    /// per_read_active_chunks in rt/tune.rs). read_budget_held: lane passes
+    /// that left a read slice unissued because the pass budget
+    /// (ReadIssueBudget) ran out, counted once per lane pass. read_active_held:
+    /// slice attempts refused by the per-read active window (chunks or bytes
+    /// in flight on one read chain), counted per attempt, so a read waiting
+    /// several passes counts several times.
+    ReadBudgetHeld = "read_budget_held",
+    ReadActiveHeld = "read_active_held",
+    /// APR jobs (command buffers) the reactor finished. job_first_issue_*:
+    /// submit accepted (AprAioReactor::submit, reactor/submit.rs) -> the job's
+    /// first read slice issued to kernel AIO or the pread pool
+    /// (account_active_read_accept, reactor/admission.rs), once per job with
+    /// such a read; job_first_issues is its count. job_notify_*: the
+    /// reactor observing a job's read chain complete (mark_seq_complete,
+    /// reactor/backoff.rs) -> the next point that tells the game: a non-read
+    /// command reached with the read fence clear (address write, counter,
+    /// equeue, native op; reactor/native.rs), a deferred native EOP released
+    /// to the kernel, or the job result published on release
+    /// (maybe_release_reactor_job, reactor/worker.rs); job_notifies is its count.
+    JobCount = "job_count",
+    JobFirstIssues = "job_first_issues",
+    JobFirstIssueNs = "job_first_issue_ns",
+    JobFirstIssueNsMax = "job_first_issue_ns_max",
+    JobNotifies = "job_notifies",
+    JobNotifyNs = "job_notify_ns",
+    JobNotifyNsMax = "job_notify_ns_max",
+    /// The part of job_notify_ns spent waiting on an earlier job of the
+    /// lane: when a lane head is released (reactor/worker.rs
+    /// maybe_release_reactor_job) and its successor's reads are all done with
+    /// its cursor on a completion command, its read-done time -> this
+    /// release. N before N+1 forces this wait; job_notify_ns minus it is the
+    /// reactor's own share (reactor/lane_overlap.rs note_successor_order_wait).
+    JobOrderWaits = "job_order_waits",
+    JobOrderWaitNs = "job_order_wait_ns",
+    /// Lane loop (reactor/progress.rs) stops before a job that has a
+    /// successor queued in its priority lane, so the successor does not parse
+    /// in this pass. Counted once per stop (per lane pass), by what the head
+    /// is parked on (reactor/lane_overlap.rs lane_block_kind):
+    /// lane_successor_blocked_fence: a completion command (EOP write, counter,
+    /// equeue) waiting on the head's own read fence or deferred native EOP;
+    /// lane_successor_blocked_wait: a WaitOnAddress/WaitOnCounter, or a
+    /// native batch wait; lane_successor_blocked_other: anything else (a read
+    /// held by budget or window, a native/AMM op, a failed head).
+    LaneSuccessorBlockedFence = "lane_successor_blocked_fence",
+    LaneSuccessorBlockedWait = "lane_successor_blocked_wait",
+    LaneSuccessorBlockedOther = "lane_successor_blocked_other",
+    /// Completion commands (not nops/markers) in head jobs whose tail the
+    /// live knob lane_eop_overlap let the successor run past, counted once
+    /// per job when its tail is first verified (reactor/lane_overlap.rs).
+    EopDeferred = "eop_deferred",
 }
 
 const N: usize = Stat::Count as usize;
@@ -130,6 +200,8 @@ fn resets_on_read(s: usize) -> bool {
         || s == Stat::PreadQueueNsMax as usize
         || s == Stat::PreadReadNsMax as usize
         || s == Stat::PreadPendingMax as usize
+        || s == Stat::JobFirstIssueNsMax as usize
+        || s == Stat::JobNotifyNsMax as usize
 }
 
 /// Chunks read so far (decoded-cache loads), as a 2^23-bit hash set; a false
@@ -227,6 +299,18 @@ pub(crate) fn since(start: u64) -> u64 {
         now().saturating_sub(start)
     } else {
         0
+    }
+}
+
+/// Records one span that started at `start` (from `now()`; 0 = no span):
+/// +1 to `count`, the elapsed ns to `sum`, and the scrape maximum to `max_ns`.
+#[inline(always)]
+pub(crate) fn span(start: u64, count: Stat, sum: Stat, max_ns: Stat) {
+    if ON && start != 0 {
+        let ns = since(start);
+        add(count, 1);
+        add(sum, ns);
+        max(max_ns, ns);
     }
 }
 

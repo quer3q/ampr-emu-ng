@@ -19,6 +19,13 @@ AMPR_INTERNAL_POOL_SIZE ?= 0x5800000
 # memory. Profiles bigger than the release config no longer fit: the decoded
 # cache halves until it does (see pack_decoded_cache_bytes in /metrics).
 AMPR_DEBUG_POOL_SIZE ?= $(AMPR_INTERNAL_POOL_SIZE)
+# Release pread threads 16 -> 32 (tune::RELEASE_PREAD_THREADS) for split loose
+# reads; internal pool unchanged: pool_peak 72.0 MiB with 16, 32 and 64
+# threads (debug /metrics, 2026-11-01). Thread stacks are libkernel default
+# stacks outside the pool and were not measured. Static reactor storage, also
+# outside the pool (host size_of vs commit 52ef644): AprAioReactor
+# 1985736 -> 1988440 B release (+2.6 KiB), 1985864 -> 2054232 B debug
+# (+66.8 KiB); ActiveRead 264 -> 280 B.
 # One runtime reads LZ4 (AMPRPAK4) and zstd (AMPRZPK1) packs, picked at load.
 # The pool fits the larger of the two: LZ4 above (peak 79.9 MiB); zstd peaks
 # at 73.3 MiB (reserve 40 + cache 32 + ampr_zstd.index 1.3).

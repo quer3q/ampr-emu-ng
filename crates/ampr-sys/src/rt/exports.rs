@@ -1,4 +1,6 @@
 //! Public PRX surface: module_start/module_stop and the 118 sceAmpr* exports.
+//! The PRX exports 137 symbols in all: the other 19 are the libc/libc++
+//! re-exports of retail libSceAmpr, in rt/libc_exports.rs.
 //! The export layer is stateless: every export forwards to the leaves in
 //! rt/amm.rs, rt/command_buffer.rs, rt/equeue.rs, rt/pack and rt/reactor.
 //!
@@ -155,25 +157,180 @@ mod notice_tests {
     }
 }
 
+// ---- /bench query parsing and region planning ---------------------------
+
+/// Pure parts of the debug build's `GET /bench?path=/app0/...`, kept apart
+/// from `mem_report` so host tests cover them without the feature.
+#[cfg(any(test, feature = "mem_report"))]
+mod bench_args {
+    /// Each test reads 32 MiB per path.
+    pub(super) const REGION: u64 = 32 << 20;
+    /// Loose-file tests (rt/exports.rs LOOSE_TESTS).
+    pub(super) const TESTS: u64 = 6;
+    /// Every test times two paths, each on its own region.
+    pub(super) const SLOTS: u64 = 2 * TESTS;
+    /// Unread file between two regions, so kernel read-ahead past one region
+    /// cannot reach the next. 32 MiB (64 MiB with three tests before) keeps
+    /// the twelve regions inside a 736 MiB file.
+    pub(super) const GAP: u64 = 32 << 20;
+    /// Twelve regions plus eleven gaps: 12 * 32 + 11 * 32 = 736 MiB.
+    pub(super) const MIN_FILE: u64 = SLOTS * REGION + (SLOTS - 1) * GAP;
+    /// Deepest AIO queue a test asks for.
+    pub(super) const QD_MAX: usize = 32;
+    /// pread threads of the thread-pool test, each on REGION / THREADS.
+    #[cfg_attr(not(feature = "mem_report"), allow(dead_code))]
+    pub(super) const THREADS: usize = 8;
+
+    /// (request bytes, queue depth) that fit a `cap`-byte buffer: depth
+    /// `qd` (0 = pread, 1 slot) lowered to QD_MAX and to `cap / req`, at
+    /// least 1, and `req` cut to `cap` when even one slot does not fit.
+    pub(super) fn fit(req: usize, qd: usize, cap: usize) -> (usize, usize) {
+        let req = req.min(cap);
+        if qd == 0 {
+            return (req, 0);
+        }
+        (req, qd.min(QD_MAX).min(cap / req.max(1)).max(1))
+    }
+    pub(super) const APP0: &[u8] = b"/app0";
+
+    /// Target (`/bench?...`) of the first request line, or empty.
+    pub(super) fn target(req: &[u8]) -> &[u8] {
+        let line = req
+            .split(|&c| c == b'\r' || c == b'\n')
+            .next()
+            .unwrap_or(&[]);
+        line.split(|&c| c == b' ').nth(1).unwrap_or(&[])
+    }
+
+    /// Query string after '?', or empty.
+    pub(super) fn query(target: &[u8]) -> &[u8] {
+        match target.iter().position(|&c| c == b'?') {
+            Some(q) => &target[q + 1..],
+            None => &[],
+        }
+    }
+
+    /// Raw (still percent-encoded) value of `key` in `a=b&c=d`.
+    /// The last `key=` value: tune::apply also lets the last pair win, so
+    /// /set validates the value it stores.
+    pub(super) fn param<'a>(query: &'a [u8], key: &[u8]) -> Option<&'a [u8]> {
+        query
+            .split(|&c| c == b'&')
+            .filter_map(|pair| {
+                let eq = pair.iter().position(|&c| c == b'=')?;
+                (&pair[..eq] == key).then(|| &pair[eq + 1..])
+            })
+            .last()
+    }
+
+    /// Percent-decoding (rt/tune.rs).
+    pub(super) use super::super::tune::url_decode;
+
+    /// True for `/app0/<something>`.
+    pub(super) fn is_app0_file(path: &[u8]) -> bool {
+        path.len() > APP0.len() + 1 && path.starts_with(APP0) && path[APP0.len()] == b'/'
+    }
+
+    /// Distance between region starts: regions spread evenly over the file
+    /// with the last one ending at or before EOF, 64 KiB aligned; None when
+    /// the file is under MIN_FILE.
+    pub(super) fn region_stride(size: u64) -> Option<u64> {
+        let gap = size.checked_sub(MIN_FILE)? / (SLOTS - 1) + GAP;
+        Some((REGION + gap) & !0xffff)
+    }
+
+    /// /app0 runs first on even tests, the backing path on odd ones, so
+    /// neither path always gets the cold start.
+    pub(super) fn app0_first(test: usize) -> bool {
+        test.is_multiple_of(2)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn query_params() {
+            let req = b"GET /bench?path=%2Fapp0%2Fdata.bin&backing=/x HTTP/1.1\r\nHost: a\r\n";
+            let q = query(target(req));
+            assert_eq!(q, b"path=%2Fapp0%2Fdata.bin&backing=/x");
+            assert_eq!(param(q, b"path"), Some(&b"%2Fapp0%2Fdata.bin"[..]));
+            assert_eq!(param(q, b"backing"), Some(&b"/x"[..]));
+            assert_eq!(param(q, b"pat"), None);
+            assert_eq!(query(target(b"GET /bench HTTP/1.0\r\n")), b"");
+            assert_eq!(param(b"flag&path=", b"path"), Some(&b""[..]));
+            assert!(
+                is_app0_file(b"/app0/a") && !is_app0_file(b"/app0/") && !is_app0_file(b"/app0x")
+            );
+        }
+
+        #[test]
+        fn decode() {
+            let mut out = [0xffu8; 32];
+            let n = url_decode(b"%2Fapp0%2fa+b%20c", &mut out).unwrap();
+            assert_eq!(&out[..n], b"/app0/a+b c");
+            assert_eq!(out[n], 0);
+            assert_eq!(url_decode(b"%2", &mut out), None);
+            assert_eq!(url_decode(b"%zz", &mut out), None);
+            assert_eq!(url_decode(b"a%00", &mut out), None);
+            assert_eq!(url_decode(b"abcd", &mut [0u8; 4]), None);
+            assert_eq!(url_decode(b"abc", &mut [0u8; 4]), Some(3));
+        }
+
+        #[test]
+        fn regions() {
+            assert_eq!(region_stride(MIN_FILE - 1), None);
+            let s = region_stride(MIN_FILE).unwrap();
+            assert_eq!(s % 0x10000, 0);
+            // Gaps of at least GAP (32 MiB), all twelve regions inside the file.
+            assert_eq!(s, REGION + GAP);
+            assert!((SLOTS - 1) * s + REGION <= MIN_FILE);
+            let big = 8_130_000_123;
+            let s = region_stride(big).unwrap();
+            assert_eq!(s % 0x10000, 0);
+            assert!(s - REGION >= GAP && (SLOTS - 1) * s + REGION <= big);
+            assert!(app0_first(0) && !app0_first(1) && app0_first(2));
+            assert_eq!(MIN_FILE, 736 << 20);
+        }
+
+        #[test]
+        fn queue_fit() {
+            const K: usize = 1024;
+            // 8 MiB buffer: every test runs at the depth it names.
+            assert_eq!(fit(256 * K, 32, 8192 * K), (256 * K, 32));
+            assert_eq!(fit(64 * K, 8, 8192 * K), (64 * K, 8));
+            // A halved 2 MiB buffer caps qd32 at 8; qd is never 0 for AIO.
+            assert_eq!(fit(256 * K, 32, 2048 * K), (256 * K, 8));
+            assert_eq!(fit(512 * K, 8, 256 * K), (256 * K, 1));
+            assert_eq!(fit(64 * K, 64, 8192 * K), (64 * K, QD_MAX));
+            assert_eq!(fit(512 * K, 0, 256 * K), (256 * K, 0));
+        }
+    }
+}
+
 /// Debug build (`make AMPR_MEM_REPORT=1`): a low-priority thread serves the
 /// internal pool usage and rt/stats.rs counters as plain text over TCP
 /// (`GET /metrics` on port METRICS_PORT, one client at a time). Counters are
 /// totals since load; `*_max` values reset on each scrape. `GET /set?k=v&...`
-/// changes rt/tune.rs knobs (no arguments: list them). No release impact.
+/// changes rt/tune.rs knobs (no arguments: list them). `GET /bench` reads
+/// pack volume 0; `GET /bench?path=/app0/<file>[&backing=/abs/file]` reads a
+/// loose file through /app0 and, with `backing=`, the same file at that
+/// path. No release impact.
 #[cfg(feature = "mem_report")]
 mod mem_report {
     use super::super::pack::{
         bench_volume_path, real_aio_delete_single, real_aio_submit_single, real_aio_wait_single,
-        SceKernelAioRWRequest, SceKernelAioResult, SceKernelAioSubmitId,
+        scePthreadJoin, SceKernelAioRWRequest, SceKernelAioResult, SceKernelAioSubmitId,
     };
     use super::super::runtime_memory::{ampr_internal_amm_pool_alloc, ampr_internal_amm_pool_free};
     use super::super::runtime_memory::{pool_tags, pool_usage, TagTotals};
     use super::super::stats::{read, NAMES};
     use super::super::sys::{
-        errno, monotonic_ns, off_t, real_physical_close, real_physical_pread, real_posix_open,
-        sceKernelUsleep, sce_errno, SceKernelUseconds, SCE_KERNEL_ERROR_ETIMEDOUT,
+        errno, monotonic_ns, off_t, real_physical_close, real_physical_fstat, real_physical_pread,
+        real_posix_open, sceKernelUsleep, sce_errno, SceKernelUseconds, SCE_KERNEL_ERROR_ETIMEDOUT,
     };
     use super::super::tune;
+    use super::bench_args;
     use core::ffi::{c_char, c_int, c_void};
 
     pub(super) const METRICS_PORT: u16 = 9090;
@@ -217,11 +374,26 @@ mod mem_report {
     }
     const _: () = assert!(size_of::<SockAddrIn>() == 16);
 
-    /// Fixed-capacity text buffer; output past the end is dropped.
+    /// Fixed-capacity text buffer; output past the end is dropped. 16 KiB:
+    /// the body reached ~3.4 KiB of the old 4 KiB with the fs log, before the
+    /// reactor stats of 2026-11-01, and the tune_/pool_ lines print last.
     struct Text {
-        buf: [u8; 4096],
+        buf: [u8; 16384],
         len: usize,
     }
+
+    /// Response and body buffers of the single server thread, in .bss rather
+    /// than on its default-size stack (debug build only).
+    static mut BUFS: (Text, Text) = (
+        Text {
+            buf: [0; 16384],
+            len: 0,
+        },
+        Text {
+            buf: [0; 16384],
+            len: 0,
+        },
+    );
 
     impl Text {
         fn s(&mut self, s: &[u8]) -> &mut Self {
@@ -258,7 +430,13 @@ mod mem_report {
 
     const KIB: usize = 1024;
     const MIB: usize = 1024 * KIB;
-    const QD_MAX: usize = 8;
+    /// Deepest AIO queue the bench runs (aio_256k_qd32); bench_args::fit
+    /// lowers it when the buffer is short.
+    const QD_MAX: usize = bench_args::QD_MAX;
+    /// sceKernelAioSubmitReadCommands priority. The bench passed 0 before
+    /// and every submit failed with 0x80020016 (EINVAL) on the 2026-11-01
+    /// console run; the reactor submits with 1..=3 (reactor/mod.rs).
+    const AIO_PRIORITY: c_int = 2;
     /// (bytes, requests, elapsed ns) or an SCE error code.
     type BenchResult = Result<(u64, u64, u64), c_int>;
 
@@ -287,7 +465,9 @@ mod mem_report {
         Ok((done, reqs, monotonic_ns().saturating_sub(t0)))
     }
 
-    /// Kernel AIO with up to `qd` single-request submits in flight (FIFO).
+    /// Kernel AIO with up to `qd` single-request submits in flight (FIFO);
+    /// slot `s` reads into `buf + s * req`, so `buf` holds `qd * req` bytes
+    /// (bench_args::fit).
     unsafe fn bench_aio(
         fd: c_int,
         buf: *mut u8,
@@ -322,7 +502,7 @@ mod mem_report {
                     result: &raw mut res[s],
                     fd,
                 };
-                let rc = unsafe { submit(&raw mut rq[s], 1, 0, &raw mut ids[s]) };
+                let rc = unsafe { submit(&raw mut rq[s], 1, AIO_PRIORITY, &raw mut ids[s]) };
                 if rc != 0 {
                     err = rc;
                     break;
@@ -342,7 +522,13 @@ mod mem_report {
                     break rc;
                 }
             };
-            let _ = unsafe { delete(ids[head], &mut state) };
+            // A request the kernel will not delete may still write `res` and
+            // the buffer: never leave this frame while it is live.
+            // ponytail: parks the metrics thread forever on a stuck request.
+            while unsafe { delete(ids[head], &mut state) } != 0 {
+                let mut usec: SceKernelUseconds = 100_000;
+                let _ = unsafe { wait(ids[head], &mut state, &mut usec) };
+            }
             let rv = res[head].return_value;
             if err == 0 && rc != 0 {
                 err = rc;
@@ -361,13 +547,313 @@ mod mem_report {
         }
     }
 
-    /// GET /bench: raw read speed of pack volume 0 through the unhooked kernel
+    // ---- /bench?path=: /app0 against its backing path ----
+
+    /// `b` up to its first NUL.
+    fn cstr(b: &[u8]) -> &[u8] {
+        &b[..b.iter().position(|&c| c == 0).unwrap_or(b.len())]
+    }
+
+    /// Opens `path` (NUL-terminated) read-only; (fd, st_size) or the error
+    /// is printed. st_size sits at offset 72 of the PS5 stat (rt/index.rs).
+    unsafe fn open_sized(label: &[u8], path: &[u8], out: &mut Text) -> Option<(c_int, u64)> {
+        let fd = unsafe { real_posix_open(path.as_ptr().cast(), 0, 0) };
+        let mut st = [0u64; 32];
+        let rc = if fd < 0 {
+            sce_errno(errno())
+        } else if unsafe { real_physical_fstat(fd, st.as_mut_ptr().cast()) } != 0 {
+            let rc = sce_errno(errno());
+            let _ = unsafe { real_physical_close(fd) };
+            rc
+        } else {
+            return Some((fd, st[9]));
+        };
+        out.s(b"bench ")
+            .s(label)
+            .s(b" open error rc=")
+            .x(rc as u32)
+            .s(b" path=")
+            .s(cstr(path))
+            .s(b"\n");
+        None
+    }
+
+    /// Bench buffer from the internal pool: 8 MiB, halved down to `min`.
+    unsafe fn alloc_buf(min: usize) -> Option<(*mut c_void, usize)> {
+        let (mut cap, mut got) = (8 * MIB, 0usize);
+        while cap >= min {
+            let buf = unsafe {
+                ampr_internal_amm_pool_alloc(cap, &mut got, c"bench".as_ptr(), false, 16 * KIB)
+            };
+            if !buf.is_null() {
+                return Some((buf, cap));
+            }
+            cap /= 2;
+        }
+        None
+    }
+
+    /// `bench <label> <test> [depth=N] MB/s=.. us_per_req=.. bytes=..
+    /// off_mib=..`. depth is the AIO queue depth or thread count used
+    /// (bench_args::fit may lower it); us_per_req is wall time over requests,
+    /// so a request's latency is about depth times it.
+    fn result_line(
+        out: &mut Text,
+        label: &[u8],
+        test: &str,
+        off: u64,
+        depth: usize,
+        r: BenchResult,
+    ) {
+        out.s(b"bench ").s(label).s(b" ").s(test.as_bytes());
+        if depth > 0 {
+            out.s(b" depth=").u(depth as u64);
+        }
+        match r {
+            Ok((b, n, ns)) => {
+                let ns = ns.max(1);
+                out.s(b" MB/s=")
+                    .u(b.saturating_mul(1000) / ns)
+                    .s(b" us_per_req=")
+                    .u(ns / n.max(1) / 1000)
+                    .s(b" bytes=")
+                    .u(b)
+            }
+            Err(0) => out.s(b" error aio unavailable"),
+            Err(rc) => out.s(b" error rc=").x(rc as u32),
+        };
+        out.s(b" off_mib=").u(off >> 20).s(b"\n");
+    }
+
+    /// How a loose-file test reads its region.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Kind {
+        /// One thread, sequential pread.
+        Pread,
+        /// Kernel AIO, `depth` requests in flight.
+        Aio,
+        /// `depth` threads, each sequential pread on its own slice: the
+        /// shape of the reactor's pread pool (reactor/pread_pool.rs).
+        Threads,
+    }
+
+    /// Loose-file tests: (name, request bytes, depth, kind). In game, 256
+    /// KiB pread parts took 4.15 ms against 1.70 ms for 64 KiB parts with
+    /// up to ~60 in flight (a game, 2026-11-01); the 256 KiB concurrent
+    /// tests show whether /app0 or its backing folder causes that.
+    const LOOSE_TESTS: [(&str, usize, usize, Kind); bench_args::TESTS as usize] = [
+        ("pread_64k", 64 * KIB, 0, Kind::Pread),
+        ("pread_512k", 512 * KIB, 0, Kind::Pread),
+        ("aio_64k_qd8", 64 * KIB, 8, Kind::Aio),
+        ("aio_256k_qd8", 256 * KIB, 8, Kind::Aio),
+        ("aio_256k_qd32", 256 * KIB, 32, Kind::Aio),
+        (
+            "pread_256k_t8",
+            256 * KIB,
+            bench_args::THREADS,
+            Kind::Threads,
+        ),
+    ];
+
+    /// One thread of bench_pread_threads.
+    struct PreadJob {
+        fd: c_int,
+        buf: *mut u8,
+        req: usize,
+        off: u64,
+        bytes: u64,
+        r: BenchResult,
+    }
+
+    unsafe extern "C" fn pread_job(arg: *mut c_void) -> *mut c_void {
+        let j = unsafe { &mut *arg.cast::<PreadJob>() };
+        j.r = unsafe { bench_pread(j.fd, j.buf, j.req, j.off, j.bytes) };
+        core::ptr::null_mut()
+    }
+
+    /// `threads` threads, thread `t` reading `bytes / threads` from
+    /// `off + t * bytes / threads` into `buf + t * req`. Elapsed time is wall
+    /// time from the first create to the last join; the first error wins.
+    unsafe fn bench_pread_threads(
+        fd: c_int,
+        buf: *mut u8,
+        req: usize,
+        off: u64,
+        bytes: u64,
+        threads: usize,
+    ) -> BenchResult {
+        const T: usize = bench_args::THREADS;
+        let n = threads.clamp(1, T);
+        let part = (bytes / n as u64) & !(req as u64 - 1);
+        let mut jobs: [PreadJob; T] = core::array::from_fn(|t| PreadJob {
+            fd,
+            buf: unsafe { buf.add(t * req) },
+            req,
+            off: off + t as u64 * part,
+            bytes: part,
+            r: Err(0),
+        });
+        let mut ids = [core::ptr::null_mut(); T];
+        let t0 = monotonic_ns();
+        let mut started = 0;
+        let mut err = 0;
+        while started < n {
+            let rc = unsafe {
+                scePthreadCreate(
+                    &mut ids[started],
+                    core::ptr::null(),
+                    pread_job,
+                    (&raw mut jobs[started]).cast(),
+                    c"ampr_bench_pread".as_ptr(),
+                )
+            };
+            if rc != 0 {
+                err = rc;
+                break;
+            }
+            started += 1;
+        }
+        for &id in &ids[..started] {
+            // A worker that failed to join may still use `jobs`, the buffer
+            // and the fd. ponytail: park the metrics thread instead of freeing.
+            while unsafe { scePthreadJoin(id, core::ptr::null_mut()) } != 0 {
+                unsafe { sceKernelUsleep(1_000_000) };
+            }
+        }
+        let ns = monotonic_ns().saturating_sub(t0);
+        if err != 0 {
+            return Err(err);
+        }
+        let (mut b, mut r) = (0, 0);
+        for j in &jobs[..n] {
+            let (jb, jr, _) = j.r?;
+            b += jb;
+            r += jr;
+        }
+        Ok((b, r, ns))
+    }
+
+    /// Opens the backing file and keeps it only if its size matches /app0's.
+    unsafe fn open_backing(path: &[u8], how: &[u8], size: u64, out: &mut Text) -> c_int {
+        let Some((fd, got)) = (unsafe { open_sized(b"backing", path, out) }) else {
+            return -1;
+        };
+        out.s(b"bench backing path=")
+            .s(cstr(path))
+            .s(b" source=")
+            .s(how)
+            .s(b"\n");
+        if got == size {
+            return fd;
+        }
+        out.s(b"bench backing file_size=")
+            .u(got)
+            .s(b" differs from /app0; benching /app0 only\n");
+        let _ = unsafe { real_physical_close(fd) };
+        -1
+    }
+
+    /// Backing fd from `backing=` (an absolute path, percent-decoded);
+    /// -1 when it is absent or does not open with /app0's size, and /app0
+    /// is then benched alone. The backing path is not detected: statfs and
+    /// fstatfs are not exported by libkernel on the 2026-11-01 console.
+    unsafe fn find_backing(q: &[u8], size: u64, out: &mut Text) -> c_int {
+        let mut path = [0u8; 1024];
+        let Some(raw) = bench_args::param(q, b"backing") else {
+            out.s(b"bench: no backing= given; benching /app0 only\n");
+            return -1;
+        };
+        if bench_args::url_decode(raw, &mut path).is_none() || path[0] != b'/' {
+            out.s(b"bench: backing= must be an absolute path; benching /app0 only\n");
+            return -1;
+        }
+        unsafe { open_backing(&path, b"param", size, out) }
+    }
+
+    /// GET /bench?path=/app0/<file>[&backing=/abs/file]: the same file read
+    /// through /app0 (a ShadowMount nullfs mount) and through its backing
+    /// path. nullfs shares the lower vnode's page cache, so each test and
+    /// path reads its own 32 MiB region with 32 MiB (GAP) or more of unread file
+    /// between regions, and the path that runs first alternates per test.
+    unsafe fn bench_loose(q: &[u8], raw_path: &[u8], out: &mut Text) {
+        let mut app0 = [0u8; 1024];
+        let n = match bench_args::url_decode(raw_path, &mut app0) {
+            Some(n) if bench_args::is_app0_file(&app0[..n]) => n,
+            _ => {
+                out.s(b"bench: path= must be /app0/<file> (%2F escapes allowed)\n");
+                return;
+            }
+        };
+        out.s(b"bench app0 path=").s(&app0[..n]).s(b"\n");
+        let Some((fd_a, size)) = (unsafe { open_sized(b"app0", &app0, out) }) else {
+            return;
+        };
+        let fd_b = unsafe { find_backing(q, size, out) };
+        out.s(b"bench file_size=").u(size).s(b"\n");
+        let stride = bench_args::region_stride(size);
+        let buf = unsafe { alloc_buf(512 * KIB) };
+        match (stride, buf) {
+            (None, _) => {
+                out.s(b"bench: file_size under 736 MiB; pick a larger file\n");
+            }
+            (_, None) => {
+                out.s(b"bench: buffer alloc failed\n");
+            }
+            (Some(stride), Some((buf, cap))) => {
+                out.s(b"note: results are invalid if the file is in the OS cache; use a file not read since boot (a repeat run reads the same regions)\n");
+                for (i, &(name, req, depth, kind)) in LOOSE_TESTS.iter().enumerate() {
+                    for k in 0..2 {
+                        let (label, fd) = if bench_args::app0_first(i) == (k == 0) {
+                            (b"app0" as &[u8], fd_a)
+                        } else {
+                            (b"backing" as &[u8], fd_b)
+                        };
+                        if fd < 0 {
+                            continue;
+                        }
+                        let off = (2 * i + k) as u64 * stride;
+                        let len = bench_args::REGION;
+                        let (req, depth) = bench_args::fit(req, depth, cap);
+                        let b = buf.cast();
+                        let r = match kind {
+                            Kind::Pread => unsafe { bench_pread(fd, b, req, off, len) },
+                            Kind::Aio => unsafe { bench_aio(fd, b, req, off, len, depth) },
+                            Kind::Threads => unsafe {
+                                bench_pread_threads(fd, b, req, off, len, depth)
+                            },
+                        };
+                        result_line(out, label, name, off, depth, r);
+                    }
+                }
+            }
+        }
+        if let Some((buf, _)) = buf {
+            let _ = unsafe { ampr_internal_amm_pool_free(buf, c"bench".as_ptr()) };
+        }
+        for fd in [fd_a, fd_b] {
+            if fd >= 0 {
+                let _ = unsafe { real_physical_close(fd) };
+            }
+        }
+    }
+
+    /// GET /bench: `path=` benches a loose /app0 file (bench_loose), else
+    /// pack volume 0 (bench_volume).
+    unsafe fn bench(req: &[u8], out: &mut Text) {
+        let q = bench_args::query(bench_args::target(req));
+        match bench_args::param(q, b"path") {
+            Some(raw) => unsafe { bench_loose(q, raw, out) },
+            None => unsafe { bench_volume(out) },
+        }
+    }
+
+    /// Raw read speed of pack volume 0 through the unhooked kernel
     /// calls. Each test reads its own 64 KiB aligned region so earlier tests do
     /// not warm the OS cache for later ones. Blocks only the metrics thread.
-    unsafe fn bench(out: &mut Text) {
+    unsafe fn bench_volume(out: &mut Text) {
         let mut path = [0u8; 1024];
         let Some((len, size)) = (unsafe { bench_volume_path(&mut path) }) else {
-            out.s(b"bench: manifest not ready\n");
+            out.s(b"bench: manifest not ready (loose game: /bench?path=/app0/<file>)\n");
             return;
         };
         if len >= path.len() {
@@ -380,20 +866,10 @@ mod mem_report {
             .s(b" file_size=")
             .u(size)
             .s(b"\n");
-        let (mut cap, mut got, mut buf) = (8 * MIB, 0usize, core::ptr::null_mut::<c_void>());
-        while cap >= 256 * KIB {
-            buf = unsafe {
-                ampr_internal_amm_pool_alloc(cap, &mut got, c"bench".as_ptr(), false, 16 * KIB)
-            };
-            if !buf.is_null() {
-                break;
-            }
-            cap /= 2;
-        }
-        if buf.is_null() {
+        let Some((buf, cap)) = (unsafe { alloc_buf(256 * KIB) }) else {
             out.s(b"bench: buffer alloc failed\n");
             return;
-        }
+        };
         let fd = unsafe { real_posix_open(path.as_ptr().cast(), 0, 0) };
         if fd < 0 {
             out.s(b"bench open error rc=")
@@ -414,7 +890,8 @@ mod mem_report {
                 stride.min(32 * MIB as u64)
             };
             for (i, &(name, req, qd)) in TESTS.iter().enumerate() {
-                let (off, req) = (i as u64 * stride, req.min(cap / qd.max(1)));
+                let off = i as u64 * stride;
+                let (req, qd) = bench_args::fit(req, qd, cap);
                 let r = if qd == 0 {
                     unsafe { bench_pread(fd, buf.cast(), req, off, bytes) }
                 } else {
@@ -590,20 +1067,16 @@ mod mem_report {
             // "GET /bench" runs the read benchmark; anything else gets the metrics.
             let mut req = [0u8; 512];
             let n = unsafe { recv(client, req.as_mut_ptr().cast(), req.len(), 0) };
-            let mut text = Text {
-                buf: [0; 4096],
-                len: 0,
-            };
-            let mut metrics = Text {
-                buf: [0; 4096],
-                len: 0,
-            };
+            // Only this thread touches BUFS.
+            let (text, metrics) = unsafe { &mut *core::ptr::addr_of_mut!(BUFS) };
+            text.len = 0;
+            metrics.len = 0;
             if n > 0 && req[..n as usize].starts_with(b"GET /bench") {
-                unsafe { bench(&mut metrics) };
+                unsafe { bench(&req[..n as usize], metrics) };
             } else if n > 0 && req[..n as usize].starts_with(b"GET /set") {
-                unsafe { set(&req[..n as usize], &mut metrics) };
+                unsafe { set(&req[..n as usize], metrics) };
             } else {
-                body(start_ns, &mut metrics);
+                body(start_ns, metrics);
             }
             text.s(b"HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\nContent-Length: ")
                 .u(metrics.len as u64)

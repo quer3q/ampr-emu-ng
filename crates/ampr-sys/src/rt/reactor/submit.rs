@@ -310,6 +310,7 @@ impl AprAioReactor {
                     self.syntheticLowerSlotAvailableCv.wait(&mut lk);
                 }
             }
+            js.stat_accepted();
             if !self.add_active_job_locked(job) {
                 self.release_unpublished_synthetic_wait_slot_locked(js);
                 drop(lk);

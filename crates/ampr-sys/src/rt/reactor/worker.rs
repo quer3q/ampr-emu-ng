@@ -194,6 +194,7 @@ impl AprAioReactor {
         if !Self::job_failed(jr) && !Self::job_processing_complete(jr) {
             return;
         }
+        let succ;
         {
             let _lk = lock_detached(&self.m);
             if jr.prioIndex >= kPriorityCount
@@ -201,11 +202,23 @@ impl AprAioReactor {
             {
                 return;
             }
+            // mem_report only (job_order_wait_ns): release keeps no extra load.
+            succ = if crate::rt::tune::ON {
+                jr.priorityNext.load(Ordering::Acquire)
+            } else {
+                null_mut()
+            };
             self.erase_active_job_locked(j);
+        }
+        // Reactor-owned like `j`; only the reactor releases lane jobs.
+        if crate::rt::tune::ON && !succ.is_null() {
+            Self::note_successor_order_wait(unsafe { &*succ });
         }
         jr.nativeCompletionAddress = null_mut();
         jr.nativeCommandBuffer = null_mut();
         self.publish_job_result(jr);
+        jr.stat_notified();
+        crate::rt::stats::add(crate::rt::stats::Stat::JobCount, 1);
         if jr.syntheticWaitPublished {
             self.publish_synthetic_wait_completion(jr);
         } else {

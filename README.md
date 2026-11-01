@@ -77,6 +77,8 @@ time:
   AMPR emulator this project ports.
 - [ps5-payload-sdk](https://github.com/ps5-payload-dev/sdk): the PS5 toolchain
   and libraries the PRX is built with.
+- [AnyPS5](https://github.com/boykopovar/AnyPS5): its libSceAmpr implementation
+  and notes on the libc exports retail libSceAmpr carries.
 
 ## License
 

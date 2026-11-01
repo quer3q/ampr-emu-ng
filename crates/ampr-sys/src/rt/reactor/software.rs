@@ -342,6 +342,7 @@ impl AprAioReactor {
         if !issueBudget.is_null()
             && unsafe { (*issueBudget).requestsLeft == 0 || (*issueBudget).bytesLeft == 0 }
         {
+            unsafe { (*issueBudget).held = true };
             return false;
         }
         let effectiveRead = *read;
@@ -396,6 +397,7 @@ impl AprAioReactor {
         let mut singleRequestBudget = ReadIssueBudget {
             requestsLeft: 1,
             bytesLeft: kSoftwareReadChunkMax,
+            held: false,
         };
         let budget: &mut ReadIssueBudget = if issueBudget.is_null() {
             &mut singleRequestBudget

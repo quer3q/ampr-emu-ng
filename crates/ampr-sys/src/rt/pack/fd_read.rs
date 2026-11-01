@@ -150,8 +150,64 @@ pub(crate) fn plan_segment_reads(
     count
 }
 
-/// EAGAIN retries of a full virtual AIO table, 100 us apart (~0.2 s).
-const SUBMIT_RETRIES: u32 = 2000;
+/// Gap between submit retries while the virtual AIO table is full.
+const SUBMIT_RETRY_USECS: u32 = 100;
+/// A full virtual AIO table (EAGAIN) is retried while pack jobs keep
+/// completing (`aio_completion_epoch` moves); the read fails with EAGAIN
+/// only after this long with no completion at all. The old fixed budget
+/// (2000 retries, ~0.2 s) failed a blocking read whose slots were only held
+/// by slow reads: one 1 MiB read from a USB disk can take longer than that,
+/// and a sleeping USB HDD takes seconds to spin up.
+const SUBMIT_IDLE_LIMIT_USECS: u64 = 10_000_000;
+/// Absolute cap from the first EAGAIN, even while completions keep moving:
+/// other readers can keep the table full forever, and a blocking read must
+/// still fail (EAGAIN, as before) instead of hanging the caller. 30 s covers
+/// the multi-second USB HDD spin-up above with room to spare.
+const SUBMIT_TOTAL_LIMIT_USECS: u64 = 30_000_000;
+
+/// Retry policy of `read_on_workers` for a full virtual AIO table.
+pub(crate) struct SubmitBackoff {
+    epoch: u64,
+    first: u64,
+    idle_since: u64,
+    /// Idle retries; bounds the wait when the clock is unavailable (now = 0).
+    idle_retries: u64,
+    /// All retries; bounds the total wait when the clock is unavailable.
+    total_retries: u64,
+}
+
+impl SubmitBackoff {
+    pub(crate) fn new(now: u64, epoch: u64) -> Self {
+        Self {
+            epoch,
+            first: now,
+            idle_since: now,
+            idle_retries: 0,
+            total_retries: 0,
+        }
+    }
+
+    /// True to retry the submit at `now` with completion epoch `epoch`.
+    pub(crate) fn retry(&mut self, now: u64, epoch: u64) -> bool {
+        if epoch != self.epoch {
+            self.epoch = epoch;
+            self.idle_since = now;
+            self.idle_retries = 0;
+        }
+        self.idle_retries += 1;
+        self.total_retries += 1;
+        elapsed_usecs(self.idle_since, now) < SUBMIT_IDLE_LIMIT_USECS
+            && self.idle_retries <= SUBMIT_IDLE_LIMIT_USECS / SUBMIT_RETRY_USECS as u64
+            && elapsed_usecs(self.first, now) < SUBMIT_TOTAL_LIMIT_USECS
+            && self.total_retries <= SUBMIT_TOTAL_LIMIT_USECS / SUBMIT_RETRY_USECS as u64
+    }
+}
+
+unsafe fn completion_epoch() -> u64 {
+    let state = unsafe { pack_state() };
+    let _lock = PACK_M.lock();
+    unsafe { (*state).aio_completion_epoch }
+}
 
 /// Reads `[offset, offset + length)` (already clamped to EOF, nonzero) of
 /// virtual fd `fd` into `vector` on the pack workers: batches of one AIO
@@ -189,7 +245,7 @@ unsafe fn read_on_workers(
             };
         }
         let mut ids = [0 as SceKernelAioSubmitId; N];
-        let mut retries = 0;
+        let mut backoff: Option<SubmitBackoff> = None;
         let rc = loop {
             let rc = unsafe {
                 sceKernelAioSubmitReadCommandsMultiple(
@@ -199,11 +255,17 @@ unsafe fn read_on_workers(
                     ids.as_mut_ptr(),
                 )
             };
-            if rc != SCE_KERNEL_ERROR_EAGAIN || retries >= SUBMIT_RETRIES {
+            if rc != SCE_KERNEL_ERROR_EAGAIN {
                 break rc;
             }
-            retries += 1;
-            unsafe { sceKernelUsleep(100) };
+            let (now, epoch) = (pack_monotonic_usecs(), unsafe { completion_epoch() });
+            let retry = backoff
+                .get_or_insert_with(|| SubmitBackoff::new(now, epoch))
+                .retry(now, epoch);
+            if !retry {
+                break rc;
+            }
+            unsafe { sceKernelUsleep(SUBMIT_RETRY_USECS) };
         };
         if rc != 0 {
             return if done != 0 {
@@ -1111,6 +1173,40 @@ mod tests {
         assert_eq!(clamp_read(0, 10, 0), Ok(0));
         assert_eq!(clamp_read(-1, 10, 100), Err(SCE_KERNEL_ERROR_EINVAL));
         assert_eq!(clamp_read(0, usize::MAX, 7), Ok(7));
+    }
+
+    #[test]
+    fn submit_backoff_waits_out_slow_reads_and_stops_when_idle() {
+        // Slow media: a completion every 150 ms keeps the read retrying far
+        // past the old fixed ~0.2 s budget.
+        let mut b = SubmitBackoff::new(1_000, 7);
+        for step in 1..=100u64 {
+            assert!(b.retry(1_000 + step * 150_000, 7 + step));
+        }
+        // No completion at all: retry until the idle limit, then give up.
+        let start = 1_000 + 100 * 150_000;
+        assert!(b.retry(start + SUBMIT_IDLE_LIMIT_USECS - 1, 107));
+        assert!(!b.retry(start + SUBMIT_IDLE_LIMIT_USECS, 107));
+        // Completions that never stop still end at the absolute cap.
+        let mut busy = SubmitBackoff::new(1_000, 0);
+        let steps = SUBMIT_TOTAL_LIMIT_USECS / 150_000;
+        assert!((1..steps).all(|step| busy.retry(1_000 + step * 150_000, step)));
+        assert!(!busy.retry(1_000 + SUBMIT_TOTAL_LIMIT_USECS, steps));
+        // Same with the clock unavailable: the total retry count ends it.
+        let mut busy0 = SubmitBackoff::new(0, 0);
+        let total = SUBMIT_TOTAL_LIMIT_USECS / SUBMIT_RETRY_USECS as u64;
+        assert!((1..=total).all(|n| busy0.retry(0, n)));
+        assert!(!busy0.retry(0, total + 1));
+        let mut idle = SubmitBackoff::new(5, 0);
+        assert!(
+            idle.retry(5 + 300_000, 0),
+            "0.3 s of slow I/O is not a failure"
+        );
+        // Clock unavailable (now stays 0): the retry count still ends the wait.
+        let mut stuck = SubmitBackoff::new(0, 0);
+        let limit = SUBMIT_IDLE_LIMIT_USECS / SUBMIT_RETRY_USECS as u64;
+        assert!((0..limit).all(|_| stuck.retry(0, 0)));
+        assert!(!stuck.retry(0, 0));
     }
 
     #[test]
