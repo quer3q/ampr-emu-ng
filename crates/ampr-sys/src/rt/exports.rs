@@ -1220,11 +1220,13 @@ pub unsafe extern "C" fn module_start(_args: usize, _argp: *const c_void) -> c_i
     unsafe { super::pack::select_pack_format() };
     unsafe { notify_loaded() };
     let rc = unsafe { hook::amprInstallLibkernelHooks() };
-    // zstd: most game files exist only inside ampr_zstd-NNN.pak, and the game
-    // opens some (e.g. its UE project descriptor) with plain open() before
-    // any AMPR call. Hooks never load the index, so load AMPRIDX3, mount
-    // ampr_zstd.index and build the id projection here, before the game runs.
-    if super::pack::zstd_mode() && rc == 0 && unsafe { super::index::ensure_ready(false) } {
+    // Most game files exist only inside the pack, and some titles open them with
+    // plain open() before any AMPR call (an LZ4 title's /app0/d/<lane>
+    // containers, for one). Hooks never load the index, so publish AMPRIDX3 and
+    // mount the manifest here, before the game runs. zstd also builds its id
+    // projection in the mount.
+    let packed = super::pack::zstd_mode() || unsafe { super::index::lz4_manifest_present() };
+    if rc == 0 && packed && unsafe { super::index::ensure_ready(false) } {
         unsafe { super::pack::ampr_pack_ensure_manifest_ready_safe() };
     }
     // Only after hooks install: a failed module_start may be unloaded.

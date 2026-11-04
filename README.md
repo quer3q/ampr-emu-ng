@@ -37,6 +37,11 @@ ShadowMountPlus. Disable fakelib update in settings. At launch the console
 shows `ampr-emu-ng: vx.x.x (zstd) running`; the mode is `zstd` (zstd packs),
 `lz4` (LZ4 packs) or `plain` (no packs, loose files only).
 
+Packed files answer plain read-only `open()`/`pread()`/AIO as virtual
+descriptors, since a packed file has no physical copy. Some titles open pack
+members (their `/app0/d/<lane>/<container>` set) before any AMPR call; the
+index and manifest are mounted at module load for that reason.
+
 ### Make packs
 
 zstd and LZ4 packs are built by

@@ -595,3 +595,104 @@ pub unsafe fn sceKernelAioPollRequests(
         0
     }
 }
+
+// ---- process-visible AIO entry points -----------------------------------------
+
+pub unsafe extern "C" fn sceKernelAioSubmitReadCommandsMultiple_emul(
+    requests: *mut SceKernelAioRWRequest,
+    count: c_int,
+    priority: c_int,
+    ids: *mut SceKernelAioSubmitId,
+) -> c_int {
+    unsafe { sceKernelAioSubmitReadCommandsMultiple(requests, count, priority, ids) }
+}
+
+/// Single-id submit: a virtual batch becomes one group id the caller can
+/// poll, wait, cancel and delete as a unit (each child stays in the tables).
+pub unsafe fn sceKernelAioSubmitReadCommands(
+    requests: *mut SceKernelAioRWRequest,
+    count: c_int,
+    priority: c_int,
+    id: *mut SceKernelAioSubmitId,
+) -> c_int {
+    unsafe {
+        if requests.is_null()
+            || id.is_null()
+            || count <= 0
+            || count as usize > SCE_KERNEL_AIO_REQUEST_NUM_MAX
+        {
+            return SCE_KERNEL_ERROR_EINVAL;
+        }
+        if !has_virtual_fd(requests, count) {
+            return match real_aio_submit_single() {
+                Some(f) => f(requests, count, priority, id),
+                None => SCE_KERNEL_ERROR_EIO,
+            };
+        }
+        const N: usize = SCE_KERNEL_AIO_REQUEST_NUM_MAX;
+        let state = pack_state();
+        let submission = PackSubmission::new(state);
+        if !submission.admitted() {
+            return SCE_KERNEL_ERROR_EBUSY;
+        }
+        let (group_index, group_generation) = {
+            let _lock = PACK_M.lock();
+            let index = allocate_virtual_aio_group_locked(state);
+            if index == INVALID_INDEX {
+                return SCE_KERNEL_ERROR_EAGAIN;
+            }
+            (index, (*state).virtual_aio_groups[index as usize].generation)
+        };
+        let mut children = [0 as SceKernelAioSubmitId; N];
+        let rc =
+            sceKernelAioSubmitReadCommandsMultiple(requests, count, priority, children.as_mut_ptr());
+        if rc != 0 {
+            let _lock = PACK_M.lock();
+            free_virtual_aio_group_locked(state, group_index);
+            return rc;
+        }
+        let published = {
+            let _lock = PACK_M.lock();
+            let group = &mut (*state).virtual_aio_groups[group_index as usize];
+            if !group.active || group.generation != group_generation {
+                false
+            } else {
+                let n = count as usize;
+                group.children[..n].copy_from_slice(&children[..n]);
+                group.child_count = n as u16;
+                *id = encode_virtual_aio_group(group_index, group_generation);
+                true
+            }
+        };
+        if !published {
+            let mut results = [0 as c_int; N];
+            let _ = sceKernelAioDeleteRequests(children.as_mut_ptr(), count, results.as_mut_ptr());
+            return SCE_KERNEL_ERROR_EIO;
+        }
+        0
+    }
+}
+
+pub unsafe extern "C" fn sceKernelAioSubmitReadCommands_emul(
+    requests: *mut SceKernelAioRWRequest,
+    count: c_int,
+    priority: c_int,
+    id: *mut SceKernelAioSubmitId,
+) -> c_int {
+    unsafe { sceKernelAioSubmitReadCommands(requests, count, priority, id) }
+}
+
+pub unsafe extern "C" fn sceKernelAioPollRequest_emul(
+    id: SceKernelAioSubmitId,
+    state_out: *mut c_int,
+) -> c_int {
+    unsafe { sceKernelAioPollRequest(id, state_out) }
+}
+
+pub unsafe extern "C" fn sceKernelAioPollRequests_emul(
+    ids: *mut SceKernelAioSubmitId,
+    count: c_int,
+    states: *mut c_int,
+) -> c_int {
+    unsafe { sceKernelAioPollRequests(ids, count, states) }
+}

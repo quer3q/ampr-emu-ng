@@ -1919,11 +1919,12 @@ unsafe fn open_resolved(
                 set_errno(ENOTDIR);
                 return -1;
             }
-            // zstd: a packed file lives only in ampr_zstd-NNN.pak, so a packed
-            // hit opens a virtual fd; a loose one (unhandled) opens the
-            // physical file below.
+            // A packed file has no physical copy (it lives in an
+            // ampr_assets-*.pak volume or ampr_zstd-NNN.pak), so a packed hit
+            // opens a virtual fd; a loose one (unhandled) opens the physical
+            // file below.
             stats::add(stats::Stat::OpenHit, 1);
-            if zstd_mode() && unsafe { ampr_pack_manifest_is_resident_ready() } {
+            if unsafe { ampr_pack_manifest_is_resident_ready() } {
                 let rc = unsafe {
                     ampr_pack_try_open_indexed(l.file_id, &l.entry, flags, mode, &mut handled)
                 };

@@ -386,3 +386,305 @@ pub unsafe fn sceKernelAioDeleteRequest(id: SceKernelAioSubmitId, result_out: *m
         0
     }
 }
+
+// ---- single-id and process entry points ---------------------------------------
+
+pub unsafe fn sceKernelAioWaitRequest(
+    id: SceKernelAioSubmitId,
+    state_out: *mut c_int,
+    usec: *mut SceKernelUseconds,
+) -> c_int {
+    unsafe {
+        if state_out.is_null() {
+            return SCE_KERNEL_ERROR_EINVAL;
+        }
+        if !has_virtual_aio_tag(id)
+            && !decode_virtual_aio_group(id, null_mut(), null_mut())
+        {
+            return match real_aio_wait_single() {
+                Some(f) => f(id, state_out, usec),
+                None => SCE_KERNEL_ERROR_EIO,
+            };
+        }
+        let mut id = id;
+        sceKernelAioWaitRequests(&raw mut id, 1, state_out, SCE_KERNEL_AIO_WAIT_AND, usec)
+    }
+}
+
+/// Cancel states of a group's children, aggregated like the kernel's.
+fn cancel_aggregate(child_states: &[c_int]) -> c_int {
+    let mut aggregate = SCE_KERNEL_AIO_STATE_COMPLETED;
+    for &st in child_states {
+        if st < 0 {
+            return st;
+        }
+        let child = st & !SCE_KERNEL_AIO_STATE_NOTIFIED;
+        if child == SCE_KERNEL_AIO_STATE_ABORTED {
+            aggregate = SCE_KERNEL_AIO_STATE_ABORTED;
+        } else if child == SCE_KERNEL_AIO_STATE_PROCESSING
+            && aggregate != SCE_KERNEL_AIO_STATE_ABORTED
+        {
+            aggregate = SCE_KERNEL_AIO_STATE_PROCESSING;
+        } else if child == SCE_KERNEL_AIO_STATE_SUBMITTED
+            && aggregate == SCE_KERNEL_AIO_STATE_COMPLETED
+        {
+            aggregate = SCE_KERNEL_AIO_STATE_SUBMITTED;
+        }
+    }
+    aggregate
+}
+
+/// Cancel marks the job and reports its state; a queued job that never
+/// reached a pipeline is completed as aborted at once.
+pub unsafe fn sceKernelAioCancelRequests(
+    ids: *mut SceKernelAioSubmitId,
+    count: c_int,
+    states: *mut c_int,
+) -> c_int {
+    unsafe {
+        if ids.is_null()
+            || states.is_null()
+            || count <= 0
+            || count as usize > SCE_KERNEL_AIO_ID_NUM_MAX
+        {
+            return SCE_KERNEL_ERROR_EINVAL;
+        }
+        const N: usize = SCE_KERNEL_AIO_REQUEST_NUM_MAX;
+        let n = count as usize;
+        let mut has_synthetic = false;
+        let mut has_group = false;
+        for i in 0..n {
+            let id = *ids.add(i);
+            has_synthetic |= has_virtual_aio_tag(id);
+            if !has_group && decode_virtual_aio_group(id, null_mut(), null_mut()) {
+                has_group = true;
+            }
+        }
+        if has_group {
+            for i in 0..n {
+                let rc = sceKernelAioCancelRequest(*ids.add(i), states.add(i));
+                if rc != 0 {
+                    return rc;
+                }
+            }
+            return 0;
+        }
+        if !has_synthetic {
+            return match real_aio_cancel() {
+                Some(f) => f(ids, count, states),
+                None => SCE_KERNEL_ERROR_EIO,
+            };
+        }
+        let state = pack_state();
+        let mut completed_queued = false;
+        let mut real_ids = [0 as SceKernelAioSubmitId; N];
+        let mut real_states = [0 as c_int; N];
+        let mut real_positions = [0usize; N];
+        let mut real_count = 0usize;
+        {
+            let _lock = PACK_M.lock();
+            for i in 0..n {
+                let id = *ids.add(i);
+                if !has_virtual_aio_tag(id) {
+                    real_positions[real_count] = i;
+                    real_ids[real_count] = id;
+                    real_count += 1;
+                    continue;
+                }
+                let mut index = 0u32;
+                let aio = lookup_virtual_aio_locked(state, id, &mut index);
+                if aio.is_null() {
+                    *states.add(i) = SCE_KERNEL_ERROR_ESRCH;
+                    continue;
+                }
+                (*aio).cancel_requested.store(true, Ordering::Release);
+                match (*aio).phase {
+                    VirtualAioPhase::Reserved => {
+                        complete_virtual_job(
+                            state,
+                            index,
+                            SCE_KERNEL_ERROR_ECANCELED as i64,
+                            SCE_KERNEL_AIO_STATE_ABORTED,
+                        );
+                        *states.add(i) = SCE_KERNEL_AIO_STATE_ABORTED;
+                        completed_queued = true;
+                    }
+                    VirtualAioPhase::Queued => {
+                        if (*aio).pipeline_index != INVALID_INDEX
+                            || !queue_remove_locked(state, index)
+                        {
+                            *states.add(i) = SCE_KERNEL_AIO_STATE_PROCESSING;
+                        } else {
+                            complete_virtual_job(
+                                state,
+                                index,
+                                SCE_KERNEL_ERROR_ECANCELED as i64,
+                                SCE_KERNEL_AIO_STATE_ABORTED,
+                            );
+                            *states.add(i) = SCE_KERNEL_AIO_STATE_ABORTED;
+                            completed_queued = true;
+                        }
+                    }
+                    VirtualAioPhase::WaitingCache => {
+                        queue_cache_waiter_locked(state, index, pack_telemetry_usecs());
+                        *states.add(i) = SCE_KERNEL_AIO_STATE_PROCESSING;
+                        completed_queued = true;
+                    }
+                    VirtualAioPhase::WaitingFd => {
+                        queue_fd_waiter_locked(state, index, pack_telemetry_usecs());
+                        *states.add(i) = SCE_KERNEL_AIO_STATE_PROCESSING;
+                        completed_queued = true;
+                    }
+                    VirtualAioPhase::Running | VirtualAioPhase::IoQueued => {
+                        *states.add(i) = SCE_KERNEL_AIO_STATE_PROCESSING;
+                    }
+                    VirtualAioPhase::Done => *states.add(i) = (*aio).completion_state,
+                    VirtualAioPhase::Free => *states.add(i) = SCE_KERNEL_ERROR_ESRCH,
+                }
+            }
+        }
+        if completed_queued {
+            QUEUE_CV.notify_all();
+        }
+        if real_count != 0 {
+            let Some(f) = real_aio_cancel() else {
+                return SCE_KERNEL_ERROR_EIO;
+            };
+            let rc = f(
+                real_ids.as_mut_ptr(),
+                real_count as c_int,
+                real_states.as_mut_ptr(),
+            );
+            if rc != 0 {
+                return rc;
+            }
+            for i in 0..real_count {
+                *states.add(real_positions[i]) = real_states[i];
+            }
+        }
+        0
+    }
+}
+
+pub unsafe fn sceKernelAioCancelRequest(
+    id: SceKernelAioSubmitId,
+    state_out: *mut c_int,
+) -> c_int {
+    unsafe {
+        if state_out.is_null() {
+            return SCE_KERNEL_ERROR_EINVAL;
+        }
+        if decode_virtual_aio_group(id, null_mut(), null_mut()) {
+            const N: usize = SCE_KERNEL_AIO_REQUEST_NUM_MAX;
+            let mut children = [0 as SceKernelAioSubmitId; N];
+            let child_count = match copy_group_children(id, &mut children) {
+                Ok(Some((count, _))) => count,
+                Ok(None) => {
+                    *state_out = SCE_KERNEL_ERROR_ESRCH;
+                    return 0;
+                }
+                Err(rc) => return rc,
+            };
+            let mut child_states = [0 as c_int; N];
+            let rc = sceKernelAioCancelRequests(
+                children.as_mut_ptr(),
+                child_count as c_int,
+                child_states.as_mut_ptr(),
+            );
+            if rc != 0 {
+                return rc;
+            }
+            *state_out = cancel_aggregate(&child_states[..child_count]);
+            return 0;
+        }
+        if !has_virtual_aio_tag(id) {
+            return match real_aio_cancel_single() {
+                Some(f) => f(id, state_out),
+                None => SCE_KERNEL_ERROR_EIO,
+            };
+        }
+        let mut first = id;
+        sceKernelAioCancelRequests(&raw mut first, 1, state_out)
+    }
+}
+
+pub unsafe extern "C" fn sceKernelAioWaitRequest_emul(
+    id: SceKernelAioSubmitId,
+    state_out: *mut c_int,
+    usec: *mut SceKernelUseconds,
+) -> c_int {
+    unsafe { sceKernelAioWaitRequest(id, state_out, usec) }
+}
+
+pub unsafe extern "C" fn sceKernelAioWaitRequests_emul(
+    ids: *mut SceKernelAioSubmitId,
+    count: c_int,
+    states: *mut c_int,
+    mode: u32,
+    usec: *mut SceKernelUseconds,
+) -> c_int {
+    unsafe { sceKernelAioWaitRequests(ids, count, states, mode, usec) }
+}
+
+pub unsafe extern "C" fn sceKernelAioCancelRequest_emul(
+    id: SceKernelAioSubmitId,
+    state_out: *mut c_int,
+) -> c_int {
+    unsafe { sceKernelAioCancelRequest(id, state_out) }
+}
+
+pub unsafe extern "C" fn sceKernelAioCancelRequests_emul(
+    ids: *mut SceKernelAioSubmitId,
+    count: c_int,
+    states: *mut c_int,
+) -> c_int {
+    unsafe { sceKernelAioCancelRequests(ids, count, states) }
+}
+
+pub unsafe extern "C" fn sceKernelAioDeleteRequest_emul(
+    id: SceKernelAioSubmitId,
+    result_out: *mut c_int,
+) -> c_int {
+    unsafe { sceKernelAioDeleteRequest(id, result_out) }
+}
+
+pub unsafe extern "C" fn sceKernelAioDeleteRequests_emul(
+    ids: *mut SceKernelAioSubmitId,
+    count: c_int,
+    results: *mut c_int,
+) -> c_int {
+    unsafe { sceKernelAioDeleteRequests(ids, count, results) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cancel_aggregate_matches_job_order() {
+        // A pending child wins over completed ones, an aborted one wins over
+        // processing, and a child error wins over everything.
+        assert_eq!(cancel_aggregate(&[SCE_KERNEL_AIO_STATE_COMPLETED]), SCE_KERNEL_AIO_STATE_COMPLETED);
+        assert_eq!(
+            cancel_aggregate(&[SCE_KERNEL_AIO_STATE_COMPLETED, SCE_KERNEL_AIO_STATE_SUBMITTED]),
+            SCE_KERNEL_AIO_STATE_SUBMITTED
+        );
+        assert_eq!(
+            cancel_aggregate(&[SCE_KERNEL_AIO_STATE_SUBMITTED, SCE_KERNEL_AIO_STATE_PROCESSING]),
+            SCE_KERNEL_AIO_STATE_PROCESSING
+        );
+        assert_eq!(
+            cancel_aggregate(&[SCE_KERNEL_AIO_STATE_PROCESSING, SCE_KERNEL_AIO_STATE_ABORTED]),
+            SCE_KERNEL_AIO_STATE_ABORTED
+        );
+        assert_eq!(
+            cancel_aggregate(&[SCE_KERNEL_AIO_STATE_ABORTED, SCE_KERNEL_ERROR_ECANCELED]),
+            SCE_KERNEL_ERROR_ECANCELED
+        );
+        // The notified bit is a pass-through detail, not a state.
+        assert_eq!(
+            cancel_aggregate(&[SCE_KERNEL_AIO_STATE_ABORTED | SCE_KERNEL_AIO_STATE_NOTIFIED]),
+            SCE_KERNEL_AIO_STATE_ABORTED
+        );
+    }
+}

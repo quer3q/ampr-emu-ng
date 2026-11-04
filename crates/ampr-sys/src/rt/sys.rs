@@ -427,7 +427,20 @@ pub mod hook {
     pub const fcntl: usize = 93;
     pub const _fcntl: usize = 94;
     pub const sceKernelFcntl: usize = 95;
-    pub const COUNT: usize = 96;
+    // Both pack modes: a game that opened a packed file through plain open()
+    // must be able to read it with kernel AIO (the LZ4 and zstd virtual fd
+    // paths in rt/pack/aio.rs and aio_wait.rs), so these install for every mode.
+    pub const sceKernelAioSubmitReadCommands: usize = 96;
+    pub const sceKernelAioSubmitReadCommandsMultiple: usize = 97;
+    pub const sceKernelAioPollRequest: usize = 98;
+    pub const sceKernelAioPollRequests: usize = 99;
+    pub const sceKernelAioWaitRequest: usize = 100;
+    pub const sceKernelAioWaitRequests: usize = 101;
+    pub const sceKernelAioCancelRequest: usize = 102;
+    pub const sceKernelAioCancelRequests: usize = 103;
+    pub const sceKernelAioDeleteRequest: usize = 104;
+    pub const sceKernelAioDeleteRequests: usize = 105;
+    pub const COUNT: usize = 106;
 }
 
 /// Original (pre-detour) libkernel entry points, indexed by `hook::*`, and

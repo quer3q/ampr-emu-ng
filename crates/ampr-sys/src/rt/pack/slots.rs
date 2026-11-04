@@ -145,8 +145,9 @@ pub unsafe fn ampr_pack_manifest_is_resident_ready() -> bool {
         && (!zstd_mode() || unsafe { zstd::try_zstd_projection() })
 }
 
-/// zstd accepts every read-only open: a packed file has no physical copy
-/// to fall back to, so a plain `O_RDONLY` open must get a virtual fd too.
+/// Every read-only open is accepted for a packed file, in both modes: the file
+/// has no physical copy to fall back to, so a plain `O_RDONLY` open must get a
+/// virtual fd too.
 pub(crate) fn pack_open_flags_supported(flags: c_int) -> bool {
     (flags & O_ACCMODE) == O_RDONLY
         && (flags & O_DIRECTORY) == 0
@@ -181,6 +182,12 @@ pub(crate) unsafe fn ampr_pack_try_open_indexed_impl(
         )
     };
     if validate_rc != AMPR_PACK_CORE_OK {
+        // A stale or foreign index/manifest pair can still name loose files;
+        // for LZ4 leave the open unhandled so the physical file gets its say.
+        // zstd ids come from its own projection, so a mismatch is an error.
+        if !zstd_mode() {
+            return SCE_KERNEL_ERROR_ENOENT;
+        }
         *handled = true;
         return SCE_KERNEL_ERROR_EIO;
     }

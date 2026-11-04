@@ -164,49 +164,71 @@ real_fn!(
     real_aio_submit,
     KernelAioSubmitFn,
     g_real_aio_submit,
-    c"sceKernelAioSubmitReadCommandsMultiple"
+    c"sceKernelAioSubmitReadCommandsMultiple",
+    sys::hook::sceKernelAioSubmitReadCommandsMultiple
 );
 real_fn!(
     real_aio_submit_single,
     KernelAioSubmitFn,
     g_real_aio_submit_single,
-    c"sceKernelAioSubmitReadCommands"
+    c"sceKernelAioSubmitReadCommands",
+    sys::hook::sceKernelAioSubmitReadCommands
 );
 real_fn!(
     real_aio_poll_single,
     KernelAioPollSingleFn,
     g_real_aio_poll_single,
-    c"sceKernelAioPollRequest"
+    c"sceKernelAioPollRequest",
+    sys::hook::sceKernelAioPollRequest
 );
 real_fn!(
     real_aio_poll,
     KernelAioPollFn,
     g_real_aio_poll,
-    c"sceKernelAioPollRequests"
+    c"sceKernelAioPollRequests",
+    sys::hook::sceKernelAioPollRequests
 );
 real_fn!(
     real_aio_wait_single,
     KernelAioWaitSingleFn,
     g_real_aio_wait_single,
-    c"sceKernelAioWaitRequest"
+    c"sceKernelAioWaitRequest",
+    sys::hook::sceKernelAioWaitRequest
 );
 real_fn!(
     real_aio_wait,
     KernelAioWaitFn,
     g_real_aio_wait,
-    c"sceKernelAioWaitRequests"
+    c"sceKernelAioWaitRequests",
+    sys::hook::sceKernelAioWaitRequests
 );
 real_fn!(
     real_aio_delete_single,
     KernelAioDeleteSingleFn,
     g_real_aio_delete_single,
-    c"sceKernelAioDeleteRequest"
+    c"sceKernelAioDeleteRequest",
+    sys::hook::sceKernelAioDeleteRequest
 );
 real_fn!(
     real_aio_delete,
     KernelAioDeleteFn,
     g_real_aio_delete,
-    c"sceKernelAioDeleteRequests"
+    c"sceKernelAioDeleteRequests",
+    sys::hook::sceKernelAioDeleteRequests
+);
+real_fn!(
+    real_aio_cancel_single,
+    KernelAioCancelSingleFn,
+    g_real_aio_cancel_single,
+    c"sceKernelAioCancelRequest",
+    sys::hook::sceKernelAioCancelRequest
+);
+real_fn!(
+    real_aio_cancel,
+    KernelAioCancelFn,
+    g_real_aio_cancel,
+    c"sceKernelAioCancelRequests",
+    sys::hook::sceKernelAioCancelRequests
 );
 
 pub(crate) unsafe fn close_physical_pack_fd(fd: c_int) -> c_int {

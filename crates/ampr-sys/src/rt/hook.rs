@@ -32,7 +32,7 @@ const PROT_RX: c_int = sys::SCE_KERNEL_PROT_CPU_READ | sys::SCE_KERNEL_PROT_CPU_
 const _: () = {
     assert!(PAGE % TRAMP_SIZE == 0 && SLOTS_PER_PAGE <= 32);
     assert!(POOL_COPY_PAGES <= 64 && TRAMP_PAGES == 4);
-    assert!(HOOK_COUNT == 96);
+    assert!(HOOK_COUNT == 106);
 };
 
 // ---- detour state (guarded by HOOK_LOCK) -------------------------------------
@@ -118,7 +118,12 @@ use super::pack::zstd_libc::{
 use super::pack::{
     posix_close_emul, posix_fstat_emul, posix_getdents_emul, posix_getdirentries_emul,
     posix_lseek_emul, posix_pread_emul, posix_preadv_emul, posix_read_emul, posix_readv_emul,
-    sceKernelClose_emul, sceKernelFstat_emul, sceKernelGetdents_emul, sceKernelGetdirentries_emul,
+    sceKernelAioCancelRequest_emul, sceKernelAioCancelRequests_emul,
+    sceKernelAioDeleteRequest_emul, sceKernelAioDeleteRequests_emul,
+    sceKernelAioPollRequest_emul, sceKernelAioPollRequests_emul,
+    sceKernelAioSubmitReadCommandsMultiple_emul, sceKernelAioSubmitReadCommands_emul,
+    sceKernelAioWaitRequest_emul, sceKernelAioWaitRequests_emul, sceKernelClose_emul,
+    sceKernelFstat_emul, sceKernelGetdents_emul, sceKernelGetdirentries_emul,
     sceKernelLseek_emul, sceKernelPread_emul, sceKernelPreadv_emul, sceKernelRead_emul,
     sceKernelReadv_emul,
 };
@@ -259,6 +264,19 @@ static HOOKS: Table<HookSpec, HOOK_COUNT> = Table(specs![
     c"fcntl" => posix_fcntl_emul, O;
     c"_fcntl" => underscore_fcntl_emul, O;
     c"sceKernelFcntl" => sceKernelFcntl_emul, O;
+    // Packed files opened through plain open() are virtual descriptors; the
+    // kernel AIO entry points must understand them (rt/pack/aio.rs, aio_wait.rs).
+    // A batch with no virtual descriptor forwards to the original.
+    c"sceKernelAioSubmitReadCommands" => sceKernelAioSubmitReadCommands_emul, O;
+    c"sceKernelAioSubmitReadCommandsMultiple" => sceKernelAioSubmitReadCommandsMultiple_emul, O;
+    c"sceKernelAioPollRequest" => sceKernelAioPollRequest_emul, O;
+    c"sceKernelAioPollRequests" => sceKernelAioPollRequests_emul, O;
+    c"sceKernelAioWaitRequest" => sceKernelAioWaitRequest_emul, O;
+    c"sceKernelAioWaitRequests" => sceKernelAioWaitRequests_emul, O;
+    c"sceKernelAioCancelRequest" => sceKernelAioCancelRequest_emul, O;
+    c"sceKernelAioCancelRequests" => sceKernelAioCancelRequests_emul, O;
+    c"sceKernelAioDeleteRequest" => sceKernelAioDeleteRequest_emul, O;
+    c"sceKernelAioDeleteRequests" => sceKernelAioDeleteRequests_emul, O;
 ]);
 
 /// `g_externalEqueueHooks`: order is `AmprExternalEqueueHookId`.
@@ -1403,13 +1421,18 @@ const fn parse_mask(s: &[u8]) -> u32 {
     v
 }
 
-/// Ids past the shared 78 are zstd only: an LZ4 title gets exactly
-/// the LZ4 hook set. Of those, 84..96 also need their `ZSTD_LIBC_HOOKS` bit.
-fn hook_enabled(id: usize) -> bool {
-    if id < FALLBACK_SHARED.len() {
+/// Ids `sceKernelAioSubmitReadCommands..=sceKernelAioDeleteRequests` serve
+/// process-visible virtual fds in both pack modes. Ids past the shared 78 are
+/// otherwise zstd only: an LZ4 title gets exactly the LZ4 hook set. Of those,
+/// 84..96 also need their `ZSTD_LIBC_HOOKS` bit.
+fn hook_enabled(hook: usize) -> bool {
+    if hook < FALLBACK_SHARED.len()
+        || (id::sceKernelAioSubmitReadCommands..=id::sceKernelAioDeleteRequests).contains(&hook)
+    {
         return true;
     }
-    super::pack::zstd_mode() && (!(84..96).contains(&id) || ZSTD_LIBC_HOOKS & 1 << (id - 84) != 0)
+    super::pack::zstd_mode()
+        && (!(84..96).contains(&hook) || ZSTD_LIBC_HOOKS & 1 << (hook - 84) != 0)
 }
 
 fn hooks_installed() -> bool {
