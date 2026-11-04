@@ -267,6 +267,10 @@ fn reset_pipeline_native(pipeline: &mut ReadPipelineContext) {
     pipeline.cache_wait_epoch = 0;
     pipeline.cache_wait_bucket = 0;
     pipeline.cache_wait_domain = CacheWaitDomain::Decoded;
+    // The parked-on load keys belong to the job that parked; a job reset
+    // here must not let the next one take a failed load's error as its own.
+    pipeline.decoded_wait_key = 0;
+    pipeline.physical_wait_key = 0;
     pipeline.fd_wait_epoch = 0;
     pipeline.fd_budget_wait_epoch = 0;
     pipeline.native_io_error = 0;

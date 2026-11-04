@@ -1,8 +1,12 @@
-//! zstd: libkernel's internal fd entry points (`_read`, `_readv`, `_close`,
+//! libkernel's internal fd entry points (`_read`, `_readv`, `_close`,
 //! `_fstat`, `_getdirentries`, and `fcntl`/`_fcntl`/`sceKernelFcntl`), which
-//! libc's stdio and dirent call in place of the hooked public names. A
-//! virtual pack fd takes the pack helpers; any other fd calls that entry
-//! point's own original, so a libkernel wrapper calling another never loops.
+//! libc's stdio and dirent call in place of the hooked public names. They
+//! serve LZ4 (AMPRPAK4) and zstd packs alike: nothing here reads the pack
+//! format, and the pack helpers they call branch on it themselves. The file
+//! and the `AMPR_ZSTD_LIBC_HOOKS` knob keep their zstd names, from the
+//! format they were first written for. A virtual pack fd takes the pack
+//! helpers; any other fd calls that entry point's own original, so a
+//! libkernel wrapper calling another never loops.
 
 use super::*;
 
@@ -94,11 +98,14 @@ fn virtual_fcntl(fd: c_int, cmd: c_int) -> Option<c_int> {
 /// third integer register on SysV x86-64 (see `posix_open_emul`).
 type FcntlFn = unsafe extern "C" fn(c_int, c_int, ...) -> c_int;
 
+/// Falls back to the `_fcntl` original, then the slot `id`: libkernel's
+/// `fcntl` calls the hooked `_fcntl`, so its original would only re-enter
+/// `underscore_fcntl_emul` (the order `pack::real_close` uses).
 unsafe fn posix_fcntl(id: usize, fd: c_int, cmd: c_int, arg: c_long) -> c_int {
     if let Some(rc) = virtual_fcntl(fd, cmd) {
         return posix_result_from_pack(rc);
     }
-    unsafe { kernel_slot::<FcntlFn>(id) }
+    unsafe { kernel_slot::<FcntlFn>(sys::hook::_fcntl).or_else(|| kernel_slot::<FcntlFn>(id)) }
         .map_or_else(posix_missing_original, |f| unsafe { f(fd, cmd, arg) })
 }
 

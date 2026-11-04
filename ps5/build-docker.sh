@@ -8,9 +8,9 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 image="${AMPR_PS5_IMAGE:-ampr-emu-ng-ps5:latest}"
 
-if ! docker image inspect "$image" >/dev/null 2>&1; then
-  docker build -t "$image" ps5
-fi
+# Always built: the layer cache makes an unchanged Dockerfile a no-op, and a
+# changed one (SDK, LLVM, Rust) is not skipped by an old local tag.
+docker build -q -t "$image" ps5 >/dev/null
 
 if [ "$#" -eq 0 ]; then
   set -- dist

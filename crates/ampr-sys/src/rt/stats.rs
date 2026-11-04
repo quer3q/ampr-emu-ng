@@ -202,6 +202,21 @@ stats! {
     /// while cross-EOP read-ahead is stubbed and lane overlap is off.
     GsRetryChecks = "gs_retry_checks",
     GsRetryMismatches = "gs_retry_mismatches",
+    /// Both pack formats: mmap/sceKernelMmap of a virtual pack fd
+    /// (rt/pack/mmap.rs), maps served from the disk cache file, bytes written
+    /// into new cache files, and maps whose cache file could not be made
+    /// (table full, mkdir, open, read or write failed).
+    MmapVirtual = "mmap_virtual",
+    MmapDisk = "mmap_disk",
+    MmapDiskBytes = "mmap_disk_bytes",
+    MmapDiskFailed = "mmap_disk_failed",
+    /// zstd, `AMPR_ZSTD_MMAP=1` (rt/pack/mmap_fault.rs): maps served by
+    /// decode on access, faults taken in them, bytes decoded into them, and
+    /// chunks whose read or decode failed (that mapping then fails).
+    MmapFaultMappings = "mmap_fault_mappings",
+    MmapFaults = "mmap_faults",
+    MmapFaultBytes = "mmap_fault_bytes",
+    MmapFaultErrors = "mmap_fault_errors",
 }
 
 const N: usize = Stat::Count as usize;
@@ -258,9 +273,28 @@ pub(crate) fn now() -> u64 {
 /// an APR path that did not resolve, b'E' a failed APR job (path = reason),
 /// b'K' a module load, b'G' a gather/scatter retry that re-resolved to
 /// another file id or offset than its first resolution (path = both pairs,
-/// see `gs_retry_mismatch`). Resident lookup: b'h' hit, b'm' miss the index
-/// answers, b'M' miss sent to the FS, b'd' directory, b'n' index not ready,
-/// b'x' not /app0, b'-' none. Then result and path.
+/// see `gs_retry_mismatch`). b'X' mmap and b'Y' sceKernelMmap of a virtual
+/// fd (rt/pack/mmap.rs, both builds hook them with `AMPR_ZSTD_MMAP` on;
+/// `/fsfail` keeps only the failed ones): path "<call> <packed file path>",
+/// lookup b'f' a decode-on-access mapping (rt/pack/mmap_fault.rs), b'k'
+/// mapped from the disk cache file, b'v' the cache file failed or the fd
+/// is a virtual directory; b'X' with lookup b'F' is a decode-on-access
+/// failure, path "mmap-fault sigaction" (the handler could not be
+/// installed) or "mmap-fault fid=<hex> chunk=<hex>" (a chunk read or decode
+/// failed in the handler). Pass-through probes for fully packed games, LZ4
+/// or zstd packs (rt/probe.rs, logged by `fs_note` whatever the result): b'I'
+/// sceKernelAioSubmitReadCommands(Multiple), b'D' dup/dup2, b'W'
+/// poll/select, b'T' openat, b'F' fstatat, b'C' faccessat, b'N' readlink;
+/// their path is the packed file's path (or the call name and `<virtual
+/// fd>`) and their lookup letter b'p' a packed file, b'd' an indexed
+/// directory, b'v' a virtual fd, and for b'W' select b'n': nfds past
+/// FD_SETSIZE, path "select nfds=<n>" (a virtual fd cannot be in an fd_set,
+/// so the sets are not read). In debug builds the libc hooks b'O', b'A',
+/// b'a', b'l' whose `AMPR_ZSTD_LIBC_HOOKS` bit is off run as such
+/// pass-through observers too (rt/hook.rs `observed_only`), logged with
+/// lookup b'p' or b'd' only. Resident lookup: b'h' hit,
+/// b'm' miss the index answers, b'M' miss sent to the FS, b'd' directory,
+/// b'n' index not ready, b'x' not /app0, b'-' none. Then result and path.
 #[cfg(feature = "mem_report")]
 pub(crate) struct FsEvents {
     pub next: usize,
@@ -337,8 +371,7 @@ unsafe fn fs_fail_locked(op: u8, how: u8, rc: i64, path: *const core::ffi::c_cha
         name[n] = unsafe { *path.add(n) } as u8;
         n += 1;
     }
-    // UE probes many optional user configs there; they always miss.
-    if name[..n].starts_with(b"/download0/") {
+    if !fail_kept(how, rc, &name[..n]) {
         return;
     }
     for i in 0..log.count.min(FS_FAILS) {
@@ -357,30 +390,74 @@ unsafe fn fs_fail_locked(op: u8, how: u8, rc: i64, path: *const core::ffi::c_cha
     log.count += 1;
 }
 
+/// An authoritative miss: the index answered "no such path" (lookup letter
+/// b'm'), which `fs_event` keeps out of `/fsfail` and the black box.
+#[cfg_attr(not(any(feature = "mem_report", test)), allow(dead_code))]
+pub(crate) const fn index_miss(how: u8, rc: i64) -> bool {
+    rc < 0 && how == b'm'
+}
+
+/// A failure `/fsfail` and the black box (rt/blackbox.rs) keep: not an
+/// authoritative miss (`index_miss`) and not under /download0/, where UE
+/// probes many optional user configs that always miss. `path` may be just
+/// the first bytes of the path.
+#[cfg_attr(not(any(feature = "mem_report", test)), allow(dead_code))]
+pub(crate) fn fail_kept(how: u8, rc: i64, path: &[u8]) -> bool {
+    !index_miss(how, rc) && !path.starts_with(b"/download0/")
+}
+
 /// Records one path hook call (racy by design: a debug trace).
 #[inline(always)]
 pub(crate) fn fs_event(op: u8, how: u8, rc: i64, path: *const core::ffi::c_char) {
     // Authoritative misses ('m') of the path hooks are answered by the index
     // alone, the same on every filesystem, so they are left out of the
-    // failure log. 'R' events carry no lookup letter and are always logged.
+    // failure log and the black box (a game probes many absent paths; a
+    // line each would be a file write per miss). 'R' events carry no lookup
+    // letter and are always logged.
     #[cfg(feature = "mem_report")]
-    if rc < 0 && how != b'm' {
-        unsafe { fs_fail(op, how, rc, path) };
+    if !index_miss(how, rc) {
+        super::blackbox::event(op, how, rc, path);
+        if rc < 0 {
+            unsafe { fs_fail(op, how, rc, path) };
+        }
     }
     #[cfg(feature = "mem_report")]
     unsafe {
-        let log = &mut *FS_LOG.get();
-        let slot = log.next % FS_EVENTS;
-        log.next = log.next.wrapping_add(1);
-        let mut n = 0;
-        while n < 160 && !path.is_null() && *path.add(n) != 0 {
-            log.path[slot][n] = *path.add(n) as u8;
-            n += 1;
-        }
-        (log.op[slot], log.how[slot], log.rc[slot], log.len[slot]) = (op, how, rc, n);
+        fs_ring(op, how, rc, path)
+    };
+    #[cfg(not(feature = "mem_report"))]
+    let _ = (op, how, rc, path);
+}
+
+/// Records one probe call (rt/probe.rs) in FS_FAIL_LOG whatever `rc` is, so
+/// `/fsfail` lists every distinct (op, path) a game used on packed files,
+/// and in the FS_LOG ring. Debug only, like `fs_event`; release builds have
+/// no probes to call it.
+#[inline(always)]
+#[cfg_attr(not(feature = "mem_report"), allow(dead_code))]
+pub(crate) fn fs_note(op: u8, how: u8, rc: i64, path: *const core::ffi::c_char) {
+    #[cfg(feature = "mem_report")]
+    unsafe {
+        fs_fail(op, how, rc, path);
+        fs_ring(op, how, rc, path);
+        super::blackbox::event(op, how, rc, path);
     }
     #[cfg(not(feature = "mem_report"))]
     let _ = (op, how, rc, path);
+}
+
+/// Appends one event to the FS_LOG ring.
+#[cfg(feature = "mem_report")]
+unsafe fn fs_ring(op: u8, how: u8, rc: i64, path: *const core::ffi::c_char) {
+    let log = unsafe { &mut *FS_LOG.get() };
+    let slot = log.next % FS_EVENTS;
+    log.next = log.next.wrapping_add(1);
+    let mut n = 0;
+    while n < 160 && !path.is_null() && unsafe { *path.add(n) } != 0 {
+        log.path[slot][n] = unsafe { *path.add(n) } as u8;
+        n += 1;
+    }
+    (log.op[slot], log.how[slot], log.rc[slot], log.len[slot]) = (op, how, rc, n);
 }
 
 /// Logs a gather/scatter retry that re-resolved to `got` instead of the
@@ -462,4 +539,21 @@ pub(crate) fn read() -> [u64; N] {
         };
     }
     out
+}
+
+// ---- tests --------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_failed_index_lookups_are_index_misses() {
+        assert!(index_miss(b'm', -2));
+        // A miss sent to the FS, a successful 'm' and a module load stay.
+        assert!(!index_miss(b'M', -2) && !index_miss(b'm', 0) && !index_miss(b'K', 5));
+        assert!(fail_kept(b'h', -2, b"/app0/a.bin") && fail_kept(b'K', 5, b"/app0/x.prx"));
+        assert!(!fail_kept(b'm', -2, b"/app0/a.bin"));
+        assert!(!fail_kept(b'M', -2, b"/download0/user.ini"));
+    }
 }

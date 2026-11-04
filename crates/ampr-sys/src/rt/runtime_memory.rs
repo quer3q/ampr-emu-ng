@@ -11,12 +11,12 @@ use core::ptr::{null, null_mut};
 // ---- internal AMM pool ---------------------------------------------------
 
 /// Pool size from the Makefile's `AMPR_INTERNAL_POOL_SIZE` (decimal or 0x hex,
-/// optional C `ull` suffix); 352 MiB if unset (room for the 64 MiB pack
-/// physical cache). Rounded up to a page multiple.
+/// optional C `ull` suffix); 256 MiB if unset, for a build outside the
+/// Makefile (which sets 128 MiB). Rounded up to a page multiple.
 const STATIC_POOL_SIZE: usize = {
     let v = match option_env!("AMPR_INTERNAL_POOL_SIZE") {
         Some(s) => parse_size(s.as_bytes()),
-        None => 0x1600_0000,
+        None => 0x1000_0000,
     };
     (v + SCE_KERNEL_PAGE_SIZE - 1) / SCE_KERNEL_PAGE_SIZE * SCE_KERNEL_PAGE_SIZE
 };

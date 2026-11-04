@@ -1450,19 +1450,6 @@ unsafe fn pack_manifest_present() -> bool {
         || errno() != ENOENT
 }
 
-/// For the load notice only: an LZ4 pack manifest is in /app0. Any stat
-/// error reads as absent (the notice then says "plain").
-pub(crate) unsafe fn lz4_manifest_present() -> bool {
-    let mut st = Stat::default();
-    let rc = unsafe {
-        real_posix_stat(
-            super::pack::AMPR_EMU_PACK_INDEX_PATH.as_ptr(),
-            (&raw mut st).cast(),
-        )
-    };
-    rc == 0
-}
-
 // ---- ensure ready (slow path) --------------------------------------------------------
 
 use super::pack::ampr_pack_ensure_manifest_ready_safe;
@@ -1723,6 +1710,58 @@ unsafe fn lookup_resident_path(path: *const c_char) -> Lookup {
     r
 }
 
+// ---- probe lookups (rt/probe.rs, debug only) ------------------------------------
+
+/// What the published index says of `path` for the debug probes: b'p' a
+/// packed file (an AMPRIDX3 hit that rt/pack `file_id_is_packed` accepts:
+/// a zstd record, or an LZ4 record flagged packed), b'd' an indexed
+/// directory, None otherwise (loose file, miss, not /app0, index or pack
+/// manifest not ready). The probes run
+/// inside libkernel hooks, possibly during early init, so this reads only
+/// the published lock-free image: it never builds, waits or opens files.
+#[cfg(feature = "mem_report")]
+pub(crate) unsafe fn probe_packed_path(path: *const c_char) -> Option<u8> {
+    if !unsafe { has_app0_root(path) } || !is_resident_ready() {
+        return None;
+    }
+    let mut buf = [0u8; RUNTIME_PATH_CAPACITY];
+    let (len, trailing) = unsafe { normalize_key_result(path, &mut buf) }.ok()?;
+    let key = &buf[..len];
+    if !is_app0_key(key) {
+        return None;
+    }
+    // is_resident_ready() holds, so ensure_ready inside returns at once.
+    if !trailing && len > 5 {
+        if let Some((_, id)) = unsafe { lookup_key_view(key, false) } {
+            // A refused guard reads as "manifest not ready": no answer.
+            let reader = super::pack::ManifestReader::enter()?;
+            return super::pack::file_id_is_packed(&reader, id).then_some(b'p');
+        }
+    }
+    unsafe { lookup_directory_key(key) }.map(|_| b'd')
+}
+
+/// Copies the indexed path of one-based file `id` into `out` (truncated,
+/// NUL-terminated) and returns its length; None when the index is not
+/// published or `id` is unknown. Lock-free, like `probe_packed_path`.
+#[cfg(feature = "mem_report")]
+pub(crate) fn probe_file_path(id: u32, out: &mut [u8]) -> Option<usize> {
+    let c = published().filter(|c| c.available)?;
+    if id == 0 || id == FILEID_INVALID || id as usize > c.count || out.is_empty() {
+        return None;
+    }
+    let mut v = empty_view();
+    if !unsafe { c.entry_view(id, &mut v) } || v.path.is_null() {
+        return None;
+    }
+    let n = (v.path_length as usize).min(out.len() - 1);
+    for (i, b) in out[..n].iter_mut().enumerate() {
+        *b = unsafe { *v.path.cast::<u8>().add(i) };
+    }
+    out[n] = 0;
+    Some(n)
+}
+
 /// `maybe_resolve_app0_path_arg`: the indexed path for a resident hit.
 #[inline(never)]
 pub(crate) unsafe fn maybe_resolve_path(path: *const c_char) -> *const c_char {
@@ -1871,7 +1910,12 @@ unsafe fn open_with(
 ) -> c_int {
     let l = unsafe { lookup_resident_path(path) };
     let fd = unsafe { open_resolved(&l, path, flags, mode, real) };
-    stats::fs_event(op, how(&l), fd as i64, path);
+    // A file hit opened with O_DIRECTORY fails ENOTDIR, as on retail. Not
+    // logged: a UE3 title tests every cooked file this way at start (~5000
+    // calls on the console), which filled all 96 /fsfail slots.
+    if !(fd < 0 && l.state == Resident::Hit && flags & O_DIRECTORY != 0) {
+        stats::fs_event(op, how(&l), fd as i64, path);
+    }
     fd
 }
 
@@ -1919,11 +1963,11 @@ unsafe fn open_resolved(
                 set_errno(ENOTDIR);
                 return -1;
             }
-            // zstd: a packed file lives only in ampr_zstd-NNN.pak, so a packed
-            // hit opens a virtual fd; a loose one (unhandled) opens the
-            // physical file below.
+            // A packed file lives only in a pack volume (ampr_zstd-NNN.pak or
+            // an AMPRPAK4 volume), so a packed hit opens a virtual fd; a loose
+            // one (unhandled) opens the physical file below.
             stats::add(stats::Stat::OpenHit, 1);
-            if zstd_mode() && unsafe { ampr_pack_manifest_is_resident_ready() } {
+            if unsafe { ampr_pack_manifest_is_resident_ready() } {
                 let rc = unsafe {
                     ampr_pack_try_open_indexed(l.file_id, &l.entry, flags, mode, &mut handled)
                 };
@@ -1940,10 +1984,10 @@ unsafe fn open_resolved(
         }
         Resident::Miss => {
             stats::add(stats::Stat::OpenMiss, 1);
-            // zstd: the runtime's own opens of its volumes and indexes can
-            // come back through the `_open` hook (from inside libkernel's
-            // `open`); they are physical files the index need not list.
-            if zstd_mode() && is_zstd_service_path(path) {
+            // The runtime's own opens of its volumes and indexes can come
+            // back through the `_open` hook (from inside libkernel's `open`);
+            // they are physical files the index need not list.
+            if is_service_path(path) {
                 return unsafe { real(path, flags, mode) };
             }
             if dir_flag && unsafe { ampr_pack_manifest_is_resident_ready() } {
@@ -2097,32 +2141,63 @@ pub unsafe extern "C" fn posix_open_emul(path: *const c_char, flags: c_int, mode
     unsafe { open_impl(path, flags, mode) }
 }
 
-// ---- zstd: libkernel's internal path entry points (libc fopen, opendir) ----
+// ---- libkernel's internal path entry points (libc fopen, opendir) ----
 
 const AT_FDCWD: c_int = -100;
 const W_OK: c_int = 2;
 const X_OK: c_int = 1;
 const EROFS: c_int = 30;
 
-/// /app0's `ampr_zstd.index`, `ampr_zstd-NNN.pak` or `ampr_emu.index`.
-fn is_zstd_service_path(path: *const c_char) -> bool {
+/// A runtime file by name, for both formats: `ampr_emu.index`, zstd's
+/// `ampr_zstd.index` and `ampr_zstd-NNN.pak`, LZ4's `ampr_assets.index`,
+/// `ampr_assets.index.runtime` and `ampr_assets-*.pak`. The LZ4 volume names
+/// are the packer's default prefix `ampr_assets-`, as in rt/pack/state.rs
+/// `service_name_hidden` (which also folds case and hides more names); a
+/// manifest that names its volumes otherwise is not matched here.
+fn is_service_path(path: *const c_char) -> bool {
     if path.is_null() {
         return false;
     }
     let bytes = unsafe { CStr::from_ptr(path) }.to_bytes();
     let name = bytes.rsplit(|&b| b == b'/').next().unwrap_or(bytes);
     use ampr_format::zstd::{INDEX_NAME, VOLUME_PREFIX, VOLUME_SUFFIX};
+    const LZ4_VOLUME_PREFIX: &[u8] = b"ampr_assets-";
+    let volume = |prefix: &[u8], suffix: &[u8]| {
+        name.len() > prefix.len() + suffix.len()
+            && name.starts_with(prefix)
+            && name.ends_with(suffix)
+    };
     name == INDEX_NAME.as_bytes()
         || name == b"ampr_emu.index"
-        || (name.starts_with(VOLUME_PREFIX.as_bytes()) && name.ends_with(VOLUME_SUFFIX.as_bytes()))
+        || name == b"ampr_assets.index"
+        || name == b"ampr_assets.index.runtime"
+        || volume(VOLUME_PREFIX.as_bytes(), VOLUME_SUFFIX.as_bytes())
+        || volume(LZ4_VOLUME_PREFIX, b".pak")
 }
 
 unsafe fn real_underscore_open(path: *const c_char, flags: c_int, mode: SceKernelMode) -> c_int {
+    unsafe { real_underscore_open_raw(path, flags, mode as c_int) }
+}
+
+/// `_open` original with the caller's mode word as passed.
+unsafe fn real_underscore_open_raw(path: *const c_char, flags: c_int, mode: c_int) -> c_int {
     type F = unsafe extern "C" fn(*const c_char, c_int, ...) -> c_int;
     match unsafe { kernel_slot::<F>(hook::_open) } {
-        Some(f) => unsafe { f(path, flags, mode as c_int) },
+        Some(f) => unsafe { f(path, flags, mode) },
         None => eio(),
     }
+}
+
+/// Logs a pass-through libc path call (debug only; see rt/hook.rs
+/// `observed_only`).
+#[inline(always)]
+unsafe fn observe_note(path: *const c_char, op: u8, rc: c_int) {
+    #[cfg(feature = "mem_report")]
+    unsafe {
+        super::probe::probe_path(path, op, rc)
+    };
+    #[cfg(not(feature = "mem_report"))]
+    let _ = (path, op, rc);
 }
 
 unsafe fn real_openat(dirfd: c_int, path: *const c_char, flags: c_int, mode: c_int) -> c_int {
@@ -2162,6 +2237,11 @@ pub unsafe extern "C" fn underscore_open_emul(
     flags: c_int,
     mode: c_int,
 ) -> c_int {
+    if super::hook::observed_only(hook::_open) {
+        let rc = unsafe { real_underscore_open_raw(path, flags, mode) };
+        unsafe { observe_note(path, b'O', rc) };
+        return rc;
+    }
     unsafe {
         open_with(
             path,
@@ -2184,10 +2264,20 @@ pub unsafe extern "C" fn underscore_openat_emul(
     if path.is_null() || (unsafe { *path } != b'/' as c_char && dirfd != AT_FDCWD) {
         return unsafe { real_openat(dirfd, path, flags, mode) };
     }
+    if super::hook::observed_only(hook::_openat) {
+        let rc = unsafe { real_openat(dirfd, path, flags, mode) };
+        unsafe { observe_note(path, b'A', rc) };
+        return rc;
+    }
     unsafe { open_with(path, flags, creat_mode(flags, mode), real_openat_cwd, b'A') }
 }
 
 pub unsafe extern "C" fn posix_lstat_emul(path: *const c_char, sb: *mut Stat) -> c_int {
+    if super::hook::observed_only(hook::lstat) {
+        let rc = unsafe { real_lstat(path, sb.cast()) };
+        unsafe { observe_note(path, b'l', rc) };
+        return rc;
+    }
     if sb.is_null() {
         set_errno(EFAULT);
         return -1;
@@ -2199,6 +2289,11 @@ pub unsafe extern "C" fn posix_lstat_emul(path: *const c_char, sb: *mut Stat) ->
 /// authoritative miss takes the stat routing (pack overlay, else ENOENT);
 /// others the original.
 pub unsafe extern "C" fn posix_access_emul(path: *const c_char, mode: c_int) -> c_int {
+    if super::hook::observed_only(hook::access) {
+        let rc = unsafe { real_access(path, mode) };
+        unsafe { observe_note(path, b'a', rc) };
+        return rc;
+    }
     let l = unsafe { lookup_resident_path(path) };
     let rc = match l.state {
         Resident::Hit | Resident::Directory if mode & W_OK != 0 => {
@@ -2551,17 +2646,16 @@ pub unsafe fn ampr_pack_core_make_task(
 mod tests {
     use super::*;
 
-    /// Runtime files bypass the index, and only misses the /app0 walk can
-    /// answer are final; the rest go to the filesystem.
+    /// zstd runtime files and the shared AMPRIDX3 index bypass the index.
     #[test]
-    fn path_routing_runtime_files_and_authoritative_misses() {
+    fn service_path_covers_zstd_index_and_volumes() {
         for yes in [
             c"/app0/ampr_zstd.index",
             c"/app0/ampr_zstd-000.pak",
             c"/app0/ampr_zstd-1234.pak",
             c"/app0/ampr_emu.index",
         ] {
-            assert!(is_zstd_service_path(yes.as_ptr()), "{yes:?}");
+            assert!(is_service_path(yes.as_ptr()), "{yes:?}");
         }
         for no in [
             c"/app0/ampr_zstd-000.pak.tmp",
@@ -2569,10 +2663,37 @@ mod tests {
             c"/app0/game/game.uproject",
             c"/app0/uecommandline.txt",
         ] {
-            assert!(!is_zstd_service_path(no.as_ptr()), "{no:?}");
+            assert!(!is_service_path(no.as_ptr()), "{no:?}");
         }
-        assert!(!is_zstd_service_path(core::ptr::null()));
+        assert!(!is_service_path(core::ptr::null()));
+    }
 
+    /// LZ4 runtime files bypass the index too: its manifest, the runtime
+    /// profile next to it, and the default-named AMPRPAK4 volumes.
+    #[test]
+    fn service_path_covers_lz4_index_and_volumes() {
+        for yes in [
+            c"/app0/ampr_assets.index",
+            c"/app0/ampr_assets.index.runtime",
+            c"/app0/ampr_assets-000.pak",
+            c"/app0/ampr_assets-17.pak",
+        ] {
+            assert!(is_service_path(yes.as_ptr()), "{yes:?}");
+        }
+        for no in [
+            c"/app0/ampr_assets-.pak",
+            c"/app0/ampr_assets-000.pak.tmp",
+            c"/app0/ampr_assets.index.bak",
+            c"/app0/d/0/actor",
+        ] {
+            assert!(!is_service_path(no.as_ptr()), "{no:?}");
+        }
+    }
+
+    /// Only misses the /app0 walk can answer are final; the rest go to the
+    /// filesystem.
+    #[test]
+    fn authoritative_misses() {
         let miss_with = |raw: &CStr, links: bool| {
             let mut key = [0u8; RUNTIME_PATH_CAPACITY];
             let len = unsafe { normalize_key(raw.as_ptr(), &mut key) }.unwrap();

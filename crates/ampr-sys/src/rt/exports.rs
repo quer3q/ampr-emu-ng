@@ -124,7 +124,7 @@ unsafe fn notify(text: &[u8]) {
 /// Docker image has no git) and the Makefile passes it as AMPR_GIT_REV;
 /// host builds and tests without it say "unknown". Debug `/metrics` only.
 #[cfg(feature = "mem_report")]
-const BUILD_REV: &str = match option_env!("AMPR_GIT_REV") {
+pub(crate) const BUILD_REV: &str = match option_env!("AMPR_GIT_REV") {
     Some(v) => v,
     None => "unknown",
 };
@@ -156,7 +156,7 @@ unsafe fn notify_loaded() {
     let mut text = [0u8; 64];
     let mode: &[u8] = if super::pack::zstd_mode() {
         b"zstd"
-    } else if unsafe { super::index::lz4_manifest_present() } {
+    } else if super::pack::packs_present() {
         b"lz4"
     } else {
         b"plain"
@@ -389,7 +389,7 @@ mod mem_report {
 
     /// Fixed-capacity text buffer; output past the end is dropped. 16 KiB:
     /// the body reached ~3.4 KiB of the old 4 KiB with the fs log, before the
-    /// reactor stats of 2026-11-01, and the tune_/pool_ lines print last.
+    /// reactor stats, and the tune_/pool_ lines print last.
     struct Text {
         buf: [u8; 16384],
         len: usize,
@@ -447,8 +447,8 @@ mod mem_report {
     /// lowers it when the buffer is short.
     const QD_MAX: usize = bench_args::QD_MAX;
     /// sceKernelAioSubmitReadCommands priority. The bench passed 0 before
-    /// and every submit failed with 0x80020016 (EINVAL) on the 2026-11-01
-    /// console run; the reactor submits with 1..=3 (reactor/mod.rs).
+    /// and every submit failed with 0x80020016 (EINVAL) on a console
+    /// run; the reactor submits with 1..=3 (reactor/mod.rs).
     const AIO_PRIORITY: c_int = 2;
     /// (bytes, requests, elapsed ns) or an SCE error code.
     type BenchResult = Result<(u64, u64, u64), c_int>;
@@ -652,7 +652,7 @@ mod mem_report {
 
     /// Loose-file tests: (name, request bytes, depth, kind). In game, 256
     /// KiB pread parts took 4.15 ms against 1.70 ms for 64 KiB parts with
-    /// up to ~60 in flight (a game, 2026-11-01); the 256 KiB concurrent
+    /// up to ~60 in flight (a game); the 256 KiB concurrent
     /// tests show whether /app0 or its backing folder causes that.
     const LOOSE_TESTS: [(&str, usize, usize, Kind); bench_args::TESTS as usize] = [
         ("pread_64k", 64 * KIB, 0, Kind::Pread),
@@ -769,7 +769,7 @@ mod mem_report {
     /// Backing fd from `backing=` (an absolute path, percent-decoded);
     /// -1 when it is absent or does not open with /app0's size, and /app0
     /// is then benched alone. The backing path is not detected: statfs and
-    /// fstatfs are not exported by libkernel on the 2026-11-01 console.
+    /// fstatfs are not exported by libkernel on the console.
     unsafe fn find_backing(q: &[u8], size: u64, out: &mut Text) -> c_int {
         let mut path = [0u8; 1024];
         let Some(raw) = bench_args::param(q, b"backing") else {
@@ -1218,13 +1218,20 @@ mod mem_report {
 pub unsafe extern "C" fn module_start(_args: usize, _argp: *const c_void) -> c_int {
     // Before any hook: the mode picks the hooks and the notification text.
     unsafe { super::pack::select_pack_format() };
+    #[cfg(feature = "mem_report")]
+    unsafe { super::blackbox::open() };
     unsafe { notify_loaded() };
     let rc = unsafe { hook::amprInstallLibkernelHooks() };
-    // zstd: most game files exist only inside ampr_zstd-NNN.pak, and the game
-    // opens some (e.g. its UE project descriptor) with plain open() before
-    // any AMPR call. Hooks never load the index, so load AMPRIDX3, mount
-    // ampr_zstd.index and build the id projection here, before the game runs.
-    if super::pack::zstd_mode() && rc == 0 && unsafe { super::index::ensure_ready(false) } {
+    // Packed files have no physical copy (ampr_zstd-NNN.pak or the AMPRPAK4
+    // volumes), and the game opens some with plain open() before any AMPR
+    // call: a UE project descriptor (zstd), /app0/d/0/actor (an Insomniac
+    // Engine title, LZ4, GitHub issue #2). Hooks never load the index, so
+    // load AMPRIDX3 and the pack manifest here, before the game runs (zstd
+    // also mounts ampr_zstd.index and builds the id projection). Without a
+    // shipped index this fails at once: ensure_ready(false) never builds one.
+    // A title with no packs skips it and loads its index on the first AMPR
+    // call, as in v0.2.0.
+    if super::pack::packs_present() && rc == 0 && unsafe { super::index::ensure_ready(false) } {
         unsafe { super::pack::ampr_pack_ensure_manifest_ready_safe() };
     }
     // Only after hooks install: a failed module_start may be unloaded.
@@ -1241,7 +1248,10 @@ pub unsafe extern "C" fn module_stop(_args: usize, _argp: *const c_void) -> c_in
         return -1;
     }
     // shutdownCommandLog/shutdownDebugLog are no-ops returning 0.
-    unsafe { hook::amprUninstallLibkernelHooks() }
+    let rc = unsafe { hook::amprUninstallLibkernelHooks() };
+    #[cfg(feature = "mem_report")]
+    super::blackbox::close();
+    rc
 }
 
 // ---- sceAmprAmm* ---------------------------------------------------------
