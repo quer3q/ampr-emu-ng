@@ -132,7 +132,7 @@ pub(crate) const BUILD_REV: &str = match option_env!("AMPR_GIT_REV") {
 #[cfg(feature = "mem_report")]
 const BUILD_FLAVOR: &str = "debug";
 
-/// "ampr-emu-ng: v0.2.0 (<mode>) running" into `out`; its length. Mode:
+/// "ampr-emu-ng: v0.3.0 (<mode>) running" into `out`; its length. Mode:
 /// "zstd" (ampr_zstd.index), "lz4" (ampr_assets.index) or "plain" (no
 /// packs, loose files only).
 fn load_notice(mode: &[u8], out: &mut [u8; 64]) -> usize {
@@ -171,12 +171,12 @@ mod notice_tests {
     fn notice_names_version_and_format() {
         let mut out = [0u8; 64];
         let n = super::load_notice(b"zstd", &mut out);
-        assert_eq!(&out[..n], b"ampr-emu-ng: v0.2.0 (zstd) running");
+        assert_eq!(&out[..n], b"ampr-emu-ng: v0.3.0 (zstd) running");
         let n = super::load_notice(b"lz4", &mut out);
-        assert_eq!(&out[..n], b"ampr-emu-ng: v0.2.0 (lz4) running");
+        assert_eq!(&out[..n], b"ampr-emu-ng: v0.3.0 (lz4) running");
         let n = super::load_notice(b"plain", &mut out);
-        assert_eq!(&out[..n], b"ampr-emu-ng: v0.2.0 (plain) running");
-        assert_eq!(&super::IDENTITY, b"ampr-emu-ng 0.2.0\0");
+        assert_eq!(&out[..n], b"ampr-emu-ng: v0.3.0 (plain) running");
+        assert_eq!(&super::IDENTITY, b"ampr-emu-ng 0.3.0\0");
     }
 }
 
