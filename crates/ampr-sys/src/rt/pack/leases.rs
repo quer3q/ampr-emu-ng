@@ -7,12 +7,15 @@ use super::super::fd_cache::{
 };
 use super::*;
 
+/// `waiter`: the caller parked on this page's load (see
+/// physical_cache_take_failed_locked).
 pub(crate) unsafe fn physical_cache_acquire_locked(
     state: *mut PackState,
     pack_id: u16,
     offset: u64,
     size: u32,
     key_hash: u64,
+    waiter: bool,
 ) -> PhysicalCacheAcquireResult {
     let mut result = PhysicalCacheAcquireResult::EMPTY;
     let found = physical_cache_find_locked(state, pack_id, offset, size, key_hash);
@@ -33,13 +36,12 @@ pub(crate) unsafe fn physical_cache_acquire_locked(
                 return result;
             }
             PhysicalCacheEntryState::Failed => {
-                result.kind = PhysicalCacheAcquireKind::Failed;
-                result.lease.error = if entry.error != 0 {
-                    entry.error
-                } else {
-                    SCE_KERNEL_ERROR_EIO
-                };
-                return result;
+                let error = physical_cache_take_failed_locked(state, found, waiter);
+                if error != 0 {
+                    result.kind = PhysicalCacheAcquireKind::Failed;
+                    result.lease.error = error;
+                    return result;
+                }
             }
             PhysicalCacheEntryState::Free => {}
         }
@@ -57,6 +59,9 @@ pub(crate) unsafe fn physical_cache_acquire_locked(
     }
 
     let index = (*state).physical_cache_free_head;
+    if index >= (*state).physical_cache_entry_high_water {
+        (*state).physical_cache_entry_high_water = index + 1;
+    }
     let entry = &mut (*state).physical_cache_entries[index as usize];
     (*state).physical_cache_free_head = entry.free_next;
     *entry = PhysicalCacheEntry {
@@ -92,17 +97,19 @@ pub(crate) unsafe fn physical_cache_acquire_locked(
 /// `through_pending`: see physical_cache_acquire_batch_locked. Only the
 /// single-chunk window (window_aio.rs) passes it: a mandatory group that meets
 /// a Pending page waits or requeues, so Loads past it would be freed unread.
+/// `waiter_key`: key hash of the page the caller last parked on, or 0.
 pub(crate) unsafe fn physical_cache_acquire_batch(
     items: *const PhysicalCacheAcquireBatchItem,
     item_count: usize,
     through_pending: bool,
+    waiter_key: u64,
 ) -> usize {
     if items.is_null() || item_count == 0 {
         return 0;
     }
     let state = pack_state();
     let _lock = PHYSICAL_CACHE_MUTEX.lock();
-    physical_cache_acquire_batch_locked(state, items, item_count, through_pending)
+    physical_cache_acquire_batch_locked(state, items, item_count, through_pending, waiter_key)
 }
 
 /// Acquires `items` in order and returns how many were processed. The batch
@@ -116,6 +123,7 @@ pub(crate) unsafe fn physical_cache_acquire_batch_locked(
     items: *const PhysicalCacheAcquireBatchItem,
     item_count: usize,
     through_pending: bool,
+    waiter_key: u64,
 ) -> usize {
     let mut processed = 0;
     while processed < item_count {
@@ -125,12 +133,14 @@ pub(crate) unsafe fn physical_cache_acquire_batch_locked(
         }
         *item.result = PhysicalCacheAcquireResult::EMPTY;
         if physical_cache_request_valid(state, item.offset, item.size) {
+            let key_hash = physical_cache_key_hash(item.pack_id, item.offset, item.size);
             *item.result = physical_cache_acquire_locked(
                 state,
                 item.pack_id,
                 item.offset,
                 item.size,
-                physical_cache_key_hash(item.pack_id, item.offset, item.size),
+                key_hash,
+                waiter_key != 0 && key_hash == waiter_key,
             );
         }
         let kind = (*item.result).kind;
@@ -219,6 +229,31 @@ pub(crate) unsafe fn physical_cache_release_locked(
         }
     }
     *lease = PhysicalCacheLease::EMPTY;
+}
+
+/// The physical counterpart of cache_take_failed_locked (caches.rs): the
+/// error goes to a reader that parked on the page's load, any other reader
+/// drops the entry and loads the page again.
+pub(crate) unsafe fn physical_cache_take_failed_locked(
+    state: *mut PackState,
+    index: u32,
+    waiter: bool,
+) -> c_int {
+    let entry = &mut (*state).physical_cache_entries[index as usize];
+    if waiter {
+        return if entry.error != 0 {
+            entry.error
+        } else {
+            SCE_KERNEL_ERROR_EIO
+        };
+    }
+    if entry.pin_count == 0 {
+        physical_cache_release_entry_locked(state, index);
+    } else {
+        entry.error = SCE_KERNEL_ERROR_EAGAIN;
+        physical_cache_hash_unlink_locked(state, index);
+    }
+    0
 }
 
 pub(crate) unsafe fn physical_cache_release_batch(
@@ -845,7 +880,7 @@ mod physical_cache_tests {
     fn acquire(state: *mut PackState, page: u64) -> PhysicalCacheAcquireResult {
         let offset = page * PAGE as u64;
         let key_hash = physical_cache_key_hash(0, offset, PAGE);
-        unsafe { physical_cache_acquire_locked(state, 0, offset, PAGE, key_hash) }
+        unsafe { physical_cache_acquire_locked(state, 0, offset, PAGE, key_hash, false) }
     }
 
     #[test]
@@ -863,7 +898,7 @@ mod physical_cache_tests {
             })
             .collect();
         let batch = |through_pending| unsafe {
-            physical_cache_acquire_batch_locked(state, items.as_ptr(), 3, through_pending)
+            physical_cache_acquire_batch_locked(state, items.as_ptr(), 3, through_pending, 0)
         };
         // LZ4 keeps stopping at the Pending page.
         assert_eq!(batch(false), 1);
@@ -875,6 +910,53 @@ mod physical_cache_tests {
         assert!(kinds[0] == PhysicalCacheAcquireKind::Pending);
         assert!(kinds[1] == PhysicalCacheAcquireKind::Load);
         assert!(kinds[2] == PhysicalCacheAcquireKind::Load);
+    }
+
+    #[test]
+    fn failed_page_errors_its_waiter_then_reloads() {
+        let state = cache_state();
+        let mut loader = acquire(state, 1);
+        let index = loader.lease.entry;
+        assert!(acquire(state, 1).kind == PhysicalCacheAcquireKind::Pending);
+        unsafe {
+            // The loader's disk read failed with EIO and it let go of the page.
+            let entry = &mut (*state).physical_cache_entries[index as usize];
+            entry.state = PhysicalCacheEntryState::Failed;
+            entry.error = SCE_KERNEL_ERROR_EIO;
+            physical_cache_release_locked(state, &mut loader.lease);
+        }
+        let offset = PAGE as u64;
+        let key_hash = physical_cache_key_hash(0, offset, PAGE);
+        // The reader that parked on the load gets the error.
+        let waited =
+            unsafe { physical_cache_acquire_locked(state, 0, offset, PAGE, key_hash, true) };
+        assert!(waited.kind == PhysicalCacheAcquireKind::Failed);
+        assert_eq!(waited.lease.error, SCE_KERNEL_ERROR_EIO);
+        // A later reader reads the page again instead of failing at once.
+        let later = acquire(state, 1);
+        assert!(later.kind == PhysicalCacheAcquireKind::Load);
+        assert_eq!(later.lease.entry, index);
+    }
+
+    #[test]
+    fn clock_scans_only_allocated_entries() {
+        let state = cache_state();
+        for page in 0..3 {
+            let mut held = acquire(state, page);
+            unsafe {
+                (*state).physical_cache_entries[held.lease.entry as usize].state =
+                    PhysicalCacheEntryState::Ready;
+                physical_cache_release_locked(state, &mut held.lease);
+            }
+        }
+        unsafe {
+            assert_eq!((*state).physical_cache_entry_high_water, 3);
+            for _ in 0..3 {
+                assert!(physical_cache_evict_one_locked(state));
+                assert!((*state).physical_cache_clock <= 3);
+            }
+            assert!(!physical_cache_evict_one_locked(state));
+        }
     }
 
     #[test]

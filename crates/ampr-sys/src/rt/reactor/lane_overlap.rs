@@ -7,7 +7,7 @@
 //! EOP (address write, counter, equeue) at the read fence (native.rs
 //! progress_native_or_address_command), so the successor's first read waits a
 //! full read time. Console, a game, loose files, debug build with the
-//! pread pool and 64 KiB split (2026-11-01, loose-pread notes): ~15.6k jobs and
+//! pread pool and 64 KiB split (loose-pread notes): ~15.6k jobs and
 //! ~24.5k reads per session, submit -> first read issued 4.3-4.8 ms per job vs
 //! 1.1 ms per read, 2-3 reads in flight per 1 s scrape = active lanes.
 //!

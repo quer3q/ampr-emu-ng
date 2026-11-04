@@ -71,8 +71,9 @@ pub(crate) unsafe fn try_process_virtual_read_cache_only(
         // Task destination offsets are u32: a read of 4 GiB or more is cut
         // to a short read at that limit instead of failing part-way with EIO.
         let length = (job.request.nbyte as u64).min(logical_size - offset).min(u32::MAX as u64);
-        // Decoded cache off (the default, AMPR_EMU_PACK_DECODED_CACHE_BYTES = 0):
-        // no chunk can be Ready, so skip the task build and pin attempts.
+        // Decoded cache off (AMPR_EMU_PACK_DECODED_CACHE_BYTES = 0, or it did
+        // not fit the pool): no chunk can be Ready, so skip the task build
+        // and pin attempts.
         if (*state).cache_base.is_null() || (*state).cache_page_count == 0 {
             return false;
         }
@@ -505,8 +506,13 @@ unsafe fn acquire_task_decoded_chunk(
     output: *mut u8,
     error_out: *mut c_int,
 ) -> Result<bool, PipelineStep> {
-    prepare_cache_wait(pipeline, CacheWaitDomain::Decoded, chunk_key_hash(chunk));
-    let mut cache = cache_acquire(chunk, file_flags, false, prefetch);
+    let key_hash = chunk_key_hash(chunk);
+    // Only a reader that parked on this chunk's load takes a Failed entry's
+    // error; any other reader loads the chunk again.
+    let waiter = key_hash != 0 && pipeline.decoded_wait_key == key_hash;
+    pipeline.decoded_wait_key = 0;
+    prepare_cache_wait(pipeline, CacheWaitDomain::Decoded, key_hash);
+    let mut cache = cache_acquire(chunk, file_flags, false, prefetch, waiter);
     if prefetch && cache.kind != CacheAcquireKind::Load {
         // Cached, being loaded, failed or no room: nothing to prefetch.
         cache_release(&mut cache.lease);
@@ -534,7 +540,10 @@ unsafe fn acquire_task_decoded_chunk(
         CacheAcquireKind::Pending | CacheAcquireKind::Failed => {}
     }
     match cache.kind {
-        CacheAcquireKind::Pending => return Err(PipelineStep::YieldCache),
+        CacheAcquireKind::Pending => {
+            pipeline.decoded_wait_key = key_hash;
+            return Err(PipelineStep::YieldCache);
+        }
         CacheAcquireKind::Failed => {
             let error = if cache.lease.error != 0 {
                 cache.lease.error

@@ -127,9 +127,9 @@ pub(crate) const AMPR_EMU_APR_READ_CREDIT_GRANULE_BYTES: u64 = 0x10000;
 pub(crate) const AMPR_EMU_APR_READ_PASS_MAX_BYTES: u64 = 0x80000;
 /// Blocking pread pool for the pack's physical reads (pread_pool.rs). Kernel AIO on BFS
 /// serves 1-2 requests at a time; 32 parallel preads reached 1.6-2.0 GB/s on
-/// the console (2026-10-25 bench). Release: 32 threads (tune::RELEASE_PREAD_THREADS),
+/// a console (bench). Release: 32 threads (tune::RELEASE_PREAD_THREADS),
 /// shared by pack groups (console peak 1.9 busy, 8 queued) and split loose reads
-/// (24-28 parts pending at 32 threads, 2026-11-01). The threads use libkernel's
+/// (24-28 parts pending at 32 threads). The threads use libkernel's
 /// default stacks, not the internal pool: pool_peak stayed 72.0 MiB with 16 and
 /// 32 threads. The debug build has room for 64 and starts `tune::pread_threads()`
 /// (default 32), so 48 or 64 threads can be A/B tested without a rebuild.
@@ -145,15 +145,15 @@ pub(crate) const AMPR_EMU_APR_LOOSE_PREAD: bool = true;
 /// Let a lane's next job parse while the head job has only completion
 /// commands (EOP writes, nops, markers) left (lane_overlap.rs). Off in
 /// release; the debug build reads `lane_eop_overlap` (default 0). A game,
-/// loose files, internal SSD, 64 KiB parts, debug /metrics
-/// (2026-11-01), estimated wait per job (first issue + reads + notify):
+/// loose files, internal SSD, 64 KiB parts, debug /metrics, estimated wait
+/// per job (first issue + reads + notify):
 /// 32 threads off ~6.1 ms, 32 threads on ~7.7 ms (28 loose tasks: the extra
 /// reads only queue), 64 threads off ~6.6 ms, on ~6.4 ms.
 pub(crate) const AMPR_EMU_APR_LANE_EOP_OVERLAP: bool = false;
 /// Part size (KiB) a loose pool read is split into, parts preaded in
 /// parallel into the same destination; the debug build reads
 /// `loose_pread_part_kib`. A game, loose files, internal SSD, 32 threads,
-/// debug /metrics (2026-11-01): 64 KiB 1.10 ms per read, 128 KiB 1.50 ms,
+/// debug /metrics: 64 KiB 1.10 ms per read, 128 KiB 1.50 ms,
 /// 256 KiB 2.09 ms, no split 2.51 ms (docs/read-path-tuning.md).
 pub(crate) const AMPR_EMU_APR_LOOSE_PREAD_PART_KIB: u32 = 64;
 /// Pool tasks (parts) loose reads may hold at once. Release: 32 =
@@ -163,7 +163,7 @@ pub(crate) const AMPR_EMU_APR_LOOSE_PREAD_PART_KIB: u32 = 64;
 /// count alone sets the cap (28 at the default 32 threads, 60 at
 /// `pread_threads=64`). So at least 96 (release) or 64 (debug) of the 128
 /// AMPR_EMU_PACK_PREAD_TASKS stay free for pack groups, 100 at 32 threads
-/// (console peak 8 queued, 2026-10-25); a full table returns EAGAIN and the
+/// (console peak 8 queued); a full table returns EAGAIN and the
 /// read goes unsplit or to kernel AIO (loose_pread.rs).
 pub(crate) const AMPR_EMU_APR_LOOSE_PREAD_TASKS_MAX: u32 = if crate::rt::tune::ON {
     AMPR_EMU_PACK_PREAD_WORKERS as u32
@@ -176,7 +176,7 @@ const _: () = assert!(
 );
 /// pread threads loose reads never take: 4 of the 32 release threads
 /// (tune::RELEASE_PREAD_THREADS; debug `pread_threads`, default 32, max 64)
-/// stay for pack tasks (console peak was 1.9 busy pack threads, 2026-10-25).
+/// stay for pack tasks (console peak was 1.9 busy pack threads).
 pub(crate) const AMPR_EMU_APR_LOOSE_PREAD_PACK_RESERVE: usize = 4;
 pub(crate) const AMPR_EMU_APR_COMMAND_BUFFER_LIVE_MAX: usize = 4096;
 pub(crate) const AMPR_EMU_FD_OPEN_BUDGET_CAP: usize = 50;

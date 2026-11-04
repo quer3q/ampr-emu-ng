@@ -367,7 +367,10 @@ unsafe fn acquire_mandatory_pages(
             pack_id: page.pack_id,
         };
     }
-    let acquired_count = physical_cache_acquire_batch(acquire_items.as_ptr(), page_count, false);
+    let waiter_key = pipeline.physical_wait_key;
+    pipeline.physical_wait_key = 0;
+    let acquired_count =
+        physical_cache_acquire_batch(acquire_items.as_ptr(), page_count, false, waiter_key);
     for i in 0..acquired_count {
         let acquired = pipeline.mandatory_pages[i].acquired;
         match acquired.kind {
@@ -393,6 +396,9 @@ unsafe fn acquire_mandatory_pages(
                 pipeline.cache_wait_domain = CacheWaitDomain::Physical;
                 pipeline.cache_wait_bucket = wait_buckets[i];
                 pipeline.cache_wait_epoch = wait_epochs[i];
+                let page = &pipeline.mandatory_pages[i];
+                pipeline.physical_wait_key =
+                    physical_cache_key_hash(page.pack_id, page.offset, page.size);
                 abandon_mandatory_page_plan(pipeline, SCE_KERNEL_ERROR_EAGAIN);
                 return Err(PipelineStep::YieldCache);
             }
@@ -443,7 +449,9 @@ unsafe fn open_mandatory_load_pages(
         if fd_index == pipeline.mandatory_fd_count {
             let fd = acquire_pack_fd(page.pack_id, prefetch);
             if fd < 0 {
-                abandon_mandatory_page_plan(pipeline, fd);
+                // EAGAIN, as in mandatory_fail: the open error goes to this
+                // task only, not to the Load pages other chunks share.
+                abandon_mandatory_page_plan(pipeline, SCE_KERNEL_ERROR_EAGAIN);
                 if fd == SCE_KERNEL_ERROR_EAGAIN {
                     return Err(PipelineStep::YieldFd);
                 }

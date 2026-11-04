@@ -246,6 +246,11 @@ pub(crate) unsafe fn ampr_pack_open_directory_impl(
         ) {
             return fallback;
         }
+        // Held through the range lookup and the slot allocation: both read
+        // the manifest (rt/pack/mod.rs `ManifestReader`).
+        let Some(_reader) = ManifestReader::enter() else {
+            return fallback;
+        };
         let manifest_ready = if allow_physical_open {
             ensure_manifest_ready()
         } else {
@@ -416,7 +421,13 @@ pub unsafe fn ampr_pack_try_stat_path(
         if !handled.is_null() {
             *handled = false;
         }
-        if path.is_null() || stat.is_null() || handled.is_null() || !ensure_manifest_ready() {
+        if path.is_null() || stat.is_null() || handled.is_null() {
+            return SCE_KERNEL_ERROR_ENOENT;
+        }
+        let Some(_reader) = ManifestReader::enter() else {
+            return SCE_KERNEL_ERROR_ENOENT;
+        };
+        if !ensure_manifest_ready() {
             return SCE_KERNEL_ERROR_ENOENT;
         }
         let state = pack_state();
@@ -458,18 +469,46 @@ pub unsafe fn ampr_pack_is_virtual_directory_fd(fd: c_int) -> bool {
     }
 }
 
+/// Copies the path of an open virtual directory fd into `out` (truncated,
+/// NUL-terminated) and returns its length; None for any other fd. Debug
+/// probes (rt/probe.rs) log it so `/fsfail` dedups by directory.
+#[cfg(feature = "mem_report")]
+pub(crate) unsafe fn virtual_directory_fd_path(fd: c_int, out: &mut [u8]) -> Option<usize> {
+    let mut slot = 0u32;
+    let mut generation = 0u16;
+    if out.is_empty() || !unsafe { decode_virtual_directory_fd(fd, &mut slot, &mut generation) } {
+        return None;
+    }
+    let state = unsafe { pack_state() };
+    let _lock = DIRECTORY_MUTEXES[slot as usize].lock();
+    let s = unsafe { &(*state).virtual_directories[slot as usize] };
+    if !s.active || s.generation != generation {
+        return None;
+    }
+    let n = (s.path_length as usize).min(s.path.len()).min(out.len() - 1);
+    for (i, b) in out[..n].iter_mut().enumerate() {
+        *b = s.path[i] as u8;
+    }
+    out[n] = 0;
+    Some(n)
+}
+
 pub unsafe fn ampr_pack_try_close_fd(fd: c_int, handled: *mut bool) -> c_int {
     unsafe {
         if !handled.is_null() {
             *handled = false;
         }
-        let state = pack_state();
+        // The fd tag decides before pack_state(): a physical fd (the runtime's
+        // own closes reach here through libkernel's `close` -> `_close` hook)
+        // must never create or wait on the pack state. tune::load inside
+        // pack_state_create once hung here spinning on that state.
         let mut index = 0u32;
         let mut generation = 0u16;
         if decode_virtual_directory_fd(fd, &mut index, &mut generation) {
             if !handled.is_null() {
                 *handled = true;
             }
+            let state = pack_state();
             let real_fd;
             {
                 // No WORKER_STOP_REQUESTED early return here: the slot array
@@ -507,6 +546,7 @@ pub unsafe fn ampr_pack_try_close_fd(fd: c_int, handled: *mut bool) -> c_int {
             if !handled.is_null() {
                 *handled = true;
             }
+            let state = pack_state();
             let _descriptor_lock = VIRTUAL_FD_MUTEXES[index as usize].lock();
             if WORKER_STOP_REQUESTED.load(Ordering::Acquire) {
                 return SCE_KERNEL_ERROR_EBADF;
@@ -537,13 +577,14 @@ pub unsafe fn ampr_pack_try_fstat_fd(
         if stat.is_null() {
             return SCE_KERNEL_ERROR_EFAULT;
         }
-        let state = pack_state();
+        // Tag decode before pack_state(), as in ampr_pack_try_close_fd.
         let mut index = 0u32;
         let mut generation = 0u16;
         if decode_virtual_directory_fd(fd, &mut index, &mut generation) {
             if !handled.is_null() {
                 *handled = true;
             }
+            let state = pack_state();
             let _lock = DIRECTORY_MUTEXES[index as usize].lock();
             if WORKER_STOP_REQUESTED.load(Ordering::Acquire) {
                 return SCE_KERNEL_ERROR_EBADF;
@@ -565,39 +606,18 @@ pub unsafe fn ampr_pack_try_fstat_fd(
             if !handled.is_null() {
                 *handled = true;
             }
-            if zstd_mode() {
-                return zstd_fstat_virtual_fd(state, index, generation, stat);
-            }
-            {
-                let _lock = PACK_M.lock();
-                let slot = &(*state).virtual_fds[index as usize];
-                if !slot.active
-                    || slot.generation != generation
-                    || (*state).header.is_null()
-                    || slot.file_id == 0
-                    || slot.file_id as u64 > { (*(*state).header).file_count }
-                {
-                    return SCE_KERNEL_ERROR_EBADF;
-                }
-                let file = *(*state).files.add(slot.file_id as usize - 1);
-                fill_synthetic_stat(
-                    stat,
-                    false,
-                    file.logical_size,
-                    file.mtime,
-                    file.path_hash ^ slot.file_id as u64,
-                );
-                return 0;
-            }
+            return fstat_virtual_fd(pack_state(), index, generation, stat);
         }
         SCE_KERNEL_ERROR_EBADF
     }
 }
 
-/// zstd fstat of a packed virtual fd: the slot keeps its one-based
+/// fstat of a packed virtual fd, both formats: the slot keeps its one-based
 /// AMPRIDX3 id, and the result equals the resident `stat` of the path
-/// (rt/index.rs `file_stat`: AMPRIDX3 size and mtime, `st_ino` = id).
-unsafe fn zstd_fstat_virtual_fd(
+/// (rt/index.rs `file_stat`: AMPRIDX3 size and mtime, `st_ino` = id), so
+/// code that compares stat and fstat (dev/ino caches, same-file checks)
+/// sees one file. The AMPRPAK4 record's own mtime and path hash are not used.
+unsafe fn fstat_virtual_fd(
     state: *const PackState,
     index: u32,
     generation: u16,
@@ -611,8 +631,12 @@ unsafe fn zstd_fstat_virtual_fd(
         }
         slot.file_id
     };
+    // A refused guard is EBADF, as for an fd whose slot shutdown closed.
+    let Some(_reader) = ManifestReader::enter() else {
+        return SCE_KERNEL_ERROR_EBADF;
+    };
     let mut entry = MaybeUninit::<FileEntryView>::zeroed();
-    if zstd::zstd_entry(file_id).is_none()
+    if !file_id_is_packed(&_reader, file_id)
         || unsafe { ampr_index_get_entry_view(file_id, entry.as_mut_ptr()) } != 0
     {
         return SCE_KERNEL_ERROR_EBADF;

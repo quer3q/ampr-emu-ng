@@ -1,6 +1,8 @@
 //! The emulator runtime. Modules call each other directly; only SDK and PRX
 //! entry points cross a C ABI boundary.
 mod amm;
+#[cfg(feature = "mem_report")]
+mod blackbox;
 mod command_buffer;
 mod equeue;
 pub(crate) mod exports;
@@ -8,6 +10,8 @@ mod fd_cache;
 mod hook;
 mod index;
 mod libc_exports;
+#[cfg(feature = "mem_report")]
+mod probe;
 pub(crate) mod pack;
 mod reactor;
 mod runtime_memory;
