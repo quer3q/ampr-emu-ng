@@ -32,10 +32,21 @@ pub(crate) unsafe fn cache_release_entry_locked(state: *mut PackState, index: u3
     (*state).cache_free_head = index;
 }
 
+/// The hand walks only the indices below the high-water mark (at most the
+/// live entry count, about 64 for 256 KiB zstd chunks in the 16 MiB cache)
+/// instead of all 8192 slots, and wraps at it, so it visits the live entries
+/// in the same order as a full-range hand would.
 pub(crate) unsafe fn cache_evict_one_locked(state: *mut PackState) -> bool {
-    for _ in 0..AMPR_EMU_PACK_CACHE_ENTRY_CAP as u32 * 2 {
-        let index = (*state).cache_clock % AMPR_EMU_PACK_CACHE_ENTRY_CAP as u32;
-        (*state).cache_clock = (*state).cache_clock.wrapping_add(1);
+    let limit = (*state)
+        .cache_entry_high_water
+        .min(AMPR_EMU_PACK_CACHE_ENTRY_CAP as u32);
+    for _ in 0..limit * 2 {
+        let index = if (*state).cache_clock < limit {
+            (*state).cache_clock
+        } else {
+            0
+        };
+        (*state).cache_clock = index + 1;
         let entry = &mut (*state).cache_entries[index as usize];
         if entry.state == CacheEntryState::Free
             || entry.pin_count != 0
@@ -51,6 +62,33 @@ pub(crate) unsafe fn cache_evict_one_locked(state: *mut PackState) -> bool {
         return true;
     }
     false
+}
+
+/// A Failed entry gives its error only to a reader that waited on its load
+/// (`waiter`); that error is returned. Any other reader drops the entry and
+/// gets 0, so one disk error does not fail every later read of the chunk
+/// until eviction: an unpinned entry is freed, a pinned one leaves the hash
+/// and turns transient, so its last release frees it.
+pub(crate) unsafe fn cache_take_failed_locked(
+    state: *mut PackState,
+    index: u32,
+    waiter: bool,
+) -> c_int {
+    let entry = &mut (*state).cache_entries[index as usize];
+    if waiter {
+        return if entry.error != 0 {
+            entry.error
+        } else {
+            SCE_KERNEL_ERROR_EIO
+        };
+    }
+    if entry.pin_count == 0 {
+        cache_release_entry_locked(state, index);
+    } else {
+        entry.error = SCE_KERNEL_ERROR_EAGAIN;
+        cache_hash_unlink_locked(state, index);
+    }
+    0
 }
 
 pub(crate) unsafe fn cache_should_admit_locked(
@@ -81,11 +119,15 @@ pub(crate) unsafe fn cache_should_admit_locked(
 /// `wait_for_loader = false` returns Pending on a Loading entry instead of
 /// blocking. `force_admit` (read-ahead, readahead.rs) skips
 /// the admission policy, so a missing chunk always gets a Load lease if room.
+/// `waiter`: the caller got Pending for this chunk last time and was woken by
+/// a publication, so a Failed entry is its loader's answer (see
+/// cache_take_failed_locked).
 pub(crate) unsafe fn cache_acquire(
     chunk: &AmprPackChunkView,
     file_flags: u32,
     wait_for_loader: bool,
     force_admit: bool,
+    mut waiter: bool,
 ) -> CacheAcquireResult {
     let state = unsafe { pack_state() };
     let mut result = CacheAcquireResult::EMPTY;
@@ -107,6 +149,7 @@ pub(crate) unsafe fn cache_acquire(
                         return result;
                     }
                     CACHE_CVS[cache_wait_bucket(key_hash) as usize].wait(&mut lock);
+                    waiter = true;
                     continue;
                 }
                 CacheEntryState::Ready => {
@@ -122,13 +165,12 @@ pub(crate) unsafe fn cache_acquire(
                     return result;
                 }
                 CacheEntryState::Failed => {
-                    result.kind = CacheAcquireKind::Failed;
-                    result.lease.error = if entry.error != 0 {
-                        entry.error
-                    } else {
-                        SCE_KERNEL_ERROR_EIO
-                    };
-                    return result;
+                    let error = cache_take_failed_locked(state, found, waiter);
+                    if error != 0 {
+                        result.kind = CacheAcquireKind::Failed;
+                        result.lease.error = error;
+                        return result;
+                    }
                 }
                 CacheEntryState::Free => {}
             }
@@ -149,6 +191,9 @@ pub(crate) unsafe fn cache_acquire(
             return result;
         }
         let index = (*state).cache_free_head;
+        if index >= (*state).cache_entry_high_water {
+            (*state).cache_entry_high_water = index + 1;
+        }
         let entry = &mut (*state).cache_entries[index as usize];
         (*state).cache_free_head = entry.free_next;
         *entry = CacheEntry {
@@ -449,10 +494,18 @@ pub(crate) unsafe fn physical_cache_release_entry_locked(state: *mut PackState, 
     (*state).physical_cache_free_head = index;
 }
 
+/// Bounded and wrapped at the high-water mark like cache_evict_one_locked.
 pub(crate) unsafe fn physical_cache_evict_one_locked(state: *mut PackState) -> bool {
-    for _ in 0..AMPR_EMU_PACK_PHYSICAL_CACHE_ENTRY_CAP as u32 * 2 {
-        let index = (*state).physical_cache_clock % AMPR_EMU_PACK_PHYSICAL_CACHE_ENTRY_CAP as u32;
-        (*state).physical_cache_clock = (*state).physical_cache_clock.wrapping_add(1);
+    let limit = (*state)
+        .physical_cache_entry_high_water
+        .min(AMPR_EMU_PACK_PHYSICAL_CACHE_ENTRY_CAP as u32);
+    for _ in 0..limit * 2 {
+        let index = if (*state).physical_cache_clock < limit {
+            (*state).physical_cache_clock
+        } else {
+            0
+        };
+        (*state).physical_cache_clock = index + 1;
         let entry = &mut (*state).physical_cache_entries[index as usize];
         if entry.state == PhysicalCacheEntryState::Free
             || entry.pin_count != 0
@@ -480,4 +533,117 @@ pub(crate) unsafe fn physical_cache_request_valid(
         && size != 0
         && size <= 1u32 << AMPR_PACK_IO_PAGE_SHIFT_MAX
         && offset & (size as u64 - 1) == 0
+}
+
+#[cfg(test)]
+mod decoded_cache_tests {
+    use super::*;
+    use std::alloc::{alloc_zeroed, Layout};
+
+    /// A zeroed PackState (leaked) with `live` Ready decoded entries at
+    /// indices 0.., one page each. The `_locked` paths run without
+    /// CACHE_MUTEX: the host has no scePthreadMutex*.
+    fn cache_state(live: u32) -> *mut PackState {
+        unsafe {
+            let state = alloc_zeroed(Layout::new::<PackState>()) as *mut PackState;
+            assert!(!state.is_null());
+            (*state).cache_page_count = 64;
+            (*state).cache_free_head = INVALID_INDEX;
+            for i in 0..live {
+                let entry = &mut (*state).cache_entries[i as usize];
+                *entry = CacheEntry::EMPTY;
+                entry.key_hash = 0x1000 + i as u64;
+                entry.page_start = i;
+                entry.page_count = 1;
+                entry.state = CacheEntryState::Ready;
+                cache_mark_pages(state, i, 1, true);
+                cache_hash_link_locked(state, i);
+            }
+            (*state).cache_entry_high_water = live;
+            state
+        }
+    }
+
+    /// Whether `index` is on the hash chain of `key_hash`.
+    fn linked(state: *mut PackState, key_hash: u64, index: u32) -> bool {
+        let bucket = ampr_format::cache::bucket_index(key_hash, AMPR_EMU_PACK_CACHE_HASH_BUCKETS);
+        let mut link = unsafe { (*state).cache_hash_heads[bucket] };
+        while link != 0 {
+            if link - 1 == index {
+                return true;
+            }
+            link = unsafe { (*state).cache_entries[(link - 1) as usize].hash_next_plus_one };
+        }
+        false
+    }
+
+    #[test]
+    fn clock_wraps_at_high_water_in_full_range_order() {
+        let state = cache_state(4);
+        unsafe {
+            (*state).cache_entries[1].referenced = true;
+            let mut order = Vec::new();
+            for _ in 0..4 {
+                let before: Vec<_> =
+                    (0..4).map(|i| (*state).cache_entries[i].state).collect();
+                assert!(cache_evict_one_locked(state));
+                let freed = (0..4)
+                    .find(|&i| {
+                        before[i] != CacheEntryState::Free
+                            && (*state).cache_entries[i].state == CacheEntryState::Free
+                    })
+                    .unwrap();
+                order.push(freed);
+                // The hand never leaves the live range.
+                assert!((*state).cache_clock <= 4);
+            }
+            // Entry 1 loses its reference bit on the first pass and goes last,
+            // as with a hand over all 8192 slots.
+            assert_eq!(order, [0, 2, 3, 1]);
+            assert!(!cache_evict_one_locked(state));
+        }
+    }
+
+    #[test]
+    fn clock_with_no_allocated_entry_evicts_nothing() {
+        let state = cache_state(0);
+        assert!(!unsafe { cache_evict_one_locked(state) });
+    }
+
+    #[test]
+    fn failed_entry_errors_only_its_waiters() {
+        let state = cache_state(2);
+        unsafe {
+            let entry = &mut (*state).cache_entries[0];
+            entry.state = CacheEntryState::Failed;
+            entry.error = SCE_KERNEL_ERROR_EIO;
+            // A reader that parked on the load gets the loader's error and
+            // the entry stays for the other waiters.
+            assert_eq!(cache_take_failed_locked(state, 0, true), SCE_KERNEL_ERROR_EIO);
+            assert!((*state).cache_entries[0].state == CacheEntryState::Failed);
+            assert!(linked(state, 0x1000, 0));
+            // A later reader drops it, so it loads the chunk again.
+            assert_eq!(cache_take_failed_locked(state, 0, false), 0);
+            assert!((*state).cache_entries[0].state == CacheEntryState::Free);
+            assert_eq!((*state).cache_free_head, 0);
+            assert!(!linked(state, 0x1000, 0));
+        }
+    }
+
+    #[test]
+    fn pinned_failed_entry_leaves_hash_and_turns_transient() {
+        let state = cache_state(1);
+        unsafe {
+            let entry = &mut (*state).cache_entries[0];
+            entry.state = CacheEntryState::Failed;
+            entry.error = SCE_KERNEL_ERROR_EIO;
+            entry.pin_count = 1;
+            assert_eq!(cache_take_failed_locked(state, 0, false), 0);
+            let entry = &(*state).cache_entries[0];
+            // The holder keeps its pages; cache_release frees it at pin 0.
+            assert!(entry.state == CacheEntryState::Failed);
+            assert!(cache_error_is_transient(entry.error));
+            assert!(!linked(state, 0x1000, 0));
+        }
+    }
 }

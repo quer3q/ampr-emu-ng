@@ -393,15 +393,22 @@ pub(crate) unsafe fn ensure_manifest_loaded() -> bool {
         if current == PACK_LOAD_UNAVAILABLE || current == PACK_LOAD_INVALID {
             return false;
         }
-        if LOAD_STATE
-            .compare_exchange(
-                PACK_LOAD_UNINITIALIZED,
-                PACK_LOAD_LOADING,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .is_ok()
-        {
+        // Claimed under MANIFEST_MUTEX with the stop flag rechecked: shutdown
+        // sets the flag and then waits for LOADING to end under the same
+        // mutex, so a load either starts before that wait or not at all.
+        let claimed = {
+            let _lock = MANIFEST_MUTEX.lock();
+            !WORKER_STOP_REQUESTED.load(Ordering::Acquire)
+                && LOAD_STATE
+                    .compare_exchange(
+                        PACK_LOAD_UNINITIALIZED,
+                        PACK_LOAD_LOADING,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_ok()
+        };
+        if claimed {
             let mut absent = false;
             let loaded = unsafe { load_manifest(state, &mut absent) };
             {

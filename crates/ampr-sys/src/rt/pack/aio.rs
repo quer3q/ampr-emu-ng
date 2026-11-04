@@ -129,7 +129,7 @@ pub unsafe extern "C" fn posix_lseek_emul(fd: c_int, offset: off_t, whence: c_in
     }
 }
 
-unsafe fn has_virtual_fd(requests: *const SceKernelAioRWRequest, count: c_int) -> bool {
+pub(crate) unsafe fn has_virtual_fd(requests: *const SceKernelAioRWRequest, count: c_int) -> bool {
     (0..count as usize)
         .any(|i| unsafe { decode_virtual_fd((*requests.add(i)).fd, null_mut(), null_mut()) })
 }
@@ -147,6 +147,11 @@ pub unsafe fn sceKernelAioSubmitReadCommandsMultiple(
     {
         return SCE_KERNEL_ERROR_EINVAL;
     }
+    // The job reads the manifest, which shutdown frees; a submit after the
+    // gate closed fails like a read of a gone mount.
+    let Some(_reader) = ManifestReader::enter() else {
+        return SCE_KERNEL_ERROR_EIO;
+    };
     unsafe {
         if !has_virtual_fd(requests, count) {
             return match real_aio_submit() {
@@ -236,7 +241,11 @@ pub unsafe fn sceKernelAioSubmitReadCommandsMultiple(
                 virtual_requests += 1;
                 // zstd: a read over >= 2 chunks becomes parallel child jobs,
                 // while the rest of the batch and SPLIT_MIN_FREE_SLOTS keep
-                // free slots (else it stays one job).
+                // free slots (else it stays one job). The split is written
+                // for zstd's fixed 256 KiB chunks and AMPRZPK1 geometry
+                // (zstd_split.rs). LZ4 files have a fixed block size too
+                // (`1 << block_shift`, ampr-lz4 plan.rs), but would need
+                // their own split, so an LZ4 read stays one job.
                 if zstd_mode() {
                     let mut children = [0u32; SPLIT_MAX_CHILDREN];
                     let rest = count as usize - i - 1;

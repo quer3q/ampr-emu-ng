@@ -107,8 +107,8 @@ mod libkernel;
 pub(crate) use libkernel::*;
 mod align;
 pub(crate) use align::*;
-// zstd: the AMPRPAK4 directory order (build_packed_file_order) is unused
-// until R6 replaces it with a zstd-backed one.
+// zstd: directories walk the zstd file order (`packed_order`, rt/pack/
+// directories.rs), not the AMPRPAK4 `build_packed_file_order`.
 mod state;
 pub(crate) use state::*;
 mod manifest;
@@ -142,6 +142,12 @@ pub(crate) use readahead::*;
 /// zstd mount state and accessors (reached as `zstd::x`).
 pub(crate) mod zstd;
 pub(crate) mod zstd_libc;
+/// mmap of a packed file (both formats) through a disk cache copy (hook ids
+/// 96, 97).
+pub(crate) mod mmap;
+/// `AMPR_ZSTD_MMAP=1`: decode-on-access mappings and their fault handler.
+/// zstd only; an LZ4 mapping takes the disk cache copy in `mmap`.
+pub(crate) mod mmap_fault;
 /// zstd: a multi-chunk read split into parallel child jobs (aio.rs).
 mod zstd_split;
 pub(crate) use zstd_split::*;
@@ -156,6 +162,136 @@ pub(crate) fn zstd_mode() -> bool {
     ZSTD_MODE.load(Ordering::Relaxed)
 }
 
+/// Set once at module_start before any hook installs: `/app0` holds the
+/// zstd index or the LZ4 manifest (`AMPR_EMU_PACK_INDEX_PATH`). Only such a
+/// title can have files with no physical copy, so only it gets the hooks
+/// past the shared 78 (rt/hook.rs `hook_enabled`), the eager index load in
+/// module_start and the mmap cache sweep. A title with no packs keeps the
+/// v0.2.0 behavior.
+static PACKS_PRESENT: AtomicBool = AtomicBool::new(false);
+
+/// True when this title ships zstd packs or an LZ4 pack manifest.
+#[inline(always)]
+pub(crate) fn packs_present() -> bool {
+    PACKS_PRESENT.load(Ordering::Relaxed)
+}
+
+/// True when one-based `file_id` names a packed file, one with no physical
+/// copy that only a virtual fd can serve. zstd: the id has a record in the
+/// R4 projection. LZ4: its AMPRPAK4 record (record index `file_id - 1`)
+/// carries `AMPR_PACK_FILE_PACKED`. False when the manifest is not loaded or
+/// the id is out of range. Lock-free, so the open hooks and the debug
+/// probes can call it. `_reader` is the proof that the caller holds the
+/// manifest gate: every caller goes on to read the manifest and holds one
+/// `ManifestReader` across both.
+pub(crate) fn file_id_is_packed(_reader: &ManifestReader, file_id: u32) -> bool {
+    if zstd_mode() {
+        return zstd::zstd_entry(file_id).is_some();
+    }
+    let state = g_pack_state.load(Ordering::Acquire);
+    if file_id == 0 || state.is_null() || LOAD_STATE.load(Ordering::Acquire) != PACK_LOAD_READY {
+        return false;
+    }
+    unsafe {
+        let header = (*state).header;
+        if header.is_null() || (*state).files.is_null() || u64::from(file_id) > (*header).file_count
+        {
+            return false;
+        }
+        (*(*state).files.add(file_id as usize - 1)).flags & AMPR_PACK_FILE_PACKED != 0
+    }
+}
+
+// ---- manifest reader guard ----
+
+/// Counts the hook threads that read the manifest (LZ4 `header`/`files`/
+/// `core_view`, the zstd mount and projection) without a `PackSubmission`.
+/// Hooks stay installed while `ampr_pack_shutdown` runs (module_stop
+/// uninstalls them after it), so without this count a reader that passed
+/// the READY check could still load from storage that
+/// `release_manifest_storage` has freed. A lock would cost every open and
+/// stat a mutex; two atomic RMWs do not.
+///
+/// Contract: a reader calls `ReaderGate::enter` before its first manifest
+/// load and keeps the returned `ManifestReader` until its last one. A
+/// refused enter means "manifest not loaded". Shutdown closes the gate first
+/// and, before it frees the manifest, waits with no lock held until the
+/// count is zero. A reader must not wait while holding the guard on anything
+/// that only shutdown can release after its wait; waiting on MANIFEST_CV is
+/// allowed because shutdown sets the stop flag and wakes it before the wait.
+pub(crate) struct ReaderGate {
+    readers: AtomicU32,
+    closed: AtomicBool,
+}
+
+impl ReaderGate {
+    pub(crate) const fn new() -> Self {
+        Self {
+            readers: AtomicU32::new(0),
+            closed: AtomicBool::new(false),
+        }
+    }
+
+    /// The increment comes before the closed check and both are SeqCst, so
+    /// either shutdown sees this reader in its count or this reader sees the
+    /// gate closed; never neither.
+    pub(crate) fn enter(&'static self) -> Option<ManifestReader> {
+        self.readers.fetch_add(1, Ordering::SeqCst);
+        if self.closed.load(Ordering::SeqCst) {
+            self.readers.fetch_sub(1, Ordering::Release);
+            return None;
+        }
+        Some(ManifestReader { gate: self })
+    }
+
+    pub(crate) fn close(&self) {
+        self.closed.store(true, Ordering::SeqCst);
+    }
+
+    pub(crate) fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn readers(&self) -> u32 {
+        self.readers.load(Ordering::SeqCst)
+    }
+
+    /// Spins until no reader holds the gate, calling `pause` between checks.
+    /// True once the count is zero; false when `pause` returns false (the
+    /// host test bounds the wait this way, shutdown never gives up).
+    pub(crate) fn wait_drained(&self, mut pause: impl FnMut() -> bool) -> bool {
+        while self.readers() != 0 {
+            if !pause() {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+/// RAII hold on a `ReaderGate`; the drop releases it.
+pub(crate) struct ManifestReader {
+    gate: &'static ReaderGate,
+}
+
+impl ManifestReader {
+    /// Enters the runtime's manifest gate; None once shutdown has started.
+    #[inline]
+    pub(crate) fn enter() -> Option<ManifestReader> {
+        MANIFEST_READERS.enter()
+    }
+}
+
+impl Drop for ManifestReader {
+    fn drop(&mut self) {
+        // Release orders this reader's manifest loads before the
+        // decrement that shutdown's SeqCst count load observes.
+        self.gate.readers.fetch_sub(1, Ordering::Release);
+    }
+}
+
+pub(crate) static MANIFEST_READERS: ReaderGate = ReaderGate::new();
+
 /// module_start, before hooks: picks the pack format from the files present.
 pub(crate) unsafe fn select_pack_format() {
     type StatFn = unsafe extern "C" fn(*const c_char, *mut c_void) -> c_int;
@@ -168,6 +304,21 @@ pub(crate) unsafe fn select_pack_format() {
         ) == 0
     });
     ZSTD_MODE.store(found, Ordering::Relaxed);
+    // Any stat error reads as absent: the title then gets the plain hook
+    // set. Resolved here because `sys::real_posix_stat` reads the stat hook
+    // slot, which stays null until the hooks install (rt/hook.rs
+    // `FALLBACK_SHARED`).
+    let packs = found
+        || unsafe { sys::resolve_kernel::<StatFn>(c"stat") }.is_some_and(|f| unsafe {
+            f(AMPR_EMU_PACK_INDEX_PATH.as_ptr(), st.as_mut_ptr().cast()) == 0
+        });
+    PACKS_PRESENT.store(packs, Ordering::Relaxed);
+    // A crash between a cache file's create and unlink leaves it named.
+    // Both pack formats map packed files through that cache, so sweep for
+    // either; a title with no packs never creates cache files.
+    if packs && mmap::MMAP_MODE != 0 {
+        unsafe { mmap::sweep_cache_dir() };
+    }
 }
 
 // ---- SDK AIO types ------------------------------------------------------------
@@ -433,14 +584,10 @@ impl AmprPackCoreView {
 }
 
 // ---- configuration (AMPR_PACK_ENABLE=1, AMPR_DIRECTORY_OVERLAY=1)
-// Process open/AIO intercepts are on, as in upstream 0.4.2.1 (config.h
-// AMPR_EMU_PACK_PROCESS_OPEN_ENABLE=1): some LZ4 titles open packed files
-// (e.g. their /app0/d/<lane>/<container> set) with a plain open() before their
-// AMPR read path runs, and a packed file has no physical copy, so the open
-// must return a virtual fd served by the pack runtime.
-
-pub(crate) const AMPR_EMU_PACK_PROCESS_OPEN_ENABLE: bool = true;
-pub(crate) const AMPR_EMU_PACK_INTERCEPT_ALL_READ_ONLY: bool = AMPR_EMU_PACK_PROCESS_OPEN_ENABLE;
+// Plain read-only opens of packed files get a virtual fd in both formats
+// (slots.rs `pack_open_flags_supported`). Upstream 0.4.2.1 assumed LZ4 packs
+// hold only files the game reads through AMPR; GitHub issue #2 (an
+// Insomniac Engine title, LZ4 packs) showed plain open() of packed files too.
 
 pub(crate) const AMPR_EMU_PACK_INDEX_PATH: &CStr = c"/app0/ampr_assets.index";
 /// `AMPR_EMU_PACK_INDEX_PATH ".runtime"` (AMPRPAK4 only; zstd keeps the defaults).
@@ -449,7 +596,8 @@ pub(crate) const AMPR_EMU_PACK_ROOT_PATH: &CStr = c"/app0";
 pub(crate) const AMPR_EMU_PACK_LOGICAL_ROOT_PATH: &CStr = c"/app0";
 
 pub(crate) const AMPR_EMU_PACK_VIRTUAL_DIRECTORY_SLOTS: usize = 256;
-/// Decode workers, from the Makefile's `AMPR_PACK_WORKERS` (default 8).
+/// Decode workers, from the Makefile's `AMPR_PACK_WORKERS` (Makefile default
+/// 4; 8 when built outside the Makefile).
 pub(crate) const AMPR_EMU_PACK_WORKERS: u32 = match option_env!("AMPR_PACK_WORKERS") {
     Some(s) => super::runtime_memory::parse_size(s.as_bytes()) as u32,
     None => 8,
@@ -459,8 +607,9 @@ const _: () = assert!(
 );
 pub(crate) const AMPR_EMU_PACK_WORKER_CAPACITY: usize = 16;
 /// Sequential read-ahead window in chunks, from the Makefile's
-/// `AMPR_PACK_READAHEAD_CHUNKS` (default 32, a ~1-1.5 MiB prefetch run); 0
-/// disables read-ahead (readahead.rs).
+/// `AMPR_PACK_READAHEAD_CHUNKS` (Makefile default 0, off; 32, a ~1-1.5 MiB
+/// prefetch run, when built outside the Makefile); 0 disables read-ahead
+/// (readahead.rs).
 pub(crate) const AMPR_EMU_PACK_READAHEAD_CHUNKS: u32 =
     match option_env!("AMPR_PACK_READAHEAD_CHUNKS") {
         Some(s) if s.len() == 1 && s.as_bytes()[0] == b'0' => 0,
@@ -500,12 +649,21 @@ pub(crate) const AMPR_EMU_PACK_VIRTUAL_FD_SLOTS: usize = 256;
 pub(crate) const AMPR_EMU_PACK_VIRTUAL_AIO_SLOTS: usize = 256;
 pub(crate) const AMPR_EMU_PACK_MAX_PACKS: usize = 1024;
 pub(crate) const AMPR_EMU_PACK_OPEN_PACK_FD_CAP: u32 = 18;
-/// 0 = off: with read-ahead off it got 1-2.5% hits (the game re-reads chunks
-/// only gigabytes later); reads take the Bypass path.
-pub(crate) const AMPR_EMU_PACK_DECODED_CACHE_BYTES: u64 = 0;
+/// 16 MiB. A fully packed LZ4 UE3 title (debug /metrics, 75 s from launch,
+/// 128 MiB pool) re-decodes a third of its chunks: 16 MiB served 14% of
+/// chunk reads, cut repeat decodes 34.7k -> 20.7k and the pack job
+/// 1.44-1.46 -> 1.40 ms (two runs without it differ by ~2%), for 16 MiB of
+/// pool (peak 113.6 MiB of 128).
+/// Other titles, same build: a fully packed LZ4 UE5 title 2.6% hits, a
+/// REDengine title (zstd) 59.6%, an RE Engine title (zstd) 20.9%.
+/// It is carved after the physical cache (manifest.rs). The default equals
+/// the 16 MiB minimum, so if the pool is short it is tried once and stays
+/// off; a larger tune or runtime-profile size halves down to the minimum.
+pub(crate) const AMPR_EMU_PACK_DECODED_CACHE_BYTES: u64 = 16 * 1024 * 1024;
 pub(crate) const AMPR_EMU_PACK_DECODED_CACHE_MIN_BYTES: u64 = 16 * 1024 * 1024;
 pub(crate) const AMPR_EMU_PACK_MEMORY_RESERVE_BYTES: u64 = 4 * 1024 * 1024;
-/// 32 MiB, the only cache: besides its hits it is where the read planner
+/// 32 MiB, carved before the decoded cache (manifest.rs): besides its hits
+/// it is where the read planner
 /// (page_plan.rs) joins neighbouring pages into one large read; with it off reads fell
 /// to 66 KB (one chunk) and load APR rose 1.65 -> 2.50 ms.
 /// zstd too: 64 MiB gave APR read 1.11 -> 1.08/1.09 ms and -10% disk bytes
@@ -1136,6 +1294,12 @@ pub(crate) struct ReadPipelineContext {
     pub cache_wait_epoch: u64,
     pub cache_wait_bucket: u16,
     pub cache_wait_domain: CacheWaitDomain,
+    /// Key of the decoded chunk this pipeline last parked on (0: none). A
+    /// Failed entry serves its error only to the readers that waited on its
+    /// load; any other reader drops it and loads again (caches.rs).
+    pub decoded_wait_key: u64,
+    /// The same for the physical page this pipeline last parked on.
+    pub physical_wait_key: u64,
     pub fd_wait_epoch: u64,
     pub fd_budget_wait_epoch: u64,
     pub native_io_error: c_int,
@@ -1184,6 +1348,8 @@ impl ReadPipelineContext {
         cache_wait_epoch: 0,
         cache_wait_bucket: 0,
         cache_wait_domain: CacheWaitDomain::Decoded,
+        decoded_wait_key: 0,
+        physical_wait_key: 0,
         fd_wait_epoch: 0,
         fd_budget_wait_epoch: 0,
         native_io_error: 0,
@@ -1281,6 +1447,9 @@ pub(crate) struct PackState {
     pub cache_hash_heads: [u32; AMPR_EMU_PACK_CACHE_HASH_BUCKETS],
     pub cache_page_cursor: u32,
     pub cache_clock: u32,
+    /// One past the highest entry index ever allocated: the LIFO free list
+    /// hands out low indices first, so the CLOCK hand scans only below it.
+    pub cache_entry_high_water: u32,
     pub touches: [TouchEntry; AMPR_EMU_PACK_TOUCH_TABLE_SIZE],
 
     pub physical_cache_base: *mut u8,
@@ -1292,6 +1461,7 @@ pub(crate) struct PackState {
     pub physical_cache_hash_heads: [u32; AMPR_EMU_PACK_PHYSICAL_CACHE_HASH_BUCKETS],
     pub physical_cache_page_cursor: u32,
     pub physical_cache_clock: u32,
+    pub physical_cache_entry_high_water: u32,
 }
 
 // ---- sync state ---------------------------------------------------------------
@@ -1333,3 +1503,30 @@ pub(crate) static g_pack_state: AtomicPtr<PackState> = AtomicPtr::new(null_mut()
 pub(crate) static g_pack_state_storage: SyncCell<MaybeUninit<PackState>> =
     SyncCell::new(MaybeUninit::zeroed());
 pub(crate) static g_pack_state_init: AtomicU32 = AtomicU32::new(0);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reader_gate_wait_blocks_while_held_and_close_refuses_enter() {
+        // A gate of its own: closing the runtime's MANIFEST_READERS would
+        // refuse readers in the other tests of this binary.
+        static GATE: ReaderGate = ReaderGate::new();
+        let reader = GATE.enter().expect("open gate admits a reader");
+        assert_eq!(GATE.readers(), 1);
+        GATE.close();
+        let mut pauses = 0u32;
+        let drained = GATE.wait_drained(|| {
+            pauses += 1;
+            pauses < 1000
+        });
+        assert!(!drained, "the wait must not finish while a reader holds the gate");
+        assert_eq!(pauses, 1000);
+        assert!(GATE.enter().is_none(), "a closed gate refuses new readers");
+        assert_eq!(GATE.readers(), 1, "a refused enter leaves the count as it was");
+        drop(reader);
+        assert_eq!(GATE.readers(), 0);
+        assert!(GATE.wait_drained(|| false), "an empty gate drains without a pause");
+    }
+}

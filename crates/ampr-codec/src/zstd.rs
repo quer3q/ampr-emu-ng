@@ -12,13 +12,18 @@ pub const ZSTD_CODEC_ZSTD: u8 = 1;
 /// A stored chunk is never larger than its raw size (the writer stores a
 /// chunk raw when zstd is not smaller), so 256 KiB bounds both codecs.
 const MAX_STORED_SIZE: usize = 1 << 18;
-/// Content size of `WARM_UP_FRAME`.
-const WARM_UP_RAW_SIZE: usize = 1 << 16;
+/// Content size of `WARM_UP_FRAME`: a full chunk, so warm-up meets the
+/// largest content size and window (256 KiB) a real chunk can have.
+const WARM_UP_RAW_SIZE: usize = ZSTD_MAX_CHUNK_SIZE;
 
-/// 64 KiB of `i % 7`, zstd level 19 with content size and checksum.
-const WARM_UP_FRAME: [u8; 29] = [
-    40, 181, 47, 253, 100, 0, 255, 125, 0, 0, 56, 0, 1, 2, 3, 4, 5, 6, 1, 0, 246, 127, 233, 197, 8,
-    18, 247, 254, 55,
+/// 256 KiB of `i % 7`, `zstd -19 -C` (content size and checksum): two
+/// 128 KiB blocks, a 256 KiB window. The decode-on-access fault handler
+/// (ampr-sys rt/pack/mmap_fault.rs) decodes inside a signal handler and must
+/// not allocate there; a 64 KiB warm-up frame left larger chunks to grow the
+/// decoder's buffers on first use (Codex review).
+const WARM_UP_FRAME: [u8; 42] = [
+    40, 181, 47, 253, 164, 0, 0, 4, 0, 124, 0, 0, 56, 0, 1, 2, 3, 4, 5, 6, 1, 0, 246, 255, 202,
+    139, 17, 69, 0, 0, 0, 1, 0, 253, 255, 202, 11, 16, 147, 29, 0, 1,
 ];
 
 /// A reusable zstd chunk decoder over one libzstd `ZSTD_DCtx` (native C
@@ -73,12 +78,11 @@ impl ZstdDecoder {
         Self { dctx }
     }
 
-    /// Decodes a built-in 64 KiB frame into `scratch`, so the decoder's
-    /// fixed buffers exist before the first real chunk. Callers pass the
-    /// scratch they decode real chunks into, which must hold
-    /// `ZSTD_MAX_CHUNK_SIZE` (256 KiB) bytes; warm-up itself writes only
-    /// the first 64 KiB. Buffers that track block content and window size
-    /// still grow, to a bounded size, on the first larger chunks.
+    /// Decodes a built-in full-size (256 KiB, 256 KiB window) frame into
+    /// `scratch`, so the decoder's buffers reach the size of the largest
+    /// real chunk before the first one. Callers pass the scratch they
+    /// decode real chunks into, which must hold `ZSTD_MAX_CHUNK_SIZE`
+    /// (256 KiB) bytes.
     pub fn warm_up(&mut self, scratch: &mut [u8]) -> Result<(), Error> {
         self.decode(ZSTD_CODEC_ZSTD, WARM_UP_RAW_SIZE, &WARM_UP_FRAME, scratch)
     }
@@ -158,7 +162,7 @@ fn decode_zstd(dctx: *mut ZSTD_DCtx, stored: &[u8], raw: &mut [u8]) -> Result<()
 mod tests {
     use super::*;
 
-    const FRAME: [u8; 29] = WARM_UP_FRAME;
+    const FRAME: [u8; 42] = WARM_UP_FRAME;
 
     #[test]
     fn reused_decoder_ignores_checksums_but_rejects_bad_frames() {
@@ -167,7 +171,7 @@ mod tests {
         decoder.warm_up(&mut out).unwrap();
         let raw = WARM_UP_RAW_SIZE;
         let mut bad_sum = FRAME;
-        bad_sum[28] ^= 1; // the last checksum byte
+        bad_sum[FRAME.len() - 1] ^= 1; // the last checksum byte
         for _ in 0..3 {
             out.fill(0xff);
             decoder

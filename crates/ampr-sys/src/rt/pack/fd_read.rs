@@ -314,6 +314,217 @@ unsafe fn read_on_workers(
     }
 }
 
+// ---- read threads ----------------------------------------------------------
+
+/// `read_on_workers` runs here, not on the caller's thread: its frames hold
+/// AIO arrays sized for 128 requests (read_on_workers 12,024 B,
+/// sceKernelAioSubmitReadCommandsMultiple 13,528 B, publish_virtual_jobs
+/// 6,600 B in the debug PRX), ~32 KB that a small game thread does not have.
+/// A UE5 title's `Bink IO` thread read a packed .bk2 and faulted
+/// on the guard page in publish_virtual_jobs. The thread stacks
+/// (READ_THREADS x READ_STACK = 4 x 256 KiB = 1 MiB) are libkernel memory,
+/// outside the internal pool.
+/// ponytail: every virtual-fd read pays one handoff; check the caller's stack
+/// and read inline when it is large, if the handoff shows in read latency.
+/// Shrinking the 128-entry AIO arrays in read_on_workers,
+/// sceKernelAioSubmitReadCommandsMultiple and publish_virtual_jobs (smaller
+/// batches, more submits) would let the caller's thread read and remove the
+/// handoff, if its latency shows.
+const READ_THREADS: usize = 4;
+const READ_STACK: usize = 256 * 1024;
+const READ_QUEUE: usize = 64;
+
+/// One read handed to a read thread; lives on the waiting caller's stack.
+struct ReadCall {
+    fd: c_int,
+    vector: *const SceKernelIovec,
+    count: usize,
+    offset: u64,
+    length: u64,
+    rc: ssize_t,
+    done: bool,
+}
+
+/// FIFO of `N` queued items: read threads take the oldest call, so a queued
+/// read cannot starve behind later ones (a first-free-slot scan took the
+/// lowest slot, which later calls could refill every time). `head` and
+/// `tail` count pops and pushes; the slot is the count mod `N`.
+struct Fifo<T: Copy, const N: usize> {
+    slots: [Option<T>; N],
+    head: usize,
+    tail: usize,
+}
+
+impl<T: Copy, const N: usize> Fifo<T, N> {
+    const fn new() -> Self {
+        Self {
+            slots: [None; N],
+            head: 0,
+            tail: 0,
+        }
+    }
+    /// Appends `item`; false (and nothing changes) when `N` are queued.
+    fn push(&mut self, item: T) -> bool {
+        if self.tail.wrapping_sub(self.head) == N {
+            return false;
+        }
+        self.slots[self.tail % N] = Some(item);
+        self.tail = self.tail.wrapping_add(1);
+        true
+    }
+    /// Removes and returns the oldest item.
+    fn pop(&mut self) -> Option<T> {
+        if self.head == self.tail {
+            return None;
+        }
+        let item = self.slots[self.head % N].take();
+        self.head = self.head.wrapping_add(1);
+        item
+    }
+}
+
+static READ_M: Mutex = Mutex::new();
+/// Queue changed: a call queued (threads wait) or a slot freed (callers wait).
+static READ_CV: Condvar = Condvar::new();
+/// A call finished.
+/// ponytail: notify_all wakes every caller waiting for its call, and each
+/// but one sleeps again; the ceiling is READ_QUEUE + READ_THREADS = 68
+/// wakeups per finished read. A condvar per ReadCall wakes only its caller,
+/// if that shows.
+static READ_DONE_CV: Condvar = Condvar::new();
+/// Calls queued for the read threads, oldest first, under READ_M.
+static READ_CALLS: SyncCell<Fifo<*mut ReadCall, READ_QUEUE>> = SyncCell::new(Fifo::new());
+static READ_START: super::super::sync::Once = super::super::sync::Once::new();
+static READ_THREADS_UP: AtomicU32 = AtomicU32::new(0);
+/// Set under READ_M by `stop_read_threads`; a read thread exits once it sees
+/// it with an empty queue.
+static READ_STOP: AtomicBool = AtomicBool::new(false);
+/// Started read threads, joined by `stop_read_threads` before module_stop
+/// returns, so none is left in the PRX's code after an unload (Codex review).
+static READ_HANDLES: SyncCell<[ScePthread; READ_THREADS]> =
+    SyncCell::new([null_mut(); READ_THREADS]);
+
+unsafe extern "C" fn read_thread(_arg: *mut c_void) -> *mut c_void {
+    loop {
+        let call = {
+            let mut g = READ_M.lock();
+            loop {
+                if let Some(call) = unsafe { (*READ_CALLS.get()).pop() } {
+                    // A slot freed: wake callers waiting on a full queue.
+                    READ_CV.notify_all();
+                    break call;
+                }
+                if READ_STOP.load(Ordering::Acquire) {
+                    return null_mut();
+                }
+                READ_CV.wait(&mut g);
+            }
+        };
+        let rc = unsafe {
+            let c = &*call;
+            read_on_workers(c.fd, core::slice::from_raw_parts(c.vector, c.count), c.offset, c.length)
+        };
+        let _g = READ_M.lock();
+        unsafe { ((*call).rc, (*call).done) = (rc, true) };
+        READ_DONE_CV.notify_all();
+    }
+}
+
+/// Starts the read threads once; false when none could start.
+unsafe fn start_read_threads() -> bool {
+    READ_START.call_once(|| {
+        type AttrFn = unsafe extern "C" fn(*mut ScePthreadAttr) -> c_int;
+        type StackFn = unsafe extern "C" fn(*mut ScePthreadAttr, usize) -> c_int;
+        let init = unsafe { resolve_kernel::<AttrFn>(c"scePthreadAttrInit") };
+        let stack = unsafe { resolve_kernel::<StackFn>(c"scePthreadAttrSetstacksize") };
+        let destroy = unsafe { resolve_kernel::<AttrFn>(c"scePthreadAttrDestroy") };
+        let (Some(init), Some(stack)) = (init, stack) else {
+            return;
+        };
+        let mut attr: ScePthreadAttr = null_mut();
+        if unsafe { init(&mut attr) } != 0 {
+            return;
+        }
+        if unsafe { stack(&mut attr, READ_STACK) } == 0 {
+            for i in 0..READ_THREADS {
+                let mut thread: ScePthread = null_mut();
+                let rc = unsafe {
+                    scePthreadCreate(&mut thread, &attr, read_thread, null_mut(), c"ampr_fd_read".as_ptr())
+                };
+                if rc == 0 {
+                    unsafe { (*READ_HANDLES.get())[i] = thread };
+                    READ_THREADS_UP.fetch_add(1, Ordering::Release);
+                }
+            }
+        }
+        if let Some(destroy) = destroy {
+            let _ = unsafe { destroy(&mut attr) };
+        }
+    });
+    READ_THREADS_UP.load(Ordering::Acquire) != 0
+}
+
+/// `read_on_workers` on a read thread; inline when no read thread started.
+/// Shutdown, after pack submissions drained (each virtual read holds one
+/// while it waits for its read thread, so the queue is empty): wakes the
+/// read threads and joins them; a read after this runs inline (READ_START
+/// does not start threads twice).
+unsafe fn stop_read_threads() {
+    if READ_THREADS_UP.load(Ordering::Acquire) == 0 {
+        return;
+    }
+    {
+        let _g = READ_M.lock();
+        READ_STOP.store(true, Ordering::Release);
+        READ_CV.notify_all();
+    }
+    for thread in unsafe { (*READ_HANDLES.get()).iter_mut() } {
+        if !thread.is_null() {
+            let _ = unsafe { scePthreadJoin(*thread, null_mut()) };
+            *thread = null_mut();
+        }
+    }
+    READ_THREADS_UP.store(0, Ordering::Release);
+}
+
+unsafe fn read_on_read_thread(
+    fd: c_int,
+    vector: &[SceKernelIovec],
+    offset: u64,
+    length: u64,
+) -> ssize_t {
+    // No read thread started (attr or create failed once, or after
+    // shutdown): read inline. An error instead would fail every packed read,
+    // also on the large-stack threads that read fine inline; only a
+    // small-stack caller is at risk, as before the read threads existed.
+    if !unsafe { start_read_threads() } {
+        return unsafe { read_on_workers(fd, vector, offset, length) };
+    }
+    let mut call = ReadCall {
+        fd,
+        vector: vector.as_ptr(),
+        count: vector.len(),
+        offset,
+        length,
+        rc: 0,
+        done: false,
+    };
+    let p: *mut ReadCall = &mut call;
+    let mut g = READ_M.lock();
+    loop {
+        if unsafe { (*READ_CALLS.get()).push(p) } {
+            break;
+        }
+        // Full: READ_QUEUE calls wait for a read thread.
+        READ_CV.wait(&mut g);
+    }
+    READ_CV.notify_all();
+    // `done` is written under READ_M by the read thread.
+    READ_DONE_CV.wait_until(&mut g, || unsafe { core::ptr::read_volatile(&(*p).done) });
+    drop(g);
+    call.rc
+}
+
 /// Logical size of the packed file behind a virtual fd slot.
 unsafe fn virtual_file_size(state: *const PackState, file_id: u32) -> Option<u64> {
     unsafe { packed_read_file(state, file_id) }.map(|(_, size, _)| size)
@@ -380,7 +591,7 @@ unsafe fn read_slot_at(
         Ok(n) => n,
         Err(e) => return e as ssize_t,
     };
-    unsafe { read_on_workers(fd, vector, offset as u64, length) }
+    unsafe { read_on_read_thread(fd, vector, offset as u64, length) }
 }
 
 /// pread/preadv: the slot cursor is neither read nor moved, so concurrent
@@ -651,10 +862,12 @@ pub unsafe fn ampr_pack_try_lseek_fd(
         }
         return unsafe { lseek_virtual_fd(index, generation, offset, whence) };
     }
-    let state = unsafe { pack_state() };
+    // Tag decode before pack_state(), as in ampr_pack_try_close_fd: a
+    // physical fd never creates or waits on the pack state.
     if !unsafe { decode_virtual_directory_fd(fd, &mut index, &mut generation) } {
         return SCE_KERNEL_ERROR_EBADF as off_t;
     }
+    let state = unsafe { pack_state() };
     if !handled.is_null() {
         unsafe { *handled = true };
     }
@@ -730,6 +943,20 @@ pub unsafe fn ampr_pack_is_virtual_fd(fd: c_int) -> bool {
     let _lock = PACK_M.lock();
     let s = &(*state).virtual_fds[slot as usize];
     s.active && s.generation == generation
+}
+
+/// One-based AMPRIDX3 file id behind an open virtual pack fd; None for any
+/// other fd. rt/pack/mmap.rs keys its disk cache by it; debug probes
+/// (rt/probe.rs) map it to the file's path.
+pub(crate) unsafe fn virtual_fd_file_id(fd: c_int) -> Option<u32> {
+    let (mut slot, mut generation) = (0u32, 0u16);
+    if !unsafe { decode_virtual_fd(fd, &mut slot, &mut generation) } {
+        return None;
+    }
+    let state = unsafe { pack_state() };
+    let _lock = PACK_M.lock();
+    let s = unsafe { &(*state).virtual_fds[slot as usize] };
+    (s.active && s.generation == generation).then_some(s.file_id)
 }
 
 pub(crate) fn native_pack_priority(priority: u8) -> c_int {
@@ -873,6 +1100,11 @@ pub unsafe fn ampr_pack_shutdown() -> c_int {
     }
     let state = sp;
 
+    // Close the manifest gate before anything else: from here on opens,
+    // stats and probes act as if no manifest were loaded, and the open path
+    // rechecks the gate under PACK_M, so no new virtual fd is allocated
+    // during the drain below (stability S4).
+    MANIFEST_READERS.close();
     {
         let mut g = PACK_M.lock();
         (*state).submissions_closed = true;
@@ -881,6 +1113,8 @@ pub unsafe fn ampr_pack_shutdown() -> c_int {
             || unsafe { core::ptr::read_volatile(addr_of_mut!((*sp).active_submissions)) } == 0,
         );
     }
+    unsafe { stop_read_threads() };
+    unsafe { super::mmap::close_cache() };
     {
         let _g = MANIFEST_MUTEX.lock();
         WORKER_STOP_REQUESTED.store(true, Ordering::Release);
@@ -941,11 +1175,20 @@ pub unsafe fn ampr_pack_shutdown() -> c_int {
     close_pack_and_directory_fds(state);
 
     free_worker_and_cache_memory(state);
-    unsafe { release_manifest_storage(state) };
     {
         let _g = MANIFEST_MUTEX.lock();
         LOAD_STATE.store(PACK_LOAD_UNAVAILABLE, Ordering::Release);
     }
+    // The hook threads' lock-free manifest readers hold a ManifestReader
+    // (rt/pack/mod.rs). The gate closed at the top, so this waits only for
+    // readers already inside; no lock is held, so none of them can block on
+    // this thread.
+    let mut spins = 0u32;
+    MANIFEST_READERS.wait_drained(|| {
+        spin_pause_or_yield(&mut spins);
+        true
+    });
+    unsafe { release_manifest_storage(state) };
     MANIFEST_CV.notify_all();
     0
 }
@@ -1265,5 +1508,25 @@ mod tests {
             ]
         );
         assert_eq!(plan_segment_reads(&v, 100, 9, 9, &mut out), 0);
+    }
+
+    #[test]
+    fn read_queue_is_fifo_and_refuses_when_full() {
+        let mut q = Fifo::<u32, 3>::new();
+        assert_eq!(q.pop(), None);
+        assert!(q.push(1) && q.push(2) && q.push(3));
+        assert!(!q.push(4));
+        assert_eq!(q.pop(), Some(1));
+        // A freed slot takes the next call behind the queued ones, not first.
+        assert!(q.push(4));
+        assert_eq!([q.pop(), q.pop(), q.pop(), q.pop()], [Some(2), Some(3), Some(4), None]);
+    }
+
+    #[test]
+    fn read_queue_survives_counter_wrap() {
+        let mut q = Fifo::<u32, 2>::new();
+        (q.head, q.tail) = (usize::MAX, usize::MAX);
+        assert!(q.push(7) && q.push(8) && !q.push(9));
+        assert_eq!([q.pop(), q.pop(), q.pop()], [Some(7), Some(8), None]);
     }
 }

@@ -92,6 +92,10 @@ pub(crate) unsafe fn prepare_pipeline_window_aio(
             }
             return PipelineStep::YieldCache;
         }
+        // Not parked: a Pending page read privately leaves no wait, so the
+        // next acquire must not pass its key and take that load's error as
+        // a waiter's.
+        pipeline.physical_wait_key = 0;
         if !acq.needs_physical_io {
             return finish_cached_window(
                 range,
@@ -158,7 +162,14 @@ unsafe fn acquire_window_pages(
             pack_id: range.pack_id,
         });
     }
-    let acquired_count = physical_cache_acquire_batch(acquire_items.as_ptr().cast(), page_count, zstd_mode());
+    let waiter_key = pipeline.physical_wait_key;
+    pipeline.physical_wait_key = 0;
+    let acquired_count = physical_cache_acquire_batch(
+        acquire_items.as_ptr().cast(),
+        page_count,
+        zstd_mode(),
+        waiter_key,
+    );
     if acquired_count == 0 {
         return false;
     }
@@ -187,6 +198,11 @@ unsafe fn acquire_window_pages(
                 pipeline.cache_wait_domain = CacheWaitDomain::Physical;
                 pipeline.cache_wait_bucket = wait_buckets[page];
                 pipeline.cache_wait_epoch = wait_epochs[page];
+                pipeline.physical_wait_key = physical_cache_key_hash(
+                    range.pack_id,
+                    range.offset + page as u64 * io_page_size as u64,
+                    io_page_size,
+                );
             }
             PhysicalCacheAcquireKind::Pending => {
                 acq.all_ready = false;
@@ -195,6 +211,11 @@ unsafe fn acquire_window_pages(
                 pipeline.cache_wait_domain = CacheWaitDomain::Physical;
                 pipeline.cache_wait_bucket = wait_buckets[page];
                 pipeline.cache_wait_epoch = wait_epochs[page];
+                pipeline.physical_wait_key = physical_cache_key_hash(
+                    range.pack_id,
+                    range.offset + page as u64 * io_page_size as u64,
+                    io_page_size,
+                );
             }
             PhysicalCacheAcquireKind::Failed => {
                 acq.all_ready = false;

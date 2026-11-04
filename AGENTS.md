@@ -1,6 +1,6 @@
 # AGENTS.md
 
-Notes for coding agents working on ampr-emu-ng (version 0.2.0, GPL-3.0-or-later).
+Notes for coding agents working on ampr-emu-ng (version 0.3.0, GPL-3.0-or-later).
 
 ## Project
 
@@ -25,7 +25,7 @@ index, `AMPRZDT1` volumes), picked at load by whether
 - `ps5/`: Dockerfile, `build-docker.sh`, target spec, PRX linker script.
 - `tools/`: Python PRX post-processing and `verify_payload_prx.py`.
 - `docs/zstd-format.md`: the zstd pack format. Keep it in sync with
-  `crates/ampr-zstd`.
+  `crates/ampr-zstd` and `crates/ampr-format/src/zstd.rs`.
 
 ## Build and test
 
@@ -39,8 +39,13 @@ cargo test --workspace                         # host tests
 
 Knobs and their defaults are at the top of the `Makefile`
 (`AMPR_INTERNAL_POOL_SIZE`, `AMPR_PACK_WORKERS`, read-ahead,
-`AMPR_ZSTD_LIBC_HOOKS`, `AMPR_MEM_REPORT`). A knob change rebuilds through
-`out/*/obj/build-config.txt`.
+`AMPR_ZSTD_LIBC_HOOKS`, `AMPR_ZSTD_MMAP`, `AMPR_MEM_REPORT`). A knob change
+rebuilds through `out/*/obj/build-config.txt`. The two `AMPR_ZSTD_*` knobs
+keep their zstd names but apply to LZ4 packs too; only `AMPR_ZSTD_MMAP=1`
+(decode on access) is zstd only. Those hooks (hook ids 78 and up), the
+eager index load and the mmap cache sweep apply only to a title that ships
+packs, zstd or LZ4 (`packs_present` in `rt/pack/mod.rs`, `hook_enabled` in
+`rt/hook.rs`); a title with no packs keeps the v0.2.0 hook set.
 CI (`.github/workflows/build.yml`) runs the same commands; a pushed `v*` tag creates a draft release with both `.sprx` and `SHA256SUMS`.
 
 ## Conventions
@@ -50,9 +55,14 @@ CI (`.github/workflows/build.yml`) runs the same commands; a pushed `v*` tag cre
 - No new dependencies without a stated reason. Runtime dependencies use
   `default-features = false`, and `lz4_flex`, `zstd-sys`, `iced-x86` are
   pinned (`=x.y.z`); follow that.
-- Memory budget: the release pool is 88 MiB (`0x5800000`); measured peaks are
-  79.9 MiB (LZ4) and 73.3 MiB (zstd). Any change that grows runtime memory
-  needs a measurement and an updated Makefile comment.
+- Memory budget: the release pool is 128 MiB (`0x8000000`). With the
+  current defaults (32 MiB physical and 16 MiB decoded cache, debug build,
+  ~75 s after launch) the measured peaks are 113.6 MiB (a fully packed LZ4
+  UE3 title, 25.2 MiB index), 93.2 MiB (a fully packed LZ4 UE5 title),
+  95.6 MiB (a REDengine title, zstd) and 90.7 MiB (an RE Engine title,
+  zstd). The peak grows with the index; the UE3 title leaves 14.4 MiB free.
+  Release runtime memory (PRX segments) is 136.7 MiB. Any change that grows
+  runtime memory needs a measurement and an updated Makefile comment.
 - Comments: plain prose `//!` and `///`, saying why, with the measured numbers
   and the source they come from (e.g. `rt/stats.rs`). Large files group items under
   `// ---- topic ----` section lines; keep that style.
@@ -78,6 +88,16 @@ CI (`.github/workflows/build.yml`) runs the same commands; a pushed `v*` tag cre
   `/modules` lists loaded modules; the op letters are documented at
   `FsEvents` in `rt/stats.rs`. When one install of a game works and another
   does not, run the same build on both and diff the two outputs.
+  The debug build also logs (op letters `D W T F C N`, and `O A a l`
+  with how `p`/`d` when an `AMPR_ZSTD_LIBC_HOOKS` bit is cleared) when a
+  packed file (zstd or LZ4) or a virtual fd reaches an API the runtime does
+  not serve; `X`/`Y` log mmap of a virtual fd (how `k` disk cache, `f`
+  decode on access, `F` failed decode-on-access fill, `v` other failure).
+- When the game dies before `:9090` answers, read the debug build's black
+  box `/data/ampr_emu_trace.txt` (`rt/blackbox.rs`): the loaded modules with
+  segment addresses (at start and after each module load), to map a crash
+  RIP to a module, and every failed file event plus module loads. It is
+  rewritten at each start, so copy it off before relaunching.
 - Folder installs on the internal SSD are case-sensitive; retail pfs and
   exFAT are not, and games depend on that (e.g. Wwise plugins loaded as
   `AkSineTone.prx`, stored `aksinetone.prx`). Paths that reach the

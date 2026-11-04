@@ -32,7 +32,9 @@ const PROT_RX: c_int = sys::SCE_KERNEL_PROT_CPU_READ | sys::SCE_KERNEL_PROT_CPU_
 const _: () = {
     assert!(PAGE % TRAMP_SIZE == 0 && SLOTS_PER_PAGE <= 32);
     assert!(POOL_COPY_PAGES <= 64 && TRAMP_PAGES == 4);
-    assert!(HOOK_COUNT == 106);
+    // Debug builds add the 8 probe slots 110..=117 (rt/probe.rs); all fit
+    // the 4 trampoline pages.
+    assert!(HOOK_COUNT == 110 + 8 * cfg!(feature = "mem_report") as usize);
 };
 
 // ---- detour state (guarded by HOOK_LOCK) -------------------------------------
@@ -127,6 +129,9 @@ use super::pack::{
     sceKernelLseek_emul, sceKernelPread_emul, sceKernelPreadv_emul, sceKernelRead_emul,
     sceKernelReadv_emul,
 };
+use super::pack::mmap::{mmap_emul, munmap_emul, sceKernelMmap_emul, sceKernelMunmap_emul};
+#[cfg(feature = "mem_report")]
+use super::probe;
 use super::services::{
     sceKernelAprGetFileSize_emul, sceKernelAprGetFileStat_emul,
     sceKernelAprResolveFilepathsToIdsAndFileSizesForEach_emul,
@@ -243,15 +248,17 @@ static HOOKS: Table<HookSpec, HOOK_COUNT> = Table(specs![
     c"sceKernelPread" => sceKernelPread_emul, O;
     c"sceKernelReadv" => sceKernelReadv_emul, O;
     c"sceKernelPreadv" => sceKernelPreadv_emul, O;
-    // zstd: packed files have no physical copy, so the sceKernel* file calls
-    // run the libc hooks above and return SCE errors. Optional.
+    // Both pack formats: packed files have no physical copy, so the
+    // sceKernel* file calls run the libc hooks above and return SCE errors.
+    // Optional.
     c"sceKernelOpen" => sceKernelOpen_emul, O;
     c"sceKernelStat" => sceKernelStat_emul, O;
     c"sceKernelFstat" => sceKernelFstat_emul, O;
     c"sceKernelLseek" => sceKernelLseek_emul, O;
     c"sceKernelGetdents" => sceKernelGetdents_emul, O;
     c"sceKernelGetdirentries" => sceKernelGetdirentries_emul, O;
-    // zstd: libkernel's internal entry points (libc's fopen/fread/opendir).
+    // Both pack formats: libkernel's internal entry points (libc's
+    // fopen/fread/opendir).
     c"_open" => underscore_open_emul, O;
     c"_openat" => underscore_openat_emul, O;
     c"_read" => underscore_read_emul, O;
@@ -264,9 +271,19 @@ static HOOKS: Table<HookSpec, HOOK_COUNT> = Table(specs![
     c"fcntl" => posix_fcntl_emul, O;
     c"_fcntl" => underscore_fcntl_emul, O;
     c"sceKernelFcntl" => sceKernelFcntl_emul, O;
-    // Packed files opened through plain open() are virtual descriptors; the
-    // kernel AIO entry points must understand them (rt/pack/aio.rs, aio_wait.rs).
-    // A batch with no virtual descriptor forwards to the original.
+    // Both pack formats, `AMPR_ZSTD_MMAP` != 0: mmap of a virtual pack fd
+    // maps a disk cache copy of the packed file (zstd with mode 1 decodes
+    // on fault instead, rt/pack/mmap_fault.rs); other fds call the original.
+    c"mmap" => mmap_emul, O;
+    c"sceKernelMmap" => sceKernelMmap_emul, O;
+    // `AMPR_ZSTD_MMAP` == 1: unregister decode-on-fault mappings, then the
+    // original.
+    c"munmap" => munmap_emul, O;
+    c"sceKernelMunmap" => sceKernelMunmap_emul, O;
+    // Both pack formats: a packed file opened through plain open() is a
+    // virtual descriptor, so the kernel AIO entry points must understand it
+    // (rt/pack/aio.rs, aio_wait.rs). A batch with no virtual descriptor
+    // forwards to the original; a single-id submit groups its batch.
     c"sceKernelAioSubmitReadCommands" => sceKernelAioSubmitReadCommands_emul, O;
     c"sceKernelAioSubmitReadCommandsMultiple" => sceKernelAioSubmitReadCommandsMultiple_emul, O;
     c"sceKernelAioPollRequest" => sceKernelAioPollRequest_emul, O;
@@ -277,6 +294,25 @@ static HOOKS: Table<HookSpec, HOOK_COUNT> = Table(specs![
     c"sceKernelAioCancelRequests" => sceKernelAioCancelRequests_emul, O;
     c"sceKernelAioDeleteRequest" => sceKernelAioDeleteRequest_emul, O;
     c"sceKernelAioDeleteRequests" => sceKernelAioDeleteRequests_emul, O;
+    // Debug, both pack formats: pass-through observers of APIs the runtime
+    // does not serve for packed files (rt/probe.rs); each calls its own
+    // original.
+    #[cfg(feature = "mem_report")]
+    c"dup" => probe::dup_probe, O;
+    #[cfg(feature = "mem_report")]
+    c"dup2" => probe::dup2_probe, O;
+    #[cfg(feature = "mem_report")]
+    c"poll" => probe::poll_probe, O;
+    #[cfg(feature = "mem_report")]
+    c"select" => probe::select_probe, O;
+    #[cfg(feature = "mem_report")]
+    c"openat" => probe::openat_probe, O;
+    #[cfg(feature = "mem_report")]
+    c"fstatat" => probe::fstatat_probe, O;
+    #[cfg(feature = "mem_report")]
+    c"faccessat" => probe::faccessat_probe, O;
+    #[cfg(feature = "mem_report")]
+    c"readlink" => probe::readlink_probe, O;
 ]);
 
 /// `g_externalEqueueHooks`: order is `AmprExternalEqueueHookId`.
@@ -294,8 +330,9 @@ macro_rules! ptrs {
 const NUL: *mut c_void = null_mut();
 
 /// `AMPR_LIBKERNEL_SDK_FALLBACKS`: SDK import used while a hook is not installed.
-/// Ids past the shared 78 have no SDK fallback. The zstd sceKernel* file
-/// wrappers call libc originals; internal-entry hooks resolve their originals.
+/// Ids past the shared 78 have no SDK fallback. The sceKernel* file wrappers
+/// (both pack formats) call libc originals; internal-entry hooks resolve
+/// their originals.
 const FALLBACK: [*mut c_void; HOOK_COUNT] = {
     let shared = FALLBACK_SHARED;
     let mut out = [NUL; HOOK_COUNT];
@@ -1393,11 +1430,13 @@ pub(crate) fn installed_bits(base: usize) -> u64 {
         .fold(0, |bits, i| bits | 1 << i)
 }
 
-/// zstd: Makefile `AMPR_ZSTD_LIBC_HOOKS`, bit i enables hook id 84 + i.
+/// Makefile `AMPR_ZSTD_LIBC_HOOKS` (both pack formats, the name is
+/// historical): bit i enables hook id 84 + i in a title with packs.
 const ZSTD_LIBC_HOOKS: u32 = match option_env!("AMPR_ZSTD_LIBC_HOOKS") {
     Some(s) => parse_mask(s.as_bytes()),
-    // ponytail: off until the startup crash is bisected (Makefile).
-    None => 0,
+    // Builds outside the Makefile (cargo check/test): its default, every
+    // entry routing.
+    None => 0xfff,
 };
 
 /// A decimal or `0x` hex mask; zero allowed (unlike `parse_size`).
@@ -1421,18 +1460,52 @@ const fn parse_mask(s: &[u8]) -> u32 {
     v
 }
 
-/// Ids `sceKernelAioSubmitReadCommands..=sceKernelAioDeleteRequests` serve
-/// process-visible virtual fds in both pack modes. Ids past the shared 78 are
-/// otherwise zstd only: an LZ4 title gets exactly the LZ4 hook set. Of those,
-/// 84..96 also need their `ZSTD_LIBC_HOOKS` bit.
-fn hook_enabled(hook: usize) -> bool {
-    if hook < FALLBACK_SHARED.len()
-        || (id::sceKernelAioSubmitReadCommands..=id::sceKernelAioDeleteRequests).contains(&hook)
-    {
+/// Whether hook `id` routes through the index: true except for the libc
+/// internal entries 84..96 whose `ZSTD_LIBC_HOOKS` bit is off. The `_emul`
+/// of an observed id (`observed_only`) checks it and, when false, only
+/// calls its original and logs (rt/index.rs).
+pub(crate) const fn routing_enabled(id: usize) -> bool {
+    id < id::_open || id > id::sceKernelFcntl || ZSTD_LIBC_HOOKS & 1 << (id - id::_open) != 0
+}
+
+/// Debug: libc entries installed even with their bit off, as pass-through
+/// observers that log the packed paths a game passes them (rt/probe.rs).
+/// Their `_emul` in rt/index.rs then calls the original with the caller's
+/// arguments. With the default 0xfff every bit is set and this is false; it
+/// applies only to a build that clears a bit (Makefile
+/// `AMPR_ZSTD_LIBC_HOOKS`). Release builds install those hooks only with
+/// their bit set, so there it is always false.
+pub(crate) const fn observed_only(id: usize) -> bool {
+    cfg!(feature = "mem_report")
+        && matches!(id, id::_open | id::_openat | id::access | id::lstat)
+        && !routing_enabled(id)
+}
+
+/// Ids past the shared 78 install for both formats, but only in a title
+/// that ships packs (`packs_present`, decided in rt/pack/mod.rs
+/// `select_pack_format`): an LZ4 pack can hold files with no physical copy
+/// too, so a game's plain open(), libc and mmap calls must reach them
+/// (GitHub issue #2). A title with no packs gets the shared 78 only, as in
+/// v0.2.0. Of the ids past 78, 84..96 also need their `ZSTD_LIBC_HOOKS`
+/// bit (or, in debug builds, `observed_only`), 96 and 97
+/// need `AMPR_ZSTD_MMAP` on, 98 and 99 need it at 1 (rt/pack/mmap.rs),
+/// 100..=109 are the AIO emulation in both builds, and 110..=117 exist
+/// only in debug builds (rt/probe.rs). The knobs keep their zstd names but
+/// apply to both formats.
+fn hook_enabled(id: usize) -> bool {
+    if id < FALLBACK_SHARED.len() {
         return true;
     }
-    super::pack::zstd_mode()
-        && (!(84..96).contains(&hook) || ZSTD_LIBC_HOOKS & 1 << (hook - 84) != 0)
+    if !super::pack::packs_present() {
+        return false;
+    }
+    if id == id::mmap || id == id::sceKernelMmap {
+        return super::pack::mmap::MMAP_MODE != 0;
+    }
+    if id == id::munmap || id == id::sceKernelMunmap {
+        return super::pack::mmap::MMAP_MODE == 1;
+    }
+    routing_enabled(id) || observed_only(id)
 }
 
 fn hooks_installed() -> bool {
@@ -1590,6 +1663,10 @@ pub unsafe extern "C" fn sceKernelLoadStartModule_equeue_observer(
     let path = unsafe { super::index::maybe_resolve_path(name) };
     let module = unsafe { orig(path, args, argp, flags, opt, result) };
     super::stats::fs_event(b'K', b'-', module as i64, name);
+    #[cfg(feature = "mem_report")]
+    if module >= 0 {
+        unsafe { super::blackbox::module(b"load", module) };
+    }
     if module < 0 {
         return module;
     }

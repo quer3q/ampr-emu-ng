@@ -15,8 +15,24 @@ pub(crate) unsafe fn resolve_cached<F: Copy>(slot: &AtomicPtr<c_void>, symbol: &
     unsafe { fn_from_ptr(value) }
 }
 
-/// Fixed pre-detour hook slot first, then the resolver cache.
+/// Fixed pre-detour hook slot first, then the resolver cache. The six-argument
+/// form takes the `_name` original before the public slot: libkernel's public
+/// entry calls its `_name` twin, which is hooked in titles with packs (ids
+/// 84..=95), so a runtime call through the public original re-enters that
+/// hook. Through `close`, the debug build's tune::load closed its file into
+/// the `_close` hook, whose `pack_state()` spun forever on the state it was
+/// still creating (see `sys::real_physical_close`).
 macro_rules! real_fn {
+    ($name:ident, $ty:ty, $slot:ident, $sym:literal, $under:expr, $id:expr) => {
+        #[allow(dead_code)]
+        pub(crate) unsafe fn $name() -> Option<$ty> {
+            unsafe {
+                kernel_slot::<$ty>($under)
+                    .or_else(|| kernel_slot::<$ty>($id))
+                    .or_else(|| resolve_cached::<$ty>(&$slot, $sym))
+            }
+        }
+    };
     ($name:ident, $ty:ty, $slot:ident, $sym:literal, $id:expr) => {
         #[allow(dead_code)]
         pub(crate) unsafe fn $name() -> Option<$ty> {
@@ -32,17 +48,30 @@ macro_rules! real_fn {
 }
 
 real_fn!(
-    real_open,
+    real_public_open,
     KernelOpenFn,
     g_real_open,
     c"open",
     sys::hook::open
 );
+
+/// The runtime's own physical open: the `_open` original while `_open` is
+/// detoured, else `open`. libkernel's `open` calls `_open`, so with the
+/// `_open` hook routing (`AMPR_ZSTD_LIBC_HOOKS` bit 0) an open through
+/// `open` re-entered the index routing: a UE5 title opens
+/// `/app0/..` as a directory, and `ampr_pack_open_directory`'s physical open
+/// looped `open` -> `_open` hook -> `ampr_pack_open_directory` until the main
+/// thread's stack ran out (0xA80 bytes a level; debug build trace
+/// `/data/ampr_emu_trace.txt`).
+pub(crate) unsafe fn real_open() -> Option<KernelOpenFn> {
+    unsafe { kernel_slot::<KernelOpenFn>(sys::hook::_open).or_else(|| real_public_open()) }
+}
 real_fn!(
     real_close,
     KernelCloseFn,
     g_real_close,
     c"close",
+    sys::hook::_close,
     sys::hook::close
 );
 real_fn!(
@@ -57,6 +86,7 @@ real_fn!(
     KernelFstatFn,
     g_real_fstat,
     c"fstat",
+    sys::hook::_fstat,
     sys::hook::fstat
 );
 real_fn!(
@@ -78,6 +108,7 @@ real_fn!(
     KernelGetdirentriesFn,
     g_real_getdirentries,
     c"getdirentries",
+    sys::hook::_getdirentries,
     sys::hook::getdirentries
 );
 // R7 read interposers: the pre-detour slot first, so a pack-internal read
@@ -109,6 +140,7 @@ real_fn!(
     KernelReadFn,
     g_real_read,
     c"read",
+    sys::hook::_read,
     sys::hook::read
 );
 real_fn!(
@@ -116,6 +148,7 @@ real_fn!(
     KernelReadvFn,
     g_real_readv,
     c"readv",
+    sys::hook::_readv,
     sys::hook::readv
 );
 real_fn!(
@@ -239,11 +272,15 @@ pub(crate) unsafe fn close_physical_pack_fd(fd: c_int) -> c_int {
         return SCE_KERNEL_ERROR_EIO;
     };
     let rc = unsafe { close_fn(fd) };
-    if rc == 0 {
+    // FreeBSD frees the descriptor even when close fails (EIO, EINTR); only
+    // EBADF means none was open. Counting just rc == 0 would shrink the fd
+    // budget for good on each failed close (a released USB image).
+    let err = if rc == -1 { errno() } else { 0 };
+    if err != EBADF {
         ampr_index_fd_pack_note_close();
     }
     if rc == -1 {
-        sce_errno_from_posix(errno())
+        sce_errno_from_posix(err)
     } else {
         rc
     }

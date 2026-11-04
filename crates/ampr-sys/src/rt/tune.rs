@@ -31,7 +31,7 @@ pub(crate) const TUNE_PATH: &CStr = c"/data/ampr_emu_tune.txt";
 pub(crate) const RELEASE_PIPELINES: u32 = 16;
 /// Pread pool threads a release build starts: 32, more than the 16
 /// pipelines, because split loose reads (reactor/loose_pread.rs) use them too.
-/// A game, loose files, internal SSD, debug /metrics (2026-11-01): 16 threads split
+/// A game, loose files, internal SSD, debug /metrics: 16 threads split
 /// 73% of loose reads at 1.35 ms per read, 32 threads split 98% at 1.10 ms.
 pub(crate) const RELEASE_PREAD_THREADS: u32 = 32;
 /// Upper bound of `ra` (one u64 bitmask per read-ahead job, pack/readahead.rs).

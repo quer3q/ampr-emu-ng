@@ -4,7 +4,7 @@
 //! loose reads of ~508 KB took 2.5 ms each with 0.79 in flight on average
 //! (apr_read_ns 61.0 s over 77.7 s uptime), 158 MB/s overall, 250 MB/s peak.
 //! Kernel AIO on this FS serves 1-2 requests at a time; 32 parallel preads
-//! reached 1.6-2.0 GB/s (mod.rs, 2026-10-25 bench).
+//! reached 1.6-2.0 GB/s (mod.rs bench).
 //!
 //! Only a read's first submit is routed, at the end-of-pass flush
 //! (`route_loose_reads_to_pread`, called from flush.rs). The read is accounted
@@ -21,7 +21,7 @@
 //! fold (`LoosePartResult`) into what one pread of the range returns, and
 //! the read finishes when the last part is in. Unmeasured: the hypothesis
 //! is that the FS serves a ~510 KB pread as sequential 64 KiB I/Os (2.50 ms
-//! per read, pread_pending_max <= 6 on 16-32 threads, console 2026-10).
+//! per read, pread_pending_max <= 6 on 16-32 threads, on a console).
 
 use super::*;
 use crate::rt::stats::{self, Stat};

@@ -46,6 +46,11 @@ pub const SCE_KERNEL_PROT_CPU_READ: c_int = 0x01;
 pub const SCE_KERNEL_PROT_CPU_RW: c_int = 0x02;
 pub const SCE_KERNEL_PROT_CPU_EXEC: c_int = 0x04;
 pub const SCE_KERNEL_PROT_CPU_ALL: c_int = 0x07;
+/// GPU access bits of mmap/sceKernelMmap prot, the PS4 SDK values (the
+/// ps5-payload-sdk headers do not define them); a GPU fault never reaches
+/// a CPU signal handler (rt/pack/mmap_fault.rs).
+pub const SCE_KERNEL_PROT_GPU_READ: c_int = 0x10;
+pub const SCE_KERNEL_PROT_GPU_WRITE: c_int = 0x20;
 pub const SCE_KERNEL_PROT_AMPR_WRITE: c_int = 0x80;
 pub const SCE_KERNEL_PROT_AMPR_ALL: c_int = 0xc0;
 
@@ -411,8 +416,10 @@ pub mod hook {
     pub const sceKernelReadv: usize = 76;
     pub const sceKernelPreadv: usize = 77;
     // 78..=83: sceKernelOpen, Stat, Fstat, Lseek, Getdents, Getdirentries
-    // (zstd; the game's file layer opens /app0 through them). No slot lookups.
-    // zstd: libc (fopen/fread, opendir, ...) calls libkernel's internal entry
+    // (both formats; the game's file layer opens /app0 through them). This
+    // id and every one past it install only in a title with packs
+    // (rt/hook.rs `hook_enabled`). No slot
+    // lookups. libc (fopen/fread, opendir, ...) calls libkernel's internal entry
     // points, which bypass every hook above; each falls back to its own
     // original so a libkernel wrapper that calls another never recurses.
     pub const _open: usize = 84;
@@ -427,20 +434,52 @@ pub mod hook {
     pub const fcntl: usize = 93;
     pub const _fcntl: usize = 94;
     pub const sceKernelFcntl: usize = 95;
-    // Both pack modes: a game that opened a packed file through plain open()
-    // must be able to read it with kernel AIO (the LZ4 and zstd virtual fd
-    // paths in rt/pack/aio.rs and aio_wait.rs), so these install for every mode.
-    pub const sceKernelAioSubmitReadCommands: usize = 96;
-    pub const sceKernelAioSubmitReadCommandsMultiple: usize = 97;
-    pub const sceKernelAioPollRequest: usize = 98;
-    pub const sceKernelAioPollRequests: usize = 99;
-    pub const sceKernelAioWaitRequest: usize = 100;
-    pub const sceKernelAioWaitRequests: usize = 101;
-    pub const sceKernelAioCancelRequest: usize = 102;
-    pub const sceKernelAioCancelRequests: usize = 103;
-    pub const sceKernelAioDeleteRequest: usize = 104;
-    pub const sceKernelAioDeleteRequests: usize = 105;
-    pub const COUNT: usize = 106;
+    // Both formats, Makefile `AMPR_ZSTD_MMAP` != 0: mmap of a virtual pack fd
+    // maps a disk cache copy of the packed file (rt/pack/mmap.rs). Both
+    // builds.
+    pub const mmap: usize = 96;
+    pub const sceKernelMmap: usize = 97;
+    // `AMPR_ZSTD_MMAP` == 1: munmap unregisters decode-on-fault mappings
+    // (rt/pack/mmap.rs). Both builds.
+    pub const munmap: usize = 98;
+    pub const sceKernelMunmap: usize = 99;
+    // 100..=109: kernel AIO, both builds. A packed file opened through plain
+    // open() is a virtual descriptor, so the AIO entry points must understand
+    // it (rt/pack/aio.rs, aio_wait.rs); a batch without a virtual descriptor
+    // forwards to the original. A single-id submit groups its batch.
+    pub const sceKernelAioSubmitReadCommands: usize = 100;
+    pub const sceKernelAioSubmitReadCommandsMultiple: usize = 101;
+    pub const sceKernelAioPollRequest: usize = 102;
+    pub const sceKernelAioPollRequests: usize = 103;
+    pub const sceKernelAioWaitRequest: usize = 104;
+    pub const sceKernelAioWaitRequests: usize = 105;
+    pub const sceKernelAioCancelRequest: usize = 106;
+    pub const sceKernelAioCancelRequests: usize = 107;
+    pub const sceKernelAioDeleteRequest: usize = 108;
+    pub const sceKernelAioDeleteRequests: usize = 109;
+    // 110..=117: debug-only pass-through probes of fully packed games, both
+    // formats (rt/probe.rs); release builds have no such slots, and the AIO
+    // emulation above replaces the two AIO probes.
+    #[cfg(feature = "mem_report")]
+    pub const dup: usize = 110;
+    #[cfg(feature = "mem_report")]
+    pub const dup2: usize = 111;
+    #[cfg(feature = "mem_report")]
+    pub const poll: usize = 112;
+    #[cfg(feature = "mem_report")]
+    pub const select: usize = 113;
+    #[cfg(feature = "mem_report")]
+    pub const openat: usize = 114;
+    #[cfg(feature = "mem_report")]
+    pub const fstatat: usize = 115;
+    #[cfg(feature = "mem_report")]
+    pub const faccessat: usize = 116;
+    #[cfg(feature = "mem_report")]
+    pub const readlink: usize = 117;
+    #[cfg(feature = "mem_report")]
+    pub const COUNT: usize = 118;
+    #[cfg(not(feature = "mem_report"))]
+    pub const COUNT: usize = 110;
 }
 
 /// Original (pre-detour) libkernel entry points, indexed by `hook::*`, and
@@ -561,9 +600,12 @@ pub unsafe fn real_mapper_get_usage_stats_data(data: *mut u64) -> c_int {
 }
 
 /// `ampr_real_posix_open`: fd, or -1 with errno set.
+/// The `_open` original while `_open` is detoured, else `open`: libkernel's
+/// `open` calls `_open`, and a runtime open through it re-entered the
+/// `_open` hook's routing (see `pack::libkernel::real_open`).
 pub unsafe fn real_posix_open(path: *const c_char, flags: c_int, mode: SceKernelMode) -> c_int {
     type F = unsafe extern "C" fn(*const c_char, c_int, ...) -> c_int;
-    match unsafe { kernel_slot::<F>(hook::open) } {
+    match unsafe { kernel_slot::<F>(hook::_open).or_else(|| kernel_slot::<F>(hook::open)) } {
         Some(f) => unsafe { f(path, flags, mode as c_int) },
         None => {
             set_errno(EIO);
@@ -572,10 +614,21 @@ pub unsafe fn real_posix_open(path: *const c_char, flags: c_int, mode: SceKernel
     }
 }
 
-/// `ampr_real_physical_close`: slot, then dynamic `close`, else -1/EIO.
+/// `ampr_real_physical_close`: the `_close` slot, then the `close` slot, then
+/// dynamic `close`, else -1/EIO. `_close` first, as `real_posix_open` takes
+/// the `_open` original:
+/// libkernel's `close` calls `_close`, which is hooked in titles with packs.
+/// Through `close`, the debug build's tune::load (inside pack_state_create,
+/// in module_start) closed its file into the `_close` hook, whose
+/// `pack_state()` spun forever on the state it was creating: the game hung
+/// on its loading screen whenever /data/ampr_emu_tune.txt existed.
 pub unsafe fn real_physical_close(fd: c_int) -> c_int {
     type F = unsafe extern "C" fn(c_int) -> c_int;
-    let f = unsafe { kernel_slot::<F>(hook::close).or_else(|| resolve_kernel::<F>(c"close")) };
+    let f = unsafe {
+        kernel_slot::<F>(hook::_close)
+            .or_else(|| kernel_slot::<F>(hook::close))
+            .or_else(|| resolve_kernel::<F>(c"close"))
+    };
     match f {
         Some(f) => unsafe { f(fd) },
         None => {
@@ -750,7 +803,9 @@ unsafe extern "C" {
 // ---- physical file wrappers for rt/index.rs ---------------------------------
 // `st` is a FreeBSD `struct stat` (120 bytes).
 
-unsafe fn slot_or_dynamic<F: Copy>(id: usize, name: &CStr) -> Option<F> {
+/// Pre-detour slot `id`, else the dynamic symbol (the real entry while
+/// that hook is not installed).
+pub(crate) unsafe fn slot_or_dynamic<F: Copy>(id: usize, name: &CStr) -> Option<F> {
     unsafe { kernel_slot::<F>(id).or_else(|| resolve_kernel::<F>(name)) }
 }
 
@@ -777,11 +832,15 @@ pub unsafe fn real_posix_rename(from: *const c_char, to: *const c_char) -> c_int
     unsafe { kernel_slot::<F>(hook::rename) }.map_or_else(eio, |f| unsafe { f(from, to) })
 }
 
-/// `ampr_real_physical_fstat`: slot, then dynamic `fstat`.
+/// `ampr_real_physical_fstat`: the `_fstat` slot, then the `fstat` slot, then
+/// dynamic `fstat`. `_fstat` first for the reason `real_physical_close` takes
+/// `_close` first: libkernel's `fstat` calls the hooked `_fstat`.
 pub unsafe fn real_physical_fstat(fd: c_int, st: *mut c_void) -> c_int {
     type F = unsafe extern "C" fn(c_int, *mut c_void) -> c_int;
-    unsafe { slot_or_dynamic::<F>(hook::fstat, c"fstat") }
-        .map_or_else(eio, |f| unsafe { f(fd, st) })
+    let f = unsafe {
+        kernel_slot::<F>(hook::_fstat).or_else(|| slot_or_dynamic::<F>(hook::fstat, c"fstat"))
+    };
+    f.map_or_else(eio, |f| unsafe { f(fd, st) })
 }
 
 /// `ampr_real_physical_getdents`: slot, then dynamic `getdents`.

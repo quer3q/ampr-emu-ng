@@ -132,6 +132,10 @@ pub unsafe fn ampr_pack_notify_fd_budget_progress() {
 }
 
 pub unsafe fn ampr_pack_ensure_manifest_ready_safe() -> bool {
+    // The zstd projection build inside writes the mount shutdown frees.
+    let Some(_reader) = ManifestReader::enter() else {
+        return false;
+    };
     unsafe { ensure_manifest_ready() }
 }
 
@@ -139,19 +143,23 @@ pub unsafe fn ampr_pack_ensure_manifest_ready_safe() -> bool {
 /// built. Hooks may run under a nonsleeping lock, so the first caller after
 /// AMPRIDX3 publication builds it inline (CPU only) and a caller that finds
 /// another thread building gets false instead of waiting.
+/// False once shutdown starts: the inline build writes the zstd mount that
+/// shutdown frees, so it runs under a `ManifestReader` (rt/pack/mod.rs).
 pub unsafe fn ampr_pack_manifest_is_resident_ready() -> bool {
+    let Some(_reader) = ManifestReader::enter() else {
+        return false;
+    };
     !g_pack_state.load(Ordering::Acquire).is_null()
         && LOAD_STATE.load(Ordering::Acquire) == PACK_LOAD_READY
         && (!zstd_mode() || unsafe { zstd::try_zstd_projection() })
 }
 
-/// Every read-only open is accepted for a packed file, in both modes: the file
-/// has no physical copy to fall back to, so a plain `O_RDONLY` open must get a
-/// virtual fd too.
+/// Every read-only non-directory open, in both formats: a packed file has
+/// no physical copy to fall back to, so a plain `O_RDONLY` open must get a
+/// virtual fd too (GitHub issue #2: an Insomniac Engine title with LZ4 packs
+/// failed plain opens of /app0/d/0/actor).
 pub(crate) fn pack_open_flags_supported(flags: c_int) -> bool {
-    (flags & O_ACCMODE) == O_RDONLY
-        && (flags & O_DIRECTORY) == 0
-        && (zstd_mode() || AMPR_EMU_PACK_INTERCEPT_ALL_READ_ONLY || (flags & O_NONBLOCK) != 0)
+    (flags & O_ACCMODE) == O_RDONLY && (flags & O_DIRECTORY) == 0
 }
 
 pub(crate) unsafe fn ampr_pack_try_open_indexed_impl(
@@ -168,7 +176,20 @@ pub(crate) unsafe fn ampr_pack_try_open_indexed_impl(
         return SCE_KERNEL_ERROR_ENOENT;
     }
     let handled = unsafe { &mut *handled };
+    // Held from the load (and zstd projection build) through the record
+    // validation and the fd allocation, all of which read the manifest.
+    let Some(_reader) = ManifestReader::enter() else {
+        return SCE_KERNEL_ERROR_ENOENT;
+    };
     if !unsafe { ensure_manifest_ready() } {
+        return SCE_KERNEL_ERROR_ENOENT;
+    }
+    // An id that is not packed (no zstd record, or an LZ4 record without
+    // AMPR_PACK_FILE_PACKED) is a loose file: unhandled, physical open.
+    // Checked before the record validation, so a loose file whose AMPRIDX3
+    // and pack records disagree still opens its physical copy instead of
+    // failing with EIO, and a loose open hashes no path here.
+    if !file_id_is_packed(&_reader, file_id) {
         return SCE_KERNEL_ERROR_ENOENT;
     }
     let state = unsafe { pack_state() };
@@ -182,30 +203,31 @@ pub(crate) unsafe fn ampr_pack_try_open_indexed_impl(
         )
     };
     if validate_rc != AMPR_PACK_CORE_OK {
-        // A stale or foreign index/manifest pair can still name loose files;
-        // for LZ4 leave the open unhandled so the physical file gets its say.
-        // zstd ids come from its own projection, so a mismatch is an error.
-        if !zstd_mode() {
+        // The AMPRIDX3 id names a pack record of another file, e.g. a walk
+        // built index whose ids follow walk order. APR opens (rt/fd_cache.rs,
+        // rt/reactor/submit.rs) pass `kAprAioOpenFlags`, which has
+        // O_NONBLOCK, and keep the v0.2.0 result: handled EIO. A game's
+        // plain open() stays unhandled, so the physical file opens if it
+        // exists on disk instead of failing here.
+        if flags & O_NONBLOCK == 0 {
             return SCE_KERNEL_ERROR_ENOENT;
         }
         *handled = true;
         return SCE_KERNEL_ERROR_EIO;
-    }
-    // zstd: the R4 projection decides; an AMPRIDX3 id without a zstd
-    // record is a loose file (unhandled, physical open), not an error.
-    let packed = if zstd_mode() {
-        zstd::zstd_entry(file_id).is_some()
-    } else {
-        (unsafe { (*(*state).files.add(file_id as usize - 1)).flags } & AMPR_PACK_FILE_PACKED) != 0
-    };
-    if !packed {
-        return SCE_KERNEL_ERROR_ENOENT;
     }
     *handled = true;
     if !pack_open_flags_supported(flags) {
         return sce_errno_from_posix(EACCES);
     }
     let _lock = PACK_M.lock();
+    // Shutdown closes the gate before its PACK_M section that closes
+    // submissions, so this check under PACK_M refuses every open that
+    // would otherwise get an fd during the drain (stability S4). The result
+    // is the one a refused enter gives: unhandled, as if no manifest.
+    if MANIFEST_READERS.is_closed() {
+        *handled = false;
+        return SCE_KERNEL_ERROR_ENOENT;
+    }
     let slot = allocate_virtual_fd_locked(state, file_id);
     if slot == INVALID_INDEX {
         return SCE_KERNEL_ERROR_EMFILE;
