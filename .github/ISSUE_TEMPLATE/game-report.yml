@@ -1,0 +1,107 @@
+name: Game report
+description: Report how a game runs with ampr-emu-ng, working or not.
+title: "[PPSAxxxxx] Game name: short result"
+labels: ["test report"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for testing. Reports that a game works are just as useful as crash reports.
+        One game per issue. Search open and closed issues for the title ID first; if it is
+        there, add a comment instead.
+
+  - type: input
+    id: game
+    attributes:
+      label: Game, title ID and game version
+      placeholder: "CONTROL Resonant, PPSA34547, 01.002"
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: ampr-emu-ng version
+      description: 'The launch notification shows it, e.g. "ampr-emu-ng: v0.3.0 (zstd) running". For a test build, name the zip.'
+      placeholder: "v0.3.0"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: build
+    attributes:
+      label: Build
+      options:
+        - release (libSceAmpr.sprx)
+        - debug (libSceAmpr-debug.sprx renamed)
+    validations:
+      required: true
+
+  - type: dropdown
+    id: packs
+    attributes:
+      label: Packs
+      description: The mode in the launch notification.
+      options:
+        - zstd
+        - lz4
+        - plain (no packs)
+        - no notification shown
+    validations:
+      required: true
+
+  - type: dropdown
+    id: result
+    attributes:
+      label: Result
+      options:
+        - Works (played past the first level load)
+        - Fails at launch ("Something went wrong" or similar)
+        - Crashes later
+        - Hangs (loading screen or black screen)
+        - Runs, but slow or stutters
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: setup
+    attributes:
+      label: Setup
+      description: Firmware, loader and its version, packer and its version, install type and storage.
+      value: |
+        Firmware:
+        Loader (e.g. ShadowMountPlus x.y), fakelib updates off: yes/no
+        Packer (e.g. ps5-dump-forge x.y):
+        Install: folder / ffpkg / pkg
+        Storage: internal SSD / extended M.2 / USB exFAT
+    validations:
+      required: true
+
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did and what you saw. Where it fails, any error code. Does the same dump run without packs, or with v0.2.0?
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Drag the files into this box. Please attach files rather than pasting their contents.
+      placeholder: |
+        Use the debug build: take libSceAmpr-debug.sprx from the release, rename it to
+        libSceAmpr.sprx and put it in the game's fakelib/ in place of the release one.
+
+        Crash or failed launch: copy /data/ampr_emu_trace.txt off the console BEFORE you
+        launch the game again (each start rewrites it).
+
+        Game still running (works, hangs, slow): save these pages and attach them:
+          curl http://<ps5-ip>:9090/metrics > metrics.txt
+          curl http://<ps5-ip>:9090/fsfail  > fsfail.txt
+          curl http://<ps5-ip>:9090/modules > modules.txt
+
+        "Something went wrong" right at launch: also attach /data/shadowmount/debug.log.
+        If ampr_emu_trace.txt did not change, the runtime never loaded.
