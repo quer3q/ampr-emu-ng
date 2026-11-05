@@ -159,7 +159,9 @@ impl AprAioReactor {
     /// pending wait included: a target freed while the wait polls is caught
     /// on the next poll (only the gap between query and load remains). An
     /// aligned u64 never crosses a page, so the query of `addr` covers all 8
-    /// bytes. Without the symbol the check passes, as before it existed.
+    /// bytes. Without the symbol the check passes, as before it existed. A
+    /// write whose query fails with EACCES also passes unchecked (see
+    /// address_query_allows), so for it none of the above holds.
     fn address_target_check(addr: usize, wait: bool) -> bool {
         type QueryProt = unsafe extern "C" fn(
             *mut c_void,
@@ -175,18 +177,65 @@ impl AprAioReactor {
         let mut end = null_mut();
         let mut prot: c_int = 0;
         let rc = unsafe { query(addr as *mut c_void, &mut start, &mut end, &mut prot) };
+        if rc == SCE_KERNEL_ERROR_EACCES {
+            crate::rt::stats::add(crate::rt::stats::Stat::AprAddressQueryDenied, 1);
+        }
+        Self::address_query_allows(rc, start as usize, end as usize, prot, addr, !wait)
+    }
+
+    /// Verdict on one sceKernelQueryMemoryProtection result for `addr`.
+    /// EACCES says the kernel refused to describe the mapping, not that it
+    /// is unmapped: a title that signals a read batch with a WriteAddress to
+    /// such a target hung on the loading screen while the op was refused
+    /// (issue #9). A write then goes ahead
+    /// unchecked, as before the check existed; if the target is in fact
+    /// unmapped the store faults the reactor thread. A wait still fails: no
+    /// title has shown an EACCES wait target, and waits are the upstream
+    /// save-time crash class this check exists for.
+    pub(crate) fn address_query_allows(
+        rc: c_int,
+        start: usize,
+        end: usize,
+        prot: c_int,
+        addr: usize,
+        write: bool,
+    ) -> bool {
+        if rc == SCE_KERNEL_ERROR_EACCES {
+            return write;
+        }
         // The entry must contain `addr`: a query that returned a neighbouring
         // mapping would otherwise pass for an unmapped target.
-        rc == 0
-            && (start as usize) <= addr
-            && addr < end as usize
-            && Self::address_prot_allows(prot, !wait)
+        rc == 0 && start <= addr && addr < end && Self::address_prot_allows(prot, write)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn address_query_allows_by_rc() {
+        let rw = SCE_KERNEL_PROT_CPU_READ | SCE_KERNEL_PROT_CPU_RW;
+        let a = 0x8_0000_1008;
+        let ok = |rc, s, e, p| AprAioReactor::address_query_allows(rc, s, e, p, a, true);
+        // Refused query (issue #9): the op goes ahead, whatever start/end/prot say.
+        assert!(ok(SCE_KERNEL_ERROR_EACCES, 0, 0, 0));
+        // Other failures still fault the op.
+        assert!(!ok(SCE_KERNEL_ERROR_EINVAL, 0, 0, 0));
+        // Success needs an entry containing addr with the right protection.
+        assert!(ok(0, a - 8, a + 8, rw));
+        assert!(!ok(0, a + 8, a + 16, rw));
+        assert!(!ok(0, a - 16, a, rw));
+        assert!(!ok(0, a - 8, a + 8, SCE_KERNEL_PROT_CPU_READ));
+        // WaitOnAddress (load): EACCES still fails, and READ is enough.
+        let r = SCE_KERNEL_PROT_CPU_READ;
+        let wait_ok = |rc, s, e, p| AprAioReactor::address_query_allows(rc, s, e, p, a, false);
+        assert!(!wait_ok(SCE_KERNEL_ERROR_EACCES, 0, 0, 0));
+        assert!(!wait_ok(SCE_KERNEL_ERROR_EINVAL, 0, 0, 0));
+        assert!(wait_ok(0, a - 8, a + 8, r));
+        assert!(!wait_ok(0, a + 8, a + 16, r));
+        assert!(!wait_ok(0, a - 16, a, r));
+    }
 
     #[test]
     fn address_prot_allows_by_op() {

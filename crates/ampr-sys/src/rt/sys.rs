@@ -99,6 +99,7 @@ pub const SCE_KERNEL_ERROR_ENXIO: c_int = sce_errno(ENXIO);
 pub const SCE_KERNEL_ERROR_EBADF: c_int = sce_errno(EBADF);
 pub const SCE_KERNEL_ERROR_ENOMEM: c_int = sce_errno(ENOMEM);
 pub const SCE_KERNEL_ERROR_EFAULT: c_int = sce_errno(EFAULT);
+pub const SCE_KERNEL_ERROR_EACCES: c_int = sce_errno(EACCES);
 pub const SCE_KERNEL_ERROR_EBUSY: c_int = sce_errno(EBUSY);
 pub const SCE_KERNEL_ERROR_EEXIST: c_int = sce_errno(EEXIST);
 pub const SCE_KERNEL_ERROR_ENOTDIR: c_int = sce_errno(ENOTDIR);

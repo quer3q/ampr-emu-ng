@@ -95,9 +95,17 @@ stats! {
     /// Software WaitOnAddress / WriteAddress commands failed with an APR
     /// error because sceKernelQueryMemoryProtection found the target
     /// unmapped or without CPU read (wait) or write (write) protection
-    /// (reactor/software.rs address_target_check). Each one would otherwise
-    /// have faulted in the reactor thread.
+    /// (reactor/software.rs address_target_check), or refused to describe it
+    /// (EACCES, waits only; see apr_address_query_denied). Each unmapped one
+    /// would otherwise have faulted in the reactor thread.
     AprAddressFaults = "apr_address_faults",
+    /// Software WaitOnAddress / WriteAddress target checks the query refused
+    /// with EACCES (reactor/software.rs address_query_allows). A write goes
+    /// ahead unchecked; a wait fails at once and also counts in
+    /// apr_address_faults. A title that signals a read batch with a
+    /// WriteAddress to such a target hung on the loading screen while the
+    /// write was refused (issue #9).
+    AprAddressQueryDenied = "apr_address_query_denied",
     /// Pack volume fds closed for a reopen after a read failed with EBADF,
     /// EIO or ENXIO (pack/leases.rs PackFdReopen; e.g. a USB image remounted
     /// after rest mode).

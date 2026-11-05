@@ -13,8 +13,8 @@ AMPR_MEM_REPORT ?= 0
 # 128 MiB: startup peak = cache-reserve 40 (4 + 16 pipeline I/O windows x
 # 2 MiB + 4 worker buffers x 1 MiB) + physical cache 32 + decoded cache 16
 # (rt/pack/mod.rs) + the index, which grows with file count. The reserve is
-# released once the caches are carved, so play uses less. Debug build,
-# default knobs, folder installs, debug /metrics ~75 s after launch, pool
+# released once the caches are carved, so play uses less. Debug build
+# with this 128 MiB pool, default knobs, folder installs, debug /metrics ~75 s after launch, pool
 # peak (index): a fully packed LZ4 UE3 title 113.6 MiB (25.2), 81.6 MiB in
 # use while it plays; a fully packed LZ4 UE5 title 93.2 MiB (5.2); a
 # REDengine title (zstd) 95.6 MiB (7.6); an RE Engine title (zstd) 90.7 MiB
@@ -23,11 +23,17 @@ AMPR_MEM_REPORT ?= 0
 # memory (PRX segments) is 136.7 MiB; the original C++ ampr_emu ran with a
 # 384 MiB pool.
 AMPR_INTERNAL_POOL_SIZE ?= 0x8000000
-# Debug build pool: same as release, so it shows the release
-# memory. Profiles bigger than the release config no longer fit: a decoded
-# cache above the 16 MiB default halves down to 16 MiB, then is off (see
-# pack_decoded_cache_bytes in /metrics).
-AMPR_DEBUG_POOL_SIZE ?= $(AMPR_INTERNAL_POOL_SIZE)
+# Debug build pool: 256 MiB, twice the release pool, so a title with a
+# larger index, or the low and medium tune profiles, runs with the full
+# cache targets; high (~262 MiB, rt/tune.rs PROFILES) still shrinks. The
+# cache targets do not grow with the pool, so the debug /metrics pool peak
+# is the memory at those targets. Only the startup carve adapts to a
+# short release pool: the caches halve, and each turns off below its
+# minimum, until index + reserve + caches fit (rt/pack/manifest.rs
+# alloc_cache_region). Pool use above 128 MiB after the carve (e.g. the
+# zstd projection, rt/pack/zstd.rs) fails in release. Debug runtime memory (PRX segments, program headers
+# of out/debug/libSceAmpr.prx) is 266.4 MiB, release 136.7 MiB.
+AMPR_DEBUG_POOL_SIZE ?= 0x10000000
 # Release pread threads 16 -> 32 (tune::RELEASE_PREAD_THREADS) for split loose
 # reads; the pool peak did not change with 16, 32 and 64 threads (debug
 # /metrics). Thread stacks are libkernel default

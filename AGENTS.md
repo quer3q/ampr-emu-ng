@@ -55,9 +55,10 @@ CI (`.github/workflows/build.yml`) runs the same commands; a pushed `v*` tag cre
 - No new dependencies without a stated reason. Runtime dependencies use
   `default-features = false`, and `lz4_flex`, `zstd-sys`, `iced-x86` are
   pinned (`=x.y.z`); follow that.
-- Memory budget: the release pool is 128 MiB (`0x8000000`). With the
-  current defaults (32 MiB physical and 16 MiB decoded cache, debug build,
-  ~75 s after launch) the measured peaks are 113.6 MiB (a fully packed LZ4
+- Memory budget: the release pool is 128 MiB (`0x8000000`); the debug
+  build's is 256 MiB (`AMPR_DEBUG_POOL_SIZE`). With the current defaults
+  (32 MiB physical and 16 MiB decoded cache, debug build at the 128 MiB
+  release pool, ~75 s after launch) the measured peaks are 113.6 MiB (a fully packed LZ4
   UE3 title, 25.2 MiB index), 93.2 MiB (a fully packed LZ4 UE5 title),
   95.6 MiB (a REDengine title, zstd) and 90.7 MiB (an RE Engine title,
   zstd). The peak grows with the index; the UE3 title leaves 14.4 MiB free.

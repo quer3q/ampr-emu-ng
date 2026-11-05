@@ -62,7 +62,9 @@ copies two files to the project root:
 
 - `libSceAmpr.sprx`, the release build;
 - `libSceAmpr-debug.sprx`, the same runtime plus the metrics endpoint
-  described below.
+  described below, with a 256 MiB pool instead of 128 MiB, so its pool
+  peak shows the memory at the default cache sizes (release shrinks its
+  caches when its pool is short).
 
 ### Debug build metrics
 
