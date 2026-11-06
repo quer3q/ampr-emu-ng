@@ -48,7 +48,9 @@ pub struct PressureCaps {
 const _: () = assert!(core::mem::size_of::<PressureCaps>() == 16);
 
 /// `AmprIndexFdCacheStats`; `open`/`pinned_open`/`pins`/`evictable` count
-/// physical descriptors only (virtual pack fds use no kernel fd).
+/// physical descriptors only. A virtual packed fd does hold a kernel fd (its
+/// `/dev/null` reservation, rt/pack/slots.rs), but that one stands in for the
+/// title's own fd and is not counted here either.
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct CacheStats {

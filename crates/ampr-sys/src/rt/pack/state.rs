@@ -746,7 +746,7 @@ mod tests {
         assert_eq!(virtual_fd_slot_for(250), Some(5));
         VIRTUAL_FD_SLOTS[250].store(0, Ordering::Release);
         assert_eq!(virtual_fd_slot_for(250), None);
-        assert_eq!(virtual_fd_slot_for(256), None);
+        assert_eq!(virtual_fd_slot_for(AMPR_EMU_PACK_VIRTUAL_FD_LIMIT as u32), None);
     }
 
     #[test]

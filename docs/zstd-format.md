@@ -136,11 +136,14 @@ fully packed game the runtime serves:
 - plain `open`/`read`/`pread`/`readv`/`preadv`/`lseek`/`fstat`/`close`,
   `stat`, `getdents`/`getdirentries` and their `sceKernel*` forms on
   virtual pack fds and indexed directories;
-- a virtual pack fd is a real descriptor below 256: the open reserves the
+- a virtual pack fd is a real descriptor below 512: the open reserves the
   number by opening `/dev/null`, and the fd hooks map it to the packed file
   until close. PPSA30601 never read the earlier tagged `0x65......` fds and
-  looped on EMFILE. Up to 128 are open at once, and the reservations are not
-  counted in the runtime's 50-fd open budget (`rt/fd_cache.rs`);
+  looped on EMFILE. Up to 256 are open at once, and the title shares that
+  table with the runtime's own cached packed opens (`rt/fd_cache.rs`); a
+  128-slot table filled with 115 title opens and 13 cached ones and the
+  title's next open failed with EMFILE. The reservations are not counted in
+  the runtime's 50-fd open budget (`rt/fd_cache.rs`);
 - a read-only open of an indexed directory, with or without `O_DIRECTORY`,
   gets the virtual directory. The kernel accepts a read-only open of a
   directory, and a title that scans a packed directory can pass plain
