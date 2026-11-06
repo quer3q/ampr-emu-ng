@@ -136,6 +136,18 @@ fully packed game the runtime serves:
 - plain `open`/`read`/`pread`/`readv`/`preadv`/`lseek`/`fstat`/`close`,
   `stat`, `getdents`/`getdirentries` and their `sceKernel*` forms on
   virtual pack fds and indexed directories;
+- a virtual pack fd is a real descriptor below 256: the open reserves the
+  number by opening `/dev/null`, and the fd hooks map it to the packed file
+  until close. PPSA30601 never read the earlier tagged `0x65......` fds and
+  looped on EMFILE. Up to 128 are open at once, and the reservations are not
+  counted in the runtime's 50-fd open budget (`rt/fd_cache.rs`);
+- a read-only open of an indexed directory, with or without `O_DIRECTORY`,
+  gets the virtual directory. The kernel accepts a read-only open of a
+  directory, and a title that scans a packed directory can pass plain
+  read-only flags: a measured packed install opened `/app0/input/` 8 times
+  with flags 0 and got ENOENT before this, and loaded no input map. A
+  physical directory that really exists (a folder install) keeps its own
+  fd and entries;
 - libc stdio and dirent (`fopen`, `fread`, `opendir`, ...) through the
   libkernel internal-entry hooks `_open` .. `sceKernelFcntl`, all routing
   by default (Makefile `AMPR_ZSTD_LIBC_HOOKS = 0xfff`);

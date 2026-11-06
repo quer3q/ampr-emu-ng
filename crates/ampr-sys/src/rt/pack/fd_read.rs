@@ -530,33 +530,28 @@ unsafe fn virtual_file_size(state: *const PackState, file_id: u32) -> Option<u64
     unsafe { packed_read_file(state, file_id) }.map(|(_, size, _)| size)
 }
 
-/// A live virtual fd slot (`active` and the fd's generation), under PACK_M.
+/// The slot `index` while it still holds `fd`, under PACK_M.
 unsafe fn virtual_fd_snapshot(
     state: *const PackState,
+    fd: c_int,
     index: u32,
-    generation: u16,
 ) -> Option<VirtualFdSlot> {
     let _lock = PACK_M.lock();
     let slot = (*state).virtual_fds[index as usize];
-    (slot.active && slot.generation == generation).then_some(slot)
+    slot.holds(fd).then_some(slot)
 }
 
-/// Classifies `fd` for a read: Some((slot, generation)) for a virtual pack
-/// fd; None with `*handled` false for any physical fd (the caller runs the
-/// real function) or true with `*rc` set for a virtual directory fd.
-unsafe fn virtual_read_target(
-    fd: c_int,
-    handled: *mut bool,
-    rc: &mut ssize_t,
-) -> Option<(u32, u16)> {
+/// Classifies `fd` for a read: Some(slot) for a virtual pack fd; None with
+/// `*handled` false for any physical fd (the caller runs the real function)
+/// or true with `*rc` set for a virtual directory fd.
+unsafe fn virtual_read_target(fd: c_int, handled: *mut bool, rc: &mut ssize_t) -> Option<u32> {
     unsafe { clear_handled(handled) };
     *rc = SCE_KERNEL_ERROR_EBADF as ssize_t;
-    let (mut index, mut generation) = (0u32, 0u16);
-    if unsafe { decode_virtual_fd(fd, &mut index, &mut generation) } {
+    if let Some(index) = decode_virtual_fd(fd) {
         if !handled.is_null() {
             unsafe { *handled = true };
         }
-        return Some((index, generation));
+        return Some(index);
     }
     if unsafe { decode_virtual_directory_fd(fd, null_mut(), null_mut()) } {
         if !handled.is_null() {
@@ -605,7 +600,7 @@ unsafe fn virtual_pread(
     handled: *mut bool,
 ) -> ssize_t {
     let mut rc = 0;
-    let Some((index, generation)) = (unsafe { virtual_read_target(fd, handled, &mut rc) }) else {
+    let Some(index) = (unsafe { virtual_read_target(fd, handled, &mut rc) }) else {
         return rc;
     };
     let state = unsafe { pack_state() };
@@ -613,7 +608,7 @@ unsafe fn virtual_pread(
     if !submission.admitted() {
         return SCE_KERNEL_ERROR_EBADF as ssize_t;
     }
-    let Some(slot) = (unsafe { virtual_fd_snapshot(state, index, generation) }) else {
+    let Some(slot) = (unsafe { virtual_fd_snapshot(state, fd, index) }) else {
         return SCE_KERNEL_ERROR_EBADF as ssize_t;
     };
     unsafe { read_slot_at(state, fd, &slot, iov, iovcnt, offset) }
@@ -629,11 +624,11 @@ unsafe fn virtual_read(
     handled: *mut bool,
 ) -> ssize_t {
     let mut rc = 0;
-    let Some((index, generation)) = (unsafe { virtual_read_target(fd, handled, &mut rc) }) else {
+    let Some(index) = (unsafe { virtual_read_target(fd, handled, &mut rc) }) else {
         return rc;
     };
     let state = unsafe { pack_state() };
-    if unsafe { virtual_fd_snapshot(state, index, generation) }.is_none() {
+    if unsafe { virtual_fd_snapshot(state, fd, index) }.is_none() {
         return SCE_KERNEL_ERROR_EBADF as ssize_t;
     }
     let _descriptor = VIRTUAL_FD_MUTEXES[index as usize].lock();
@@ -646,7 +641,7 @@ unsafe fn virtual_read(
     }
     // Close needs the descriptor mutex, so this slot stays this fd's until
     // the guard drops; re-check in case it closed before we took it.
-    let Some(slot) = (unsafe { virtual_fd_snapshot(state, index, generation) }) else {
+    let Some(slot) = (unsafe { virtual_fd_snapshot(state, fd, index) }) else {
         return SCE_KERNEL_ERROR_EBADF as ssize_t;
     };
     let cursor = slot.cursor;
@@ -659,7 +654,7 @@ unsafe fn virtual_read(
     if n > 0 {
         let _lock = PACK_M.lock();
         let s = &mut (*state).virtual_fds[index as usize];
-        if s.active && s.generation == generation {
+        if s.holds(fd) {
             s.cursor = cursor + n as u64;
         }
     }
@@ -855,15 +850,16 @@ pub unsafe fn ampr_pack_try_lseek_fd(
     handled: *mut bool,
 ) -> off_t {
     unsafe { clear_handled(handled) };
-    let (mut index, mut generation) = (0u32, 0u16);
-    if unsafe { decode_virtual_fd(fd, &mut index, &mut generation) } {
+    if let Some(index) = decode_virtual_fd(fd) {
         if !handled.is_null() {
             unsafe { *handled = true };
         }
-        return unsafe { lseek_virtual_fd(index, generation, offset, whence) };
+        return unsafe { lseek_virtual_fd(fd, index, offset, whence) };
     }
-    // Tag decode before pack_state(), as in ampr_pack_try_close_fd: a
-    // physical fd never creates or waits on the pack state.
+    // Decode before pack_state(), as in ampr_pack_try_close_fd: a physical
+    // fd never creates or waits on the pack state.
+    let mut index = 0u32;
+    let mut generation = 0u16;
     if !unsafe { decode_virtual_directory_fd(fd, &mut index, &mut generation) } {
         return SCE_KERNEL_ERROR_EBADF as off_t;
     }
@@ -900,16 +896,16 @@ pub unsafe fn ampr_pack_try_lseek_fd(
 
 /// lseek of a virtual pack fd: moves the slot cursor under the descriptor
 /// mutex that read/readv hold for their whole read.
-unsafe fn lseek_virtual_fd(index: u32, generation: u16, offset: off_t, whence: c_int) -> off_t {
+unsafe fn lseek_virtual_fd(fd: c_int, index: u32, offset: off_t, whence: c_int) -> off_t {
     let state = unsafe { pack_state() };
-    if unsafe { virtual_fd_snapshot(state, index, generation) }.is_none() {
+    if unsafe { virtual_fd_snapshot(state, fd, index) }.is_none() {
         return SCE_KERNEL_ERROR_EBADF as off_t;
     }
     let _descriptor = VIRTUAL_FD_MUTEXES[index as usize].lock();
     if WORKER_STOP_REQUESTED.load(Ordering::Acquire) {
         return SCE_KERNEL_ERROR_EBADF as off_t;
     }
-    let Some(slot) = (unsafe { virtual_fd_snapshot(state, index, generation) }) else {
+    let Some(slot) = (unsafe { virtual_fd_snapshot(state, fd, index) }) else {
         return SCE_KERNEL_ERROR_EBADF as off_t;
     };
     // SEEK_END needs the size; SEEK_SET/SEEK_CUR do not touch the mount.
@@ -927,7 +923,7 @@ unsafe fn lseek_virtual_fd(index: u32, generation: u16, offset: off_t, whence: c
     };
     let _lock = PACK_M.lock();
     let s = &mut (*state).virtual_fds[index as usize];
-    if !s.active || s.generation != generation {
+    if !s.holds(fd) {
         return SCE_KERNEL_ERROR_EBADF as off_t;
     }
     s.cursor = target;
@@ -935,28 +931,23 @@ unsafe fn lseek_virtual_fd(index: u32, generation: u16, offset: off_t, whence: c
 }
 
 pub unsafe fn ampr_pack_is_virtual_fd(fd: c_int) -> bool {
-    let (mut slot, mut generation) = (0u32, 0u16);
-    if !unsafe { decode_virtual_fd(fd, &mut slot, &mut generation) } {
+    let Some(slot) = decode_virtual_fd(fd) else {
         return false;
-    }
+    };
     let state = unsafe { pack_state() };
     let _lock = PACK_M.lock();
-    let s = &(*state).virtual_fds[slot as usize];
-    s.active && s.generation == generation
+    (*state).virtual_fds[slot as usize].holds(fd)
 }
 
 /// One-based AMPRIDX3 file id behind an open virtual pack fd; None for any
 /// other fd. rt/pack/mmap.rs keys its disk cache by it; debug probes
 /// (rt/probe.rs) map it to the file's path.
 pub(crate) unsafe fn virtual_fd_file_id(fd: c_int) -> Option<u32> {
-    let (mut slot, mut generation) = (0u32, 0u16);
-    if !unsafe { decode_virtual_fd(fd, &mut slot, &mut generation) } {
-        return None;
-    }
+    let slot = decode_virtual_fd(fd)?;
     let state = unsafe { pack_state() };
     let _lock = PACK_M.lock();
     let s = unsafe { &(*state).virtual_fds[slot as usize] };
-    (s.active && s.generation == generation).then_some(s.file_id)
+    s.holds(fd).then_some(s.file_id)
 }
 
 pub(crate) fn native_pack_priority(priority: u8) -> c_int {
@@ -1240,6 +1231,8 @@ unsafe fn cancel_virtual_jobs(state: *mut PackState) {
 unsafe fn close_pack_and_directory_fds(state: *mut PackState) {
     let mut pack_fds = [0 as c_int; AMPR_EMU_PACK_MAX_PACKS];
     let mut pack_fd_count = 0usize;
+    let mut virtual_fds = [0 as c_int; AMPR_EMU_PACK_VIRTUAL_FD_SLOTS];
+    let mut virtual_fd_count = 0usize;
     {
         let _g = PACK_M.lock();
         for handle in (*state).pack_handles.iter_mut() {
@@ -1256,11 +1249,20 @@ unsafe fn close_pack_and_directory_fds(state: *mut PackState) {
             free_virtual_aio_group_locked(state, i);
         }
         for fd in (*state).virtual_fds.iter_mut() {
+            if fd.real_fd >= 0 {
+                virtual_fds[virtual_fd_count] = fd.real_fd;
+                virtual_fd_count += 1;
+                VIRTUAL_FD_SLOTS[fd.real_fd as usize].store(0, Ordering::Release);
+            }
             *fd = VirtualFdSlot::EMPTY;
         }
     }
     for &fd in &pack_fds[..pack_fd_count] {
         unsafe { close_physical_pack_fd(fd) };
+    }
+    // `/dev/null` reservations are not in the open budget (slots.rs).
+    for &fd in &virtual_fds[..virtual_fd_count] {
+        unsafe { close_real_fd(fd) };
     }
 
     let mut directory_fds = [0 as c_int; AMPR_EMU_PACK_VIRTUAL_DIRECTORY_SLOTS];

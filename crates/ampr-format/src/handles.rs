@@ -1,12 +1,13 @@
-//! Virtual handle encoding: fds, directory fds,
-//! AIO submit ids and AIO group ids share one 32-bit layout,
-//! `tag(8) | generation(16) | slot(8)`.
+//! Virtual handle encoding: directory fds, AIO submit ids and AIO group ids
+//! share one 32-bit layout, `tag(8) | generation(16) | slot(8)`. Packed-file
+//! fds are not encoded: each is a real low descriptor the runtime reserves on
+//! open (ampr-sys `rt/pack/slots.rs` `allocate_virtual_fd_locked`).
 
-/// Handle kinds; the discriminant is the C ABI value.
+/// Handle kinds; the discriminant is the C ABI value. 0 was the packed-file
+/// fd, which is no longer a tagged handle.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u32)]
 pub enum Kind {
-    Fd = 0,
     Aio = 1,
     DirectoryFd = 2,
     AioGroup = 3,
@@ -18,7 +19,6 @@ pub const GENERATION_MASK: u32 = 0xffff;
 impl Kind {
     pub fn from_u32(value: u32) -> Option<Self> {
         Some(match value {
-            0 => Self::Fd,
             1 => Self::Aio,
             2 => Self::DirectoryFd,
             3 => Self::AioGroup,
@@ -29,7 +29,6 @@ impl Kind {
     /// High-byte tag of this handle kind.
     pub fn tag(self) -> u32 {
         match self {
-            Self::Fd => 0x6500_0000,
             Self::Aio => 0x6600_0000,
             Self::DirectoryFd => 0x6700_0000,
             Self::AioGroup => 0x6800_0000,
@@ -71,11 +70,14 @@ mod tests {
     fn round_trip_checks_tag_slot_limit_and_generation_wrap() {
         assert_eq!(next_generation(0xffff), 1);
         assert_eq!(next_generation(7), 8);
-        let fd = encode(Kind::Fd, 3, 0xbeef);
-        assert_eq!(fd, 0x65be_ef03);
-        assert_eq!(decode(Kind::Fd, fd, 256), Some((3, 0xbeef)));
-        assert_eq!(decode(Kind::Fd, fd, 3), None);
-        assert_eq!(decode(Kind::Aio, fd, 256), None);
+        let aio = encode(Kind::Aio, 3, 0xbeef);
+        assert_eq!(aio, 0x66be_ef03);
+        assert_eq!(decode(Kind::Aio, aio, 256), Some((3, 0xbeef)));
+        assert_eq!(decode(Kind::Aio, aio, 3), None);
+        assert_eq!(decode(Kind::DirectoryFd, aio, 256), None);
+        // A plain low fd is never a tagged handle.
+        assert_eq!(decode(Kind::Aio, 3, 256), None);
+        assert_eq!(Kind::from_u32(0), None);
         let group = encode(Kind::AioGroup, 255, 1);
         assert_eq!(decode(Kind::AioGroup, group, 256), Some((255, 1)));
         assert_eq!(

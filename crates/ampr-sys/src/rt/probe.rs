@@ -218,9 +218,8 @@ type PollFn = unsafe extern "C" fn(*mut PollFd, u32, c_int) -> c_int;
 type SelectFn =
     unsafe extern "C" fn(c_int, *mut c_void, *mut c_void, *mut c_void, *mut c_void) -> c_int;
 
-/// FD_SETSIZE: no real fd of a select set reaches it, and a virtual fd
-/// number (about 0x65000000, rt/pack/state.rs `decode_virtual_fd`) cannot
-/// be in one.
+/// FreeBSD `FD_SETSIZE`. `select` remains a pass-through probe; low-range
+/// virtual fds can fit in a set but are not implemented by this observer.
 const FD_SETSIZE: c_int = 1024;
 
 /// Inspects `fds` only after the original returned >= 0: it validated the

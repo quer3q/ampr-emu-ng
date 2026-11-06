@@ -185,12 +185,24 @@ pub(crate) fn open_failure_errno(rc: c_int) -> c_int {
     posix_errno_from_sce(rc)
 }
 
-unsafe fn close_real_fd(real_fd: c_int) {
+/// Closes a runtime descriptor that is not counted in the open budget (a
+/// directory's physical fd, a packed fd's `/dev/null` reservation).
+pub(crate) unsafe fn close_real_fd(real_fd: c_int) {
     if real_fd >= 0 {
         if let Some(close_fn) = unsafe { real_close() } {
             unsafe { close_fn(real_fd) };
         }
     }
+}
+
+/// Whether an open may name a directory, so the overlay serves it: an
+/// explicit `O_DIRECTORY` open, or any read-only open, which the kernel
+/// accepts for a directory too. A packed directory has no physical copy to
+/// fall back to: PPSA30601 opened `/app0/input/` 8 times with flags 0, got
+/// ENOENT every time and loaded no input map (issue #14). Also the gate of
+/// the rt/index.rs open hooks.
+pub(crate) fn directory_open_flags(flags: c_int) -> bool {
+    flags & O_DIRECTORY != 0 || flags & O_ACCMODE == O_RDONLY
 }
 
 #[inline(never)]
@@ -205,7 +217,7 @@ pub(crate) unsafe fn ampr_pack_open_directory_impl(
         if !handled.is_null() {
             *handled = false;
         }
-        if path.is_null() || handled.is_null() || flags & O_DIRECTORY == 0 {
+        if path.is_null() || handled.is_null() || !directory_open_flags(flags) {
             return SCE_KERNEL_ERROR_EINVAL;
         }
         let mut real_fd: c_int = -1;
@@ -220,6 +232,12 @@ pub(crate) unsafe fn ampr_pack_open_directory_impl(
         // Read-only overlay: never turn an access/permission error or a
         // writable request into a synthetic success.
         if allow_physical_open && flags & O_ACCMODE != O_RDONLY {
+            return real_fd;
+        }
+        // A plain read-only open of a directory that really is on disk (a
+        // folder install) keeps the kernel's fd and its own entries; only a
+        // missing directory is served from the index.
+        if allow_physical_open && flags & O_DIRECTORY == 0 && real_fd >= 0 {
             return real_fd;
         }
         if allow_physical_open && real_fd < 0 {
@@ -498,10 +516,11 @@ pub unsafe fn ampr_pack_try_close_fd(fd: c_int, handled: *mut bool) -> c_int {
         if !handled.is_null() {
             *handled = false;
         }
-        // The fd tag decides before pack_state(): a physical fd (the runtime's
-        // own closes reach here through libkernel's `close` -> `_close` hook)
-        // must never create or wait on the pack state. tune::load inside
-        // pack_state_create once hung here spinning on that state.
+        // A tagged directory fd or a table-mapped packed fd is decided before
+        // pack_state(): a physical fd (the runtime's own closes reach here
+        // through libkernel's `close` -> `_close` hook) must never create or
+        // wait on the pack state. tune::load inside pack_state_create once
+        // hung here spinning on that state.
         let mut index = 0u32;
         let mut generation = 0u16;
         if decode_virtual_directory_fd(fd, &mut index, &mut generation) {
@@ -542,23 +561,25 @@ pub unsafe fn ampr_pack_try_close_fd(fd: c_int, handled: *mut bool) -> c_int {
                 rc
             };
         }
-        if decode_virtual_fd(fd, &mut index, &mut generation) {
+        if let Some(index) = decode_virtual_fd(fd) {
             if !handled.is_null() {
                 *handled = true;
             }
             let state = pack_state();
-            let _descriptor_lock = VIRTUAL_FD_MUTEXES[index as usize].lock();
-            if WORKER_STOP_REQUESTED.load(Ordering::Acquire) {
-                return SCE_KERNEL_ERROR_EBADF;
+            {
+                let _descriptor_lock = VIRTUAL_FD_MUTEXES[index as usize].lock();
+                if WORKER_STOP_REQUESTED.load(Ordering::Acquire) {
+                    return SCE_KERNEL_ERROR_EBADF;
+                }
+                let _lock = PACK_M.lock();
+                let slot = &mut (*state).virtual_fds[index as usize];
+                if !slot.holds(fd) {
+                    return SCE_KERNEL_ERROR_EBADF;
+                }
+                *slot = VirtualFdSlot::EMPTY;
+                VIRTUAL_FD_SLOTS[fd as usize].store(0, Ordering::Release);
             }
-            let _lock = PACK_M.lock();
-            let slot = &mut (*state).virtual_fds[index as usize];
-            if !slot.active || slot.generation != generation {
-                return SCE_KERNEL_ERROR_EBADF;
-            }
-            slot.active = false;
-            slot.file_id = 0;
-            slot.cursor = 0;
+            close_real_fd(fd);
             return 0;
         }
         SCE_KERNEL_ERROR_EBADF
@@ -602,11 +623,11 @@ pub unsafe fn ampr_pack_try_fstat_fd(
             );
             return 0;
         }
-        if decode_virtual_fd(fd, &mut index, &mut generation) {
+        if let Some(index) = decode_virtual_fd(fd) {
             if !handled.is_null() {
                 *handled = true;
             }
-            return fstat_virtual_fd(pack_state(), index, generation, stat);
+            return fstat_virtual_fd(pack_state(), fd, index, stat);
         }
         SCE_KERNEL_ERROR_EBADF
     }
@@ -619,14 +640,14 @@ pub unsafe fn ampr_pack_try_fstat_fd(
 /// sees one file. The AMPRPAK4 record's own mtime and path hash are not used.
 unsafe fn fstat_virtual_fd(
     state: *const PackState,
+    fd: c_int,
     index: u32,
-    generation: u16,
     stat: *mut SceKernelStat,
 ) -> c_int {
     let file_id = {
         let _lock = PACK_M.lock();
         let slot = &(*state).virtual_fds[index as usize];
-        if !slot.active || slot.generation != generation {
+        if !slot.holds(fd) {
             return SCE_KERNEL_ERROR_EBADF;
         }
         slot.file_id

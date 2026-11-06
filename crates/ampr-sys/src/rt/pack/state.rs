@@ -18,6 +18,9 @@ pub(crate) unsafe fn pack_state_create() -> *mut PackState {
         // Storage is zeroed .bss; apply the non-zero `PackState()` defaults in place.
         let s = g_pack_state_storage.get() as *mut PackState;
         unsafe {
+            for i in 0..AMPR_EMU_PACK_VIRTUAL_FD_SLOTS {
+                addr_of_mut!((*s).virtual_fds[i]).write(VirtualFdSlot::EMPTY);
+            }
             for i in 0..AMPR_EMU_PACK_VIRTUAL_DIRECTORY_SLOTS {
                 addr_of_mut!((*s).virtual_directories[i]).write(VirtualDirectorySlot::EMPTY);
             }
@@ -111,20 +114,51 @@ pub(crate) fn next_generation(current: u16) -> u32 {
     ampr_rust_virtual_next_generation(current)
 }
 
-pub(crate) fn encode_virtual_fd(slot: u32, generation: u16) -> c_int {
-    ampr_rust_virtual_encode(VIRTUAL_KIND_FD, slot, generation) as c_int
+/// Slot mapped to low fd `number`, or None when it is a physical fd.
+pub(crate) fn virtual_fd_slot_for(number: u32) -> Option<u32> {
+    if number as usize >= AMPR_EMU_PACK_VIRTUAL_FD_LIMIT {
+        return None;
+    }
+    let entry = VIRTUAL_FD_SLOTS[number as usize].load(Ordering::Acquire);
+    entry.checked_sub(1)
 }
 
-pub(crate) unsafe fn decode_virtual_fd(fd: c_int, slot: *mut u32, generation: *mut u16) -> bool {
-    unsafe {
-        ampr_rust_virtual_decode(
-            VIRTUAL_KIND_FD,
-            fd as u32,
-            AMPR_EMU_PACK_VIRTUAL_FD_SLOTS as u32,
-            slot,
-            generation,
-        )
+/// Slot of a packed fd, through the reserved-descriptor table. Unlike the
+/// tagged handles, a physical fd in the low range is also a candidate, so
+/// the table decides; no pack state is created when none exists. Callers
+/// confirm the slot under PACK_M with `VirtualFdSlot::holds`.
+pub(crate) fn decode_virtual_fd(fd: c_int) -> Option<u32> {
+    if g_pack_state.load(Ordering::Acquire).is_null() {
+        return None;
     }
+    virtual_fd_slot_for(fd as u32)
+}
+
+/// Drops a packed-fd mapping whose reserved descriptor the kernel has
+/// handed out again. `fd` is a descriptor a physical open just returned, so
+/// a slot still mapped to that number lost its `/dev/null` reservation to a
+/// close the runtime did not see (a `dup2` onto it, an unhooked close such
+/// as `_close` with its `AMPR_ZSTD_LIBC_HOOKS` bit cleared). Left mapped,
+/// the new file would read as the old packed one. Lock-free unless mapped.
+pub(crate) unsafe fn forget_stale_virtual_fd(fd: c_int) {
+    if fd < 0 || decode_virtual_fd(fd).is_none() {
+        return;
+    }
+    let _lock = PACK_M.lock();
+    unsafe { forget_stale_virtual_fd_locked(g_pack_state.load(Ordering::Acquire), fd) };
+}
+
+/// `forget_stale_virtual_fd` under PACK_M. The kernel owns the number now,
+/// so the slot is cleared and nothing is closed.
+pub(crate) unsafe fn forget_stale_virtual_fd_locked(state: *mut PackState, fd: c_int) {
+    let Some(index) = virtual_fd_slot_for(fd as u32) else {
+        return;
+    };
+    let slot = unsafe { &mut (*state).virtual_fds[index as usize] };
+    if slot.holds(fd) {
+        *slot = VirtualFdSlot::EMPTY;
+    }
+    VIRTUAL_FD_SLOTS[fd as usize].store(0, Ordering::Release);
 }
 
 pub(crate) fn encode_virtual_directory_fd(slot: u32, generation: u16) -> c_int {
@@ -701,5 +735,30 @@ mod tests {
         assert!(!pread_loop(1, 0, 4, |_, _, _| -1, || EINTR + 1), "EIO");
         assert!(!pread_loop(1, off_t::MAX as u64, 4, |_, _, _| 1, || 0));
         assert!(!pread_loop(2, 0, 4, |_, _, _| 3, || 0), "rc above request");
+    }
+
+    #[test]
+    fn packed_fd_lookup_is_range_and_table_based() {
+        assert_eq!(virtual_fd_slot_for(250), None);
+
+        // `slot + 1` leaves zero as "not a packed fd".
+        VIRTUAL_FD_SLOTS[250].store(6, Ordering::Release);
+        assert_eq!(virtual_fd_slot_for(250), Some(5));
+        VIRTUAL_FD_SLOTS[250].store(0, Ordering::Release);
+        assert_eq!(virtual_fd_slot_for(250), None);
+        assert_eq!(virtual_fd_slot_for(256), None);
+    }
+
+    #[test]
+    fn virtual_fd_slot_holds_only_its_own_number() {
+        let slot = VirtualFdSlot {
+            real_fd: 40,
+            active: true,
+            ..VirtualFdSlot::EMPTY
+        };
+        assert!(slot.holds(40));
+        // Slot reused under another number after a close: the old fd misses.
+        assert!(!slot.holds(41));
+        assert!(!VirtualFdSlot::EMPTY.holds(-1));
     }
 }
