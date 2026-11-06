@@ -1644,8 +1644,23 @@ pub unsafe extern "C" fn sceKernelLoadStartModule_equeue_observer(
     // /app0/prx/AkSineTone.prx, stored aksinetone.prx): retail pfs and exFAT
     // fold case, a folder install on the internal SSD does not and the load
     // fails with ENOENT. An indexed /app0 path goes in as its stored path.
+    // The index can disagree in case with the disk too (issue #15, Hollow
+    // Knight Silksong: indexed Il2cppUserAssemblies.prx, on disk and asked
+    // for as Il2CppUserAssemblies.prx), so an ENOENT on the stored path
+    // retries the name the game asked for. Only ENOENT, the error of a
+    // missing file; other failures may come after the loader mapped or
+    // started the module. An ENOENT for another reason (a missing import)
+    // costs one more failed load with the same result. An index hit points
+    // into the index even when the bytes match; those do not retry.
     let path = unsafe { super::index::maybe_resolve_path(name) };
-    let module = unsafe { orig(path, args, argp, flags, opt, result) };
+    let mut module = unsafe { orig(path, args, argp, flags, opt, result) };
+    if module == sys::SCE_KERNEL_ERROR_ENOENT
+        && path != name
+        && unsafe { super::index::cstr_bytes(path) != super::index::cstr_bytes(name) }
+    {
+        super::stats::fs_event(b'K', b'h', module as i64, path);
+        module = unsafe { orig(name, args, argp, flags, opt, result) };
+    }
     super::stats::fs_event(b'K', b'-', module as i64, name);
     #[cfg(feature = "mem_report")]
     if module >= 0 {

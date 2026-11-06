@@ -279,7 +279,11 @@ pub(crate) fn now() -> u64 {
 /// b'l' lstat, b'a' access, b'r' reachability, b'O'/b'A' libc _open/_openat;
 /// and from the runtime itself b'L' its open of an indexed loose file, b'R'
 /// an APR path that did not resolve, b'E' a failed APR job (path = reason),
-/// b'K' a module load, b'G' a gather/scatter retry that re-resolved to
+/// b'K' a module load: lookup b'-' the name the game asked for with the
+/// final result; b'h' the index hit's stored path when its load failed with
+/// ENOENT and the name, whose bytes differ (case or a normalized spelling),
+/// was tried next (rt/hook.rs).
+/// b'G' a gather/scatter retry that re-resolved to
 /// another file id or offset than its first resolution (path = both pairs,
 /// see `gs_retry_mismatch`). b'X' mmap and b'Y' sceKernelMmap of a virtual
 /// fd (rt/pack/mmap.rs, both builds hook them with `AMPR_ZSTD_MMAP` on;
