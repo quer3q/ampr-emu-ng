@@ -645,14 +645,22 @@ pub(crate) const AMPR_EMU_PACK_LATENCY_READ_MAX_BYTES: u64 = 64 * 1024;
 pub(crate) const AMPR_EMU_PACK_BULK_READ_MIN_BYTES: u64 = 256 * 1024;
 pub(crate) const AMPR_EMU_PACK_IO_STAGING_BYTES: u64 = 2 * 1024 * 1024;
 pub(crate) const AMPR_EMU_PACK_PREAD_MAX_BYTES: u64 = AMPR_EMU_PACK_IO_STAGING_BYTES;
-/// Each packed open reserves one `/dev/null` descriptor, so this bounds the
-/// extra fds too. 128 slots fit inside `AMPR_EMU_PACK_VIRTUAL_FD_LIMIT`,
-/// which the title's own fds share.
-pub(crate) const AMPR_EMU_PACK_VIRTUAL_FD_SLOTS: usize = 128;
+/// Packed files open at once. The slots serve the title's own opens and the
+/// runtime's cached ones alike: the APR fd cache opens packed files through
+/// the same allocator (rt/fd_cache.rs `open_indexed_or_real`), so up to
+/// `CACHE_CAP` (45) of these belong to the runtime. Each slot also reserves
+/// one `/dev/null` descriptor, so this bounds the extra fds too. 128 was too
+/// few: PPSA03671 held 115 packed fds and the fd cache the other 13, the
+/// table filled, and its next open (a 24.7 MiB soundbank, at 63 s) failed
+/// with EMFILE in every one of 45 retries (`open_hit` and `open_virtual` both
+/// 115 -> 160, `open_real_failed` 0); the title then quit. v0.3.1 gave 256.
+pub(crate) const AMPR_EMU_PACK_VIRTUAL_FD_SLOTS: usize = 256;
 /// Packed fds are real descriptors below this number: PPSA30601 never read a
 /// packed fd handed out as a tagged 0x65...... value and looped on EMFILE
-/// (issue #14), and read low ones.
-pub(crate) const AMPR_EMU_PACK_VIRTUAL_FD_LIMIT: usize = 256;
+/// (issue #14), and read low ones. The fd-to-slot table is indexed by
+/// descriptor, so this has to cover a full slot table plus the title's own
+/// fds and the pack volumes (18): 512 for 256 slots.
+pub(crate) const AMPR_EMU_PACK_VIRTUAL_FD_LIMIT: usize = 512;
 pub(crate) const AMPR_EMU_PACK_VIRTUAL_AIO_SLOTS: usize = 256;
 pub(crate) const AMPR_EMU_PACK_MAX_PACKS: usize = 1024;
 pub(crate) const AMPR_EMU_PACK_OPEN_PACK_FD_CAP: u32 = 18;
