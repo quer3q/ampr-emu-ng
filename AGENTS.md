@@ -1,6 +1,6 @@
 # AGENTS.md
 
-Notes for coding agents working on ampr-emu-ng (version 0.3.1, GPL-3.0-or-later).
+Notes for coding agents working on ampr-emu-ng (version 0.3.2, GPL-3.0-or-later).
 
 ## Project
 
