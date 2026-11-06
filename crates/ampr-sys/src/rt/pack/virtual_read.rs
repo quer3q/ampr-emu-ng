@@ -1,5 +1,6 @@
-//! Cache-only virtual reads, pipeline windows, chunk decode and the
-//! virtual read AIO state machine.
+//! Virtual read AIO state machine, pipeline windows and chunk decode. A
+//! chunk already in the decoded cache is copied by the worker's chunk path,
+//! never by the submit call (aio.rs `publish_virtual_jobs`).
 
 use super::*;
 use core::ptr::copy_nonoverlapping;
@@ -46,93 +47,6 @@ pub(crate) unsafe fn packed_read_file(
     }
 }
 
-pub(crate) unsafe fn try_process_virtual_read_cache_only(
-    job: &mut VirtualAioSlot,
-    completed_bytes: *mut u64,
-) -> bool {
-    unsafe {
-        if !completed_bytes.is_null() {
-            *completed_bytes = 0;
-        }
-        let state = pack_state();
-        if job.request.result.is_null() || job.request.offset < 0 {
-            return false;
-        }
-        let Some((file_ptr, logical_size, _)) = packed_read_file(state, job.file_id) else {
-            return false;
-        };
-        let offset = job.request.offset as u64;
-        if job.request.nbyte == 0 || offset >= logical_size {
-            return true;
-        }
-        if job.request.buf.is_null() {
-            return false;
-        }
-        // Task destination offsets are u32: a read of 4 GiB or more is cut
-        // to a short read at that limit instead of failing part-way with EIO.
-        let length = (job.request.nbyte as u64).min(logical_size - offset).min(u32::MAX as u64);
-        // Decoded cache off (AMPR_EMU_PACK_DECODED_CACHE_BYTES = 0, or it did
-        // not fit the pool): no chunk can be Ready, so skip the task build
-        // and pin attempts.
-        if (*state).cache_base.is_null() || (*state).cache_page_count == 0 {
-            return false;
-        }
-
-        let task_count = ampr_pack_core_task_count(file_ptr, offset, length);
-        if task_count == 0 || task_count > AMPR_EMU_PACK_INLINE_CACHE_MAX_TASKS {
-            return false;
-        }
-        let mut tasks = [AmprPackBlockReadTask::default(); AMPR_EMU_PACK_INLINE_CACHE_MAX_TASKS];
-        let mut leases = [CacheLease::EMPTY; AMPR_EMU_PACK_INLINE_CACHE_MAX_TASKS];
-        let mut pinned = 0;
-        for task_index in 0..task_count {
-            if ampr_pack_core_make_task(
-                &(*state).core_view,
-                file_ptr,
-                offset,
-                length,
-                task_index,
-                &mut tasks[task_index],
-            ) != AMPR_PACK_CORE_OK
-                || tasks[task_index].chunk_index as u64 >= pack_chunk_count(state)
-                || tasks[task_index].destination_offset as u64
-                    + tasks[task_index].copy_length as u64
-                    > length
-            {
-                break;
-            }
-            let chunk = tasks[task_index].chunk;
-            if !cache_try_pin_ready(&chunk, &mut leases[task_index]) {
-                break;
-            }
-            pinned += 1;
-        }
-        if pinned != task_count {
-            for lease in &mut leases[..pinned] {
-                cache_release(lease);
-            }
-            // Not counted here: the worker pipeline looks these chunks up again.
-            return false;
-        }
-        stats::add(stats::Stat::CacheHits, task_count as u64);
-
-        let output = job.request.buf as *mut u8;
-        for (task, lease) in tasks[..task_count].iter().zip(&leases[..task_count]) {
-            copy_nonoverlapping(
-                lease.data.add(task.source_offset as usize),
-                output.add(task.destination_offset as usize),
-                task.copy_length as usize,
-            );
-        }
-        for lease in &mut leases[..task_count] {
-            cache_release(lease);
-        }
-        if !completed_bytes.is_null() {
-            *completed_bytes = length;
-        }
-        true
-    }
-}
 
 pub(crate) unsafe fn cleanup_pipeline_continuation(
     pipeline: &mut ReadPipelineContext,

@@ -296,36 +296,6 @@ pub(crate) unsafe fn cache_release(lease: &mut CacheLease) {
     *lease = CacheLease::EMPTY;
 }
 
-pub(crate) unsafe fn cache_try_pin_ready(chunk: &AmprPackChunkView, out: *mut CacheLease) -> bool {
-    if out.is_null() {
-        return false;
-    }
-    let out = unsafe { &mut *out };
-    *out = CacheLease::EMPTY;
-    let state = unsafe { pack_state() };
-    if (*state).cache_base.is_null() || (*state).cache_page_count == 0 {
-        return false;
-    }
-    let key_hash = chunk_key_hash(chunk);
-    let _lock = CACHE_MUTEX.lock();
-    let found = cache_find_locked(state, chunk, key_hash);
-    if found == INVALID_INDEX {
-        return false;
-    }
-    let entry = &mut (*state).cache_entries[found as usize];
-    if entry.state != CacheEntryState::Ready {
-        return false;
-    }
-    entry.pin_count += 1;
-    entry.referenced = true;
-    out.entry = found;
-    out.data = unsafe {
-        (*state)
-            .cache_base
-            .add(entry.page_start as usize * PACK_CACHE_PAGE_BYTES)
-    };
-    true
-}
 
 pub(crate) fn physical_cache_key_hash(pack_id: u16, offset: u64, size: u32) -> u64 {
     ampr_rust_physical_cache_key_hash(pack_id, offset, size)

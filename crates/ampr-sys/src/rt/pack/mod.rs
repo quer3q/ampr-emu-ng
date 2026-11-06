@@ -688,7 +688,6 @@ pub(crate) const AMPR_EMU_PACK_PHYSICAL_CACHE_BYTES: u64 = 32 * 1024 * 1024;
 pub(crate) const AMPR_EMU_PACK_PHYSICAL_CACHE_MIN_BYTES: u64 = 8 * 1024 * 1024;
 pub(crate) const AMPR_EMU_PACK_PHYSICAL_CACHE_ENTRY_CAP: usize = 4096;
 pub(crate) const AMPR_EMU_PACK_PHYSICAL_CACHE_HASH_BUCKETS: usize = 8192;
-pub(crate) const AMPR_EMU_PACK_INLINE_CACHE_MAX_TASKS: usize = 64;
 pub(crate) const AMPR_EMU_PACK_CACHE_ENTRY_CAP: usize = 8192;
 pub(crate) const AMPR_EMU_PACK_CACHE_PAGE_SHIFT: u32 = 14;
 pub(crate) const AMPR_EMU_PACK_CACHE_HASH_BUCKETS: usize = 16384;
