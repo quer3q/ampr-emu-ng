@@ -641,8 +641,6 @@ const O_WRONLY: c_int = 0x1;
 const O_CREAT: c_int = 0x200;
 const O_TRUNC: c_int = 0x400;
 const O_DIRECTORY: c_int = 0x20000;
-/// Access-mode mask of `open` flags (rt/pack/mod.rs `O_ACCMODE`).
-const O_ACCMODE: c_int = 0x3;
 const S_IRWU: SceKernelMode = 0o600; // SCE_KERNEL_S_IRWU
 const S_IFMT: u16 = 0o170000;
 const S_IFDIR: u16 = 0o040000;
@@ -1790,7 +1788,7 @@ unsafe fn is_app0_path(path: *const c_char) -> bool {
 use super::pack::{
     ampr_pack_manifest_is_resident_ready, ampr_pack_open_directory,
     ampr_pack_open_virtual_directory, ampr_pack_try_open_indexed, ampr_pack_try_reachability,
-    ampr_pack_try_stat_path,
+    ampr_pack_try_stat_path, directory_open_flags, forget_stale_virtual_fd,
 };
 
 /// `ampr_real_sceKernelCheckReachability` (slot must be installed).
@@ -1934,14 +1932,14 @@ fn how(l: &Lookup) -> u8 {
     }
 }
 
-/// Whether an open may name a directory: an explicit `O_DIRECTORY` open, or
-/// any read-only open, which the kernel accepts for a directory too. A title
-/// that scans a packed directory can use the second form: a measured packed
-/// install opened `/app0/input/` 8 times with flags 0 and got ENOENT every
-/// time (the directory exists only in the index), then loaded no input map.
-/// Both forms reach the overlay.
-fn directory_open(flags: c_int) -> bool {
-    flags & O_DIRECTORY != 0 || flags & O_ACCMODE == O_RDONLY
+/// A descriptor from a physical open (the original, or the directory
+/// overlay's own open): drops a packed-fd mapping the kernel reused the
+/// number of (rt/pack/state.rs `forget_stale_virtual_fd`).
+/// ponytail: covers the opens routed here; a number reused by an unhooked
+/// open (a relative `openat`, the runtime's own opens) is not checked.
+fn physical(fd: c_int) -> c_int {
+    unsafe { forget_stale_virtual_fd(fd) };
+    fd
 }
 
 unsafe fn open_resolved(
@@ -1962,13 +1960,13 @@ unsafe fn open_resolved(
                 return -1;
             }
             let canon: *const c_char = canon.as_ptr().cast();
-            if directory_open(flags) && unsafe { ampr_pack_manifest_is_resident_ready() } {
+            if directory_open_flags(flags) && unsafe { ampr_pack_manifest_is_resident_ready() } {
                 let rc = unsafe { ampr_pack_open_directory(canon, flags, mode, &mut handled) };
                 if handled {
-                    return posix_return_from_sce(rc);
+                    return physical(posix_return_from_sce(rc));
                 }
             }
-            unsafe { real(canon, flags, mode) }
+            physical(unsafe { real(canon, flags, mode) })
         }
         Resident::Hit => {
             if dir_flag {
@@ -1988,7 +1986,7 @@ unsafe fn open_resolved(
                     return posix_return_from_sce(rc);
                 }
             }
-            let fd = unsafe { real(l.entry.path, flags, mode) };
+            let fd = physical(unsafe { real(l.entry.path, flags, mode) });
             if fd < 0 {
                 stats::add(stats::Stat::OpenRealFailed, 1);
             }
@@ -2000,9 +1998,9 @@ unsafe fn open_resolved(
             // back through the `_open` hook (from inside libkernel's `open`);
             // they are physical files the index need not list.
             if is_service_path(path) {
-                return unsafe { real(path, flags, mode) };
+                return physical(unsafe { real(path, flags, mode) });
             }
-            if directory_open(flags) && unsafe { ampr_pack_manifest_is_resident_ready() } {
+            if directory_open_flags(flags) && unsafe { ampr_pack_manifest_is_resident_ready() } {
                 let rc =
                     unsafe { ampr_pack_open_virtual_directory(path, flags, mode, &mut handled) };
                 if handled {
@@ -2010,7 +2008,7 @@ unsafe fn open_resolved(
                 }
             }
             if !l.authoritative {
-                return unsafe { real(path, flags, mode) };
+                return physical(unsafe { real(path, flags, mode) });
             }
             index_miss()
         }
@@ -2024,15 +2022,15 @@ unsafe fn open_resolved(
                 },
                 1,
             );
-            if directory_open(flags)
+            if directory_open_flags(flags)
                 && unsafe { has_app0_root(path) && ampr_pack_manifest_is_resident_ready() }
             {
                 let rc = unsafe { ampr_pack_open_directory(path, flags, mode, &mut handled) };
                 if handled {
-                    return posix_return_from_sce(rc);
+                    return physical(posix_return_from_sce(rc));
                 }
             }
-            let fd = unsafe { real(path, flags, mode) };
+            let fd = physical(unsafe { real(path, flags, mode) });
             if fd < 0 {
                 stats::add(stats::Stat::OpenRealFailed, 1);
             }

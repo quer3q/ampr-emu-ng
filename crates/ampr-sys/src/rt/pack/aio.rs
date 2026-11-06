@@ -131,7 +131,7 @@ pub unsafe extern "C" fn posix_lseek_emul(fd: c_int, offset: off_t, whence: c_in
 
 pub(crate) unsafe fn has_virtual_fd(requests: *const SceKernelAioRWRequest, count: c_int) -> bool {
     (0..count as usize)
-        .any(|i| unsafe { decode_virtual_fd((*requests.add(i)).fd, null_mut(), null_mut()) })
+        .any(|i| decode_virtual_fd(unsafe { (*requests.add(i)).fd }).is_some())
 }
 
 pub unsafe fn sceKernelAioSubmitReadCommandsMultiple(
@@ -189,15 +189,14 @@ pub unsafe fn sceKernelAioSubmitReadCommandsMultiple(
             let _lock = PACK_M.lock();
             for i in 0..count as usize {
                 let req = *requests.add(i);
-                let mut fd_index = 0u32;
-                if !decode_virtual_fd(req.fd, &mut fd_index, null_mut()) {
+                let Some(fd_index) = decode_virtual_fd(req.fd) else {
                     real_positions[real_count] = i;
                     real_requests[real_count] = req;
                     real_count += 1;
                     continue;
-                }
+                };
                 let fd_slot = (*state).virtual_fds[fd_index as usize];
-                if !fd_slot.active {
+                if !fd_slot.holds(req.fd) {
                     prepare_rc = SCE_KERNEL_ERROR_EBADF;
                     break;
                 }

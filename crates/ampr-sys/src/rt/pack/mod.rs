@@ -646,11 +646,13 @@ pub(crate) const AMPR_EMU_PACK_BULK_READ_MIN_BYTES: u64 = 256 * 1024;
 pub(crate) const AMPR_EMU_PACK_IO_STAGING_BYTES: u64 = 2 * 1024 * 1024;
 pub(crate) const AMPR_EMU_PACK_PREAD_MAX_BYTES: u64 = AMPR_EMU_PACK_IO_STAGING_BYTES;
 /// Each packed open reserves one `/dev/null` descriptor, so this bounds the
-/// extra fds too. 128 keeps reserved values below `FD_LIMIT` (256), the low
-/// range a title's own fd table accepted in the boot-loop report.
+/// extra fds too. 128 slots fit inside `AMPR_EMU_PACK_VIRTUAL_FD_LIMIT`,
+/// which the title's own fds share.
 pub(crate) const AMPR_EMU_PACK_VIRTUAL_FD_SLOTS: usize = 128;
-pub(crate) const AMPR_EMU_PACK_VIRTUAL_FD_LIMIT: usize =
-    ampr_format::handles::FD_LIMIT as usize;
+/// Packed fds are real descriptors below this number: PPSA30601 never read a
+/// packed fd handed out as a tagged 0x65...... value and looped on EMFILE
+/// (issue #14), and read low ones.
+pub(crate) const AMPR_EMU_PACK_VIRTUAL_FD_LIMIT: usize = 256;
 pub(crate) const AMPR_EMU_PACK_VIRTUAL_AIO_SLOTS: usize = 256;
 pub(crate) const AMPR_EMU_PACK_MAX_PACKS: usize = 1024;
 pub(crate) const AMPR_EMU_PACK_OPEN_PACK_FD_CAP: u32 = 18;
@@ -713,7 +715,6 @@ pub(crate) const PACK_PHYSICAL_CACHE_BITMAP_WORDS: usize =
     (PACK_PHYSICAL_CACHE_MAX_PAGES + 63) / 64;
 pub(crate) const INVALID_INDEX: u32 = u32::MAX;
 // ampr_format::handles::Kind; the tags live in Rust.
-pub(crate) const VIRTUAL_KIND_FD: u32 = 0;
 pub(crate) const VIRTUAL_KIND_AIO: u32 = 1;
 pub(crate) const VIRTUAL_KIND_DIRECTORY_FD: u32 = 2;
 pub(crate) const VIRTUAL_KIND_AIO_GROUP: u32 = 3;
@@ -831,6 +832,13 @@ impl VirtualFdSlot {
         cursor: 0,
         active: false,
     };
+
+    /// Open and still the slot of `fd`. Stands in for the removed handle
+    /// generation: a read that decoded `fd` before a close sees EBADF, not
+    /// the file a later open put in the same slot under another number.
+    pub(crate) fn holds(&self, fd: c_int) -> bool {
+        self.active && self.real_fd == fd
+    }
 }
 
 pub(crate) struct VirtualDirectorySlot {
@@ -1474,9 +1482,9 @@ pub(crate) static PACK_M: Mutex = Mutex::new();
 pub(crate) static VIRTUAL_FD_MUTEXES: [Mutex; AMPR_EMU_PACK_VIRTUAL_FD_SLOTS] =
     [const { Mutex::new() }; AMPR_EMU_PACK_VIRTUAL_FD_SLOTS];
 /// Maps a reserved low OS fd to `slot + 1`; zero means not a packed fd.
+/// Written only under PACK_M; read lock-free by the fd hooks.
 pub(crate) static VIRTUAL_FD_SLOTS: [AtomicU32; AMPR_EMU_PACK_VIRTUAL_FD_LIMIT] =
     [const { AtomicU32::new(0) }; AMPR_EMU_PACK_VIRTUAL_FD_LIMIT];
-pub(crate) static VIRTUAL_FD_TABLE_MUTEX: Mutex = Mutex::new();
 pub(crate) static CACHE_MUTEX: Mutex = Mutex::new();
 pub(crate) static PHYSICAL_CACHE_MUTEX: Mutex = Mutex::new();
 /// Cold manifest publication (may include large index I/O).
