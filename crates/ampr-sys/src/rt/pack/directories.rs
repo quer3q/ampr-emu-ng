@@ -498,10 +498,11 @@ pub unsafe fn ampr_pack_try_close_fd(fd: c_int, handled: *mut bool) -> c_int {
         if !handled.is_null() {
             *handled = false;
         }
-        // The fd tag decides before pack_state(): a physical fd (the runtime's
-        // own closes reach here through libkernel's `close` -> `_close` hook)
-        // must never create or wait on the pack state. tune::load inside
-        // pack_state_create once hung here spinning on that state.
+        // A tagged directory fd or a table-mapped packed fd is decided before
+        // pack_state(): a physical fd (the runtime's own closes reach here
+        // through libkernel's `close` -> `_close` hook) must never create or
+        // wait on the pack state. tune::load inside pack_state_create once
+        // hung here spinning on that state.
         let mut index = 0u32;
         let mut generation = 0u16;
         if decode_virtual_directory_fd(fd, &mut index, &mut generation) {
@@ -547,18 +548,23 @@ pub unsafe fn ampr_pack_try_close_fd(fd: c_int, handled: *mut bool) -> c_int {
                 *handled = true;
             }
             let state = pack_state();
-            let _descriptor_lock = VIRTUAL_FD_MUTEXES[index as usize].lock();
-            if WORKER_STOP_REQUESTED.load(Ordering::Acquire) {
-                return SCE_KERNEL_ERROR_EBADF;
+            let real_fd;
+            {
+                let _descriptor_lock = VIRTUAL_FD_MUTEXES[index as usize].lock();
+                if WORKER_STOP_REQUESTED.load(Ordering::Acquire) {
+                    return SCE_KERNEL_ERROR_EBADF;
+                }
+                let _lock = PACK_M.lock();
+                let _table = VIRTUAL_FD_TABLE_MUTEX.lock();
+                let slot = &mut (*state).virtual_fds[index as usize];
+                if !slot.active {
+                    return SCE_KERNEL_ERROR_EBADF;
+                }
+                real_fd = slot.real_fd;
+                *slot = VirtualFdSlot::EMPTY;
+                VIRTUAL_FD_SLOTS[real_fd as usize].store(0, Ordering::Release);
             }
-            let _lock = PACK_M.lock();
-            let slot = &mut (*state).virtual_fds[index as usize];
-            if !slot.active || slot.generation != generation {
-                return SCE_KERNEL_ERROR_EBADF;
-            }
-            slot.active = false;
-            slot.file_id = 0;
-            slot.cursor = 0;
+            close_physical_pack_fd(real_fd);
             return 0;
         }
         SCE_KERNEL_ERROR_EBADF
@@ -606,7 +612,7 @@ pub unsafe fn ampr_pack_try_fstat_fd(
             if !handled.is_null() {
                 *handled = true;
             }
-            return fstat_virtual_fd(pack_state(), index, generation, stat);
+            return fstat_virtual_fd(pack_state(), index, stat);
         }
         SCE_KERNEL_ERROR_EBADF
     }
@@ -617,16 +623,11 @@ pub unsafe fn ampr_pack_try_fstat_fd(
 /// (rt/index.rs `file_stat`: AMPRIDX3 size and mtime, `st_ino` = id), so
 /// code that compares stat and fstat (dev/ino caches, same-file checks)
 /// sees one file. The AMPRPAK4 record's own mtime and path hash are not used.
-unsafe fn fstat_virtual_fd(
-    state: *const PackState,
-    index: u32,
-    generation: u16,
-    stat: *mut SceKernelStat,
-) -> c_int {
+unsafe fn fstat_virtual_fd(state: *const PackState, index: u32, stat: *mut SceKernelStat) -> c_int {
     let file_id = {
         let _lock = PACK_M.lock();
         let slot = &(*state).virtual_fds[index as usize];
-        if !slot.active || slot.generation != generation {
+        if !slot.active {
             return SCE_KERNEL_ERROR_EBADF;
         }
         slot.file_id

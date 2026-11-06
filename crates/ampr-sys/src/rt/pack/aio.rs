@@ -189,15 +189,15 @@ pub unsafe fn sceKernelAioSubmitReadCommandsMultiple(
             let _lock = PACK_M.lock();
             for i in 0..count as usize {
                 let req = *requests.add(i);
-                let (mut fd_index, mut fd_generation) = (0u32, 0u16);
-                if !decode_virtual_fd(req.fd, &mut fd_index, &mut fd_generation) {
+                let mut fd_index = 0u32;
+                if !decode_virtual_fd(req.fd, &mut fd_index, null_mut()) {
                     real_positions[real_count] = i;
                     real_requests[real_count] = req;
                     real_count += 1;
                     continue;
                 }
                 let fd_slot = (*state).virtual_fds[fd_index as usize];
-                if !fd_slot.active || fd_slot.generation != fd_generation {
+                if !fd_slot.active {
                     prepare_rc = SCE_KERNEL_ERROR_EBADF;
                     break;
                 }

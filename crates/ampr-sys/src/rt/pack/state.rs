@@ -18,6 +18,9 @@ pub(crate) unsafe fn pack_state_create() -> *mut PackState {
         // Storage is zeroed .bss; apply the non-zero `PackState()` defaults in place.
         let s = g_pack_state_storage.get() as *mut PackState;
         unsafe {
+            for i in 0..AMPR_EMU_PACK_VIRTUAL_FD_SLOTS {
+                addr_of_mut!((*s).virtual_fds[i]).write(VirtualFdSlot::EMPTY);
+            }
             for i in 0..AMPR_EMU_PACK_VIRTUAL_DIRECTORY_SLOTS {
                 addr_of_mut!((*s).virtual_directories[i]).write(VirtualDirectorySlot::EMPTY);
             }
@@ -111,20 +114,36 @@ pub(crate) fn next_generation(current: u16) -> u32 {
     ampr_rust_virtual_next_generation(current)
 }
 
-pub(crate) fn encode_virtual_fd(slot: u32, generation: u16) -> c_int {
-    ampr_rust_virtual_encode(VIRTUAL_KIND_FD, slot, generation) as c_int
+pub(crate) fn encode_virtual_fd(fd: u32, _generation: u16) -> c_int {
+    ampr_rust_virtual_encode(VIRTUAL_KIND_FD, fd, 0) as c_int
 }
 
-pub(crate) unsafe fn decode_virtual_fd(fd: c_int, slot: *mut u32, generation: *mut u16) -> bool {
-    unsafe {
-        ampr_rust_virtual_decode(
-            VIRTUAL_KIND_FD,
-            fd as u32,
-            AMPR_EMU_PACK_VIRTUAL_FD_SLOTS as u32,
-            slot,
-            generation,
-        )
+/// Slot mapped to low fd `number`, or None when it is a physical fd.
+pub(crate) fn virtual_fd_slot_for(number: u32) -> Option<u32> {
+    if number as usize >= AMPR_EMU_PACK_VIRTUAL_FD_LIMIT {
+        return None;
     }
+    let entry = VIRTUAL_FD_SLOTS[number as usize].load(Ordering::Acquire);
+    entry.checked_sub(1)
+}
+
+/// Decodes a packed fd through the reserved-descriptor table. Unlike the
+/// tagged handles, a physical fd in the low range is also a valid candidate,
+/// so the table decides; no pack state is created when none exists.
+pub(crate) unsafe fn decode_virtual_fd(fd: c_int, slot: *mut u32, generation: *mut u16) -> bool {
+    if g_pack_state.load(Ordering::Acquire).is_null() {
+        return false;
+    }
+    let Some(mapped) = virtual_fd_slot_for(fd as u32) else {
+        return false;
+    };
+    if !slot.is_null() {
+        unsafe { slot.write(mapped) };
+    }
+    if !generation.is_null() {
+        unsafe { generation.write(0) };
+    }
+    true
 }
 
 pub(crate) fn encode_virtual_directory_fd(slot: u32, generation: u16) -> c_int {
@@ -701,5 +720,18 @@ mod tests {
         assert!(!pread_loop(1, 0, 4, |_, _, _| -1, || EINTR + 1), "EIO");
         assert!(!pread_loop(1, off_t::MAX as u64, 4, |_, _, _| 1, || 0));
         assert!(!pread_loop(2, 0, 4, |_, _, _| 3, || 0), "rc above request");
+    }
+
+    #[test]
+    fn packed_fd_lookup_is_range_and_table_based() {
+        assert_eq!(encode_virtual_fd(250, 9), 250);
+        assert_eq!(virtual_fd_slot_for(250), None);
+
+        // `slot + 1` leaves zero as "not a packed fd".
+        VIRTUAL_FD_SLOTS[250].store(6, Ordering::Release);
+        assert_eq!(virtual_fd_slot_for(250), Some(5));
+        VIRTUAL_FD_SLOTS[250].store(0, Ordering::Release);
+        assert_eq!(virtual_fd_slot_for(250), None);
+        assert_eq!(virtual_fd_slot_for(256), None);
     }
 }
