@@ -193,6 +193,13 @@ unsafe fn close_real_fd(real_fd: c_int) {
     }
 }
 
+/// Directory opens this overlay serves: `O_DIRECTORY`, or any read-only open
+/// (retail allows a read-only open of a directory, and a packed directory has
+/// no physical copy to fall back to).
+fn directory_open_flags(flags: c_int) -> bool {
+    flags & O_DIRECTORY != 0 || flags & O_ACCMODE == O_RDONLY
+}
+
 #[inline(never)]
 pub(crate) unsafe fn ampr_pack_open_directory_impl(
     path: *const c_char,
@@ -205,7 +212,10 @@ pub(crate) unsafe fn ampr_pack_open_directory_impl(
         if !handled.is_null() {
             *handled = false;
         }
-        if path.is_null() || handled.is_null() || flags & O_DIRECTORY == 0 {
+        // `O_DIRECTORY`, or any read-only open: the kernel accepts a
+        // read-only open of a directory, and a title that scans a packed
+        // directory uses that form (rt/index.rs `directory_open`).
+        if path.is_null() || handled.is_null() || !directory_open_flags(flags) {
             return SCE_KERNEL_ERROR_EINVAL;
         }
         let mut real_fd: c_int = -1;
@@ -220,6 +230,12 @@ pub(crate) unsafe fn ampr_pack_open_directory_impl(
         // Read-only overlay: never turn an access/permission error or a
         // writable request into a synthetic success.
         if allow_physical_open && flags & O_ACCMODE != O_RDONLY {
+            return real_fd;
+        }
+        // A plain read-only open of a directory that really is on disk (a
+        // folder install) keeps the kernel's fd and its own entries; only a
+        // missing directory is served from the index.
+        if allow_physical_open && flags & O_DIRECTORY == 0 && real_fd >= 0 {
             return real_fd;
         }
         if allow_physical_open && real_fd < 0 {

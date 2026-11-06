@@ -641,6 +641,8 @@ const O_WRONLY: c_int = 0x1;
 const O_CREAT: c_int = 0x200;
 const O_TRUNC: c_int = 0x400;
 const O_DIRECTORY: c_int = 0x20000;
+/// Access-mode mask of `open` flags (rt/pack/mod.rs `O_ACCMODE`).
+const O_ACCMODE: c_int = 0x3;
 const S_IRWU: SceKernelMode = 0o600; // SCE_KERNEL_S_IRWU
 const S_IFMT: u16 = 0o170000;
 const S_IFDIR: u16 = 0o040000;
@@ -1932,6 +1934,16 @@ fn how(l: &Lookup) -> u8 {
     }
 }
 
+/// Whether an open may name a directory: an explicit `O_DIRECTORY` open, or
+/// any read-only open, which the kernel accepts for a directory too. A title
+/// that scans a packed directory can use the second form: a measured packed
+/// install opened `/app0/input/` 8 times with flags 0 and got ENOENT every
+/// time (the directory exists only in the index), then loaded no input map.
+/// Both forms reach the overlay.
+fn directory_open(flags: c_int) -> bool {
+    flags & O_DIRECTORY != 0 || flags & O_ACCMODE == O_RDONLY
+}
+
 unsafe fn open_resolved(
     l: &Lookup,
     path: *const c_char,
@@ -1950,7 +1962,7 @@ unsafe fn open_resolved(
                 return -1;
             }
             let canon: *const c_char = canon.as_ptr().cast();
-            if dir_flag && unsafe { ampr_pack_manifest_is_resident_ready() } {
+            if directory_open(flags) && unsafe { ampr_pack_manifest_is_resident_ready() } {
                 let rc = unsafe { ampr_pack_open_directory(canon, flags, mode, &mut handled) };
                 if handled {
                     return posix_return_from_sce(rc);
@@ -1990,7 +2002,7 @@ unsafe fn open_resolved(
             if is_service_path(path) {
                 return unsafe { real(path, flags, mode) };
             }
-            if dir_flag && unsafe { ampr_pack_manifest_is_resident_ready() } {
+            if directory_open(flags) && unsafe { ampr_pack_manifest_is_resident_ready() } {
                 let rc =
                     unsafe { ampr_pack_open_virtual_directory(path, flags, mode, &mut handled) };
                 if handled {
@@ -2012,7 +2024,8 @@ unsafe fn open_resolved(
                 },
                 1,
             );
-            if dir_flag && unsafe { has_app0_root(path) && ampr_pack_manifest_is_resident_ready() }
+            if directory_open(flags)
+                && unsafe { has_app0_root(path) && ampr_pack_manifest_is_resident_ready() }
             {
                 let rc = unsafe { ampr_pack_open_directory(path, flags, mode, &mut handled) };
                 if handled {
