@@ -136,14 +136,21 @@ fully packed game the runtime serves:
 - plain `open`/`read`/`pread`/`readv`/`preadv`/`lseek`/`fstat`/`close`,
   `stat`, `getdents`/`getdirentries` and their `sceKernel*` forms on
   virtual pack fds and indexed directories;
-- a virtual pack fd is a real descriptor below 512: the open reserves the
-  number by opening `/dev/null`, and the fd hooks map it to the packed file
-  until close. PPSA30601 never read the earlier tagged `0x65......` fds and
-  looped on EMFILE. Up to 256 are open at once, and the title shares that
-  table with the runtime's own cached packed opens (`rt/fd_cache.rs`); a
-  128-slot table filled with 115 title opens and 13 cached ones and the
-  title's next open failed with EMFILE. The reservations are not counted in
-  the runtime's 50-fd open budget (`rt/fd_cache.rs`);
+- a virtual pack fd is a synthetic number in `512..1024` (`512 + slot`, 512
+  slots), not a kernel descriptor. The range is above the kernel's effective
+  fd table (259 measured on PPSA03671 and PPSA30601: 248 `open("/dev/null")`
+  calls succeeded, highest fd 258, despite `RLIMIT_NOFILE` 13,952) and below
+  the strictest title limit: PPSA30601 rejects fd >= 1024 (base 1000 failed
+  on `CHARACTERS_STRUCTURE.PS5.PCK` at fd 1024, while base 768 and 512 boot),
+  and PPSA03671 accepted 170 packed fds at 1024..1193. Because no kernel
+  descriptor is used, the title keeps its whole fd table for real files; a
+  previous design reserved one `/dev/null` descriptor per packed fd, which
+  left PPSA03671 only ~49 of its 259 descriptors and made its own
+  `/dev/urandom`, ACM device and save opens fail with EMFILE. A closed slot
+  is reused, so the slot count is the number of packed files open at once
+  (512, shared with the runtime's cached packed opens in `rt/fd_cache.rs`),
+  not a lifetime limit. The runtime serves reads, seeks, fstat, close, AIO
+  and mmap on the synthetic number;
 - a read-only open of an indexed directory, with or without `O_DIRECTORY`,
   gets the virtual directory. The kernel accepts a read-only open of a
   directory, and a title that scans a packed directory can pass plain

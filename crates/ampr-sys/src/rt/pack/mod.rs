@@ -648,19 +648,25 @@ pub(crate) const AMPR_EMU_PACK_PREAD_MAX_BYTES: u64 = AMPR_EMU_PACK_IO_STAGING_B
 /// Packed files open at once. The slots serve the title's own opens and the
 /// runtime's cached ones alike: the APR fd cache opens packed files through
 /// the same allocator (rt/fd_cache.rs `open_indexed_or_real`), so up to
-/// `CACHE_CAP` (45) of these belong to the runtime. Each slot also reserves
-/// one `/dev/null` descriptor, so this bounds the extra fds too. 128 was too
-/// few: PPSA03671 held 115 packed fds and the fd cache the other 13, the
-/// table filled, and its next open (a 24.7 MiB soundbank, at 63 s) failed
-/// with EMFILE in every one of 45 retries (`open_hit` and `open_virtual` both
-/// 115 -> 160, `open_real_failed` 0); the title then quit. v0.3.1 gave 256.
-pub(crate) const AMPR_EMU_PACK_VIRTUAL_FD_SLOTS: usize = 256;
-/// Packed fds are real descriptors below this number: PPSA30601 never read a
-/// packed fd handed out as a tagged 0x65...... value and looped on EMFILE
-/// (issue #14), and read low ones. The fd-to-slot table is indexed by
-/// descriptor, so this has to cover a full slot table plus the title's own
-/// fds and the pack volumes (18): 512 for 256 slots.
-pub(crate) const AMPR_EMU_PACK_VIRTUAL_FD_LIMIT: usize = 512;
+/// `CACHE_CAP` (45) of these belong to the runtime. A closed slot is reused,
+/// so this is the number of packed files open at one time, not a lifetime
+/// limit. PPSA03671 held 220 during its world load; 512 is comfortable.
+pub(crate) const AMPR_EMU_PACK_VIRTUAL_FD_SLOTS: usize = 512;
+/// First synthetic packed-file descriptor: a packed fd is `BASE + slot`, in
+/// `512..1024`. That range is above the kernel's effective fd table and below
+/// the strictest title limit:
+/// - the kernel's table tops out at 259 on PPSA03671 and PPSA30601 (248
+///   `open("/dev/null")` calls succeeded, highest fd 258), despite
+///   `RLIMIT_NOFILE` reporting 13,952, so a real descriptor can never land in
+///   the synthetic range;
+/// - PPSA30601 rejects fd >= 1024: base 1000 failed on
+///   `CHARACTERS_STRUCTURE.PS5.PCK` at fd 1024, while base 768 and 512 boot.
+///   PPSA03671 accepted 170 packed fds at 1024..1193, so 1024 is that title's
+///   own limit, not a system one.
+/// The range needs no kernel descriptor, so the title keeps its whole fd table
+/// for real files. The runtime serves reads, seeks, fstat, close, AIO and mmap
+/// on the synthetic number.
+pub(crate) const AMPR_EMU_PACK_VIRTUAL_FD_BASE: usize = 512;
 pub(crate) const AMPR_EMU_PACK_VIRTUAL_AIO_SLOTS: usize = 256;
 pub(crate) const AMPR_EMU_PACK_MAX_PACKS: usize = 1024;
 pub(crate) const AMPR_EMU_PACK_OPEN_PACK_FD_CAP: u32 = 18;
@@ -688,7 +694,6 @@ pub(crate) const AMPR_EMU_PACK_PHYSICAL_CACHE_BYTES: u64 = 32 * 1024 * 1024;
 pub(crate) const AMPR_EMU_PACK_PHYSICAL_CACHE_MIN_BYTES: u64 = 8 * 1024 * 1024;
 pub(crate) const AMPR_EMU_PACK_PHYSICAL_CACHE_ENTRY_CAP: usize = 4096;
 pub(crate) const AMPR_EMU_PACK_PHYSICAL_CACHE_HASH_BUCKETS: usize = 8192;
-pub(crate) const AMPR_EMU_PACK_INLINE_CACHE_MAX_TASKS: usize = 64;
 pub(crate) const AMPR_EMU_PACK_CACHE_ENTRY_CAP: usize = 8192;
 pub(crate) const AMPR_EMU_PACK_CACHE_PAGE_SHIFT: u32 = 14;
 pub(crate) const AMPR_EMU_PACK_CACHE_HASH_BUCKETS: usize = 16384;
@@ -825,8 +830,9 @@ pub(crate) static g_real_aio_delete: AtomicPtr<c_void> = AtomicPtr::new(null_mut
 #[derive(Clone, Copy)]
 pub(crate) struct VirtualFdSlot {
     pub file_id: u32,
-    /// The low OS descriptor reserved for this virtual fd, or -1.
-    pub real_fd: c_int,
+    /// The value returned to the game: `AMPR_EMU_PACK_VIRTUAL_FD_BASE + slot`.
+    /// A reused slot returns the same number, like a reused OS fd.
+    pub handle: c_int,
     /// First local chunk not yet covered by read-ahead (readahead.rs).
     pub readahead_next: u32,
     pub cursor: u64,
@@ -835,17 +841,16 @@ pub(crate) struct VirtualFdSlot {
 impl VirtualFdSlot {
     pub(crate) const EMPTY: Self = Self {
         file_id: 0,
-        real_fd: -1,
+        handle: -1,
         readahead_next: 0,
         cursor: 0,
         active: false,
     };
 
-    /// Open and still the slot of `fd`. Stands in for the removed handle
-    /// generation: a read that decoded `fd` before a close sees EBADF, not
-    /// the file a later open put in the same slot under another number.
+    /// Open and still the slot of `fd`. A closed slot that has been reused
+    /// for another file returns the same number, like a reused OS fd.
     pub(crate) fn holds(&self, fd: c_int) -> bool {
-        self.active && self.real_fd == fd
+        self.active && self.handle == fd
     }
 }
 
@@ -1486,13 +1491,9 @@ pub(crate) struct PackState {
 // Locks, condvars and atomics of the pack runtime, kept outside PackState.
 
 pub(crate) static PACK_M: Mutex = Mutex::new();
-/// Cursor operations and close on the same reserved descriptor.
+/// Cursor operations and close on the same packed fd.
 pub(crate) static VIRTUAL_FD_MUTEXES: [Mutex; AMPR_EMU_PACK_VIRTUAL_FD_SLOTS] =
     [const { Mutex::new() }; AMPR_EMU_PACK_VIRTUAL_FD_SLOTS];
-/// Maps a reserved low OS fd to `slot + 1`; zero means not a packed fd.
-/// Written only under PACK_M; read lock-free by the fd hooks.
-pub(crate) static VIRTUAL_FD_SLOTS: [AtomicU32; AMPR_EMU_PACK_VIRTUAL_FD_LIMIT] =
-    [const { AtomicU32::new(0) }; AMPR_EMU_PACK_VIRTUAL_FD_LIMIT];
 pub(crate) static CACHE_MUTEX: Mutex = Mutex::new();
 pub(crate) static PHYSICAL_CACHE_MUTEX: Mutex = Mutex::new();
 /// Cold manifest publication (may include large index I/O).

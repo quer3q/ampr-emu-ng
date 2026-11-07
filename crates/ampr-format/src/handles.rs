@@ -1,10 +1,9 @@
 //! Virtual handle encoding: directory fds, AIO submit ids and AIO group ids
 //! share one 32-bit layout, `tag(8) | generation(16) | slot(8)`. Packed-file
-//! fds are not encoded: each is a real low descriptor the runtime reserves on
-//! open (ampr-sys `rt/pack/slots.rs` `allocate_virtual_fd_locked`).
+//! fds are plain synthetic numbers in `512..1024` (ampr-sys `rt/pack/mod.rs`
+//! `AMPR_EMU_PACK_VIRTUAL_FD_BASE`), not tagged handles.
 
-/// Handle kinds; the discriminant is the C ABI value. 0 was the packed-file
-/// fd, which is no longer a tagged handle.
+/// Handle kinds; the discriminant is the C ABI value.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u32)]
 pub enum Kind {

@@ -99,49 +99,37 @@ pub(crate) unsafe fn lookup_virtual_aio_group_locked(
     slot
 }
 
-/// Reserves a low OS descriptor by opening `/dev/null`, then takes a free
-/// slot and publishes the fd-to-slot mapping. The reserved descriptor keeps
-/// the number from being reused by another file, so an fd in the low range is
-/// unambiguously either physical or mapped virtual. Returns the fd as the
-/// caller's handle, or an SCE error (never a positive value).
-///
-/// The reservation stands in for the title's own fd, so it is not counted in
-/// the runtime's open budget (rt/fd_cache.rs `BUDGET_CAP`, 50). Counted, 32
-/// open packed files plus 18 open pack volumes (`OPEN_PACK_FD_CAP`) would
-/// fill it, and a read needing another volume would park until the title
-/// closed a file (rt/pack/leases.rs, rt/pack/worker.rs `park_on_fd_locked`).
-/// Derived from the code, not seen on a console.
+/// Takes a free slot and returns the synthetic packed fd `BASE + slot`.
+/// No kernel descriptor is involved: the range is above the kernel's
+/// effective fd table (259) and below the strictest title limit (PPSA30601
+/// rejects fd >= 1024). A closed slot is reused, so the number behaves like
+/// a reused OS fd. Returns an SCE error (never a positive value) when all
+/// slots are open.
 pub(crate) unsafe fn allocate_virtual_fd_locked(state: *mut PackState, file_id: u32) -> c_int {
     let slots = AMPR_EMU_PACK_VIRTUAL_FD_SLOTS as u32;
     let index = ((*state).virtual_fd_cursor..slots)
         .chain(0..(*state).virtual_fd_cursor)
         .find(|&i| !(*state).virtual_fds[i as usize].active);
     let Some(index) = index else {
+        #[cfg(feature = "mem_report")]
+        stats::fs_event(
+            b'Q',
+            b'S',
+            SCE_KERNEL_ERROR_EMFILE as i64,
+            c"virtual-fd-slots".as_ptr(),
+        );
         return SCE_KERNEL_ERROR_EMFILE;
     };
-    let Some(open_fn) = (unsafe { real_open() }) else {
-        return SCE_KERNEL_ERROR_EIO;
-    };
-    let fd = unsafe { open_fn(c"/dev/null".as_ptr(), O_RDONLY, 0) };
-    if fd < 0 {
-        return sce_errno_from_posix(errno());
-    }
-    if fd as usize >= AMPR_EMU_PACK_VIRTUAL_FD_LIMIT {
-        let _ = unsafe { real_close() }.map(|close_fn| unsafe { close_fn(fd) });
-        return SCE_KERNEL_ERROR_EMFILE;
-    }
-    // A stale slot can still name this number (see forget_stale_virtual_fd).
-    forget_stale_virtual_fd_locked(state, fd);
+    let handle = (AMPR_EMU_PACK_VIRTUAL_FD_BASE as u32 + index) as c_int;
     let slot = &mut (*state).virtual_fds[index as usize];
     *slot = VirtualFdSlot {
         file_id,
-        real_fd: fd,
+        handle,
         ..VirtualFdSlot::EMPTY
     };
     slot.active = true;
-    VIRTUAL_FD_SLOTS[fd as usize].store(index + 1, Ordering::Release);
     (*state).virtual_fd_cursor = (index + 1) % slots;
-    fd
+    handle
 }
 
 pub unsafe fn ampr_pack_notify_fd_budget_progress() {

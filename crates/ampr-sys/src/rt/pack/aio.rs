@@ -381,9 +381,15 @@ unsafe fn submit_real_requests(
     }
 }
 
-/// Completes the virtual jobs served from the decoded cache inline, queues
-/// the rest for the pack workers, stores every caller id and queues the
-/// batch's read-ahead windows.
+/// Queues every virtual job for the pack workers and stores every caller id.
+/// A read is never completed inside the submit call: the caller learns the
+/// ids only from the return value. A fully packed zstd title black-screened
+/// at startup in release (128 MiB pool, decoded cache carved) and, with the
+/// probe hooks off in a debug build so it has counters, stalled at 5,060
+/// reads / 213 MB with no I/O and no errors; queuing that read instead
+/// reached 25,823 reads / 657 MB. The debug build with its probes installed
+/// moved the window past the hang, which is why only release showed it.
+/// Also queues the batch's read-ahead windows.
 unsafe fn publish_virtual_jobs(
     state: *mut PackState,
     ids: *mut SceKernelAioSubmitId,
@@ -393,16 +399,7 @@ unsafe fn publish_virtual_jobs(
     readahead: &[(u32, u32, u32)],
 ) {
     unsafe {
-        const J: usize = AMPR_EMU_PACK_VIRTUAL_AIO_SLOTS;
         let virtual_count = virtual_indexes.len();
-        let mut inline_completed = [false; J];
-        let mut inline_bytes = [0u64; J];
-        for i in 0..virtual_count {
-            inline_completed[i] = try_process_virtual_read_cache_only(
-                &mut (*state).virtual_aio[virtual_indexes[i] as usize],
-                &mut inline_bytes[i],
-            );
-        }
         let queued_at_usec = pack_telemetry_usecs();
         let mut queued = 0usize;
         let notify_one;
@@ -413,17 +410,8 @@ unsafe fn publish_virtual_jobs(
                 let id = encode_virtual_aio(index, (*state).virtual_aio[index as usize].generation);
                 let id = split_caller_id(state, split_groups[virtual_positions[i]], id);
                 *ids.add(virtual_positions[i]) = id;
-                if inline_completed[i] {
-                    complete_virtual_job(
-                        state,
-                        index,
-                        inline_bytes[i] as i64,
-                        SCE_KERNEL_AIO_STATE_COMPLETED,
-                    );
-                } else {
-                    queue_push_locked(state, index, queued_at_usec);
-                    queued += 1;
-                }
+                queue_push_locked(state, index, queued_at_usec);
+                queued += 1;
             }
             notify_one = queued == 1 && effective_latency_reserve_locked(state) == 0;
         }
