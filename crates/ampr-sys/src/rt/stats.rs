@@ -464,6 +464,13 @@ pub(crate) fn fs_note(op: u8, how: u8, rc: i64, path: *const core::ffi::c_char) 
 /// Appends one event to the FS_LOG ring.
 #[cfg(feature = "mem_report")]
 unsafe fn fs_ring(op: u8, how: u8, rc: i64, path: *const core::ffi::c_char) {
+    // Hooks can arrive on multiple threads. Keep this log best-effort rather
+    // than wait in a callback or race its shared cursor and entries.
+    static BUSY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+    use core::sync::atomic::Ordering;
+    if BUSY.swap(true, Ordering::Acquire) {
+        return;
+    }
     let log = unsafe { &mut *FS_LOG.get() };
     let slot = log.next % FS_EVENTS;
     log.next = log.next.wrapping_add(1);
@@ -473,6 +480,7 @@ unsafe fn fs_ring(op: u8, how: u8, rc: i64, path: *const core::ffi::c_char) {
         n += 1;
     }
     (log.op[slot], log.how[slot], log.rc[slot], log.len[slot]) = (op, how, rc, n);
+    BUSY.store(false, Ordering::Release);
 }
 
 /// Logs a gather/scatter retry that re-resolved to `got` instead of the
