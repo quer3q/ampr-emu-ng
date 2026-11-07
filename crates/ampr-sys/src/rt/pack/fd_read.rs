@@ -1231,8 +1231,6 @@ unsafe fn cancel_virtual_jobs(state: *mut PackState) {
 unsafe fn close_pack_and_directory_fds(state: *mut PackState) {
     let mut pack_fds = [0 as c_int; AMPR_EMU_PACK_MAX_PACKS];
     let mut pack_fd_count = 0usize;
-    let mut virtual_fds = [0 as c_int; AMPR_EMU_PACK_VIRTUAL_FD_SLOTS];
-    let mut virtual_fd_count = 0usize;
     {
         let _g = PACK_M.lock();
         for handle in (*state).pack_handles.iter_mut() {
@@ -1249,20 +1247,11 @@ unsafe fn close_pack_and_directory_fds(state: *mut PackState) {
             free_virtual_aio_group_locked(state, i);
         }
         for fd in (*state).virtual_fds.iter_mut() {
-            if fd.real_fd >= 0 {
-                virtual_fds[virtual_fd_count] = fd.real_fd;
-                virtual_fd_count += 1;
-                VIRTUAL_FD_SLOTS[fd.real_fd as usize].store(0, Ordering::Release);
-            }
             *fd = VirtualFdSlot::EMPTY;
         }
     }
     for &fd in &pack_fds[..pack_fd_count] {
         unsafe { close_physical_pack_fd(fd) };
-    }
-    // `/dev/null` reservations are not in the open budget (slots.rs).
-    for &fd in &virtual_fds[..virtual_fd_count] {
-        unsafe { close_real_fd(fd) };
     }
 
     let mut directory_fds = [0 as c_int; AMPR_EMU_PACK_VIRTUAL_DIRECTORY_SLOTS];

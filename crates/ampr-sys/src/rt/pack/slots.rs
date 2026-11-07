@@ -99,18 +99,12 @@ pub(crate) unsafe fn lookup_virtual_aio_group_locked(
     slot
 }
 
-/// Reserves a low OS descriptor by opening `/dev/null`, then takes a free
-/// slot and publishes the fd-to-slot mapping. The reserved descriptor keeps
-/// the number from being reused by another file, so an fd in the low range is
-/// unambiguously either physical or mapped virtual. Returns the fd as the
-/// caller's handle, or an SCE error (never a positive value).
-///
-/// The reservation stands in for the title's own fd, so it is not counted in
-/// the runtime's open budget (rt/fd_cache.rs `BUDGET_CAP`, 50). Counted, 32
-/// open packed files plus 18 open pack volumes (`OPEN_PACK_FD_CAP`) would
-/// fill it, and a read needing another volume would park until the title
-/// closed a file (rt/pack/leases.rs, rt/pack/worker.rs `park_on_fd_locked`).
-/// Derived from the code, not seen on a console.
+/// Takes a free slot and returns the synthetic packed fd `BASE + slot`.
+/// No kernel descriptor is involved: the range is above the kernel's
+/// effective fd table (259) and below the strictest title limit (PPSA30601
+/// rejects fd >= 1024). A closed slot is reused, so the number behaves like
+/// a reused OS fd. Returns an SCE error (never a positive value) when all
+/// slots are open.
 pub(crate) unsafe fn allocate_virtual_fd_locked(state: *mut PackState, file_id: u32) -> c_int {
     let slots = AMPR_EMU_PACK_VIRTUAL_FD_SLOTS as u32;
     let index = ((*state).virtual_fd_cursor..slots)
@@ -126,72 +120,14 @@ pub(crate) unsafe fn allocate_virtual_fd_locked(state: *mut PackState, file_id: 
         );
         return SCE_KERNEL_ERROR_EMFILE;
     };
-    // Every allocation gets a fresh generation, so a tagged fallback handle
-    // never matches a slot reused after an older close.
-    let generation = next_generation((*state).virtual_fds[index as usize].generation) as u16;
-    // Reserve a low descriptor while the process still has room for one,
-    // leaving `AMPR_EMU_PACK_RESERVED_FD_HEADROOM` descriptors to the title.
-    // At that mark, or when the kernel is already at its open-file limit (a
-    // fully packed title can hold a few hundred packed fds), fall back to
-    // the tagged handle v0.3.1 handed out instead of failing the open with
-    // EMFILE: the runtime serves every operation on it itself, and a title
-    // that rejects tagged fds has already received low ones while
-    // descriptors were available.
-    let reserve_ceiling = AMPR_EMU_PACK_VIRTUAL_FD_LIMIT
-        .saturating_sub(AMPR_EMU_PACK_RESERVED_FD_HEADROOM);
-    let reserved = (*state)
-        .virtual_fds
-        .iter()
-        .filter(|slot| slot.active && slot.real_fd >= 0)
-        .count();
-    let (real_fd, handle, fallback_errno) = if reserved >= AMPR_EMU_PACK_RESERVED_FD_SLOTS {
-        (-1, encode_virtual_fd(index, generation), EMFILE)
-    } else {
-        match unsafe { real_open() } {
-            Some(open_fn) => {
-                let fd = unsafe { open_fn(c"/dev/null".as_ptr(), O_RDONLY, 0) };
-                if fd >= 0 && (fd as usize) < reserve_ceiling {
-                    (fd, fd, 0)
-                } else {
-                    let err = if fd >= 0 {
-                        let _ = unsafe { real_close() }.map(|close_fn| unsafe { close_fn(fd) });
-                        EMFILE
-                    } else {
-                        errno()
-                    };
-                    (-1, encode_virtual_fd(index, generation), err)
-                }
-            }
-            None => (-1, encode_virtual_fd(index, generation), EIO),
-        }
-    };
-    #[cfg(feature = "mem_report")]
-    if real_fd < 0 {
-        stats::fs_event(
-            b'Q',
-            b'D',
-            -(fallback_errno as i64),
-            c"tagged-fallback".as_ptr(),
-        );
-    }
-    #[cfg(not(feature = "mem_report"))]
-    let _ = fallback_errno;
-    if real_fd >= 0 {
-        // A stale slot can still name this number (see forget_stale_virtual_fd).
-        forget_stale_virtual_fd_locked(state, real_fd);
-    }
+    let handle = (AMPR_EMU_PACK_VIRTUAL_FD_BASE as u32 + index) as c_int;
     let slot = &mut (*state).virtual_fds[index as usize];
     *slot = VirtualFdSlot {
         file_id,
-        real_fd,
         handle,
-        generation,
         ..VirtualFdSlot::EMPTY
     };
     slot.active = true;
-    if real_fd >= 0 {
-        VIRTUAL_FD_SLOTS[real_fd as usize].store(index + 1, Ordering::Release);
-    }
     (*state).virtual_fd_cursor = (index + 1) % slots;
     handle
 }

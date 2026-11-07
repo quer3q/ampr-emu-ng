@@ -114,79 +114,24 @@ pub(crate) fn next_generation(current: u16) -> u32 {
     ampr_rust_virtual_next_generation(current)
 }
 
-/// Slot mapped to low fd `number`, or None when it is a physical fd.
-pub(crate) fn virtual_fd_slot_for(number: u32) -> Option<u32> {
-    if number as usize >= AMPR_EMU_PACK_VIRTUAL_FD_LIMIT {
-        return None;
+/// Slot named by a synthetic packed fd (`BASE + slot`), or None for a
+/// physical fd. The kernel's effective table tops out at 258, so a real
+/// descriptor can never be mistaken for one of these. Callers confirm the
+/// slot under PACK_M with `VirtualFdSlot::holds`.
+fn packed_fd_slot(value: u32) -> Option<u32> {
+    let base = AMPR_EMU_PACK_VIRTUAL_FD_BASE as u32;
+    if value >= base && value < base + AMPR_EMU_PACK_VIRTUAL_FD_SLOTS as u32 {
+        Some(value - base)
+    } else {
+        None
     }
-    let entry = VIRTUAL_FD_SLOTS[number as usize].load(Ordering::Acquire);
-    entry.checked_sub(1)
 }
 
-/// Tagged packed-file handle for `slot` (`0x6500_0000 | generation << 8 |
-/// slot`). Used when no low descriptor could be reserved, so the open does
-/// not fail with EMFILE once the process is at its file limit.
-pub(crate) fn encode_virtual_fd(slot: u32, generation: u16) -> c_int {
-    ampr_rust_virtual_encode(VIRTUAL_KIND_FD, slot, generation) as c_int
-}
-
-/// Slot named by a tagged packed-file handle, before `VirtualFdSlot::holds`
-/// confirms it is still the same generation.
-fn tagged_virtual_fd_slot(fd: c_int) -> Option<u32> {
-    if fd < 0 {
-        return None;
-    }
-    let mut slot = 0u32;
-    let found = unsafe {
-        ampr_rust_virtual_decode(
-            VIRTUAL_KIND_FD,
-            fd as u32,
-            AMPR_EMU_PACK_VIRTUAL_FD_SLOTS as u32,
-            &mut slot,
-            null_mut(),
-        )
-    };
-    found.then_some(slot)
-}
-
-/// Slot of a packed fd: through the reserved-descriptor table when it is a
-/// low number, else through its tagged handle (the EMFILE fallback). Unlike
-/// the tagged-only handles, a physical fd in the low range is also a
-/// candidate, so the table decides; no pack state is created when none
-/// exists. Callers confirm the slot under PACK_M with
-/// `VirtualFdSlot::holds`.
 pub(crate) fn decode_virtual_fd(fd: c_int) -> Option<u32> {
-    if g_pack_state.load(Ordering::Acquire).is_null() {
+    if fd < 0 || g_pack_state.load(Ordering::Acquire).is_null() {
         return None;
     }
-    virtual_fd_slot_for(fd as u32).or_else(|| tagged_virtual_fd_slot(fd))
-}
-
-/// Drops a packed-fd mapping whose reserved descriptor the kernel has
-/// handed out again. `fd` is a descriptor a physical open just returned, so
-/// a slot still mapped to that number lost its `/dev/null` reservation to a
-/// close the runtime did not see (a `dup2` onto it, an unhooked close such
-/// as `_close` with its `AMPR_ZSTD_LIBC_HOOKS` bit cleared). Left mapped,
-/// the new file would read as the old packed one. Lock-free unless mapped.
-pub(crate) unsafe fn forget_stale_virtual_fd(fd: c_int) {
-    if fd < 0 || decode_virtual_fd(fd).is_none() {
-        return;
-    }
-    let _lock = PACK_M.lock();
-    unsafe { forget_stale_virtual_fd_locked(g_pack_state.load(Ordering::Acquire), fd) };
-}
-
-/// `forget_stale_virtual_fd` under PACK_M. The kernel owns the number now,
-/// so the slot is cleared and nothing is closed.
-pub(crate) unsafe fn forget_stale_virtual_fd_locked(state: *mut PackState, fd: c_int) {
-    let Some(index) = virtual_fd_slot_for(fd as u32) else {
-        return;
-    };
-    let slot = unsafe { &mut (*state).virtual_fds[index as usize] };
-    if slot.holds(fd) {
-        *slot = VirtualFdSlot::EMPTY;
-    }
-    VIRTUAL_FD_SLOTS[fd as usize].store(0, Ordering::Release);
+    packed_fd_slot(fd as u32)
 }
 
 pub(crate) fn encode_virtual_directory_fd(slot: u32, generation: u16) -> c_int {
@@ -766,38 +711,21 @@ mod tests {
     }
 
     #[test]
-    fn packed_fd_lookup_is_range_and_table_based() {
-        assert_eq!(virtual_fd_slot_for(250), None);
+    fn packed_fd_range_and_slot_reuse() {
+        let base = AMPR_EMU_PACK_VIRTUAL_FD_BASE as u32;
+        let end = base + AMPR_EMU_PACK_VIRTUAL_FD_SLOTS as u32;
+        assert_eq!(packed_fd_slot(base - 1), None);
+        assert_eq!(packed_fd_slot(base), Some(0));
+        assert_eq!(packed_fd_slot(end - 1), Some(AMPR_EMU_PACK_VIRTUAL_FD_SLOTS as u32 - 1));
+        assert_eq!(packed_fd_slot(end), None);
 
-        // `slot + 1` leaves zero as "not a packed fd".
-        VIRTUAL_FD_SLOTS[250].store(6, Ordering::Release);
-        assert_eq!(virtual_fd_slot_for(250), Some(5));
-        VIRTUAL_FD_SLOTS[250].store(0, Ordering::Release);
-        assert_eq!(virtual_fd_slot_for(250), None);
-        assert_eq!(virtual_fd_slot_for(AMPR_EMU_PACK_VIRTUAL_FD_LIMIT as u32), None);
-    }
-
-    #[test]
-    fn virtual_fd_slot_holds_only_its_own_number() {
         let slot = VirtualFdSlot {
-            real_fd: 40,
-            handle: 40,
+            handle: base as c_int,
             active: true,
             ..VirtualFdSlot::EMPTY
         };
-        assert!(slot.holds(40));
-        // Slot reused under another number after a close: the old fd misses.
-        assert!(!slot.holds(41));
+        assert!(slot.holds(base as c_int));
+        assert!(!slot.holds(base as c_int + 1));
         assert!(!VirtualFdSlot::EMPTY.holds(-1));
-        // Tagged fallback handles compare exactly too.
-        let tagged = VirtualFdSlot {
-            real_fd: -1,
-            handle: 0x6500_0100u32 as i32,
-            generation: 1,
-            active: true,
-            ..VirtualFdSlot::EMPTY
-        };
-        assert!(tagged.holds(0x6500_0100u32 as i32));
-        assert!(!tagged.holds(0x6500_0101u32 as i32));
     }
 }

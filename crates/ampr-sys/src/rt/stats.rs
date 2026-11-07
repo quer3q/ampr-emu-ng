@@ -307,11 +307,9 @@ pub(crate) fn now() -> u64 {
 /// lookup b'p' or b'd' only. Resident lookup: b'h' hit,
 /// b'm' miss the index answers, b'M' miss sent to the FS, b'd' directory,
 /// b'n' index not ready, b'x' not /app0, b'-' none. Then result and path.
-/// b'Q' fd pressure from the packed-fd reservations (rt/pack/slots.rs,
-/// rt/index.rs): lookup b'H' a packed open's raw SCE error, b'R' a physical
-/// open's errno (ring only, positive), b'S' the virtual-fd table full, b'D'
-/// the tagged-handle fallback and the errno that forced it (path
-/// "tagged-fallback", errno 24 = EMFILE).
+/// b'Q' packed-fd/open failures (rt/pack/slots.rs, rt/index.rs): lookup b'H'
+/// a packed open's raw SCE error, b'R' a physical open's errno (ring only,
+/// positive), b'S' the 512-slot synthetic packed-fd table full.
 #[cfg(feature = "mem_report")]
 pub(crate) struct FsEvents {
     pub next: usize,

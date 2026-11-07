@@ -1,17 +1,12 @@
-//! Virtual handle encoding: packed-file fds, directory fds, AIO submit ids and
-//! AIO group ids share one 32-bit layout, `tag(8) | generation(16) | slot(8)`.
-//! A packed file normally gets a real low descriptor the runtime reserves on
-//! open (ampr-sys `rt/pack/slots.rs` `allocate_virtual_fd_locked`); when the
-//! process is out of descriptors, the same slot falls back to the tagged
-//! `0x6500_0000` handle so the open still succeeds.
+//! Virtual handle encoding: directory fds, AIO submit ids and AIO group ids
+//! share one 32-bit layout, `tag(8) | generation(16) | slot(8)`. Packed-file
+//! fds are plain synthetic numbers in `512..1024` (ampr-sys `rt/pack/mod.rs`
+//! `AMPR_EMU_PACK_VIRTUAL_FD_BASE`), not tagged handles.
 
 /// Handle kinds; the discriminant is the C ABI value.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u32)]
 pub enum Kind {
-    /// Packed-file fd, used only when no low descriptor could be reserved
-    /// (the process is at its open-file limit).
-    Fd = 0,
     Aio = 1,
     DirectoryFd = 2,
     AioGroup = 3,
@@ -23,7 +18,6 @@ pub const GENERATION_MASK: u32 = 0xffff;
 impl Kind {
     pub fn from_u32(value: u32) -> Option<Self> {
         Some(match value {
-            0 => Self::Fd,
             1 => Self::Aio,
             2 => Self::DirectoryFd,
             3 => Self::AioGroup,
@@ -34,7 +28,6 @@ impl Kind {
     /// High-byte tag of this handle kind.
     pub fn tag(self) -> u32 {
         match self {
-            Self::Fd => 0x6500_0000,
             Self::Aio => 0x6600_0000,
             Self::DirectoryFd => 0x6700_0000,
             Self::AioGroup => 0x6800_0000,
@@ -83,12 +76,7 @@ mod tests {
         assert_eq!(decode(Kind::DirectoryFd, aio, 256), None);
         // A plain low fd is never a tagged handle.
         assert_eq!(decode(Kind::Aio, 3, 256), None);
-        assert_eq!(Kind::from_u32(0), Some(Kind::Fd));
-        let fd = encode(Kind::Fd, 3, 0xbeef);
-        assert_eq!(fd, 0x65be_ef03);
-        assert_eq!(decode(Kind::Fd, fd, 256), Some((3, 0xbeef)));
-        assert_eq!(decode(Kind::Fd, 131, 256), None);
-        assert_eq!(decode(Kind::Aio, fd, 256), None);
+        assert_eq!(Kind::from_u32(0), None);
         let group = encode(Kind::AioGroup, 255, 1);
         assert_eq!(decode(Kind::AioGroup, group, 256), Some((255, 1)));
         assert_eq!(
