@@ -186,7 +186,7 @@ pub(crate) fn open_failure_errno(rc: c_int) -> c_int {
 }
 
 /// Closes a runtime descriptor that is not counted in the open budget (a
-/// directory's physical fd, a packed fd's `/dev/null` reservation).
+/// directory's physical fd).
 pub(crate) unsafe fn close_real_fd(real_fd: c_int) {
     if real_fd >= 0 {
         if let Some(close_fn) = unsafe { real_close() } {
@@ -516,7 +516,7 @@ pub unsafe fn ampr_pack_try_close_fd(fd: c_int, handled: *mut bool) -> c_int {
         if !handled.is_null() {
             *handled = false;
         }
-        // A tagged directory fd or a table-mapped packed fd is decided before
+        // A tagged directory fd or an open synthetic packed fd is decided before
         // pack_state(): a physical fd (the runtime's own closes reach here
         // through libkernel's `close` -> `_close` hook) must never create or
         // wait on the pack state. tune::load inside pack_state_create once
@@ -576,6 +576,7 @@ pub unsafe fn ampr_pack_try_close_fd(fd: c_int, handled: *mut bool) -> c_int {
                 return SCE_KERNEL_ERROR_EBADF;
             }
             *slot = VirtualFdSlot::EMPTY;
+            VIRTUAL_FD_LIVE[index as usize].store(false, Ordering::Release);
             return 0;
         }
         SCE_KERNEL_ERROR_EBADF

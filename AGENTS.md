@@ -85,7 +85,8 @@ CI (`.github/workflows/build.yml`) runs the same commands; a pushed `v*` tag cre
 
 - The debug build's `/fsfail` lists failed calls (path hooks, the runtime's
   own loose opens `L`, APR resolves `R`, APR jobs `E`, module loads `K`,
-  gather/scatter retry mismatches `G`, the upstream #7 wrong-file class) and
+  gather/scatter retry mismatches `G`, packed-fd and open failures `Q`, the
+  upstream #7 wrong-file class) and
   `/modules` lists loaded modules; the op letters are documented at
   `FsEvents` in `rt/stats.rs`. When one install of a game works and another
   does not, run the same build on both and diff the two outputs.

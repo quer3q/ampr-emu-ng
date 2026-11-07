@@ -47,7 +47,6 @@ pub(crate) unsafe fn packed_read_file(
     }
 }
 
-
 pub(crate) unsafe fn cleanup_pipeline_continuation(
     pipeline: &mut ReadPipelineContext,
     error: c_int,

@@ -663,6 +663,7 @@ pub(crate) const AMPR_EMU_PACK_VIRTUAL_FD_SLOTS: usize = 512;
 ///   `CHARACTERS_STRUCTURE.PS5.PCK` at fd 1024, while base 768 and 512 boot.
 ///   PPSA03671 accepted 170 packed fds at 1024..1193, so 1024 is that title's
 ///   own limit, not a system one.
+///
 /// The range needs no kernel descriptor, so the title keeps its whole fd table
 /// for real files. The runtime serves reads, seeks, fstat, close, AIO and mmap
 /// on the synthetic number.
@@ -1494,6 +1495,12 @@ pub(crate) static PACK_M: Mutex = Mutex::new();
 /// Cursor operations and close on the same packed fd.
 pub(crate) static VIRTUAL_FD_MUTEXES: [Mutex; AMPR_EMU_PACK_VIRTUAL_FD_SLOTS] =
     [const { Mutex::new() }; AMPR_EMU_PACK_VIRTUAL_FD_SLOTS];
+/// Set while a slot is open. Written only under PACK_M; read lock-free by
+/// `decode_virtual_fd`, so a number in the synthetic range with no open slot
+/// goes to the kernel without taking PACK_M, as with the fd-to-slot table
+/// before #23. A real fd is not expected there (kernel table: 259).
+pub(crate) static VIRTUAL_FD_LIVE: [AtomicBool; AMPR_EMU_PACK_VIRTUAL_FD_SLOTS] =
+    [const { AtomicBool::new(false) }; AMPR_EMU_PACK_VIRTUAL_FD_SLOTS];
 pub(crate) static CACHE_MUTEX: Mutex = Mutex::new();
 pub(crate) static PHYSICAL_CACHE_MUTEX: Mutex = Mutex::new();
 /// Cold manifest publication (may include large index I/O).

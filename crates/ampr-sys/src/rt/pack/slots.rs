@@ -128,6 +128,7 @@ pub(crate) unsafe fn allocate_virtual_fd_locked(state: *mut PackState, file_id: 
         ..VirtualFdSlot::EMPTY
     };
     slot.active = true;
+    VIRTUAL_FD_LIVE[index as usize].store(true, Ordering::Release);
     (*state).virtual_fd_cursor = (index + 1) % slots;
     handle
 }

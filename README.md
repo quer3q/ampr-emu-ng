@@ -100,7 +100,8 @@ flavor of the running PRX, for example
   cache, `f` for decode on access, `F` for a failed decode-on-access fill
   and `v` for any other failure. See `AMPR_ZSTD_MMAP` in the `Makefile`.
   `Q` reports packed-fd/open failures: how `H` the raw SCE error of a
-  failed packed open, `R` the errno of a failed physical open, and `S` the
+  failed packed open, `R` the errno of a failed physical open (in the
+  `/metrics` event ring only, not `/fsfail`), and `S` the
   512-slot synthetic packed-fd table full.
 - `curl http://<ps5-ip>:9090/modules` lists the modules the game loaded, with
   name, segment size and fingerprint. To find a module that failed to load,

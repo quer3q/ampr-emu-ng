@@ -114,17 +114,15 @@ pub(crate) fn next_generation(current: u16) -> u32 {
     ampr_rust_virtual_next_generation(current)
 }
 
-/// Slot named by a synthetic packed fd (`BASE + slot`), or None for a
-/// physical fd. The kernel's effective table tops out at 258, so a real
-/// descriptor can never be mistaken for one of these. Callers confirm the
-/// slot under PACK_M with `VirtualFdSlot::holds`.
+/// Open slot named by a synthetic packed fd (`BASE + slot`), or None for a
+/// number outside the range or whose slot is closed. The kernel's effective
+/// table tops out at 258. Callers confirm the slot under PACK_M with
+/// `VirtualFdSlot::holds`.
 fn packed_fd_slot(value: u32) -> Option<u32> {
-    let base = AMPR_EMU_PACK_VIRTUAL_FD_BASE as u32;
-    if value >= base && value < base + AMPR_EMU_PACK_VIRTUAL_FD_SLOTS as u32 {
-        Some(value - base)
-    } else {
-        None
-    }
+    let slot = value.checked_sub(AMPR_EMU_PACK_VIRTUAL_FD_BASE as u32)?;
+    ((slot as usize) < AMPR_EMU_PACK_VIRTUAL_FD_SLOTS
+        && VIRTUAL_FD_LIVE[slot as usize].load(Ordering::Acquire))
+    .then_some(slot)
 }
 
 pub(crate) fn decode_virtual_fd(fd: c_int) -> Option<u32> {
@@ -714,10 +712,18 @@ mod tests {
     fn packed_fd_range_and_slot_reuse() {
         let base = AMPR_EMU_PACK_VIRTUAL_FD_BASE as u32;
         let end = base + AMPR_EMU_PACK_VIRTUAL_FD_SLOTS as u32;
+        let last = AMPR_EMU_PACK_VIRTUAL_FD_SLOTS - 1;
+        // A closed slot's number is not claimed: it goes to the kernel.
+        assert_eq!(packed_fd_slot(base), None);
+        VIRTUAL_FD_LIVE[0].store(true, Ordering::Release);
+        VIRTUAL_FD_LIVE[last].store(true, Ordering::Release);
         assert_eq!(packed_fd_slot(base - 1), None);
         assert_eq!(packed_fd_slot(base), Some(0));
-        assert_eq!(packed_fd_slot(end - 1), Some(AMPR_EMU_PACK_VIRTUAL_FD_SLOTS as u32 - 1));
+        assert_eq!(packed_fd_slot(end - 1), Some(last as u32));
         assert_eq!(packed_fd_slot(end), None);
+        VIRTUAL_FD_LIVE[0].store(false, Ordering::Release);
+        VIRTUAL_FD_LIVE[last].store(false, Ordering::Release);
+        assert_eq!(packed_fd_slot(base), None);
 
         let slot = VirtualFdSlot {
             handle: base as c_int,

@@ -218,8 +218,9 @@ type PollFn = unsafe extern "C" fn(*mut PollFd, u32, c_int) -> c_int;
 type SelectFn =
     unsafe extern "C" fn(c_int, *mut c_void, *mut c_void, *mut c_void, *mut c_void) -> c_int;
 
-/// FreeBSD `FD_SETSIZE`. `select` remains a pass-through probe; low-range
-/// virtual fds can fit in a set but are not implemented by this observer.
+/// FreeBSD `FD_SETSIZE`. `select` remains a pass-through probe; synthetic
+/// packed fds (512..1024) fit in a set but are not implemented by this
+/// observer.
 const FD_SETSIZE: c_int = 1024;
 
 /// Inspects `fds` only after the original returned >= 0: it validated the
@@ -251,7 +252,7 @@ pub(crate) unsafe extern "C" fn select_probe(
         .map_or_else(posix_missing_original, |f| unsafe {
             f(nfds, r, w, e, timeout)
         });
-    // A virtual fd does not fit an fd_set, so the sets are not read; an nfds
+    // The sets are not read (the observer does not serve virtual fds); an nfds
     // past FD_SETSIZE is logged as itself, lookup b'n' (rt/stats.rs).
     if nfds > FD_SETSIZE {
         stats::fs_note(b'W', HOW_NFDS, rc.into(), select_text(nfds).ptr());

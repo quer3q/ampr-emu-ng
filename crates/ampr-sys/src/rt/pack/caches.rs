@@ -296,7 +296,6 @@ pub(crate) unsafe fn cache_release(lease: &mut CacheLease) {
     *lease = CacheLease::EMPTY;
 }
 
-
 pub(crate) fn physical_cache_key_hash(pack_id: u16, offset: u64, size: u32) -> u64 {
     ampr_rust_physical_cache_key_hash(pack_id, offset, size)
 }

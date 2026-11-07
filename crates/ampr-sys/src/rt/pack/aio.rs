@@ -382,9 +382,10 @@ unsafe fn submit_real_requests(
 }
 
 /// Queues every virtual job for the pack workers and stores every caller id.
-/// A read is never completed inside the submit call: the caller learns the
-/// ids only from the return value. A fully packed zstd title black-screened
-/// at startup in release (128 MiB pool, decoded cache carved) and, with the
+/// A read is never completed inside the submit call. A worker can still
+/// finish one before submit returns, so why the inline completion hung is
+/// not confirmed; the A/B below is the evidence. A fully packed zstd title
+/// black-screened at startup in release (128 MiB pool, decoded cache carved) and, with the
 /// probe hooks off in a debug build so it has counters, stalled at 5,060
 /// reads / 213 MB with no I/O and no errors; queuing that read instead
 /// reached 25,823 reads / 657 MB. The debug build with its probes installed

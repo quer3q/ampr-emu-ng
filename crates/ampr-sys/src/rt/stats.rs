@@ -300,10 +300,9 @@ pub(crate) fn now() -> u64 {
 /// their path is the packed file's path (or the call name and `<virtual
 /// fd>`) and their lookup letter b'p' a packed file, b'd' an indexed
 /// directory, b'v' a virtual fd, and for b'W' select b'n': nfds past
-/// FD_SETSIZE, path "select nfds=<n>" (a virtual fd cannot be in an fd_set,
-/// so the sets are not read). In debug builds the libc hooks b'O', b'A',
-/// b'a', b'l' whose `AMPR_ZSTD_LIBC_HOOKS` bit is off run as such
-/// pass-through observers too (rt/hook.rs `observed_only`), logged with
+/// FD_SETSIZE, path "select nfds=<n>" (the sets are not read). In debug
+/// builds the libc hooks b'O', b'A', b'a', b'l' whose
+/// `AMPR_ZSTD_LIBC_HOOKS` bit is off run as such pass-through observers too (rt/hook.rs `observed_only`), logged with
 /// lookup b'p' or b'd' only. Resident lookup: b'h' hit,
 /// b'm' miss the index answers, b'M' miss sent to the FS, b'd' directory,
 /// b'n' index not ready, b'x' not /app0, b'-' none. Then result and path.

@@ -1246,8 +1246,9 @@ unsafe fn close_pack_and_directory_fds(state: *mut PackState) {
             free_virtual_aio_locked(state, i);
             free_virtual_aio_group_locked(state, i);
         }
-        for fd in (*state).virtual_fds.iter_mut() {
+        for (fd, live) in (*state).virtual_fds.iter_mut().zip(&VIRTUAL_FD_LIVE) {
             *fd = VirtualFdSlot::EMPTY;
+            live.store(false, Ordering::Release);
         }
     }
     for &fd in &pack_fds[..pack_fd_count] {
