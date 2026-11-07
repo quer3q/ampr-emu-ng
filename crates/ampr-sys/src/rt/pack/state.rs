@@ -123,15 +123,43 @@ pub(crate) fn virtual_fd_slot_for(number: u32) -> Option<u32> {
     entry.checked_sub(1)
 }
 
-/// Slot of a packed fd, through the reserved-descriptor table. Unlike the
-/// tagged handles, a physical fd in the low range is also a candidate, so
-/// the table decides; no pack state is created when none exists. Callers
-/// confirm the slot under PACK_M with `VirtualFdSlot::holds`.
+/// Tagged packed-file handle for `slot` (`0x6500_0000 | generation << 8 |
+/// slot`). Used when no low descriptor could be reserved, so the open does
+/// not fail with EMFILE once the process is at its file limit.
+pub(crate) fn encode_virtual_fd(slot: u32, generation: u16) -> c_int {
+    ampr_rust_virtual_encode(VIRTUAL_KIND_FD, slot, generation) as c_int
+}
+
+/// Slot named by a tagged packed-file handle, before `VirtualFdSlot::holds`
+/// confirms it is still the same generation.
+fn tagged_virtual_fd_slot(fd: c_int) -> Option<u32> {
+    if fd < 0 {
+        return None;
+    }
+    let mut slot = 0u32;
+    let found = unsafe {
+        ampr_rust_virtual_decode(
+            VIRTUAL_KIND_FD,
+            fd as u32,
+            AMPR_EMU_PACK_VIRTUAL_FD_SLOTS as u32,
+            &mut slot,
+            null_mut(),
+        )
+    };
+    found.then_some(slot)
+}
+
+/// Slot of a packed fd: through the reserved-descriptor table when it is a
+/// low number, else through its tagged handle (the EMFILE fallback). Unlike
+/// the tagged-only handles, a physical fd in the low range is also a
+/// candidate, so the table decides; no pack state is created when none
+/// exists. Callers confirm the slot under PACK_M with
+/// `VirtualFdSlot::holds`.
 pub(crate) fn decode_virtual_fd(fd: c_int) -> Option<u32> {
     if g_pack_state.load(Ordering::Acquire).is_null() {
         return None;
     }
-    virtual_fd_slot_for(fd as u32)
+    virtual_fd_slot_for(fd as u32).or_else(|| tagged_virtual_fd_slot(fd))
 }
 
 /// Drops a packed-fd mapping whose reserved descriptor the kernel has
@@ -753,6 +781,7 @@ mod tests {
     fn virtual_fd_slot_holds_only_its_own_number() {
         let slot = VirtualFdSlot {
             real_fd: 40,
+            handle: 40,
             active: true,
             ..VirtualFdSlot::EMPTY
         };
@@ -760,5 +789,15 @@ mod tests {
         // Slot reused under another number after a close: the old fd misses.
         assert!(!slot.holds(41));
         assert!(!VirtualFdSlot::EMPTY.holds(-1));
+        // Tagged fallback handles compare exactly too.
+        let tagged = VirtualFdSlot {
+            real_fd: -1,
+            handle: 0x6500_0100u32 as i32,
+            generation: 1,
+            active: true,
+            ..VirtualFdSlot::EMPTY
+        };
+        assert!(tagged.holds(0x6500_0100u32 as i32));
+        assert!(!tagged.holds(0x6500_0101u32 as i32));
     }
 }

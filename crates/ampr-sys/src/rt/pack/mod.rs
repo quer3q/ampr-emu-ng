@@ -661,6 +661,23 @@ pub(crate) const AMPR_EMU_PACK_VIRTUAL_FD_SLOTS: usize = 256;
 /// descriptor, so this has to cover a full slot table plus the title's own
 /// fds and the pack volumes (18): 512 for 256 slots.
 pub(crate) const AMPR_EMU_PACK_VIRTUAL_FD_LIMIT: usize = 512;
+/// Packed files that may hold a reserved descriptor at once. The rest of
+/// the title's descriptors are left to the title: PPSA03671 held 220 packed
+/// fds during its world load and then got EMFILE on its own `/dev/urandom`,
+/// ACM device and save opens, so the streamed world came up empty. The fd
+/// cache's opens share this cap (they use the same slots). 192 leaves room
+/// for the 256-slot table and the 18 pack volumes while a title with a few
+/// hundred fds of its own still has room; past it, packed opens use the
+/// tagged fallback (rt/pack/slots.rs).
+pub(crate) const AMPR_EMU_PACK_RESERVED_FD_SLOTS: usize = 192;
+/// Descriptors above this mark are left to the title instead of being
+/// reserved for packed files. A fully packed title (PPSA03671) held 220
+/// packed fds and then could not open its own `/dev/urandom`, ACM device or
+/// save: the kernel returned EMFILE to every open. Once the next free
+/// descriptor is this close to the range the table can address, packed
+/// opens fall back to the tagged handle v0.3.1 used (rt/pack/slots.rs), so
+/// the title keeps the remaining descriptors for itself.
+pub(crate) const AMPR_EMU_PACK_RESERVED_FD_HEADROOM: usize = 96;
 pub(crate) const AMPR_EMU_PACK_VIRTUAL_AIO_SLOTS: usize = 256;
 pub(crate) const AMPR_EMU_PACK_MAX_PACKS: usize = 1024;
 pub(crate) const AMPR_EMU_PACK_OPEN_PACK_FD_CAP: u32 = 18;
@@ -722,6 +739,7 @@ pub(crate) const PACK_PHYSICAL_CACHE_BITMAP_WORDS: usize =
     (PACK_PHYSICAL_CACHE_MAX_PAGES + 63) / 64;
 pub(crate) const INVALID_INDEX: u32 = u32::MAX;
 // ampr_format::handles::Kind; the tags live in Rust.
+pub(crate) const VIRTUAL_KIND_FD: u32 = 0;
 pub(crate) const VIRTUAL_KIND_AIO: u32 = 1;
 pub(crate) const VIRTUAL_KIND_DIRECTORY_FD: u32 = 2;
 pub(crate) const VIRTUAL_KIND_AIO_GROUP: u32 = 3;
@@ -824,8 +842,14 @@ pub(crate) static g_real_aio_delete: AtomicPtr<c_void> = AtomicPtr::new(null_mut
 #[derive(Clone, Copy)]
 pub(crate) struct VirtualFdSlot {
     pub file_id: u32,
-    /// The low OS descriptor reserved for this virtual fd, or -1.
+    /// The low OS descriptor reserved for this virtual fd, or -1 when the fd
+    /// is a tagged handle (see `handle`).
     pub real_fd: c_int,
+    /// The value returned to the game: the reserved descriptor, or a tagged
+    /// `0x65......` handle when no descriptor could be reserved.
+    pub handle: c_int,
+    /// Generation of a tagged handle, bumped on reuse.
+    pub generation: u16,
     /// First local chunk not yet covered by read-ahead (readahead.rs).
     pub readahead_next: u32,
     pub cursor: u64,
@@ -835,16 +859,19 @@ impl VirtualFdSlot {
     pub(crate) const EMPTY: Self = Self {
         file_id: 0,
         real_fd: -1,
+        handle: -1,
+        generation: 0,
         readahead_next: 0,
         cursor: 0,
         active: false,
     };
 
-    /// Open and still the slot of `fd`. Stands in for the removed handle
-    /// generation: a read that decoded `fd` before a close sees EBADF, not
-    /// the file a later open put in the same slot under another number.
+    /// Open and still the slot of `fd`. The exact handle (reserved number or
+    /// tagged value with its generation) is remembered, so a read that
+    /// decoded `fd` before a close sees EBADF instead of the file a later
+    /// open put in the same slot under another number.
     pub(crate) fn holds(&self, fd: c_int) -> bool {
-        self.active && self.real_fd == fd
+        self.active && self.handle == fd
     }
 }
 

@@ -143,7 +143,16 @@ fully packed game the runtime serves:
   table with the runtime's own cached packed opens (`rt/fd_cache.rs`); a
   128-slot table filled with 115 title opens and 13 cached ones and the
   title's next open failed with EMFILE. The reservations are not counted in
-  the runtime's 50-fd open budget (`rt/fd_cache.rs`);
+  the runtime's 50-fd open budget (`rt/fd_cache.rs`). Because each reserved
+  number is a real descriptor, a title that holds a few hundred packed files
+  can leave the process with none for its own opens (PPSA03671 at ~220
+  packed fds: `/dev/urandom`, the ACM device and a save all got EMFILE, and
+  its world stream came up empty). At most 192 packed files hold a reserved
+  descriptor at once, and the last 96 descriptors below 512 are left to the
+  title: past either mark, and whenever the `/dev/null` open itself fails,
+  the packed fd falls back to the tagged `0x65......` handle v0.3.1 used.
+  The runtime serves reads, seeks, fstat, close, AIO and mmap on it without a
+  kernel descriptor, so the open succeeds and the title keeps its own fds;
 - a read-only open of an indexed directory, with or without `O_DIRECTORY`,
   gets the virtual directory. The kernel accepts a read-only open of a
   directory, and a title that scans a packed directory can pass plain

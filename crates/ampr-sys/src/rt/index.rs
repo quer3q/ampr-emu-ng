@@ -1983,12 +1983,18 @@ unsafe fn open_resolved(
                 };
                 if handled {
                     stats::add(stats::Stat::OpenVirtual, 1);
+                    #[cfg(feature = "mem_report")]
+                    if rc < 0 {
+                        stats::fs_event(b'Q', b'H', rc as i64, path);
+                    }
                     return posix_return_from_sce(rc);
                 }
             }
             let fd = physical(unsafe { real(l.entry.path, flags, mode) });
             if fd < 0 {
                 stats::add(stats::Stat::OpenRealFailed, 1);
+                #[cfg(feature = "mem_report")]
+                stats::fs_event(b'Q', b'R', errno() as i64, path);
             }
             fd
         }
@@ -2033,6 +2039,8 @@ unsafe fn open_resolved(
             let fd = physical(unsafe { real(path, flags, mode) });
             if fd < 0 {
                 stats::add(stats::Stat::OpenRealFailed, 1);
+                #[cfg(feature = "mem_report")]
+                stats::fs_event(b'Q', b'R', errno() as i64, path);
             }
             fd
         }

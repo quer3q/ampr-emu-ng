@@ -566,6 +566,7 @@ pub unsafe fn ampr_pack_try_close_fd(fd: c_int, handled: *mut bool) -> c_int {
                 *handled = true;
             }
             let state = pack_state();
+            let real_fd;
             {
                 let _descriptor_lock = VIRTUAL_FD_MUTEXES[index as usize].lock();
                 if WORKER_STOP_REQUESTED.load(Ordering::Acquire) {
@@ -576,10 +577,15 @@ pub unsafe fn ampr_pack_try_close_fd(fd: c_int, handled: *mut bool) -> c_int {
                 if !slot.holds(fd) {
                     return SCE_KERNEL_ERROR_EBADF;
                 }
+                real_fd = slot.real_fd;
                 *slot = VirtualFdSlot::EMPTY;
-                VIRTUAL_FD_SLOTS[fd as usize].store(0, Ordering::Release);
+                if real_fd >= 0 {
+                    VIRTUAL_FD_SLOTS[real_fd as usize].store(0, Ordering::Release);
+                }
             }
-            close_real_fd(fd);
+            if real_fd >= 0 {
+                close_real_fd(real_fd);
+            }
             return 0;
         }
         SCE_KERNEL_ERROR_EBADF

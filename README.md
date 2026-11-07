@@ -99,6 +99,10 @@ flavor of the running PRX, for example
   `X`/`Y` when an mmap of a packed file fails, with how `k` for the disk
   cache, `f` for decode on access, `F` for a failed decode-on-access fill
   and `v` for any other failure. See `AMPR_ZSTD_MMAP` in the `Makefile`.
+  `Q` reports fd pressure on the packed-fd reservations: how `D` a packed
+  open that fell back to a tagged handle (path `tagged-fallback`, errno 24 =
+  EMFILE), `H` the raw SCE error of a failed packed open, and `R` the errno
+  of a failed physical open.
 - `curl http://<ps5-ip>:9090/modules` lists the modules the game loaded, with
   name, segment size and fingerprint. To find a module that failed to load,
   run the same build on two installs and diff the two lists.
