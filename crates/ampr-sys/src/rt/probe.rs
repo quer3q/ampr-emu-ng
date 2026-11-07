@@ -1,13 +1,15 @@
 //! Debug-only pass-through observers for fully packed games, LZ4 or zstd
 //! packs (every game file except the executables, sce_sys, sce_module and
 //! the fakelib packed): they show on a console which file APIs the runtime
-//! does not serve a game uses on packed files (game AIO, dup, poll, openat,
-//! ...). Each calls its own original libkernel entry point
-//! (`sys::kernel_slot`, as rt/pack/zstd_libc.rs does) and never changes the
-//! result; it only logs through `stats::fs_note`, so `/fsfail` lists
-//! each distinct (op, file) once. The op letters are documented at
+//! does not serve a game uses on packed files (dup, poll, openat, ...).
+//! Each calls its own original libkernel entry point (`sys::kernel_slot`,
+//! as rt/pack/zstd_libc.rs does) and never changes the result; it only
+//! logs through `stats::fs_note`, so `/fsfail` lists each distinct
+//! (op, file) once. The op letters are documented at
 //! `FsEvents` in rt/stats.rs. Built only with `mem_report`; rt/hook.rs
-//! installs the observers into slots 100..=109, and rt/index.rs
+//! installs the observers into slots 110..=117, the game AIO submit hooks
+//! (rt/pack/aio.rs) log their served packed requests through
+//! `note_aio_submit`, and rt/index.rs
 //! calls `probe_path` from the libc path hooks it installs as observers.
 //! rt/pack/mmap.rs logs its b'X'/b'Y' events through `fd_path` and
 //! `event_text`.
@@ -15,13 +17,10 @@
 use super::index::{probe_file_path, probe_packed_path};
 use super::pack::{
     has_virtual_fd, posix_missing_original, posix_read_missing, virtual_directory_fd_path,
-    virtual_fd_file_id, SceKernelAioRWRequest, SceKernelAioSubmitId,
-    SCE_KERNEL_AIO_REQUEST_NUM_MAX,
+    virtual_fd_file_id, SceKernelAioRWRequest, SCE_KERNEL_AIO_REQUEST_NUM_MAX,
 };
 use super::stats;
-use super::sys::{
-    self, kernel_slot, EACCES, EBADF, ENAMETOOLONG, ENOENT, ENOTDIR, SCE_KERNEL_ERROR_EIO,
-};
+use super::sys::{self, kernel_slot, EACCES, EBADF, ENAMETOOLONG, ENOENT, ENOTDIR};
 use core::ffi::{c_char, c_int, c_void};
 
 // ---- event text ---------------------------------------------------------------
@@ -110,13 +109,6 @@ pub(crate) fn event_text(op: u8, how: u8, rc: i64, call: &[u8], t: &Text) {
 
 // ---- AIO ----------------------------------------------------------------------
 
-type AioSubmitFn = unsafe extern "C" fn(
-    *mut SceKernelAioRWRequest,
-    c_int,
-    c_int,
-    *mut SceKernelAioSubmitId,
-) -> c_int;
-
 /// The path of the first virtual fd among `count` requests, if any.
 unsafe fn aio_path(reqs: *const SceKernelAioRWRequest, count: c_int) -> Option<Text> {
     if reqs.is_null() || count <= 0 || count as usize > SCE_KERNEL_AIO_REQUEST_NUM_MAX {
@@ -133,52 +125,21 @@ unsafe fn aio_path(reqs: *const SceKernelAioRWRequest, count: c_int) -> Option<T
     })
 }
 
-unsafe fn aio_submit(
-    id: usize,
+/// Logs b'I' "<call> <path>" with `rc` when the game's own AIO submit
+/// (rt/pack/aio.rs, hook ids 100 and 101) had a request on a packed fd,
+/// which the runtime's AIO emulation served. The emulation already read
+/// every request's fd before returning, so a bad `reqs` faults there first;
+/// the callers skip this when the id pointer is null, the one rejection
+/// that comes before that read.
+pub(crate) unsafe fn note_aio_submit(
     call: &[u8],
-    reqs: *mut SceKernelAioRWRequest,
+    reqs: *const SceKernelAioRWRequest,
     count: c_int,
-    prio: c_int,
-    ids: *mut SceKernelAioSubmitId,
-) -> c_int {
-    let rc = unsafe { kernel_slot::<AioSubmitFn>(id) }.map_or(SCE_KERNEL_ERROR_EIO, |f| unsafe {
-        f(reqs, count, prio, ids)
-    });
-    // `reqs` is read only after the original accepted it, so a bad pointer
-    // gets the original's error instead of a fault in the probe (Codex
-    // review), as in `poll_probe`. The caller keeps the requests alive
-    // until they complete, and the probe reads only their fd fields.
-    let seen = if rc >= 0 {
-        unsafe { aio_path(reqs, count) }
-    } else {
-        None
-    };
-    if let Some(t) = seen {
+    rc: c_int,
+) {
+    if let Some(t) = unsafe { aio_path(reqs, count) } {
         note_text(b'I', HOW_VIRTUAL, rc.into(), call, &t);
     }
-    rc
-}
-
-#[allow(non_snake_case)]
-pub(crate) unsafe extern "C" fn sceKernelAioSubmitReadCommands_probe(
-    reqs: *mut SceKernelAioRWRequest,
-    count: c_int,
-    prio: c_int,
-    ids: *mut SceKernelAioSubmitId,
-) -> c_int {
-    let id = sys::hook::sceKernelAioSubmitReadCommands;
-    unsafe { aio_submit(id, b"AioSubmitRead", reqs, count, prio, ids) }
-}
-
-#[allow(non_snake_case)]
-pub(crate) unsafe extern "C" fn sceKernelAioSubmitReadCommandsMultiple_probe(
-    reqs: *mut SceKernelAioRWRequest,
-    count: c_int,
-    prio: c_int,
-    ids: *mut SceKernelAioSubmitId,
-) -> c_int {
-    let id = sys::hook::sceKernelAioSubmitReadCommandsMultiple;
-    unsafe { aio_submit(id, b"AioSubmitReadMultiple", reqs, count, prio, ids) }
 }
 
 // ---- dup, poll, select --------------------------------------------------------

@@ -43,6 +43,27 @@ pub(crate) unsafe fn mark_virtual_wait_notified(
     }
 }
 
+/// Hook id 105: the game's own wait; ids from a packed submit are served
+/// here, the rest go to the original.
+pub unsafe extern "C" fn sceKernelAioWaitRequests_emul(
+    ids: *mut SceKernelAioSubmitId,
+    count: c_int,
+    states: *mut c_int,
+    mode: u32,
+    usec: *mut SceKernelUseconds,
+) -> c_int {
+    unsafe {
+        if !game_ids_emulated(ids, count) {
+            return match real_aio_wait() {
+                Some(f) => f(ids, count, states, mode, usec),
+                None => SCE_KERNEL_ERROR_EIO,
+            };
+        }
+        sceKernelAioWaitRequests(ids, count, states, mode, usec)
+    }
+}
+
+#[inline(never)]
 pub unsafe fn sceKernelAioWaitRequests(
     ids: *mut SceKernelAioSubmitId,
     count: c_int,
@@ -79,10 +100,19 @@ pub unsafe fn sceKernelAioWaitRequests(
         let timeout = if usec.is_null() { 0 } else { *usec as u64 };
         let start = pack_monotonic_usecs();
         let pack = pack_state();
-        let mut observed_epoch = {
+        let mut observed_epoch;
+        {
             let _lock = PACK_M.lock();
-            (*pack).aio_completion_epoch
-        };
+            observed_epoch = (*pack).aio_completion_epoch;
+            // A plain group's native children complete in the kernel
+            // without bumping the epoch: poll, never sleep on AIO_CV alone.
+            for i in 0..count as usize {
+                let group = lookup_virtual_aio_group_locked(pack, *ids.add(i), null_mut());
+                if !group.is_null() && (*group).has_native_children {
+                    needs_native_polling = true;
+                }
+            }
+        }
 
         loop {
             let poll_rc = sceKernelAioPollRequests(ids, count, states);
@@ -140,6 +170,24 @@ pub unsafe fn sceKernelAioWaitRequests(
     }
 }
 
+/// Hook id 107: the game's own delete.
+pub unsafe extern "C" fn sceKernelAioDeleteRequests_emul(
+    ids: *mut SceKernelAioSubmitId,
+    count: c_int,
+    results: *mut c_int,
+) -> c_int {
+    unsafe {
+        if !game_ids_emulated(ids, count) {
+            return match real_aio_delete() {
+                Some(f) => f(ids, count, results),
+                None => SCE_KERNEL_ERROR_EIO,
+            };
+        }
+        sceKernelAioDeleteRequests(ids, count, results)
+    }
+}
+
+#[inline(never)]
 pub unsafe fn sceKernelAioDeleteRequests(
     ids: *mut SceKernelAioSubmitId,
     count: c_int,
@@ -169,7 +217,7 @@ pub unsafe fn sceKernelAioDeleteRequests(
                 None => SCE_KERNEL_ERROR_EIO,
             };
         }
-        if zstd_mode() && has_group {
+        if has_group {
             return groups_single_rest_batched(
                 ids,
                 count,
@@ -177,15 +225,6 @@ pub unsafe fn sceKernelAioDeleteRequests(
                 sceKernelAioDeleteRequest,
                 sceKernelAioDeleteRequests,
             );
-        }
-        if has_group {
-            for i in 0..n {
-                let rc = sceKernelAioDeleteRequest(*ids.add(i), results.add(i));
-                if rc != 0 {
-                    return rc;
-                }
-            }
-            return 0;
         }
         let mut real_ids = [0 as SceKernelAioSubmitId; SCE_KERNEL_AIO_ID_NUM_MAX];
         let mut real_results = [0 as c_int; SCE_KERNEL_AIO_ID_NUM_MAX];
@@ -239,11 +278,12 @@ pub unsafe fn sceKernelAioDeleteRequests(
 
 /// Copies a group's child ids under `PACK_M` (shared by the single-id group
 /// paths). Err is the early return code; Ok(None) means the group is unknown;
-/// Ok(Some((count, split))) also says whether it is a zstd split read.
+/// Ok(Some(count)) is the child count. Split and plain groups are handled
+/// alike: a plain group's children can be native ids or split group ids.
 unsafe fn copy_group_children(
     id: SceKernelAioSubmitId,
     children: &mut [SceKernelAioSubmitId; SCE_KERNEL_AIO_REQUEST_NUM_MAX],
-) -> Result<Option<(usize, bool)>, c_int> {
+) -> Result<Option<usize>, c_int> {
     unsafe {
         let state = pack_state();
         let _lock = PACK_M.lock();
@@ -256,11 +296,27 @@ unsafe fn copy_group_children(
             return Err(SCE_KERNEL_ERROR_EIO);
         }
         children[..child_count].copy_from_slice(&(&(*group).children)[..child_count]);
-        let split = (*group).split.count != 0;
-        Ok(Some((child_count, split)))
+        Ok(Some(child_count))
     }
 }
 
+/// Hook id 102: the game's own single-id poll.
+pub unsafe extern "C" fn sceKernelAioPollRequest_emul(
+    id: SceKernelAioSubmitId,
+    state_out: *mut c_int,
+) -> c_int {
+    unsafe {
+        if !runtime_aio_id(id) {
+            return match real_aio_poll_single() {
+                Some(f) => f(id, state_out),
+                None => SCE_KERNEL_ERROR_EIO,
+            };
+        }
+        sceKernelAioPollRequest(id, state_out)
+    }
+}
+
+#[inline(never)]
 pub unsafe fn sceKernelAioPollRequest(id: SceKernelAioSubmitId, state_out: *mut c_int) -> c_int {
     unsafe {
         if state_out.is_null() {
@@ -277,13 +333,13 @@ pub unsafe fn sceKernelAioPollRequest(id: SceKernelAioSubmitId, state_out: *mut 
             };
         }
         let mut children = [0 as SceKernelAioSubmitId; SCE_KERNEL_AIO_REQUEST_NUM_MAX];
-        let (child_count, split) = match copy_group_children(id, &mut children) {
+        let child_count = match copy_group_children(id, &mut children) {
             Err(rc) => return rc,
             Ok(None) => {
                 *state_out = SCE_KERNEL_ERROR_ESRCH;
                 return 0;
             }
-            Ok(Some(found)) => found,
+            Ok(Some(n)) => n,
         };
         let mut child_states = [0 as c_int; SCE_KERNEL_AIO_REQUEST_NUM_MAX];
         let poll_rc = sceKernelAioPollRequests(
@@ -310,15 +366,16 @@ pub unsafe fn sceKernelAioPollRequest(id: SceKernelAioSubmitId, state_out: *mut 
                 processing |= base == SCE_KERNEL_AIO_STATE_PROCESSING;
             }
         }
-        *state_out = if !terminal && split {
-            // A split read reports like the one job it replaces.
+        *state_out = if !terminal {
+            // A group reports like one job: a split read like the job it
+            // replaces, a plain group the same way, since 0 is not an AIO
+            // state (what the kernel reports for a pending single-id
+            // submit is not measured).
             if processing {
                 SCE_KERNEL_AIO_STATE_PROCESSING
             } else {
                 SCE_KERNEL_AIO_STATE_SUBMITTED
             }
-        } else if !terminal {
-            0
         } else if aborted {
             SCE_KERNEL_AIO_STATE_ABORTED
         } else {
@@ -328,6 +385,122 @@ pub unsafe fn sceKernelAioPollRequest(id: SceKernelAioSubmitId, state_out: *mut 
     }
 }
 
+/// Hook id 104: the game's own single-id wait.
+pub unsafe extern "C" fn sceKernelAioWaitRequest_emul(
+    id: SceKernelAioSubmitId,
+    state_out: *mut c_int,
+    usec: *mut SceKernelUseconds,
+) -> c_int {
+    unsafe {
+        if !runtime_aio_id(id) {
+            return match real_aio_wait_single() {
+                Some(f) => f(id, state_out, usec),
+                None => SCE_KERNEL_ERROR_EIO,
+            };
+        }
+        sceKernelAioWaitRequest(id, state_out, usec)
+    }
+}
+
+/// Serves the game's own single-id wait on a packed submit's id (issue
+/// #22); native ids go to the kernel.
+#[inline(never)]
+pub unsafe fn sceKernelAioWaitRequest(
+    id: SceKernelAioSubmitId,
+    state_out: *mut c_int,
+    usec: *mut SceKernelUseconds,
+) -> c_int {
+    unsafe {
+        if state_out.is_null() {
+            return SCE_KERNEL_ERROR_EINVAL;
+        }
+        let mut id = id;
+        if !decode_virtual_aio(id, null_mut(), null_mut())
+            && !decode_virtual_aio_group(id, null_mut(), null_mut())
+        {
+            return match real_aio_wait_single() {
+                Some(f) => f(id, state_out, usec),
+                None => SCE_KERNEL_ERROR_EIO,
+            };
+        }
+        sceKernelAioWaitRequests(&mut id, 1, state_out, SCE_KERNEL_AIO_WAIT_AND, usec)
+    }
+}
+
+/// Hook id 108: the game's own single-id cancel.
+pub unsafe extern "C" fn sceKernelAioCancelRequest_emul(
+    id: SceKernelAioSubmitId,
+    state_out: *mut c_int,
+) -> c_int {
+    unsafe {
+        if !runtime_aio_id(id) {
+            return match real_aio_cancel_single() {
+                Some(f) => f(id, state_out),
+                None => SCE_KERNEL_ERROR_EIO,
+            };
+        }
+        sceKernelAioCancelRequest(id, state_out)
+    }
+}
+
+/// Serves the game's own single-id cancel on a packed submit's id (issue
+/// #22). A group cancels its children and reports `cancel_group_state`.
+#[inline(never)]
+pub unsafe fn sceKernelAioCancelRequest(id: SceKernelAioSubmitId, state_out: *mut c_int) -> c_int {
+    unsafe {
+        if state_out.is_null() {
+            return SCE_KERNEL_ERROR_EINVAL;
+        }
+        let mut id = id;
+        if decode_virtual_aio(id, null_mut(), null_mut()) {
+            return sceKernelAioCancelRequests(&mut id, 1, state_out);
+        }
+        if !decode_virtual_aio_group(id, null_mut(), null_mut()) {
+            return match real_aio_cancel_single() {
+                Some(f) => f(id, state_out),
+                None => SCE_KERNEL_ERROR_EIO,
+            };
+        }
+        let mut children = [0 as SceKernelAioSubmitId; SCE_KERNEL_AIO_REQUEST_NUM_MAX];
+        let child_count = match copy_group_children(id, &mut children) {
+            Err(rc) => return rc,
+            Ok(None) => {
+                *state_out = SCE_KERNEL_ERROR_ESRCH;
+                return 0;
+            }
+            Ok(Some(n)) => n,
+        };
+        let mut child_states = [0 as c_int; SCE_KERNEL_AIO_REQUEST_NUM_MAX];
+        let cancel_rc = sceKernelAioCancelRequests(
+            children.as_mut_ptr(),
+            child_count as c_int,
+            child_states.as_mut_ptr(),
+        );
+        if cancel_rc != 0 {
+            return cancel_rc;
+        }
+        *state_out = cancel_group_state(&child_states[..child_count]);
+        0
+    }
+}
+
+/// Hook id 106: the game's own single-id delete.
+pub unsafe extern "C" fn sceKernelAioDeleteRequest_emul(
+    id: SceKernelAioSubmitId,
+    result_out: *mut c_int,
+) -> c_int {
+    unsafe {
+        if !runtime_aio_id(id) {
+            return match real_aio_delete_single() {
+                Some(f) => f(id, result_out),
+                None => SCE_KERNEL_ERROR_EIO,
+            };
+        }
+        sceKernelAioDeleteRequest(id, result_out)
+    }
+}
+
+#[inline(never)]
 pub unsafe fn sceKernelAioDeleteRequest(id: SceKernelAioSubmitId, result_out: *mut c_int) -> c_int {
     unsafe {
         if result_out.is_null() {
@@ -347,7 +520,7 @@ pub unsafe fn sceKernelAioDeleteRequest(id: SceKernelAioSubmitId, result_out: *m
         let child_count = match copy_group_children(id, &mut children) {
             Err(rc) => return rc,
             Ok(None) => return SCE_KERNEL_ERROR_ESRCH,
-            Ok(Some((n, _))) => n,
+            Ok(Some(n)) => n,
         };
         let mut child_results = [0 as c_int; SCE_KERNEL_AIO_REQUEST_NUM_MAX];
         let delete_rc = sceKernelAioDeleteRequests(
@@ -384,5 +557,74 @@ pub unsafe fn sceKernelAioDeleteRequest(id: SceKernelAioSubmitId, result_out: *m
         *result_out = group.delete_result;
         free_virtual_aio_group_locked(state, group_index);
         0
+    }
+}
+
+/// A group's state after a cancel, from its children's: an error first,
+/// then SUBMITTED or PROCESSING while any child is not terminal (a running
+/// child can still write the caller's buffer, so ABORTED must wait for it),
+/// then ABORTED if any child was aborted, else COMPLETED.
+pub(crate) fn cancel_group_state(child_states: &[c_int]) -> c_int {
+    let (mut aborted, mut submitted, mut processing) = (false, false, false);
+    for &cs in child_states {
+        if cs < 0 {
+            return cs;
+        }
+        match cs & !SCE_KERNEL_AIO_STATE_NOTIFIED {
+            SCE_KERNEL_AIO_STATE_ABORTED => aborted = true,
+            SCE_KERNEL_AIO_STATE_PROCESSING => processing = true,
+            SCE_KERNEL_AIO_STATE_COMPLETED => {}
+            _ => submitted = true,
+        }
+    }
+    if processing {
+        SCE_KERNEL_AIO_STATE_PROCESSING
+    } else if submitted {
+        SCE_KERNEL_AIO_STATE_SUBMITTED
+    } else if aborted {
+        SCE_KERNEL_AIO_STATE_ABORTED
+    } else {
+        SCE_KERNEL_AIO_STATE_COMPLETED
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn canceled_group_stays_open_while_a_child_runs() {
+        let (a, p, s, c) = (
+            SCE_KERNEL_AIO_STATE_ABORTED,
+            SCE_KERNEL_AIO_STATE_PROCESSING,
+            SCE_KERNEL_AIO_STATE_SUBMITTED,
+            SCE_KERNEL_AIO_STATE_COMPLETED,
+        );
+        assert_eq!(cancel_group_state(&[a, p]), p);
+        assert_eq!(cancel_group_state(&[s, a]), s);
+        assert_eq!(cancel_group_state(&[a, c]), a);
+        assert_eq!(
+            cancel_group_state(&[c, c | SCE_KERNEL_AIO_STATE_NOTIFIED]),
+            c
+        );
+        assert_eq!(cancel_group_state(&[c, -5, p]), -5);
+    }
+
+    /// The game's own AIO reaches the emulation only with a runtime id; a
+    /// native or malformed call goes to the kernel untouched.
+    #[test]
+    fn game_aio_routes_only_runtime_ids() {
+        let group = encode_virtual_aio_group(3, 1);
+        let mut ids = [5 as SceKernelAioSubmitId, 0x0100_0001, group];
+        assert!(runtime_aio_id(group));
+        assert!(!runtime_aio_id(5));
+        unsafe {
+            assert!(game_ids_emulated(ids.as_ptr(), 3));
+            assert!(!game_ids_emulated(ids.as_ptr(), 2));
+            assert!(!game_ids_emulated(ids.as_ptr(), 0));
+            assert!(!game_ids_emulated(core::ptr::null(), 3));
+            ids[0] = group;
+            assert!(!game_ids_emulated(ids.as_ptr(), 1 + SCE_KERNEL_AIO_ID_NUM_MAX as c_int));
+        }
     }
 }

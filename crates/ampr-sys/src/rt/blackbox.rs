@@ -6,9 +6,12 @@
 //! `open`, see `pack::libkernel::real_open`). It holds the loaded modules
 //! with their segment addresses (all of them at module_start, then each
 //! module a load returns), so a crash RIP from ShadowMount+'s log maps to a
-//! module, and the failed path hook events (`stats::fs_event`,
-//! `stats::fs_note`, rc < 0) that `/fsfail` would keep (`stats::fail_kept`)
-//! plus every module load (op b'K'). Successful file calls are not written:
+//! module, and the failed path hook events (`stats::fs_event`, rc < 0) that
+//! `/fsfail` would keep (`stats::fail_kept`) plus every module load (op b'K').
+//! Probe events (`stats::fs_note`, rt/probe.rs) are written whatever their
+//! rc, once per distinct (op, path) as `/fsfail` lists them: a probe that
+//! succeeds (issue #22, `I v 0x0 ... noloc.larc`) shows what a game used on
+//! packed files before it died. Other successful file calls are not written:
 //! a write per file call would slow the debug build, and a crash is placed by
 //! the module list and the last failures. The file is truncated at each
 //! start.
@@ -110,6 +113,19 @@ pub(crate) fn event(op: u8, how: u8, rc: i64, path: *const c_char) {
     if !super::stats::fail_kept(how, rc, unsafe { &prefix(path) }) {
         return;
     }
+    line(op, how, rc, path);
+}
+
+/// A probe event (`stats::fs_note`), same line as `event` whatever `rc` is.
+/// The caller writes each distinct (op, path) once and has already applied
+/// `stats::fail_kept`.
+pub(crate) fn note(op: u8, how: u8, rc: i64, path: *const c_char) {
+    if FD.load(Ordering::Relaxed) >= 0 {
+        line(op, how, rc, path);
+    }
+}
+
+fn line(op: u8, how: u8, rc: i64, path: *const c_char) {
     let mut l = Line::new();
     l.s(b"fs ").s(&[op, b' ', how, b' ']).x(rc as u64).s(b" ");
     unsafe { l.cstr(path) }.emit();

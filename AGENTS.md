@@ -1,6 +1,6 @@
 # AGENTS.md
 
-Notes for coding agents working on ampr-emu-ng (version 0.3.2, GPL-3.0-or-later).
+Notes for coding agents working on ampr-emu-ng (version 0.3.3, GPL-3.0-or-later).
 
 ## Project
 
@@ -45,7 +45,12 @@ keep their zstd names but apply to LZ4 packs too; only `AMPR_ZSTD_MMAP=1`
 (decode on access) is zstd only. Those hooks (hook ids 78 and up), the
 eager index load and the mmap cache sweep apply only to a title that ships
 packs, zstd or LZ4 (`packs_present` in `rt/pack/mod.rs`, `hook_enabled` in
-`rt/hook.rs`); a title with no packs keeps the v0.2.0 hook set.
+`rt/hook.rs`); a title with no packs keeps the v0.2.0 hook set. Among them,
+ids 100..=109 route the game's own kernel AIO (`sceKernelAioSubmitReadCommands*`,
+poll, wait, delete, cancel) to the runtime's AIO emulation
+(`rt/pack/aio.rs`, `rt/pack/aio_wait.rs`); the runtime's own native AIO
+calls the pre-detour slot (`real_aio_*` in `rt/pack/libkernel.rs`), never
+the symbol by name, which would re-enter the hook.
 CI (`.github/workflows/build.yml`) runs the same commands; a pushed `v*` tag creates a draft release with both `.sprx` and `SHA256SUMS`.
 
 ## Conventions
@@ -90,10 +95,11 @@ CI (`.github/workflows/build.yml`) runs the same commands; a pushed `v*` tag cre
   `/modules` lists loaded modules; the op letters are documented at
   `FsEvents` in `rt/stats.rs`. When one install of a game works and another
   does not, run the same build on both and diff the two outputs.
-  The debug build also logs (op letters `I D W T F C N`, and `O A a l`
+  The debug build also logs (op letters `D W T F C N`, and `O A a l`
   with how `p`/`d` when an `AMPR_ZSTD_LIBC_HOOKS` bit is cleared) when a
   packed file (zstd or LZ4) or a virtual fd reaches an API the runtime does
-  not serve; `X`/`Y` log mmap of a virtual fd (how `k` disk cache, `f`
+  not serve; `I` logs a game's own AIO submit on a packed fd, which the
+  runtime serves; `X`/`Y` log mmap of a virtual fd (how `k` disk cache, `f`
   decode on access, `F` failed decode-on-access fill, `v` other failure).
 - When the game dies before `:9090` answers, read the debug build's black
   box `/data/ampr_emu_trace.txt` (`rt/blackbox.rs`): the loaded modules with

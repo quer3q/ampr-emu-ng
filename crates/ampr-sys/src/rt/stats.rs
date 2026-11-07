@@ -293,9 +293,12 @@ pub(crate) fn now() -> u64 {
 /// is a virtual directory; b'X' with lookup b'F' is a decode-on-access
 /// failure, path "mmap-fault sigaction" (the handler could not be
 /// installed) or "mmap-fault fid=<hex> chunk=<hex>" (a chunk read or decode
-/// failed in the handler). Pass-through probes for fully packed games, LZ4
-/// or zstd packs (rt/probe.rs, logged by `fs_note` whatever the result): b'I'
-/// sceKernelAioSubmitReadCommands(Multiple), b'D' dup/dup2, b'W'
+/// failed in the handler). b'I' a game's own
+/// sceKernelAioSubmitReadCommands(Multiple) with a request on a packed fd,
+/// which the runtime's AIO emulation served (rt/pack/aio.rs, logged through
+/// rt/probe.rs `note_aio_submit` whatever the result), lookup b'v'.
+/// Pass-through probes for fully packed games, LZ4 or zstd packs
+/// (rt/probe.rs, logged by `fs_note` whatever the result): b'D' dup/dup2, b'W'
 /// poll/select, b'T' openat, b'F' fstatat, b'C' faccessat, b'N' readlink;
 /// their path is the packed file's path (or the call name and `<virtual
 /// fd>`) and their lookup letter b'p' a packed file, b'd' an indexed
@@ -362,22 +365,25 @@ pub(crate) static FS_FAIL_LOG: super::sync::SyncCell<FsFails> =
 
 /// Counts a failed call in FS_FAIL_LOG. Paths are kept and deduplicated by
 /// their first 128 bytes, so longer paths that differ only past that share
-/// an entry.
+/// an entry. Returns true only when the call added a new (op, path) entry,
+/// so `fs_note` writes each distinct probe to the black box once; a repeat,
+/// a filtered path, a busy log or a full table returns false.
 #[cfg(feature = "mem_report")]
-unsafe fn fs_fail(op: u8, how: u8, rc: i64, path: *const core::ffi::c_char) {
+unsafe fn fs_fail(op: u8, how: u8, rc: i64, path: *const core::ffi::c_char) -> bool {
     use core::sync::atomic::{AtomicBool, Ordering};
     // One writer at a time; a hook never waits for it: a busy log drops.
     static BUSY: AtomicBool = AtomicBool::new(false);
     if BUSY.swap(true, Ordering::Acquire) {
         unsafe { (*FS_FAIL_LOG.get()).dropped.fetch_add(1, Ordering::Relaxed) };
-        return;
+        return false;
     }
-    unsafe { fs_fail_locked(op, how, rc, path) };
+    let added = unsafe { fs_fail_locked(op, how, rc, path) };
     BUSY.store(false, Ordering::Release);
+    added
 }
 
 #[cfg(feature = "mem_report")]
-unsafe fn fs_fail_locked(op: u8, how: u8, rc: i64, path: *const core::ffi::c_char) {
+unsafe fn fs_fail_locked(op: u8, how: u8, rc: i64, path: *const core::ffi::c_char) -> bool {
     let log = unsafe { &mut *FS_FAIL_LOG.get() };
     let mut name = [0u8; 128];
     let mut n = 0;
@@ -386,22 +392,23 @@ unsafe fn fs_fail_locked(op: u8, how: u8, rc: i64, path: *const core::ffi::c_cha
         n += 1;
     }
     if !fail_kept(how, rc, &name[..n]) {
-        return;
+        return false;
     }
     for i in 0..log.count.min(FS_FAILS) {
         if log.op[i] == op && log.path[i][..log.len[i]] == name[..n] {
             log.hits[i] = log.hits[i].saturating_add(1);
-            return;
+            return false;
         }
     }
     if log.count >= FS_FAILS {
         log.dropped.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        return;
+        return false;
     }
     let i = log.count;
     (log.op[i], log.how[i], log.rc[i], log.hits[i], log.len[i]) = (op, how, rc, 1, n);
     log.path[i] = name;
     log.count += 1;
+    true
 }
 
 /// An authoritative miss: the index answered "no such path" (lookup letter
@@ -445,16 +452,22 @@ pub(crate) fn fs_event(op: u8, how: u8, rc: i64, path: *const core::ffi::c_char)
 
 /// Records one probe call (rt/probe.rs) in FS_FAIL_LOG whatever `rc` is, so
 /// `/fsfail` lists every distinct (op, path) a game used on packed files,
-/// and in the FS_LOG ring. Debug only, like `fs_event`; release builds have
-/// no probes to call it.
+/// and in the FS_LOG ring. A note that adds a new (op, path) entry is also
+/// written to the black box (rt/blackbox.rs) whatever `rc` is, once each:
+/// a probe that succeeds (issue #22, `I v 0x0 ... noloc.larc`) is still in
+/// the trace when the game dies before :9090 answers (issue #18), and a
+/// repeat costs no file write. Debug only, like `fs_event`; release builds
+/// have no probes to call it.
 #[inline(always)]
 #[cfg_attr(not(feature = "mem_report"), allow(dead_code))]
 pub(crate) fn fs_note(op: u8, how: u8, rc: i64, path: *const core::ffi::c_char) {
     #[cfg(feature = "mem_report")]
     unsafe {
-        fs_fail(op, how, rc, path);
+        let added = fs_fail(op, how, rc, path);
         fs_ring(op, how, rc, path);
-        super::blackbox::event(op, how, rc, path);
+        if added {
+            super::blackbox::note(op, how, rc, path);
+        }
     }
     #[cfg(not(feature = "mem_report"))]
     let _ = (op, how, rc, path);
@@ -577,5 +590,19 @@ mod tests {
         assert!(fail_kept(b'h', -2, b"/app0/a.bin") && fail_kept(b'K', 5, b"/app0/x.prx"));
         assert!(!fail_kept(b'm', -2, b"/app0/a.bin"));
         assert!(!fail_kept(b'M', -2, b"/download0/user.ini"));
+    }
+
+    #[cfg(feature = "mem_report")]
+    #[test]
+    fn a_repeated_note_is_new_once() {
+        // `fs_note` writes the black box only when `fs_fail` reports a new
+        // (op, path): the same probe twice is one trace line, rc 0 or not.
+        let p = c"/app0/cache_ps5/loc/test-repeat.larc";
+        assert!(unsafe { fs_fail(b'I', b'v', 0, p.as_ptr()) });
+        assert!(!unsafe { fs_fail(b'I', b'v', 0, p.as_ptr()) });
+        // Another op on the same path is a distinct entry.
+        assert!(unsafe { fs_fail(b'D', b'v', 0, p.as_ptr()) });
+        // A path `/fsfail` filters out is never new.
+        assert!(!unsafe { fs_fail(b'I', b'v', 0, c"/download0/u.ini".as_ptr()) });
     }
 }

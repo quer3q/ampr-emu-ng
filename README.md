@@ -93,9 +93,10 @@ flavor of the running PRX, for example
   gather/scatter retries that re-resolved to another file or offset. Misses
   that the index answers by itself and `/download0` probes are left out. The
   debug build also logs when a packed file (zstd or LZ4) or a virtual fd
-  reaches an API the runtime does not serve (op letters `I D W T F C N`,
+  reaches an API the runtime does not serve (op letters `D W T F C N`,
   plus `O A a l` with how `p`/`d` when an `AMPR_ZSTD_LIBC_HOOKS` bit is
-  cleared). It logs
+  cleared), and `I` when a game's own AIO submit on a packed file is
+  served. It logs
   `X`/`Y` when an mmap of a packed file fails, with how `k` for the disk
   cache, `f` for decode on access, `F` for a failed decode-on-access fill
   and `v` for any other failure. See `AMPR_ZSTD_MMAP` in the `Makefile`.

@@ -164,8 +164,11 @@ fully packed game the runtime serves:
 - `mmap`/`sceKernelMmap`, through the disk cache or decoded on access (see
   below).
 
-The game's own kernel AIO (`sceKernelAioSubmitReadCommands*`) on a packed
-file is not served. The debug build only logs it (`rt/probe.rs`, `/fsfail`).
+The game's own kernel AIO (`sceKernelAioSubmitReadCommands*` and the
+matching poll, wait, delete and cancel calls) on a packed file is served
+by the runtime's AIO emulation (`rt/pack/aio.rs`, `rt/pack/aio_wait.rs`);
+requests on other fds go to the kernel. The debug build lists the served packed
+submits in `/fsfail` (op `I`, once per file).
 
 Three fully packed zstd games were tested on a console with release and
 debug builds: boot, video, load, save and play, with 0 errors. Two fully

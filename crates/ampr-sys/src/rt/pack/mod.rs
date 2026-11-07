@@ -786,7 +786,6 @@ pub(crate) type KernelAioPollSingleFn =
     unsafe extern "C" fn(SceKernelAioSubmitId, *mut c_int) -> c_int;
 pub(crate) type KernelAioPollFn =
     unsafe extern "C" fn(*mut SceKernelAioSubmitId, c_int, *mut c_int) -> c_int;
-#[allow(dead_code)]
 pub(crate) type KernelAioWaitSingleFn =
     unsafe extern "C" fn(SceKernelAioSubmitId, *mut c_int, *mut SceKernelUseconds) -> c_int;
 pub(crate) type KernelAioWaitFn = unsafe extern "C" fn(
@@ -796,6 +795,10 @@ pub(crate) type KernelAioWaitFn = unsafe extern "C" fn(
     u32,
     *mut SceKernelUseconds,
 ) -> c_int;
+pub(crate) type KernelAioCancelSingleFn =
+    unsafe extern "C" fn(SceKernelAioSubmitId, *mut c_int) -> c_int;
+pub(crate) type KernelAioCancelFn =
+    unsafe extern "C" fn(*mut SceKernelAioSubmitId, c_int, *mut c_int) -> c_int;
 pub(crate) type KernelAioDeleteSingleFn =
     unsafe extern "C" fn(SceKernelAioSubmitId, *mut c_int) -> c_int;
 pub(crate) type KernelAioDeleteFn =
@@ -812,14 +815,14 @@ pub(crate) static g_real_getdents: AtomicPtr<c_void> = AtomicPtr::new(null_mut()
 pub(crate) static g_real_getdirentries: AtomicPtr<c_void> = AtomicPtr::new(null_mut());
 pub(crate) static g_real_pread: AtomicPtr<c_void> = AtomicPtr::new(null_mut());
 pub(crate) static g_real_lseek: AtomicPtr<c_void> = AtomicPtr::new(null_mut());
-#[allow(dead_code)]
 pub(crate) static g_real_aio_submit_single: AtomicPtr<c_void> = AtomicPtr::new(null_mut());
 pub(crate) static g_real_aio_submit: AtomicPtr<c_void> = AtomicPtr::new(null_mut());
 pub(crate) static g_real_aio_poll_single: AtomicPtr<c_void> = AtomicPtr::new(null_mut());
 pub(crate) static g_real_aio_poll: AtomicPtr<c_void> = AtomicPtr::new(null_mut());
-#[allow(dead_code)]
 pub(crate) static g_real_aio_wait_single: AtomicPtr<c_void> = AtomicPtr::new(null_mut());
 pub(crate) static g_real_aio_wait: AtomicPtr<c_void> = AtomicPtr::new(null_mut());
+pub(crate) static g_real_aio_cancel_single: AtomicPtr<c_void> = AtomicPtr::new(null_mut());
+pub(crate) static g_real_aio_cancel: AtomicPtr<c_void> = AtomicPtr::new(null_mut());
 pub(crate) static g_real_aio_delete_single: AtomicPtr<c_void> = AtomicPtr::new(null_mut());
 pub(crate) static g_real_aio_delete: AtomicPtr<c_void> = AtomicPtr::new(null_mut());
 
@@ -971,6 +974,11 @@ pub(crate) struct VirtualAioGroupSlot {
     pub delete_result: c_int,
     pub active: bool,
     pub wait_notified: bool,
+    /// A plain group (`sceKernelAioSubmitReadCommands`, aio.rs) holds a
+    /// native kernel id: kernel completions do not bump
+    /// `aio_completion_epoch`, so `sceKernelAioWaitRequests` must poll it.
+    /// Never set on a zstd split group (all children are virtual jobs).
+    pub has_native_children: bool,
     /// zstd: split-read state; `split.count == 0` for a plain group.
     pub split: SplitGroup,
 }
@@ -982,6 +990,7 @@ impl VirtualAioGroupSlot {
         delete_result: 0,
         active: false,
         wait_notified: false,
+        has_native_children: false,
         split: SplitGroup::EMPTY,
     };
 }

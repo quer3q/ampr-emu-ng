@@ -130,10 +130,177 @@ pub unsafe extern "C" fn posix_lseek_emul(fd: c_int, offset: off_t, whence: c_in
 }
 
 pub(crate) unsafe fn has_virtual_fd(requests: *const SceKernelAioRWRequest, count: c_int) -> bool {
-    (0..count as usize)
-        .any(|i| decode_virtual_fd(unsafe { (*requests.add(i)).fd }).is_some())
+    (0..count as usize).any(|i| decode_virtual_fd(unsafe { (*requests.add(i)).fd }).is_some())
 }
 
+/// Hook id 100: the game's own single-id submit (issue #22: Ghost of Yotei
+/// reads packed files with it). Debug builds log a served packed request
+/// as b'I' in `/fsfail` (rt/probe.rs `note_aio_submit`).
+pub unsafe extern "C" fn sceKernelAioSubmitReadCommands_emul(
+    requests: *mut SceKernelAioRWRequest,
+    count: c_int,
+    priority: c_int,
+    id: *mut SceKernelAioSubmitId,
+) -> c_int {
+    unsafe {
+        if !game_submit_emulated(requests, count, id) {
+            return match real_aio_submit_single() {
+                Some(f) => f(requests, count, priority, id),
+                None => SCE_KERNEL_ERROR_EIO,
+            };
+        }
+        let rc = sceKernelAioSubmitReadCommands(requests, count, priority, id);
+        #[cfg(feature = "mem_report")]
+        super::super::probe::note_aio_submit(b"AioSubmitRead", requests, count, rc);
+        rc
+    }
+}
+
+/// Hook id 101: the game's own multi-id submit, logged as id 100 is.
+pub unsafe extern "C" fn sceKernelAioSubmitReadCommandsMultiple_emul(
+    requests: *mut SceKernelAioRWRequest,
+    count: c_int,
+    priority: c_int,
+    ids: *mut SceKernelAioSubmitId,
+) -> c_int {
+    unsafe {
+        if !game_submit_emulated(requests, count, ids) {
+            return match real_aio_submit() {
+                Some(f) => f(requests, count, priority, ids),
+                None => SCE_KERNEL_ERROR_EIO,
+            };
+        }
+        let rc = sceKernelAioSubmitReadCommandsMultiple(requests, count, priority, ids);
+        #[cfg(feature = "mem_report")]
+        super::super::probe::note_aio_submit(b"AioSubmitReadMultiple", requests, count, rc);
+        rc
+    }
+}
+
+// ---- the game's own AIO: routing -----------------------------------------------
+
+/// Whether the game's own submit (hook ids 100, 101) needs the emulation:
+/// only a well-formed call with a request on a packed fd does. Every other
+/// call goes to the kernel untouched, so a native or malformed call keeps
+/// the kernel's result, and the game's thread never takes the emulation's
+/// stack frame (its arrays hold 128 requests) for a native call.
+unsafe fn game_submit_emulated(
+    requests: *const SceKernelAioRWRequest,
+    count: c_int,
+    ids: *const SceKernelAioSubmitId,
+) -> bool {
+    !requests.is_null()
+        && !ids.is_null()
+        && count > 0
+        && count as usize <= SCE_KERNEL_AIO_REQUEST_NUM_MAX
+        && unsafe { has_virtual_fd(requests, count) }
+}
+
+/// An id this runtime handed out: a virtual job's tag or a group's.
+pub(crate) fn runtime_aio_id(id: SceKernelAioSubmitId) -> bool {
+    has_virtual_aio_tag(id) || unsafe { decode_virtual_aio_group(id, null_mut(), null_mut()) }
+}
+
+/// Whether the game's own poll, wait, delete or cancel of `ids` needs the
+/// emulation: only a well-formed call naming a runtime id does; the rest go
+/// to the kernel untouched, as `game_submit_emulated` says.
+pub(crate) unsafe fn game_ids_emulated(ids: *const SceKernelAioSubmitId, count: c_int) -> bool {
+    !ids.is_null()
+        && count > 0
+        && count as usize <= SCE_KERNEL_AIO_ID_NUM_MAX
+        && (0..count as usize).any(|i| runtime_aio_id(unsafe { *ids.add(i) }))
+}
+
+/// Serves the game's own single-id submit on packed fds (issue #22: Ghost
+/// of Yotei reads packed files with it). One plain virtual AIO group id
+/// covers the batch; its children are the `Multiple` ids, which can be
+/// native kernel ids, virtual jobs or zstd split group ids.
+#[inline(never)]
+pub unsafe fn sceKernelAioSubmitReadCommands(
+    requests: *mut SceKernelAioRWRequest,
+    count: c_int,
+    priority: c_int,
+    id: *mut SceKernelAioSubmitId,
+) -> c_int {
+    if requests.is_null()
+        || id.is_null()
+        || count <= 0
+        || count as usize > SCE_KERNEL_AIO_REQUEST_NUM_MAX
+    {
+        return SCE_KERNEL_ERROR_EINVAL;
+    }
+    unsafe {
+        if !has_virtual_fd(requests, count) {
+            return match real_aio_submit_single() {
+                Some(f) => f(requests, count, priority, id),
+                None => SCE_KERNEL_ERROR_EIO,
+            };
+        }
+
+        let state = pack_state();
+        let submission = PackSubmission::new(state);
+        if !submission.admitted() {
+            return SCE_KERNEL_ERROR_EBUSY;
+        }
+        let group_index;
+        let group_generation;
+        {
+            let _lock = PACK_M.lock();
+            group_index = allocate_virtual_aio_group_locked(state);
+            if group_index == INVALID_INDEX {
+                return SCE_KERNEL_ERROR_EAGAIN;
+            }
+            group_generation = (*state).virtual_aio_groups[group_index as usize].generation;
+        }
+
+        let mut child_ids = [0 as SceKernelAioSubmitId; SCE_KERNEL_AIO_REQUEST_NUM_MAX];
+        let submit_rc = sceKernelAioSubmitReadCommandsMultiple(
+            requests,
+            count,
+            priority,
+            child_ids.as_mut_ptr(),
+        );
+        if submit_rc != 0 {
+            let _lock = PACK_M.lock();
+            let group = &(*state).virtual_aio_groups[group_index as usize];
+            if group.active && group.generation == group_generation {
+                free_virtual_aio_group_locked(state, group_index);
+            }
+            return submit_rc;
+        }
+
+        let mut group_published = false;
+        {
+            let _lock = PACK_M.lock();
+            let group = &mut (*state).virtual_aio_groups[group_index as usize];
+            if group.active && group.generation == group_generation {
+                let n = count as usize;
+                group.children[..n].copy_from_slice(&child_ids[..n]);
+                group.child_count = count as u16;
+                for &child in &child_ids[..n] {
+                    // A zstd split read's id is a virtual group, not native.
+                    group.has_native_children = group.has_native_children
+                        || (!has_virtual_aio_tag(child)
+                            && !decode_virtual_aio_group(child, null_mut(), null_mut()));
+                }
+                *id = encode_virtual_aio_group(group_index, group_generation);
+                group_published = true;
+            }
+        }
+        if !group_published {
+            let mut child_results = [0 as c_int; SCE_KERNEL_AIO_REQUEST_NUM_MAX];
+            let _ = sceKernelAioDeleteRequests(
+                child_ids.as_mut_ptr(),
+                count,
+                child_results.as_mut_ptr(),
+            );
+            return SCE_KERNEL_ERROR_EIO;
+        }
+        0
+    }
+}
+
+#[inline(never)]
 pub unsafe fn sceKernelAioSubmitReadCommandsMultiple(
     requests: *mut SceKernelAioRWRequest,
     count: c_int,
@@ -433,9 +600,10 @@ unsafe fn publish_virtual_jobs(
     }
 }
 
-/// zstd: runs `single` on each group id of `ids` and `batch` once on all the
-/// others, so a split read's group id mixed into a reactor batch does not
-/// turn every native id into its own kernel call. First nonzero rc wins.
+/// Runs `single` on each group id of `ids` and `batch` once on all the
+/// others, so a group id (a zstd split read's or a game single-id submit's)
+/// mixed into a batch does not turn every native id into its own kernel
+/// call. First nonzero rc wins.
 pub(crate) unsafe fn groups_single_rest_batched(
     ids: *mut SceKernelAioSubmitId,
     count: c_int,
@@ -479,6 +647,25 @@ pub(crate) unsafe fn groups_single_rest_batched(
     0
 }
 
+/// Hook id 103: the game's own poll; ids from a packed submit are served
+/// here, the rest go to the original.
+pub unsafe extern "C" fn sceKernelAioPollRequests_emul(
+    ids: *mut SceKernelAioSubmitId,
+    count: c_int,
+    states: *mut c_int,
+) -> c_int {
+    unsafe {
+        if !game_ids_emulated(ids, count) {
+            return match real_aio_poll() {
+                Some(f) => f(ids, count, states),
+                None => SCE_KERNEL_ERROR_EIO,
+            };
+        }
+        sceKernelAioPollRequests(ids, count, states)
+    }
+}
+
+#[inline(never)]
 pub unsafe fn sceKernelAioPollRequests(
     ids: *mut SceKernelAioSubmitId,
     count: c_int,
@@ -505,7 +692,7 @@ pub unsafe fn sceKernelAioPollRequests(
                 None => SCE_KERNEL_ERROR_EIO,
             };
         }
-        if zstd_mode() && has_group {
+        if has_group {
             return groups_single_rest_batched(
                 ids,
                 count,
@@ -513,15 +700,6 @@ pub unsafe fn sceKernelAioPollRequests(
                 sceKernelAioPollRequest,
                 sceKernelAioPollRequests,
             );
-        }
-        if has_group {
-            for i in 0..n {
-                let rc = sceKernelAioPollRequest(*ids.add(i), states.add(i));
-                if rc != 0 {
-                    return rc;
-                }
-            }
-            return 0;
         }
         const M: usize = SCE_KERNEL_AIO_ID_NUM_MAX;
         let mut real_ids = [0 as SceKernelAioSubmitId; M];
@@ -570,6 +748,155 @@ pub unsafe fn sceKernelAioPollRequests(
         }
         if real_count != 0 {
             let Some(f) = real_aio_poll() else {
+                return SCE_KERNEL_ERROR_EIO;
+            };
+            let rc = f(
+                real_ids.as_mut_ptr(),
+                real_count as c_int,
+                real_states.as_mut_ptr(),
+            );
+            if rc != 0 {
+                return rc;
+            }
+            for i in 0..real_count {
+                *states.add(real_positions[i]) = real_states[i];
+            }
+        }
+        0
+    }
+}
+
+/// Hook id 109: the game's own cancel.
+pub unsafe extern "C" fn sceKernelAioCancelRequests_emul(
+    ids: *mut SceKernelAioSubmitId,
+    count: c_int,
+    states: *mut c_int,
+) -> c_int {
+    unsafe {
+        if !game_ids_emulated(ids, count) {
+            return match real_aio_cancel() {
+                Some(f) => f(ids, count, states),
+                None => SCE_KERNEL_ERROR_EIO,
+            };
+        }
+        sceKernelAioCancelRequests(ids, count, states)
+    }
+}
+
+/// Serves the game's own cancel of ids from the packed submits above
+/// (issue #22). Virtual jobs not yet picked up complete as aborted here;
+/// running ones get `cancel_requested` and report PROCESSING; native ids go
+/// to the kernel.
+#[inline(never)]
+pub unsafe fn sceKernelAioCancelRequests(
+    ids: *mut SceKernelAioSubmitId,
+    count: c_int,
+    states: *mut c_int,
+) -> c_int {
+    if ids.is_null() || states.is_null() || count <= 0 || count as usize > SCE_KERNEL_AIO_ID_NUM_MAX
+    {
+        return SCE_KERNEL_ERROR_EINVAL;
+    }
+    unsafe {
+        let n = count as usize;
+        let mut has_virtual = false;
+        for i in 0..n {
+            has_virtual = has_virtual || decode_virtual_aio(*ids.add(i), null_mut(), null_mut());
+            if decode_virtual_aio_group(*ids.add(i), null_mut(), null_mut()) {
+                return groups_single_rest_batched(
+                    ids,
+                    count,
+                    states,
+                    sceKernelAioCancelRequest,
+                    sceKernelAioCancelRequests,
+                );
+            }
+        }
+        if !has_virtual {
+            return match real_aio_cancel() {
+                Some(f) => f(ids, count, states),
+                None => SCE_KERNEL_ERROR_EIO,
+            };
+        }
+        const M: usize = SCE_KERNEL_AIO_ID_NUM_MAX;
+        let mut real_ids = [0 as SceKernelAioSubmitId; M];
+        let mut real_states = [0 as c_int; M];
+        let mut real_positions = [0usize; M];
+        let mut real_count = 0usize;
+        let mut completed_queued_job = false;
+        let state = pack_state();
+        {
+            let _lock = PACK_M.lock();
+            for i in 0..n {
+                let id = *ids.add(i);
+                if !has_virtual_aio_tag(id) {
+                    real_positions[real_count] = i;
+                    real_ids[real_count] = id;
+                    real_count += 1;
+                    continue;
+                }
+                let mut index = 0u32;
+                let aio = lookup_virtual_aio_locked(state, id, &mut index);
+                if aio.is_null() {
+                    *states.add(i) = SCE_KERNEL_ERROR_ESRCH;
+                    continue;
+                }
+                let out = &mut *states.add(i);
+                match (*aio).phase {
+                    VirtualAioPhase::Reserved => {
+                        (*aio).cancel_requested.store(true, Ordering::Release);
+                        complete_virtual_job(
+                            state,
+                            index,
+                            SCE_KERNEL_ERROR_ECANCELED as i64,
+                            SCE_KERNEL_AIO_STATE_ABORTED,
+                        );
+                        *out = SCE_KERNEL_AIO_STATE_ABORTED;
+                        completed_queued_job = true;
+                    }
+                    VirtualAioPhase::Queued => {
+                        (*aio).cancel_requested.store(true, Ordering::Release);
+                        if (*aio).pipeline_index != INVALID_INDEX
+                            || !queue_remove_locked(state, index)
+                        {
+                            *out = SCE_KERNEL_AIO_STATE_PROCESSING;
+                        } else {
+                            complete_virtual_job(
+                                state,
+                                index,
+                                SCE_KERNEL_ERROR_ECANCELED as i64,
+                                SCE_KERNEL_AIO_STATE_ABORTED,
+                            );
+                            *out = SCE_KERNEL_AIO_STATE_ABORTED;
+                            completed_queued_job = true;
+                        }
+                    }
+                    VirtualAioPhase::WaitingCache => {
+                        (*aio).cancel_requested.store(true, Ordering::Release);
+                        queue_cache_waiter_locked(state, index, pack_telemetry_usecs());
+                        *out = SCE_KERNEL_AIO_STATE_PROCESSING;
+                        completed_queued_job = true;
+                    }
+                    VirtualAioPhase::WaitingFd => {
+                        (*aio).cancel_requested.store(true, Ordering::Release);
+                        queue_fd_waiter_locked(state, index, pack_telemetry_usecs());
+                        *out = SCE_KERNEL_AIO_STATE_PROCESSING;
+                        completed_queued_job = true;
+                    }
+                    VirtualAioPhase::Running | VirtualAioPhase::IoQueued => {
+                        (*aio).cancel_requested.store(true, Ordering::Release);
+                        *out = SCE_KERNEL_AIO_STATE_PROCESSING;
+                    }
+                    VirtualAioPhase::Done => *out = (*aio).completion_state,
+                    _ => *out = SCE_KERNEL_ERROR_ESRCH,
+                }
+            }
+        }
+        if completed_queued_job {
+            QUEUE_CV.notify_all();
+        }
+        if real_count != 0 {
+            let Some(f) = real_aio_cancel() else {
                 return SCE_KERNEL_ERROR_EIO;
             };
             let rc = f(

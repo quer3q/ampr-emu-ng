@@ -32,9 +32,12 @@ const PROT_RX: c_int = sys::SCE_KERNEL_PROT_CPU_READ | sys::SCE_KERNEL_PROT_CPU_
 const _: () = {
     assert!(PAGE % TRAMP_SIZE == 0 && SLOTS_PER_PAGE <= 32);
     assert!(POOL_COPY_PAGES <= 64 && TRAMP_PAGES == 4);
-    // Debug builds add the 10 probe slots 100..=109 (rt/probe.rs); both fit
-    // the 4 trampoline pages.
-    assert!(HOOK_COUNT == 100 + 10 * cfg!(feature = "mem_report") as usize);
+    // 10 game AIO slots 100..=109 in both builds, and in debug builds the 8
+    // probe slots 110..=117 (rt/probe.rs). With the 5 external equeue hooks
+    // and the loader hook that is 116 (release) or 124 (debug) trampolines,
+    // within the 4 pages x 32 slots = 128.
+    assert!(HOOK_COUNT == 110 + 8 * cfg!(feature = "mem_report") as usize);
+    assert!(HOOK_COUNT + EXT_COUNT + 1 <= TRAMP_PAGES * SLOTS_PER_PAGE);
 };
 
 // ---- detour state (guarded by HOOK_LOCK) -------------------------------------
@@ -112,6 +115,7 @@ use super::index::{
     posix_unlink_emul, sceKernelCheckReachability_emul, sceKernelOpen_emul, sceKernelStat_emul,
     underscore_open_emul, underscore_openat_emul,
 };
+use super::pack::mmap::{mmap_emul, munmap_emul, sceKernelMmap_emul, sceKernelMunmap_emul};
 use super::pack::zstd_libc::{
     posix_fcntl_emul, sceKernelFcntl_emul, underscore_close_emul, underscore_fcntl_emul,
     underscore_fstat_emul, underscore_getdirentries_emul, underscore_read_emul,
@@ -124,7 +128,13 @@ use super::pack::{
     sceKernelLseek_emul, sceKernelPread_emul, sceKernelPreadv_emul, sceKernelRead_emul,
     sceKernelReadv_emul,
 };
-use super::pack::mmap::{mmap_emul, munmap_emul, sceKernelMmap_emul, sceKernelMunmap_emul};
+use super::pack::{
+    sceKernelAioCancelRequest_emul, sceKernelAioCancelRequests_emul,
+    sceKernelAioDeleteRequest_emul, sceKernelAioDeleteRequests_emul, sceKernelAioPollRequest_emul,
+    sceKernelAioPollRequests_emul, sceKernelAioSubmitReadCommandsMultiple_emul,
+    sceKernelAioSubmitReadCommands_emul, sceKernelAioWaitRequest_emul,
+    sceKernelAioWaitRequests_emul,
+};
 #[cfg(feature = "mem_report")]
 use super::probe;
 use super::services::{
@@ -160,8 +170,20 @@ const M: bool = true;
 const O: bool = false;
 use super::amm as a;
 
-/// `g_hooks`: order is `AmprLibkernelHookId`.
-static HOOKS: Table<HookSpec, HOOK_COUNT> = Table(specs![
+/// `HOOKS` from one entry list, plus its symbols and mandatory flags alone
+/// for host tests, which cannot take `HOOKS` itself: its `_emul` pointers
+/// pull in the libkernel imports, which the host linker lacks.
+macro_rules! hook_table {
+    ($($(#[$a:meta])* $sym:literal => $f:path, $m:expr;)*) => {
+        /// `g_hooks`: order is `AmprLibkernelHookId`.
+        static HOOKS: Table<HookSpec, HOOK_COUNT> =
+            Table(specs![$($(#[$a])* $sym => $f, $m;)*]);
+        #[cfg(test)]
+        const HOOK_SYMBOLS: [(&core::ffi::CStr, bool); HOOK_COUNT] = [$($(#[$a])* ($sym, $m),)*];
+    };
+}
+
+hook_table! {
     c"open" => posix_open_emul, M;
     c"stat" => posix_stat_emul, M;
     c"sceKernelCheckReachability" => sceKernelCheckReachability_emul, M;
@@ -275,13 +297,22 @@ static HOOKS: Table<HookSpec, HOOK_COUNT> = Table(specs![
     // original.
     c"munmap" => munmap_emul, O;
     c"sceKernelMunmap" => sceKernelMunmap_emul, O;
+    // Both pack formats: the game's own kernel AIO. Requests on a packed fd
+    // and ids from such a submit are served by the runtime's AIO emulation;
+    // the rest call the original (rt/pack/aio.rs, rt/pack/aio_wait.rs).
+    c"sceKernelAioSubmitReadCommands" => sceKernelAioSubmitReadCommands_emul, O;
+    c"sceKernelAioSubmitReadCommandsMultiple" => sceKernelAioSubmitReadCommandsMultiple_emul, O;
+    c"sceKernelAioPollRequest" => sceKernelAioPollRequest_emul, O;
+    c"sceKernelAioPollRequests" => sceKernelAioPollRequests_emul, O;
+    c"sceKernelAioWaitRequest" => sceKernelAioWaitRequest_emul, O;
+    c"sceKernelAioWaitRequests" => sceKernelAioWaitRequests_emul, O;
+    c"sceKernelAioDeleteRequest" => sceKernelAioDeleteRequest_emul, O;
+    c"sceKernelAioDeleteRequests" => sceKernelAioDeleteRequests_emul, O;
+    c"sceKernelAioCancelRequest" => sceKernelAioCancelRequest_emul, O;
+    c"sceKernelAioCancelRequests" => sceKernelAioCancelRequests_emul, O;
     // Debug, both pack formats: pass-through observers of APIs the runtime
     // does not serve for packed files (rt/probe.rs); each calls its own
     // original.
-    #[cfg(feature = "mem_report")]
-    c"sceKernelAioSubmitReadCommands" => probe::sceKernelAioSubmitReadCommands_probe, O;
-    #[cfg(feature = "mem_report")]
-    c"sceKernelAioSubmitReadCommandsMultiple" => probe::sceKernelAioSubmitReadCommandsMultiple_probe, O;
     #[cfg(feature = "mem_report")]
     c"dup" => probe::dup_probe, O;
     #[cfg(feature = "mem_report")]
@@ -298,7 +329,7 @@ static HOOKS: Table<HookSpec, HOOK_COUNT> = Table(specs![
     c"faccessat" => probe::faccessat_probe, O;
     #[cfg(feature = "mem_report")]
     c"readlink" => probe::readlink_probe, O;
-]);
+}
 
 /// `g_externalEqueueHooks`: order is `AmprExternalEqueueHookId`.
 static EXT_HOOKS: Table<HookSpec, EXT_COUNT> = Table(specs![
@@ -1473,8 +1504,9 @@ pub(crate) const fn observed_only(id: usize) -> bool {
 /// (GitHub issue #2). A title with no packs gets the shared 78 only, as in
 /// v0.2.0. Of the ids past 78, 84..96 also need their `ZSTD_LIBC_HOOKS`
 /// bit (or, in debug builds, `observed_only`), 96 and 97
-/// need `AMPR_ZSTD_MMAP` on, 98 and 99 need it at 1 (rt/pack/mmap.rs), and
-/// 100..110 exist only in debug builds (rt/probe.rs). The knobs keep their
+/// need `AMPR_ZSTD_MMAP` on, 98 and 99 need it at 1 (rt/pack/mmap.rs),
+/// 100..=109 (the game's kernel AIO, rt/pack/aio.rs) need nothing more, and
+/// 110..=117 exist only in debug builds (rt/probe.rs). The knobs keep their
 /// zstd names but apply to both formats.
 fn hook_enabled(id: usize) -> bool {
     if id < FALLBACK_SHARED.len() {
@@ -1726,6 +1758,27 @@ unsafe fn install_all(lib: SceKernelModule) -> c_int {
         }
     }
 
+    // The game's AIO (ids 100..=109) is routed all or nothing: a packed
+    // submit hands out synthetic ids that only the hooked poll, wait, delete
+    // and cancel know, so with one of them missing (an alias or a prologue
+    // the decoder rejects) none stays installed and packed AIO fails as
+    // before; upstream gates on all 10 too (amprPackProcessOpenHooksReady).
+    // Each entry is optional, so `install` alone would keep a partial set.
+    // The submits go first, so no new synthetic id is handed out while the
+    // completion calls come off; each slot gets its fallback at once, since
+    // the loader and equeue hooks below may reuse the freed trampolines
+    // before `refresh`.
+    let aio = id::sceKernelAioSubmitReadCommands..=id::sceKernelAioCancelRequests;
+    if !aio.clone().all(|i| st.hooks[i].installed) {
+        for i in aio {
+            let was = st.hooks[i].installed;
+            if unsafe { uninstall(&mut st.tramp, &mut st.hooks[i]) } && was {
+                unsafe { store_slot(lib_slot(i), SDK_FALLBACK.0[i]) };
+                installed -= 1;
+            }
+        }
+    }
+
     if installed == 0 {
         unsafe { refresh(st) };
         return -1;
@@ -1784,4 +1837,62 @@ pub unsafe fn amprUninstallLibkernelHooks() -> c_int {
 
 pub unsafe fn amprResolveLibkernelFunction(symbol: *const c_char) -> *mut c_void {
     unsafe { resolve(LIBKERNEL, symbol) }
+}
+
+// ---- tests ---------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Each `HOOKS` entry sits at its `sys::hook` id, since the original
+    /// slot `g_amprOriginalLibkernelById[id]` is filled by table position
+    /// (`HOOK_SYMBOLS` is built from the same list).
+    #[test]
+    fn hooks_table_order_matches_hook_ids() {
+        let named: &[(usize, &core::ffi::CStr)] = &[
+            (id::open, c"open"),
+            (id::sceKernelClose, c"sceKernelClose"),
+            (id::sceKernelPreadv, c"sceKernelPreadv"),
+            (id::_open, c"_open"),
+            (id::sceKernelFcntl, c"sceKernelFcntl"),
+            (id::sceKernelMunmap, c"sceKernelMunmap"),
+            (
+                id::sceKernelAioSubmitReadCommands,
+                c"sceKernelAioSubmitReadCommands",
+            ),
+            (
+                id::sceKernelAioSubmitReadCommandsMultiple,
+                c"sceKernelAioSubmitReadCommandsMultiple",
+            ),
+            (id::sceKernelAioPollRequest, c"sceKernelAioPollRequest"),
+            (id::sceKernelAioPollRequests, c"sceKernelAioPollRequests"),
+            (id::sceKernelAioWaitRequest, c"sceKernelAioWaitRequest"),
+            (id::sceKernelAioWaitRequests, c"sceKernelAioWaitRequests"),
+            (id::sceKernelAioDeleteRequest, c"sceKernelAioDeleteRequest"),
+            (
+                id::sceKernelAioDeleteRequests,
+                c"sceKernelAioDeleteRequests",
+            ),
+            (id::sceKernelAioCancelRequest, c"sceKernelAioCancelRequest"),
+            (
+                id::sceKernelAioCancelRequests,
+                c"sceKernelAioCancelRequests",
+            ),
+            #[cfg(feature = "mem_report")]
+            (id::dup, c"dup"),
+            #[cfg(feature = "mem_report")]
+            (id::readlink, c"readlink"),
+        ];
+        for &(i, sym) in named {
+            assert_eq!(HOOK_SYMBOLS[i].0, sym, "hook id {i}");
+        }
+        assert_eq!(HOOK_SYMBOLS.len(), id::COUNT);
+        // The AIO ids are past the libc routing range, so no
+        // `AMPR_ZSTD_LIBC_HOOKS` bit can turn them off.
+        for i in id::sceKernelAioSubmitReadCommands..=id::sceKernelAioCancelRequests {
+            assert!(routing_enabled(i) && !observed_only(i));
+            assert!(!HOOK_SYMBOLS[i].1);
+        }
+    }
 }

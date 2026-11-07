@@ -444,32 +444,42 @@ pub mod hook {
     // (rt/pack/mmap.rs). Both builds.
     pub const munmap: usize = 98;
     pub const sceKernelMunmap: usize = 99;
-    // 100..=109: debug-only pass-through probes of fully packed games, both
+    // 100..=109: the game's own kernel AIO, both formats, both builds: a
+    // request on a packed fd or an id from such a submit is served by the
+    // runtime's AIO emulation (rt/pack/aio.rs, rt/pack/aio_wait.rs, GitHub
+    // issue #22); every other request and id goes to the original.
+    pub const sceKernelAioSubmitReadCommands: usize = 100;
+    pub const sceKernelAioSubmitReadCommandsMultiple: usize = 101;
+    pub const sceKernelAioPollRequest: usize = 102;
+    pub const sceKernelAioPollRequests: usize = 103;
+    pub const sceKernelAioWaitRequest: usize = 104;
+    pub const sceKernelAioWaitRequests: usize = 105;
+    pub const sceKernelAioDeleteRequest: usize = 106;
+    pub const sceKernelAioDeleteRequests: usize = 107;
+    pub const sceKernelAioCancelRequest: usize = 108;
+    pub const sceKernelAioCancelRequests: usize = 109;
+    // 110..=117: debug-only pass-through probes of fully packed games, both
     // formats (rt/probe.rs); release builds have no such slots.
     #[cfg(feature = "mem_report")]
-    pub const sceKernelAioSubmitReadCommands: usize = 100;
+    pub const dup: usize = 110;
     #[cfg(feature = "mem_report")]
-    pub const sceKernelAioSubmitReadCommandsMultiple: usize = 101;
+    pub const dup2: usize = 111;
     #[cfg(feature = "mem_report")]
-    pub const dup: usize = 102;
+    pub const poll: usize = 112;
     #[cfg(feature = "mem_report")]
-    pub const dup2: usize = 103;
+    pub const select: usize = 113;
     #[cfg(feature = "mem_report")]
-    pub const poll: usize = 104;
+    pub const openat: usize = 114;
     #[cfg(feature = "mem_report")]
-    pub const select: usize = 105;
+    pub const fstatat: usize = 115;
     #[cfg(feature = "mem_report")]
-    pub const openat: usize = 106;
+    pub const faccessat: usize = 116;
     #[cfg(feature = "mem_report")]
-    pub const fstatat: usize = 107;
+    pub const readlink: usize = 117;
     #[cfg(feature = "mem_report")]
-    pub const faccessat: usize = 108;
-    #[cfg(feature = "mem_report")]
-    pub const readlink: usize = 109;
-    #[cfg(feature = "mem_report")]
-    pub const COUNT: usize = 110;
+    pub const COUNT: usize = 118;
     #[cfg(not(feature = "mem_report"))]
-    pub const COUNT: usize = 100;
+    pub const COUNT: usize = 110;
 }
 
 /// Original (pre-detour) libkernel entry points, indexed by `hook::*`, and
