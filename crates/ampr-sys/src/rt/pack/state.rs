@@ -44,7 +44,6 @@ pub(crate) unsafe fn pack_state_create() -> *mut PackState {
             st.queue_tail = [[INVALID_INDEX; PACK_WORK_CLASS_COUNT]; 3];
             st.prefetch_head = INVALID_INDEX;
             st.prefetch_tail = INVALID_INDEX;
-            super::super::tune::load();
             st.decoded_cache_target_bytes = super::super::tune::decoded_bytes();
             st.physical_cache_target_bytes = super::super::tune::physical_bytes();
             st.requested_workers = super::super::tune::workers();

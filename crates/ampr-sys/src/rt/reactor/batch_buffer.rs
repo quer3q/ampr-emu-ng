@@ -117,8 +117,16 @@ impl AprAioReactor {
             apr_libkernel_rc_to_sce(submitRcRaw)
         };
         if submitRc != 0 {
+            crate::rt::stats::apr_call_error(
+                b'n',
+                submitRc.into(),
+                b"native batch lane=",
+                laneIndex.into(),
+                b"",
+            );
             return false;
         }
+        crate::rt::stats::add(crate::rt::stats::Stat::NativeBatchSubmits, 1);
         state.submitId = submitId;
         state.submitTimeNs = time_counter_now();
         if state.lastReleaseTimeNs < state.submitTimeNs {

@@ -29,11 +29,15 @@ pub(crate) const ON: bool = cfg!(feature = "mem_report");
 pub(crate) const TUNE_PATH: &CStr = c"/data/ampr_emu_tune.txt";
 /// Pipelines a release build has; the debug build has room for 32.
 pub(crate) const RELEASE_PIPELINES: u32 = 16;
-/// Pread pool threads a release build starts: 32, more than the 16
-/// pipelines, because split loose reads (reactor/loose_pread.rs) use them too.
-/// A game, loose files, internal SSD, debug /metrics: 16 threads split
-/// 73% of loose reads at 1.35 ms per read, 32 threads split 98% at 1.10 ms.
-pub(crate) const RELEASE_PREAD_THREADS: u32 = 32;
+/// Most pread pool threads, both builds (the pool starts at 1 and grows on
+/// demand within the thread budget, rt/thread_hooks.rs). At 32 a game's own
+/// thread creation failed once the pool had grown to 24, with never more
+/// than 4 reads in flight; a zstd title peaked at 5-6 threads and its game
+/// wait per read did not change between 8 and 32 (debug /metrics).
+pub(crate) const RELEASE_PREAD_THREADS: u32 = 16;
+/// Most worker threads the runtime grows, all groups together, both builds
+/// (rt/thread_hooks.rs budget); the debug knob `thread_budget` lowers it.
+pub(crate) const THREAD_BUDGET: u32 = 16;
 /// Upper bound of `ra` (one u64 bitmask per read-ahead job, pack/readahead.rs).
 pub(crate) const RA_MAX: u32 = 64;
 
@@ -76,6 +80,10 @@ const READ_CHUNK_QUANTUM: usize = 12;
 const PER_READ_ACTIVE_KIB: usize = 13;
 const PER_READ_ACTIVE_CHUNKS: usize = 14;
 const LANE_EOP_OVERLAP: usize = 15;
+const PREAD_WAKE_ALL: usize = 16;
+const ZSTD_VERIFY: usize = 17;
+const EQUEUE_LOCAL: usize = 18;
+const THREAD_BUDGET_KNOB: usize = 19;
 
 /// Smallest pass budget and per-read active window, in KiB: one full read
 /// slice (kSoftwareReadChunkMax, 512 KiB). A smaller value would leave a full
@@ -87,7 +95,7 @@ const READ_LIMIT_MAX_KIB: u32 = 16 * 1024;
 
 /// Cache sizes: 0 turns a cache off (reads bypass it); otherwise the cache
 /// allocators' minimums apply (decoded 16, physical 8 MiB, pack/manifest.rs).
-pub(crate) static KNOBS: [Knob; 16] = [
+pub(crate) static KNOBS: [Knob; 20] = [
     knob(
         "decoded_mib",
         false,
@@ -182,6 +190,10 @@ pub(crate) static KNOBS: [Knob; 16] = [
         1,
         AMPR_EMU_APR_LANE_EOP_OVERLAP as u32,
     ),
+    knob("pread_wake_all", true, 0, 1, 0),
+    knob("zstd_verify", false, 0, 1, ON as u32),
+    knob("equeue_local", false, 0, 1, 0),
+    knob("thread_budget", true, 1, THREAD_BUDGET, THREAD_BUDGET),
 ];
 
 /// (name, [decoded_mib, physical_mib, workers, pipelines, reserve_mib]).
@@ -270,6 +282,36 @@ pub(crate) fn loose_pread_part_kib() -> u32 {
         get(LOOSE_PREAD_PART_KIB)
     } else {
         AMPR_EMU_APR_LOOSE_PREAD_PART_KIB
+    }
+}
+/// 1: a pool submit wakes every pool thread (the old behavior, for A/B);
+/// 0: one thread per queued task (reactor/pread_pool.rs).
+pub(crate) fn pread_wake_all() -> bool {
+    ON && get(PREAD_WAKE_ALL) != 0
+}
+/// 1 (the debug default): zstd decoders check each chunk's frame checksum,
+/// and a mismatch fails the read and logs a 'Z' event. Release never
+/// checks. Read when the decoders are created.
+pub(crate) fn zstd_verify() -> bool {
+    ON && get(ZSTD_VERIFY) != 0
+}
+/// 1 lets the equeue overlay wait on a queue it classified as AMPR-only in
+/// user space (rt/equeue.rs `queue_would_be_exclusive_local_ignoring_amm_health_locked`);
+/// 0, the default in both builds, keeps every tracked wait a native kernel
+/// wait, which the overlay wakes privately to hand over its own events.
+/// The user-space wait missed native events added by paths the overlay
+/// does not hook (a game's save mount was never unmounted, kernel log).
+/// Queues are tracked either way (rt/hook.rs `refresh`): the kernel merges
+/// two events of one id, which hung a save load. The knob is for A/B.
+pub(crate) fn equeue_local() -> bool {
+    ON && get(EQUEUE_LOCAL) != 0
+}
+/// `THREAD_BUDGET`; the debug build reads `thread_budget` (1..=16).
+pub(crate) fn thread_budget() -> u32 {
+    if ON {
+        get(THREAD_BUDGET_KNOB)
+    } else {
+        THREAD_BUDGET
     }
 }
 pub(crate) fn pread_threads() -> usize {
@@ -423,7 +465,8 @@ const O_CREAT: c_int = 0x200;
 const O_TRUNC: c_int = 0x400;
 
 /// Reads TUNE_PATH into the knobs; a missing or bad file keeps the defaults
-/// of the pairs it does not set. Called once, before the pack state is built.
+/// of the pairs it does not set. Called once, from module_start before the
+/// hooks install (rt/exports.rs).
 pub(crate) unsafe fn load() {
     if !ON {
         return;
@@ -535,6 +578,7 @@ mod tests {
                 AMPR_EMU_APR_LANE_EOP_OVERLAP as u32,
             ),
             (PREAD_THREADS, "pread_threads", RELEASE_PREAD_THREADS),
+            (PREAD_WAKE_ALL, "pread_wake_all", 0),
         ];
         for (i, name, v) in defaults {
             assert_eq!((KNOBS[i].name, knob_value(i)), (name, v));
@@ -550,7 +594,7 @@ mod tests {
             KNOBS[PREAD_THREADS].max as usize,
             AMPR_EMU_PACK_PREAD_WORKERS
         );
-        assert_eq!(AMPR_EMU_PACK_PREAD_WORKERS, if ON { 64 } else { 32 });
+        assert_eq!(AMPR_EMU_PACK_PREAD_WORKERS, 16);
         if !ON {
             assert_eq!(read_pass_bytes(), AMPR_EMU_APR_READ_PASS_MAX_BYTES);
             assert_eq!(read_chunk_quantum(), AMPR_EMU_APR_READ_CHUNK_QUANTUM);
@@ -561,6 +605,8 @@ mod tests {
             );
             assert_eq!(pread_threads(), RELEASE_PREAD_THREADS as usize);
             assert!(!lane_eop_overlap());
+            assert!(!pread_wake_all());
+            assert!(!zstd_verify());
         }
     }
 

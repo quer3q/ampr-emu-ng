@@ -359,6 +359,7 @@ pub(crate) unsafe fn advance_virtual_read_aio(
             let decode_rc =
                 decode_task_chunk(state, worker, pipeline, &chunk, &task, prefetch, output);
             if decode_rc != 0 {
+                note_decode_error(job.file_id, task.chunk_index, &chunk, decode_rc);
                 return fail_virtual_read(pipeline, decode_rc, error_out);
             }
             pipeline.task_index += 1;
@@ -372,6 +373,37 @@ pub(crate) unsafe fn advance_virtual_read_aio(
         }
         PipelineStep::Complete
     }
+}
+
+/// Debug: a chunk that failed to decode (with `zstd_verify`, also a frame
+/// checksum mismatch) as op b'Z', lookup b'-', path "decode fid=<file id>
+/// chunk=<file chunk> pack=<volume> off=<volume offset> size=<stored>" (hex).
+fn note_decode_error(file_id: u32, chunk_index: u32, chunk: &AmprPackChunkView, rc: c_int) {
+    if !cfg!(feature = "mem_report") {
+        return;
+    }
+    let mut buf = [0u8; 128];
+    let mut n = 0;
+    let mut text = |s: &[u8]| {
+        buf[n..n + s.len()].copy_from_slice(s);
+        n += s.len();
+    };
+    let fields: [(&[u8], u64); 5] = [
+        (b"decode fid=", file_id as u64),
+        (b" chunk=", chunk_index as u64),
+        (b" pack=", chunk.pack_id as u64),
+        (b" off=", chunk.offset),
+        (b" size=", chunk.stored_size as u64),
+    ];
+    for (label, v) in fields {
+        text(label);
+        let digits = (64 - (v | 1).leading_zeros()).div_ceil(4);
+        for i in (0..digits).rev() {
+            text(&[b"0123456789abcdef"[((v >> (i * 4)) & 0xf) as usize]]);
+        }
+    }
+    // buf[n] is still 0: the path is NUL-terminated.
+    stats::fs_event(b'Z', b'-', rc as i64, buf.as_ptr().cast());
 }
 
 /// Finishes the completed native read (mandatory group or window). Some(step)

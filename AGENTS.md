@@ -50,7 +50,13 @@ ids 100..=109 route the game's own kernel AIO (`sceKernelAioSubmitReadCommands*`
 poll, wait, delete, cancel) to the runtime's AIO emulation
 (`rt/pack/aio.rs`, `rt/pack/aio_wait.rs`); the runtime's own native AIO
 calls the pre-detour slot (`real_aio_*` in `rt/pack/libkernel.rs`), never
-the symbol by name, which would re-enter the hook.
+the symbol by name, which would re-enter the hook. The exception is ids
+110..=111 (`scePthreadCreate`, `pthread_create`, `rt/thread_hooks.rs`):
+they install in every title, packs or not. A game thread creation that
+fails with EAGAIN makes the runtime give threads back and is retried; the
+runtime-wide budget of 16 worker threads is cut and regrows by one per
+30 s quiet. The runtime creates its own threads through `create_internal`
+(the pre-detour slot).
 CI (`.github/workflows/build.yml`) runs the same commands; a pushed `v*` tag creates a draft release with both `.sprx` and `SHA256SUMS`.
 
 ## Conventions
@@ -60,14 +66,15 @@ CI (`.github/workflows/build.yml`) runs the same commands; a pushed `v*` tag cre
 - No new dependencies without a stated reason. Runtime dependencies use
   `default-features = false`, and `lz4_flex`, `zstd-sys`, `iced-x86` are
   pinned (`=x.y.z`); follow that.
-- Memory budget: the release pool is 128 MiB (`0x8000000`); the debug
-  build's is 256 MiB (`AMPR_DEBUG_POOL_SIZE`). With the current defaults
-  (32 MiB physical and 16 MiB decoded cache, debug build at the 128 MiB
-  release pool, ~75 s after launch) the measured peaks are 113.6 MiB (a fully packed LZ4
-  UE3 title, 25.2 MiB index), 93.2 MiB (a fully packed LZ4 UE5 title),
-  95.6 MiB (a REDengine title, zstd) and 90.7 MiB (an RE Engine title,
-  zstd). The peak grows with the index; the UE3 title leaves 14.4 MiB free.
-  Release runtime memory (PRX segments) is 136.7 MiB. Any change that grows
+- Memory budget: the release pool is 192 MiB (`0xC000000`); the debug
+  build's is 256 MiB (`AMPR_DEBUG_POOL_SIZE`). The cache defaults are 64 MiB
+  physical and 32 MiB decoded. With the earlier 32 + 16 MiB caches (debug
+  build at a 128 MiB pool, ~75 s after launch) the measured peaks were
+  113.6 MiB (a fully packed LZ4 UE3 title, 25.2 MiB index), 93.2 MiB (a
+  fully packed LZ4 UE5 title), 95.6 MiB (a REDengine title, zstd) and
+  90.7 MiB (an RE Engine title, zstd); the 48 MiB larger caches put the UE3
+  title near 161.6 MiB, not measured yet. The peak grows with the index.
+  Release runtime memory (PRX segments) is 200.7 MiB. Any change that grows
   runtime memory needs a measurement and an updated Makefile comment.
 - Comments: plain prose `//!` and `///`, saying why, with the measured numbers
   and the source they come from (e.g. `rt/stats.rs`). Large files group items under

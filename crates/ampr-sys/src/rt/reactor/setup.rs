@@ -42,8 +42,18 @@ impl AprAioReactor {
         unsafe { sceKernelAioInitialize(&mut param) }
     }
 
-    /// Only fed the dropped `aioSubmitEagainCount` counter.
-    pub(crate) fn note_aio_submit_result(&self, _sceRc: c_int, _requestCount: usize) {}
+    /// Debug counters: request ids the kernel accepted, submits deferred
+    /// (EAGAIN: the kernel AIO table is full) and refused otherwise.
+    pub(crate) fn note_aio_submit_result(&self, sceRc: c_int, requestCount: usize) {
+        use crate::rt::stats::{self, Stat};
+        if sceRc == 0 {
+            stats::add(Stat::AioIdsSubmitted, requestCount as u64);
+        } else if apr_aio_submit_sce_rc_is_deferred(sceRc) {
+            stats::add(Stat::AioSubmitDeferred, 1);
+        } else {
+            stats::add(Stat::AioSubmitFailed, 1);
+        }
+    }
 
     pub(crate) fn configure_worker_thread(&self) {
         unsafe {

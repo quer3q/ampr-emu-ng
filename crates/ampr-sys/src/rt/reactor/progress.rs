@@ -465,6 +465,16 @@ impl AprAioReactor {
         if deleteRc != 0 {
             abort();
         }
+        for &r in &deleteResults[..terminalCount] {
+            crate::rt::stats::add(
+                if r == 0 {
+                    crate::rt::stats::Stat::AioIdsDeleted
+                } else {
+                    crate::rt::stats::Stat::AioDeleteFailed
+                },
+                1,
+            );
+        }
 
         let mut completedAny = false;
         for terminal in 0..terminalCount {

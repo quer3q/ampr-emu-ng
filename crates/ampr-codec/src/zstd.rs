@@ -78,6 +78,21 @@ impl ZstdDecoder {
         Self { dctx }
     }
 
+    /// Turns the frame checksum check (XXH64, written by the packer) on or
+    /// off; off after `new`. On costs a few percent of decode time and
+    /// fails a chunk whose decoded bytes do not match. False when libzstd
+    /// refused the setting. Call between frames.
+    pub fn set_verify_checksum(&mut self, on: bool) -> bool {
+        !self.dctx.is_null()
+            && unsafe {
+                ZSTD_isError(ZSTD_DCtx_setParameter(
+                    self.dctx,
+                    ZSTD_dParameter::ZSTD_d_experimentalParam3,
+                    i32::from(!on),
+                ))
+            } == 0
+    }
+
     /// Decodes a built-in full-size (256 KiB, 256 KiB window) frame into
     /// `scratch`, so the decoder's buffers reach the size of the largest
     /// real chunk before the first one. Callers pass the scratch they
@@ -193,5 +208,18 @@ mod tests {
                 .decode(ZSTD_CODEC_ZSTD, raw - 1, &FRAME, &mut out)
                 .is_err());
         }
+        // With the check on, the wrong checksum fails and the good frame
+        // still decodes; off again, the wrong one passes.
+        assert!(decoder.set_verify_checksum(true));
+        assert!(decoder
+            .decode(ZSTD_CODEC_ZSTD, raw, &bad_sum, &mut out)
+            .is_err());
+        decoder
+            .decode(ZSTD_CODEC_ZSTD, raw, &FRAME, &mut out)
+            .unwrap();
+        assert!(decoder.set_verify_checksum(false));
+        decoder
+            .decode(ZSTD_CODEC_ZSTD, raw, &bad_sum, &mut out)
+            .unwrap();
     }
 }

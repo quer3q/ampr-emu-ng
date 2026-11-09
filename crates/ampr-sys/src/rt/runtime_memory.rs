@@ -12,7 +12,7 @@ use core::ptr::{null, null_mut};
 
 /// Pool size from the Makefile's `AMPR_INTERNAL_POOL_SIZE` (decimal or 0x hex,
 /// optional C `ull` suffix); 256 MiB if unset, for a build outside the
-/// Makefile (which sets 128 MiB). Rounded up to a page multiple.
+/// Makefile (which sets 192 MiB). Rounded up to a page multiple.
 const STATIC_POOL_SIZE: usize = {
     let v = match option_env!("AMPR_INTERNAL_POOL_SIZE") {
         Some(s) => parse_size(s.as_bytes()),

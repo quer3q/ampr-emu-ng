@@ -75,15 +75,7 @@ use super::reactor;
 pub(crate) use super::reactor::apr_reactor_notify_external_progress;
 
 // ---- libScePthread thread API (same signatures as rt/reactor/mod.rs) -------
-pub(crate) type ScePthreadAttr = *mut c_void;
 unsafe extern "C" {
-    pub(crate) fn scePthreadCreate(
-        thread: *mut ScePthread,
-        attr: *const ScePthreadAttr,
-        entry: unsafe extern "C" fn(*mut c_void) -> *mut c_void,
-        arg: *mut c_void,
-        name: *const c_char,
-    ) -> c_int;
     pub(crate) fn scePthreadJoin(thread: ScePthread, value: *mut *mut c_void) -> c_int;
     pub(crate) fn scePthreadSelf() -> ScePthread;
     pub(crate) fn scePthreadSetprio(thread: ScePthread, prio: c_int) -> c_int;
@@ -670,28 +662,31 @@ pub(crate) const AMPR_EMU_PACK_VIRTUAL_FD_SLOTS: usize = 512;
 pub(crate) const AMPR_EMU_PACK_VIRTUAL_FD_BASE: usize = 512;
 pub(crate) const AMPR_EMU_PACK_VIRTUAL_AIO_SLOTS: usize = 256;
 pub(crate) const AMPR_EMU_PACK_MAX_PACKS: usize = 1024;
-pub(crate) const AMPR_EMU_PACK_OPEN_PACK_FD_CAP: u32 = 18;
-/// 16 MiB. A fully packed LZ4 UE3 title (debug /metrics, 75 s from launch,
+/// Pack volume descriptors open at once, at most one per volume; the least
+/// recently used closes to open another. 32, the most a mandatory page group
+/// may span (PACK_MANDATORY_GROUP_MAX_REQUESTS). A zstd title with 28
+/// volumes kept all 18 of the old cap busy (debug /metrics).
+pub(crate) const AMPR_EMU_PACK_OPEN_PACK_FD_CAP: u32 = 32;
+/// 32 MiB. At 16 MiB a zstd title (debug /metrics, 150 s) re-decoded an
+/// evicted chunk in 73% of its misses: 29.9 GB decoded for 6.56 GB read.
+/// Before, at 16 MiB: a fully packed LZ4 UE3 title (debug /metrics, 75 s from launch,
 /// 128 MiB pool) re-decodes a third of its chunks: 16 MiB served 14% of
 /// chunk reads, cut repeat decodes 34.7k -> 20.7k and the pack job
 /// 1.44-1.46 -> 1.40 ms (two runs without it differ by ~2%), for 16 MiB of
 /// pool (peak 113.6 MiB of 128).
 /// Other titles, same build: a fully packed LZ4 UE5 title 2.6% hits, a
 /// REDengine title (zstd) 59.6%, an RE Engine title (zstd) 20.9%.
-/// It is carved after the physical cache (manifest.rs). The default equals
-/// the 16 MiB minimum, so if the pool is short it is tried once and stays
-/// off; a larger tune or runtime-profile size halves down to the minimum.
-pub(crate) const AMPR_EMU_PACK_DECODED_CACHE_BYTES: u64 = 16 * 1024 * 1024;
+/// It is carved after the physical cache (manifest.rs); in a short pool it
+/// halves down to the 16 MiB minimum, then stays off.
+pub(crate) const AMPR_EMU_PACK_DECODED_CACHE_BYTES: u64 = 32 * 1024 * 1024;
 pub(crate) const AMPR_EMU_PACK_DECODED_CACHE_MIN_BYTES: u64 = 16 * 1024 * 1024;
 pub(crate) const AMPR_EMU_PACK_MEMORY_RESERVE_BYTES: u64 = 4 * 1024 * 1024;
-/// 32 MiB, carved before the decoded cache (manifest.rs): besides its hits
-/// it is where the read planner
-/// (page_plan.rs) joins neighbouring pages into one large read; with it off reads fell
-/// to 66 KB (one chunk) and load APR rose 1.65 -> 2.50 ms.
-/// zstd too: 64 MiB gave APR read 1.11 -> 1.08/1.09 ms and -10% disk bytes
-/// at 8.9 GB read for 32 MiB more pool;
-/// 32 MiB is kept as the version to compare.
-pub(crate) const AMPR_EMU_PACK_PHYSICAL_CACHE_BYTES: u64 = 32 * 1024 * 1024;
+/// 64 MiB, carved before the decoded cache (manifest.rs): besides its hits
+/// it is where the read planner (page_plan.rs) joins neighbouring pages
+/// into one large read; with it off reads fell to 66 KB (one chunk) and
+/// load APR rose 1.65 -> 2.50 ms. zstd: 64 MiB against 32 gave APR read
+/// 1.11 -> 1.08/1.09 ms and -10% disk bytes at 8.9 GB read.
+pub(crate) const AMPR_EMU_PACK_PHYSICAL_CACHE_BYTES: u64 = 64 * 1024 * 1024;
 pub(crate) const AMPR_EMU_PACK_PHYSICAL_CACHE_MIN_BYTES: u64 = 8 * 1024 * 1024;
 pub(crate) const AMPR_EMU_PACK_PHYSICAL_CACHE_ENTRY_CAP: usize = 4096;
 pub(crate) const AMPR_EMU_PACK_PHYSICAL_CACHE_HASH_BUCKETS: usize = 8192;

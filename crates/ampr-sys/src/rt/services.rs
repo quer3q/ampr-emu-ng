@@ -444,6 +444,7 @@ unsafe fn submit(
         },
     );
     if rc != 0 {
+        super::stats::apr_call_error(b'u', rc.into(), b"submit prio=", prio.into(), b"");
         return reject(res, rc);
     }
     if !id.is_null() {
@@ -500,15 +501,27 @@ pub unsafe extern "C" fn sceKernelAprSubmitCommandBufferAndGetId_emul(
 
 /// Synthetic (reactor-owned) ids first, else the original libkernel wait.
 unsafe fn wait(id: SceAprSubmitId, hook_id: usize) -> c_int {
+    use super::stats::{self, Stat};
+    stats::add(Stat::AprWaits, 1);
     let mut handled = false;
     let rc = apr_reactor_wait_synthetic_submit_id(id, &mut handled);
     if handled {
+        if rc != 0 {
+            stats::add(Stat::AprWaitErrors, 1);
+            stats::apr_call_error(b'w', rc.into(), b"wait id=", id as u64, b" how=s");
+        }
         return libkernel_return_from_sce(rc);
     }
-    match kernel_slot::<unsafe extern "C" fn(SceAprSubmitId) -> c_int>(hook_id) {
+    stats::add(Stat::AprWaitNative, 1);
+    let rc = match kernel_slot::<unsafe extern "C" fn(SceAprSubmitId) -> c_int>(hook_id) {
         Some(f) => f(id),
         None => libkernel_return_from_sce(SCE_KERNEL_ERROR_ENOSYS),
+    };
+    if rc != 0 {
+        stats::add(Stat::AprWaitErrors, 1);
+        stats::apr_call_error(b'w', rc.into(), b"wait id=", id as u64, b" how=n");
     }
+    rc
 }
 
 pub unsafe extern "C" fn sceKernelAprWaitCommandBuffer_emul(id: SceAprSubmitId) -> c_int {

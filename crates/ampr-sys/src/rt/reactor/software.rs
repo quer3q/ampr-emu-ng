@@ -131,6 +131,7 @@ impl AprAioReactor {
         let address = unsafe { AtomicU64::from_ptr(addr as *mut u64) };
         unsafe { *outHandled = true };
         if !wait {
+            crate::rt::stats::add(crate::rt::stats::Stat::SoftwareWriteAddress, 1);
             address.store(op.u64a, Ordering::Release);
             unsafe { *outComplete = true };
             return true;

@@ -254,6 +254,9 @@ unsafe fn make_slots() -> bool {
             break;
         }
         let mut decoder = alloc::boxed::Box::new(ampr_codec::ZstdDecoder::new());
+        if crate::rt::tune::zstd_verify() {
+            let _ = decoder.set_verify_checksum(true);
+        }
         let out = unsafe { core::slice::from_raw_parts_mut(buf.add(CHUNK as usize), CHUNK as usize) };
         // A decoder that cannot warm up (libzstd allocation or init failed)
         // would fail its first fill; fail the setup instead, so every map

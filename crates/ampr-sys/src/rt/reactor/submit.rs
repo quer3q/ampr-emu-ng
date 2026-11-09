@@ -1,6 +1,7 @@
 //! Direct-read fd policy, read descriptor acquire/release, `submit` and synthetic submit-id waits.
 
 use super::*;
+use crate::rt::stats::{self, Stat};
 
 pub(crate) const fn apr_direct_read_aio_limit(effectiveLimit: u32, baseLimit: u32) -> u32 {
     if effectiveLimit == 0 || baseLimit == 0 {
@@ -244,9 +245,12 @@ impl AprAioReactor {
                 return SCE_KERNEL_ERROR_ECANCELED;
             }
             self.jobStateWaiterCount.fetch_add(1, Ordering::Release);
+            stats::add(Stat::AprSubmitBlocked, 1);
+            stats::enter(Stat::AprSubmitBlockedNow);
             self.jobStateAvailableCv.wait_until(&mut lk, || {
                 self.stopping() || self.jobStateFreeCount.load(Ordering::Acquire) != 0
             });
+            stats::leave(Stat::AprSubmitBlockedNow);
             self.jobStateWaiterCount.fetch_sub(1, Ordering::Release);
             if self.stopping() {
                 return SCE_KERNEL_ERROR_ECANCELED;
@@ -297,7 +301,10 @@ impl AprAioReactor {
                         self.release_job_state(job);
                         return SCE_KERNEL_ERROR_ECANCELED;
                     }
+                    stats::add(Stat::AprSubmitBlocked, 1);
+                    stats::enter(Stat::AprSubmitBlockedNow);
                     self.syntheticRequestAvailableCv.wait(&mut lk);
+                    stats::leave(Stat::AprSubmitBlockedNow);
                 }
                 // The lower submit-id descriptor is released on completion.
                 while !self.allocate_synthetic_lower_slot_locked(js, &mut syntheticId) {
@@ -307,7 +314,10 @@ impl AprAioReactor {
                         self.release_job_state(job);
                         return SCE_KERNEL_ERROR_ECANCELED;
                     }
+                    stats::add(Stat::AprSubmitBlocked, 1);
+                    stats::enter(Stat::AprSubmitBlockedNow);
                     self.syntheticLowerSlotAvailableCv.wait(&mut lk);
+                    stats::leave(Stat::AprSubmitBlockedNow);
                 }
             }
             js.stat_accepted();
@@ -353,6 +363,7 @@ impl AprAioReactor {
         if !(lower.active && lower.generation == generation)
             && self.take_synthetic_done_result_locked(id, &mut completedResult)
         {
+            stats::add(Stat::AprWaitDoneRing, 1);
             set_handled(true);
             return completedResult;
         }
@@ -362,6 +373,7 @@ impl AprAioReactor {
             return 0;
         }
         set_handled(true);
+        stats::add(Stat::AprWaitLive, 1);
         let slot = requestSlot as usize;
         let waitSlot = &mut self.syntheticWaitSlots[slot];
         if waitSlot.waiterClaimed {
@@ -378,10 +390,12 @@ impl AprAioReactor {
         let laneIndex = waitSlot.prioIndex as usize;
         self.reactorWakeEpoch.fetch_add(1, Ordering::Release);
         self.reactorCv.notify_one();
+        stats::enter(Stat::AprWaitBlockedNow);
         self.syntheticWaitCvs[laneIndex].wait_until(&mut lk, || {
             let current = &self.syntheticWaitSlots[slot];
             !current.active || current.submitId != id || current.done
         });
+        stats::leave(Stat::AprWaitBlockedNow);
         let completed = &mut self.syntheticWaitSlots[slot];
         if !completed.active || completed.submitId != id {
             return SCE_KERNEL_ERROR_ESRCH;

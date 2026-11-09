@@ -84,6 +84,12 @@ impl AprAioReactor {
                     if rc == SCE_KERNEL_ERROR_EAGAIN {
                         continue;
                     }
+                    // No pool thread (all given to the game, or none could
+                    // start): kernel AIO from the next pass, not a failed read.
+                    if rc == SCE_KERNEL_ERROR_ENOMEM {
+                        external.preadBacked = false;
+                        continue;
+                    }
                     if rc != 0 {
                         self.externalAioLiveCount.fetch_sub(1, Ordering::Release);
                         self.notify_external_aio(

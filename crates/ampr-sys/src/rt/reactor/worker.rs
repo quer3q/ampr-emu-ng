@@ -537,6 +537,44 @@ pub unsafe fn apr_reactor_submit_external_aio_read_group(
     )
 }
 
+/// A game thread creation failed (rt/thread_hooks.rs): asks the read pool
+/// to give up to `want` threads back. Returns how many exited.
+pub unsafe fn pread_pool_yield(want: u32) -> u32 {
+    let reactor = g_apr_aio_reactor.load(Ordering::Acquire);
+    if reactor.is_null() {
+        0
+    } else {
+        unsafe { (*reactor).yield_pread_threads(want) }
+    }
+}
+
+/// Pool thread exits asked (pread_pool_yield) not yet done.
+pub fn pread_pool_pending_exits() -> u32 {
+    let reactor = g_apr_aio_reactor.load(Ordering::Acquire);
+    if reactor.is_null() {
+        return 0;
+    }
+    let r = unsafe { &*reactor };
+    let _g = r.preadMutex.lock();
+    r.preadExitRequests
+}
+
+/// Debug /metrics: live pool threads, ceiling, idle threads.
+#[cfg(feature = "mem_report")]
+pub fn pread_pool_state() -> (u64, u64, u64) {
+    let reactor = g_apr_aio_reactor.load(Ordering::Acquire);
+    if reactor.is_null() {
+        return (0, 0, 0);
+    }
+    let r = unsafe { &*reactor };
+    let _g = r.preadMutex.lock();
+    (
+        r.preadThreadCount as u64,
+        r.preadCeiling as u64,
+        r.preadIdle as u64,
+    )
+}
+
 pub unsafe fn apr_reactor_notify_external_progress() {
     let reactor = g_apr_aio_reactor.load(Ordering::Acquire);
     if !reactor.is_null() {

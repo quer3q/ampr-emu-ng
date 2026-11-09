@@ -10,34 +10,38 @@ BUILD_MAKEFILE := $(lastword $(MAKEFILE_LIST))
 # 1 = debug build: TCP metrics endpoint on port 9090 (rt/exports.rs, rt/stats.rs).
 AMPR_MEM_REPORT ?= 0
 # Internal pool size in bytes, read by rt/runtime_memory.rs.
-# 128 MiB: startup peak = cache-reserve 40 (4 + 16 pipeline I/O windows x
-# 2 MiB + 4 worker buffers x 1 MiB) + physical cache 32 + decoded cache 16
+# 192 MiB: startup peak = cache-reserve 40 (4 + 16 pipeline I/O windows x
+# 2 MiB + 4 worker buffers x 1 MiB) + physical cache 64 + decoded cache 32
 # (rt/pack/mod.rs) + the index, which grows with file count. The reserve is
-# released once the caches are carved, so play uses less. Debug build
-# with this 128 MiB pool, default knobs, folder installs, debug /metrics ~75 s after launch, pool
-# peak (index): a fully packed LZ4 UE3 title 113.6 MiB (25.2), 81.6 MiB in
-# use while it plays; a fully packed LZ4 UE5 title 93.2 MiB (5.2); a
-# REDengine title (zstd) 95.6 MiB (7.6); an RE Engine title (zstd) 90.7 MiB
-# (2.6). All four play and save with 0 job, decode or address errors. The
-# largest index leaves 14.4 MiB free. The pool is .bss: release runtime
-# memory (PRX segments) is 136.7 MiB; the original C++ ampr_emu ran with a
-# 384 MiB pool.
-AMPR_INTERNAL_POOL_SIZE ?= 0x8000000
-# Debug build pool: 256 MiB, twice the release pool, so a title with a
+# released once the caches are carved, so play uses less. Measured with
+# the earlier 32 + 16 MiB caches, debug build with a 128 MiB pool, default
+# knobs, folder installs, debug /metrics ~75 s after launch, pool peak
+# (index): a fully packed LZ4 UE3 title 113.6 MiB (25.2), 81.6 MiB in use
+# while it plays; a fully packed LZ4 UE5 title 93.2 MiB (5.2); a REDengine
+# title (zstd) 95.6 MiB (7.6); an RE Engine title (zstd) 90.7 MiB (2.6).
+# All four play and save with 0 job, decode or address errors. The caches
+# grew by 48 MiB (a zstd title re-decoded 73% of its decoded cache misses
+# at 16 MiB), so the UE3 title should peak near 161.6 MiB; not measured
+# yet. The pool is .bss: release runtime memory (PRX segments) is
+# 200.7 MiB; the original C++ ampr_emu ran with a 384 MiB pool. The .bss
+# does not count against the game's flexible memory (debug /metrics
+# flex_at_start_bytes).
+AMPR_INTERNAL_POOL_SIZE ?= 0xC000000
+# Debug build pool: 256 MiB, 64 MiB above the release pool, so a title with a
 # larger index, or the low and medium tune profiles, runs with the full
 # cache targets; high (~262 MiB, rt/tune.rs PROFILES) still shrinks. The
 # cache targets do not grow with the pool, so the debug /metrics pool peak
 # is the memory at those targets. Only the startup carve adapts to a
 # short release pool: the caches halve, and each turns off below its
 # minimum, until index + reserve + caches fit (rt/pack/manifest.rs
-# alloc_cache_region). Pool use above 128 MiB after the carve (e.g. the
+# alloc_cache_region). Pool use above 192 MiB after the carve (e.g. the
 # zstd projection, rt/pack/zstd.rs) fails in release. Debug runtime memory (PRX segments, program headers
-# of out/debug/libSceAmpr.prx) is 266.4 MiB, release 136.7 MiB.
+# of out/debug/libSceAmpr.prx) is 266.4 MiB, release 200.7 MiB.
 AMPR_DEBUG_POOL_SIZE ?= 0x10000000
-# Release pread threads 16 -> 32 (tune::RELEASE_PREAD_THREADS) for split loose
-# reads; the pool peak did not change with 16, 32 and 64 threads (debug
-# /metrics). Thread stacks are libkernel default
-# stacks outside the pool and were not measured. Static reactor storage, also
+# Pread pool threads: at most 16 (tune::RELEASE_PREAD_THREADS), within the
+# runtime-wide budget of 16 worker threads (rt/thread_hooks.rs); the pool
+# peak did not change with 16 to 64 threads (debug /metrics). Their 32 KiB
+# stacks are libkernel memory outside the pool. Static reactor storage, also
 # outside the pool (host size_of vs commit 52ef644): AprAioReactor
 # 1985736 -> 1988440 B release (+2.6 KiB), 1985864 -> 2054232 B debug
 # (+66.8 KiB); ActiveRead 264 -> 280 B. Debug only (host size_of): the
@@ -45,8 +49,8 @@ AMPR_DEBUG_POOL_SIZE ?= 0x10000000
 # and AprAioReactor 2054232 -> 2152536 B (+96 KiB, 4096 slots), and the
 # /fsfail table adds ~14 KiB of .bss; release sizes unchanged.
 # One runtime reads LZ4 (AMPRPAK4) and zstd (AMPRZPK1) packs, picked at load,
-# from one pool (peaks above). The 4 virtual-fd read threads
-# (rt/pack/fd_read.rs) have 256 KiB libkernel stacks outside the pool.
+# from one pool (peaks above). The at most 4 virtual-fd read threads
+# (rt/pack/fd_read.rs) have 128 KiB libkernel stacks outside the pool.
 # Virtual fds, the libc hooks and mmap below serve both formats, in a title
 # that ships packs only (a plain title keeps the v0.2.0 hooks, rt/hook.rs
 # `hook_enabled`).

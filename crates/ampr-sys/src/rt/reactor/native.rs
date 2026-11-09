@@ -136,6 +136,21 @@ impl AprAioReactor {
             let paddingBytes = kAprNativeBatchPayloadSlotBytes - packedBytes;
             let dst = (addr_of_mut!((*slot).commands) as *mut u8).add(payloadOffset as usize);
             ptr::copy_nonoverlapping(packedSource as *const u8, dst, packedBytes as usize);
+            {
+                use crate::rt::stats::{self, Stat};
+                stats::add(
+                    match op.op_type {
+                        WAIT_ON_COUNTER => Stat::NativeWaitOnCounter,
+                        WRITE_COUNTER => Stat::NativeWriteCounter,
+                        WRITE_EQUEUE => Stat::NativeWriteEqueue,
+                        WRITE_ADDRESS_FROM_TIME_COUNTER
+                        | WRITE_ADDRESS_FROM_COUNTER
+                        | WRITE_ADDRESS_FROM_COUNTER_PAIR => Stat::NativeWriteFromCounter,
+                        _ => Stat::NativeOther,
+                    },
+                    1,
+                );
+            }
             let paddingHeaderIndex = (paddingBytes / 4 - 1) as usize;
             let hdr = self.nativeBatchPaddingHeaders[paddingHeaderIndex];
             ptr::copy_nonoverlapping(addr_of!(hdr) as *const u8, dst.add(packedBytes as usize), 4);
@@ -953,6 +968,16 @@ impl AprAioReactor {
         let publish = unsafe {
             apr_equeue_try_publish(op.u64b as usize as SceKernelEqueue, op.u32b as i32, op.u64a)
         };
+        #[cfg(feature = "mem_report")]
+        note_equeue_target(op.u64b as usize, op.u32b, op.u64a);
+        crate::rt::stats::add(
+            match publish {
+                AprEqueuePublishResult::Published => crate::rt::stats::Stat::EqueueLocalPublished,
+                AprEqueuePublishResult::Backpressure => crate::rt::stats::Stat::EqueueLocalBackpressure,
+                AprEqueuePublishResult::NativeFallback => crate::rt::stats::Stat::EqueueLocalFallback,
+            },
+            1,
+        );
         match publish {
             AprEqueuePublishResult::Published => {
                 Self::advance_job_source(jb, opBytes);
@@ -1059,5 +1084,54 @@ impl AprAioReactor {
         }
         Self::advance_job_source(jb, opBytes);
         *progressed = true;
+    }
+}
+
+// ---- debug equeue targets ----
+
+/// Debug /metrics (rt/exports.rs `eqtarget` lines): WriteKernelEventQueue
+/// targets the game's jobs write, keyed by (queue, id): writes, the last
+/// data, how often data changed from the previous write, and the time of
+/// the last write. Our native batch can run several jobs' event writes back
+/// to back, so a kernel event that clears on delivery may arrive once for
+/// two writes; that loses information only if data differs per job.
+#[cfg(feature = "mem_report")]
+pub(crate) struct EqueueTarget {
+    pub(crate) eq: AtomicUsize,
+    pub(crate) id: AtomicU32,
+    pub(crate) writes: AtomicU64,
+    pub(crate) data: AtomicU64,
+    pub(crate) changes: AtomicU64,
+    pub(crate) last_ns: AtomicU64,
+}
+#[cfg(feature = "mem_report")]
+pub(crate) static EQUEUE_TARGETS: [EqueueTarget; 16] = [const {
+    EqueueTarget {
+        eq: AtomicUsize::new(0),
+        id: AtomicU32::new(0),
+        writes: AtomicU64::new(0),
+        data: AtomicU64::new(0),
+        changes: AtomicU64::new(0),
+        last_ns: AtomicU64::new(0),
+    }
+}; 16];
+
+/// Reactor thread only (the single writer).
+#[cfg(feature = "mem_report")]
+fn note_equeue_target(eq: usize, id: u32, data: u64) {
+    for t in &EQUEUE_TARGETS {
+        let cur = t.eq.load(Ordering::Relaxed);
+        if cur == 0 {
+            t.id.store(id, Ordering::Relaxed);
+            t.data.store(data, Ordering::Relaxed);
+            t.eq.store(eq, Ordering::Release);
+        } else if cur != eq || t.id.load(Ordering::Relaxed) != id {
+            continue;
+        } else if t.data.swap(data, Ordering::Relaxed) != data {
+            t.changes.fetch_add(1, Ordering::Relaxed);
+        }
+        t.writes.fetch_add(1, Ordering::Relaxed);
+        t.last_ns.store(crate::rt::services::time_counter_now(), Ordering::Relaxed);
+        return;
     }
 }

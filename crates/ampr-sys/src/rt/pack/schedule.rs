@@ -67,6 +67,7 @@ pub(crate) unsafe fn queue_push_locked(state: *mut PackState, index: u32, _queue
     }
     (*state).queue_depth[work_class] += 1;
     (*state).virtual_aio[index as usize].phase = VirtualAioPhase::Queued;
+    unsafe { super::worker::maybe_grow_workers_locked(state) };
 }
 
 pub(crate) unsafe fn queue_pop_lane_locked(

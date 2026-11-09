@@ -344,18 +344,11 @@ mod mem_report {
     };
     use super::super::tune;
     use super::bench_args;
-    use core::ffi::{c_char, c_int, c_void};
+    use core::ffi::{c_int, c_void};
 
     pub(super) const METRICS_PORT: u16 = 9090;
 
     extern "C" {
-        fn scePthreadCreate(
-            thread: *mut *mut c_void,
-            attr: *const *mut c_void,
-            entry: unsafe extern "C" fn(*mut c_void) -> *mut c_void,
-            arg: *mut c_void,
-            name: *const c_char,
-        ) -> c_int;
         fn socket(domain: c_int, kind: c_int, protocol: c_int) -> c_int;
         fn setsockopt(
             fd: c_int,
@@ -712,7 +705,7 @@ mod mem_report {
         let mut err = 0;
         while started < n {
             let rc = unsafe {
-                scePthreadCreate(
+                super::super::thread_hooks::create_internal(
                     &mut ids[started],
                     core::ptr::null(),
                     pread_job,
@@ -941,6 +934,56 @@ mod mem_report {
         let _ = unsafe { ampr_internal_amm_pool_free(buf, c"bench".as_ptr()) };
     }
 
+    /// `GET /threads?hold=N` holds up to N more idle threads, stopping at the
+    /// first failed creation; `?release=1` frees them; `?yield=N` makes the
+    /// read pool give N threads back as a failed game creation would (N at
+    /// least the live count turns the pool off); `?yield_workers=N` does the
+    /// same for the pack workers (down to 1); no argument reports.
+    /// Measures the game's thread limit (rt/thread_hooks.rs `limit_probe`).
+    unsafe fn threads(req: &[u8], out: &mut Text) {
+        use super::super::thread_hooks::limit_probe as lp;
+        let q = bench_args::query(bench_args::target(req));
+        let number = |n: &[u8]| {
+            n.iter()
+                .take_while(|c| c.is_ascii_digit())
+                .fold(0usize, |v, &c| v.saturating_mul(10).saturating_add((c - b'0') as usize))
+        };
+        if bench_args::param(q, b"release").is_some() {
+            unsafe { lp::release() };
+        } else if let Some(n) = bench_args::param(q, b"yield") {
+            // Simulates a failed game creation: the pool gives n threads back.
+            let given = unsafe { super::super::reactor::pread_pool_yield(number(n) as u32) };
+            out.kv("threads_yielded_now", given as u64);
+        } else if let Some(n) = bench_args::param(q, b"yield_workers") {
+            // As a failed game creation once the pool has none: the pack
+            // workers give n back (down to 1).
+            let given = unsafe { super::super::pack::pack_workers_yield(number(n) as u32) };
+            out.kv("threads_yielded_now", given as u64);
+        } else if let Some(n) = bench_args::param(q, b"hold") {
+            unsafe { lp::grow(number(n).min(lp::MAX_HELD)) };
+        }
+        let (held, rc) = lp::status();
+        let (live, ceiling, idle) = super::super::reactor::pread_pool_state();
+        out.kv("threads_held", held as u64)
+            .s(b"threads_hold_last_rc ")
+            .x(rc as u32)
+            .s(b"\n");
+        for (name, v) in NAMES.iter().zip(read()) {
+            if name.starts_with("thread")
+                || name.starts_with("pread_thread")
+                || name.starts_with("pack_worker")
+            {
+                out.kv(name, v);
+            }
+        }
+        let (workers, worker_ceiling) = super::super::pack::pack_workers_state();
+        out.kv("pread_threads_live", live)
+            .kv("pread_threads_ceiling", ceiling)
+            .kv("pread_threads_idle", idle)
+            .kv("pack_workers_live", workers as u64)
+            .kv("pack_workers_ceiling", worker_ceiling as u64);
+    }
+
     /// `GET /fsfail`: every distinct failed path hook call since load (op,
     /// lookup, result, count, path), first stats::FS_FAILS kept.
     fn fsfail(out: &mut Text) {
@@ -957,6 +1000,50 @@ mod mem_report {
                 .s(b" ")
                 .s(&log.path[i][..log.len[i]])
                 .s(b"\n");
+        }
+    }
+
+    /// `GET /queues`: event queue waits in progress, queues with pending
+    /// events and the queues AMPR jobs signal.
+    /// Its own page, so a busy title cannot crowd `/metrics` out of its
+    /// 16 KiB buffer.
+    fn queues(out: &mut Text) {
+        // Event queue waits in progress and queues with pending events
+        // (rt/equeue.rs `equeue_views`).
+        let mut views = [super::super::equeue::EqueueView::default(); 48];
+        let count = super::super::equeue::equeue_views(&mut views);
+        for v in &views[..count] {
+            out.s(if v.waiting { b"eqwait eq=" } else { b"eqpend eq=" }).u(v.eq as u64);
+            if v.waiting {
+                out.s(b" age_ms=").u(v.age_ms).s(b" timeout_us=");
+                if v.timeout_us == u64::MAX {
+                    out.s(b"none");
+                } else {
+                    out.u(v.timeout_us);
+                }
+            }
+            if v.tracked {
+                out.s(b" pending=").u(v.pending.into()).s(b" regs=").u(v.registrations.into());
+                out.s(b" native_intent=").u(v.native_intent.into()).s(b" parked=");
+                out.u(v.parked.into()).s(b" trigger=").u(v.trigger.into());
+                out.s(b" flags=").u(v.flags.into());
+            } else {
+                out.s(b" untracked");
+            }
+            out.s(b"\n");
+        }
+        // WriteKernelEventQueue targets (reactor/native.rs).
+        let now = super::super::services::time_counter_now();
+        for t in &super::super::reactor::EQUEUE_TARGETS {
+            use core::sync::atomic::Ordering::Relaxed;
+            let eq = t.eq.load(core::sync::atomic::Ordering::Acquire);
+            if eq == 0 {
+                continue;
+            }
+            out.s(b"eqtarget eq=").u(eq as u64).s(b" id=").u(t.id.load(Relaxed).into());
+            out.s(b" writes=").u(t.writes.load(Relaxed)).s(b" data=").u(t.data.load(Relaxed));
+            out.s(b" changes=").u(t.changes.load(Relaxed)).s(b" age_ms=");
+            out.u(now.saturating_sub(t.last_ns.load(Relaxed)) / 1_000_000).s(b"\n");
         }
     }
 
@@ -1061,6 +1148,83 @@ mod mem_report {
                     .kv("pack_pipelines", (*s).pipeline_capacity as u64);
             }
         }
+        {
+            // The game's flexible memory, free and configured: tells whether
+            // the static pool comes out of the game's budget.
+            type FlexFn = unsafe extern "C" fn(*mut usize) -> c_int;
+            let flex = |name: &core::ffi::CStr| {
+                let mut v = 0usize;
+                match unsafe { super::super::sys::resolve_kernel::<FlexFn>(name) } {
+                    Some(f) if unsafe { f(&mut v) } == 0 => v as u64,
+                    _ => 0,
+                }
+            };
+            out.kv(
+                "flex_at_start_bytes",
+                super::FLEX_AT_START.load(core::sync::atomic::Ordering::Relaxed),
+            )
+            .kv(
+                "flex_after_start_bytes",
+                super::FLEX_AFTER_START.load(core::sync::atomic::Ordering::Relaxed),
+            );
+            out.kv("flex_free_bytes", flex(c"sceKernelAvailableFlexibleMemorySize"))
+                .kv(
+                    "flex_configured_bytes",
+                    flex(c"sceKernelConfiguredFlexibleMemorySize"),
+                );
+        }
+        {
+            // The descriptor table limit (getrlimit RLIMIT_NOFILE, 0 when
+            // libkernel lacks it), how many real fds are open and the
+            // highest one (fstat on 0..scan, the limit or 1024, at most
+            // 4096). Virtual pack fds are above the table and not counted.
+            #[repr(C)]
+            struct Rlimit {
+                cur: i64,
+                max: i64,
+            }
+            type RlimitFn = unsafe extern "C" fn(c_int, *mut Rlimit) -> c_int;
+            type FstatFn = unsafe extern "C" fn(c_int, *mut c_void) -> c_int;
+            let mut lim = Rlimit { cur: 0, max: 0 };
+            let limit = match unsafe { super::super::sys::resolve_kernel::<RlimitFn>(c"getrlimit") } {
+                Some(f) if unsafe { f(8, &mut lim) } == 0 && lim.cur > 0 => lim.cur as usize,
+                _ => 0,
+            };
+            let scan = if limit != 0 { limit.min(4096) } else { 1024 };
+            // fstat, not fcntl: the libkernel fcntl entry returned -1 for
+            // every fd here, even the pack volumes'.
+            let fstat = unsafe {
+                super::super::sys::kernel_slot::<FstatFn>(super::super::sys::hook::fstat)
+            }
+            .or_else(|| unsafe { super::super::sys::resolve_kernel::<FstatFn>(c"fstat") });
+            let (mut open, mut highest) = (0u64, 0u64);
+            #[repr(C, align(16))]
+            struct StatBuf([u8; 512]);
+            let mut st = StatBuf([0; 512]);
+            if let Some(f) = fstat {
+                for fd in 0..scan as c_int {
+                    if unsafe { f(fd, st.0.as_mut_ptr().cast()) } == 0 {
+                        open += 1;
+                        highest = fd as u64;
+                    }
+                }
+            }
+            out.kv("fd_limit", limit as u64)
+                .kv("fd_open", open)
+                .kv("fd_highest_open", highest)
+                .kv("fd_scanned", scan as u64);
+        }
+        {
+            let (live, ceiling, idle) = super::super::reactor::pread_pool_state();
+            out.kv("pread_threads_live", live)
+                .kv("pread_threads_ceiling", ceiling)
+                .kv("pread_threads_idle", idle);
+            let (counted, budget) = super::super::thread_hooks::budget_state();
+            out.kv("runtime_threads_live", counted.into()).kv("thread_budget", budget.into());
+            let (workers, worker_ceiling) = super::super::pack::pack_workers_state();
+            out.kv("pack_workers_live", workers as u64)
+                .kv("pack_workers_ceiling", worker_ceiling as u64);
+        }
         tune_lines(b"tune_", out);
         let (now, peak) = pool_tags();
         tag_lines(b"pool_now:", &now, out);
@@ -1150,6 +1314,10 @@ mod mem_report {
                 unsafe { set(&req[..n as usize], metrics) };
             } else if n > 0 && req[..n as usize].starts_with(b"GET /fsfail") {
                 fsfail(metrics);
+            } else if n > 0 && req[..n as usize].starts_with(b"GET /threads") {
+                unsafe { threads(&req[..n as usize], metrics) };
+            } else if n > 0 && req[..n as usize].starts_with(b"GET /queues") {
+                queues(metrics);
             } else if n > 0 && req[..n as usize].starts_with(b"GET /modules") {
                 unsafe { modules(metrics) };
             } else {
@@ -1203,7 +1371,7 @@ mod mem_report {
     pub(super) unsafe fn start() {
         let mut thread = core::ptr::null_mut();
         let _ = unsafe {
-            scePthreadCreate(
+            super::super::thread_hooks::create_internal(
                 &mut thread,
                 core::ptr::null(),
                 run,
@@ -1214,8 +1382,34 @@ mod mem_report {
     }
 }
 
+/// Debug: the game's free flexible memory when module_start began and when
+/// it ended (hooks, index, pack manifest), to measure the runtime's own
+/// share of the game's budget (/metrics flex_at_start_bytes,
+/// flex_after_start_bytes).
+#[cfg(feature = "mem_report")]
+static FLEX_AT_START: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "mem_report")]
+static FLEX_AFTER_START: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// The process's free flexible memory, 0 when libkernel lacks the call.
+#[cfg(feature = "mem_report")]
+fn flex_free_now() -> u64 {
+    type FlexFn = unsafe extern "C" fn(*mut usize) -> c_int;
+    let mut v = 0usize;
+    match unsafe { super::sys::resolve_kernel::<FlexFn>(c"sceKernelAvailableFlexibleMemorySize") } {
+        Some(f) if unsafe { f(&mut v) } == 0 => v as u64,
+        _ => 0,
+    }
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn module_start(_args: usize, _argp: *const c_void) -> c_int {
+    #[cfg(feature = "mem_report")]
+    FLEX_AT_START.store(flex_free_now(), core::sync::atomic::Ordering::Relaxed);
+    // The knobs once (debug only; release returns at once), before the hooks
+    // and the pack state, so titles with no packs read them too (thread
+    // budget, pool size, equeue_local).
+    unsafe { super::tune::load() };
     // Before any hook: the mode picks the hooks and the notification text.
     unsafe { super::pack::select_pack_format() };
     #[cfg(feature = "mem_report")]
@@ -1239,6 +1433,8 @@ pub unsafe extern "C" fn module_start(_args: usize, _argp: *const c_void) -> c_i
     if rc == 0 {
         unsafe { mem_report::start() };
     }
+    #[cfg(feature = "mem_report")]
+    FLEX_AFTER_START.store(flex_free_now(), core::sync::atomic::Ordering::Relaxed);
     rc
 }
 

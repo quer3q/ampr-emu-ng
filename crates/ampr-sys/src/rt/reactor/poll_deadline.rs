@@ -342,13 +342,15 @@ impl AprAioReactor {
             }
         }
         let mut thread: ScePthread = null_mut();
+        // libkernel's original entry, not the import the thread hooks detour
+        // (rt/thread_hooks.rs `create_internal`).
         let createRc = unsafe {
-            scePthreadCreate(
-                &mut thread,
+            crate::rt::thread_hooks::create_internal(
+                (&mut thread as *mut ScePthread).cast(),
                 null(),
                 Self::worker_entry,
                 this.cast(),
-                b"ampr_apr_reactor\0".as_ptr().cast(),
+                c"ampr_apr_reactor".as_ptr(),
             )
         };
         if createRc == 0 {

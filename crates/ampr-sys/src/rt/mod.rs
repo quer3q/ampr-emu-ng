@@ -12,6 +12,7 @@ mod index;
 mod libc_exports;
 #[cfg(feature = "mem_report")]
 mod probe;
+pub(crate) mod thread_hooks;
 pub(crate) mod pack;
 mod reactor;
 mod runtime_memory;

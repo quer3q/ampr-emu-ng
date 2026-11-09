@@ -70,6 +70,43 @@ stats! {
     PreadReadNs = "pread_read_ns",
     PreadReadNsMax = "pread_read_ns_max",
     PreadPendingMax = "pread_pending_max",
+    /// Pool thread wake-ups, and those that found no queued task (a wake-up
+    /// that only takes the lock and scans the table).
+    PreadWakeups = "pread_wakeups",
+    PreadWakeupsIdle = "pread_wakeups_idle",
+    /// Debug: threads created through scePthreadCreate/pthread_create, the
+    /// game's and the runtime's, and the creations that failed (each failure
+    /// is also a 'P' event; rt/probe.rs).
+    ThreadsCreated = "threads_created",
+    ThreadCreateFailed = "thread_create_failed",
+    /// Failed game creations retried after the pool gave threads back, and
+    /// the retries that succeeded (rt/thread_hooks.rs).
+    ThreadCreateRetried = "thread_create_retried",
+    ThreadCreateRescued = "thread_create_rescued",
+    /// The runtime-wide thread budget (rt/thread_hooks.rs): cuts after a
+    /// game creation failed, and growths back by one after 30 s quiet.
+    ThreadBudgetCuts = "thread_budget_cuts",
+    ThreadBudgetRegrows = "thread_budget_regrows",
+    /// Read pool size (reactor/pread_pool.rs): threads started, the most
+    /// live at once, exits after idle time, threads given back to the
+    /// game, and our own creations that failed (the pool stops growing).
+    PreadThreadsStarted = "pread_threads_started",
+    PreadThreadsMax = "pread_threads_max",
+    PreadThreadsRetired = "pread_threads_retired",
+    PreadThreadsYielded = "pread_threads_yielded",
+    PreadThreadCreateFailed = "pread_thread_create_failed",
+    /// Pack volume descriptors (rt/pack/leases.rs): opens, time spent in
+    /// open, and closes of the least recently used one to make room
+    /// (AMPR_EMU_PACK_OPEN_PACK_FD_CAP).
+    PackFdOpens = "pack_fd_opens",
+    PackFdOpenNs = "pack_fd_open_ns",
+    PackFdEvictions = "pack_fd_evictions",
+    /// Pack workers (rt/pack/worker.rs): threads started, idle exits, given
+    /// back to the game, own creations that failed.
+    PackWorkersStarted = "pack_workers_started",
+    PackWorkersRetired = "pack_workers_retired",
+    PackWorkersYielded = "pack_workers_yielded",
+    PackWorkerCreateFailed = "pack_worker_create_failed",
     /// Loose APR reads (real fds) through the pread pool (reactor/loose_pread.rs):
     /// full reads and their bytes; pool reads that got EFAULT and went to
     /// kernel AIO; pool reads that failed otherwise or came back short and went
@@ -210,6 +247,59 @@ stats! {
     /// while cross-EOP read-ahead is stubbed and lane overlap is off.
     GsRetryChecks = "gs_retry_checks",
     GsRetryMismatches = "gs_retry_mismatches",
+    /// Gauges that rise and fall (`enter`/`leave`): game threads blocked
+    /// inside the runtime right now. apr_submit_blocked_now: an APR submit
+    /// waiting for a free job state, request slot or submit-id slot
+    /// (reactor/submit.rs `submit`); apr_wait_blocked_now: an APR wait on a
+    /// synthetic id (`wait_synthetic_submit_id`); equeue_wait_now: anywhere
+    /// in sceKernelWaitEqueue_emul, native waits included (a render thread
+    /// waiting on vblank counts); equeue_private_spin_now: spinning in the
+    /// equeue private wake (rt/equeue.rs `wait_for_private_wake`). In a hang
+    /// with the reactor idle, a gauge above 0 names where the game waits.
+    AprSubmitBlockedNow = "apr_submit_blocked_now",
+    AprWaitBlockedNow = "apr_wait_blocked_now",
+    EqueueWaitNow = "equeue_wait_now",
+    EqueuePrivateSpinNow = "equeue_private_spin_now",
+    /// Submits that had to wait for a slot; APR waits (rt/services.rs
+    /// `wait`) by outcome: answered from the done ring, waited on a live
+    /// synthetic id, not ours (passed to libkernel), and those that returned
+    /// an error (each logged as op b'J', first 64 only).
+    AprSubmitBlocked = "apr_submit_blocked",
+    AprWaits = "apr_waits",
+    AprWaitDoneRing = "apr_wait_done_ring",
+    AprWaitLive = "apr_wait_live",
+    AprWaitNative = "apr_wait_native",
+    AprWaitErrors = "apr_wait_errors",
+    /// Native APR batch buffers the kernel accepted (reactor/batch_buffer.rs
+    /// `submit_native_batch_buffer`); a refused one is logged as op b'J'
+    /// lookup b'n'.
+    NativeBatchSubmits = "native_batch_submits",
+    /// The reactor's own kernel AIO (reactor/flush.rs, progress.rs): request
+    /// ids the kernel accepted, ids deleted after they finished, deletes the
+    /// kernel refused, and submits deferred (EAGAIN, the AIO table is full)
+    /// or refused. submitted minus deleted is what the runtime holds now.
+    AioIdsSubmitted = "aio_ids_submitted",
+    AioIdsDeleted = "aio_ids_deleted",
+    AioDeleteFailed = "aio_delete_failed",
+    AioSubmitDeferred = "aio_submit_deferred",
+    AioSubmitFailed = "aio_submit_failed",
+    /// Completion signals by how they reach the game: packets placed in a
+    /// native APR batch by op type (reactor/native.rs
+    /// `append_native_apr_batch`; WriteAddressFrom{TimeCounter,Counter,
+    /// CounterPair} together), software WriteAddress stores
+    /// (reactor/software.rs), and WriteKernelEventQueue commands offered to
+    /// the equeue overlay by its answer (rt/equeue.rs
+    /// `apr_equeue_try_publish`; a fallback then becomes a native packet,
+    /// a backpressure is offered again later).
+    NativeWaitOnCounter = "native_wait_on_counter",
+    NativeWriteCounter = "native_write_counter",
+    NativeWriteEqueue = "native_write_equeue",
+    NativeWriteFromCounter = "native_write_from_counter",
+    NativeOther = "native_other",
+    SoftwareWriteAddress = "software_write_address",
+    EqueueLocalPublished = "equeue_local_published",
+    EqueueLocalBackpressure = "equeue_local_backpressure",
+    EqueueLocalFallback = "equeue_local_fallback",
     /// Both pack formats: mmap/sceKernelMmap of a virtual pack fd
     /// (rt/pack/mmap.rs), maps served from the disk cache file, bytes written
     /// into new cache files, and maps whose cache file could not be made
@@ -298,17 +388,33 @@ pub(crate) fn now() -> u64 {
 /// which the runtime's AIO emulation served (rt/pack/aio.rs, logged through
 /// rt/probe.rs `note_aio_submit` whatever the result), lookup b'v'.
 /// Pass-through probes for fully packed games, LZ4 or zstd packs
-/// (rt/probe.rs, logged by `fs_note` whatever the result): b'D' dup/dup2, b'W'
-/// poll/select, b'T' openat, b'F' fstatat, b'C' faccessat, b'N' readlink;
+/// (rt/probe.rs, logged by `fs_note` whatever the result): b'D' dup, b'W'
+/// poll, b'T' openat, b'F' fstatat, b'C' faccessat, b'N' readlink;
 /// their path is the packed file's path (or the call name and `<virtual
 /// fd>`) and their lookup letter b'p' a packed file, b'd' an indexed
-/// directory, b'v' a virtual fd, and for b'W' select b'n': nfds past
-/// FD_SETSIZE, path "select nfds=<n>" (the sets are not read). In debug
+/// directory, b'v' a virtual fd. In debug
 /// builds the libc hooks b'O', b'A', b'a', b'l' whose
 /// `AMPR_ZSTD_LIBC_HOOKS` bit is off run as such pass-through observers too (rt/hook.rs `observed_only`), logged with
 /// lookup b'p' or b'd' only. Resident lookup: b'h' hit,
 /// b'm' miss the index answers, b'M' miss sent to the FS, b'd' directory,
 /// b'n' index not ready, b'x' not /app0, b'-' none. Then result and path.
+/// b'Z' a pack chunk that failed to decode (rt/pack/virtual_read.rs; with
+/// the debug `zstd_verify` knob also a zstd frame checksum mismatch),
+/// lookup b'-', path "decode fid=<hex> chunk=<hex> pack=<hex> off=<hex>
+/// size=<hex>".
+/// b'V' a save data mount (rt/probe.rs `save_probe`, debug), lookup b'-',
+/// path the call name, rc its result.
+/// b'P' thread creation (rt/thread_hooks.rs): a game creation that failed,
+/// lookup b's' scePthreadCreate (rc the SCE error) or b'p' pthread_create
+/// (rc minus its errno), path "<call> <thread name>"; b'r' its retry after
+/// the read pool gave threads back, path "<call>-retry <thread name>" (rc
+/// -1 when the retry succeeded); b'h'
+/// the `GET /threads` limit probe (black box only, rc = threads held, or
+/// the failure).
+/// b'J' an APR call that returned an error (rt/services.rs): lookup b'w'
+/// a wait, path "wait id=<hex> how=<s|n>" (synthetic id, or passed to libkernel);
+/// b'u' a submit, path "submit prio=<n>"; b'n' a native batch submit the
+/// kernel refused, path "native batch lane=<n>". First 64 only.
 /// b'Q' packed-fd/open failures (rt/pack/slots.rs, rt/index.rs): lookup b'H'
 /// a packed open's raw SCE error, b'R' a physical open's errno (ring only,
 /// positive), b'S' the 512-slot synthetic packed-fd table full.
@@ -495,23 +601,47 @@ unsafe fn fs_ring(op: u8, how: u8, rc: i64, path: *const core::ffi::c_char) {
     BUSY.store(false, Ordering::Release);
 }
 
+#[cfg(feature = "mem_report")]
+fn hex(buf: &mut [u8; 128], n: &mut usize, v: u64) {
+    let digits = (64 - (v | 1).leading_zeros()).div_ceil(4);
+    for i in (0..digits).rev() {
+        buf[*n] = b"0123456789abcdef"[((v >> (i * 4)) & 0xf) as usize];
+        *n += 1;
+    }
+}
+#[cfg(feature = "mem_report")]
+fn text(buf: &mut [u8; 128], n: &mut usize, s: &[u8]) {
+    buf[*n..*n + s.len()].copy_from_slice(s);
+    *n += s.len();
+}
+
+/// Logs a failed APR call as op b'J' (see `FsEvents`), path
+/// "<label><hex v><tail>"; the first 64 only, so a game retrying a failed
+/// wait in a loop does not flood the black box.
+pub(crate) fn apr_call_error(how: u8, rc: i64, label: &[u8], v: u64, tail: &[u8]) {
+    #[cfg(feature = "mem_report")]
+    {
+        static LOGGED: AtomicU64 = AtomicU64::new(0);
+        if LOGGED.fetch_add(1, Relaxed) >= 64 {
+            return;
+        }
+        let mut buf = [0u8; 128];
+        let mut n = 0;
+        text(&mut buf, &mut n, label);
+        hex(&mut buf, &mut n, v);
+        text(&mut buf, &mut n, tail);
+        fs_event(b'J', how, rc, buf.as_ptr().cast());
+    }
+    #[cfg(not(feature = "mem_report"))]
+    let _ = (how, rc, label, v, tail);
+}
+
 /// Logs a gather/scatter retry that re-resolved to `got` instead of the
 /// `prep` (file id, offset) of its first resolution, as a 'G' event with path
 /// "gs-retry fid=<hex> off=<hex> got fid=<hex> off=<hex>" (at most 80 bytes,
 /// within FsFails' 128). Debug only; the caller counts GsRetryMismatches.
 #[cfg(feature = "mem_report")]
 pub(crate) fn gs_retry_mismatch(rc: i64, prep: (u32, u64), got: (u32, u64)) {
-    fn hex(buf: &mut [u8; 128], n: &mut usize, v: u64) {
-        let digits = (64 - (v | 1).leading_zeros()).div_ceil(4);
-        for i in (0..digits).rev() {
-            buf[*n] = b"0123456789abcdef"[((v >> (i * 4)) & 0xf) as usize];
-            *n += 1;
-        }
-    }
-    fn text(buf: &mut [u8; 128], n: &mut usize, s: &[u8]) {
-        buf[*n..*n + s.len()].copy_from_slice(s);
-        *n += s.len();
-    }
     let mut buf = [0u8; 128];
     let mut n = 0;
     text(&mut buf, &mut n, b"gs-retry fid=");
@@ -530,6 +660,20 @@ pub(crate) fn gs_retry_mismatch(rc: i64, prep: (u32, u64), got: (u32, u64)) {
 pub(crate) fn add(s: Stat, v: u64) {
     if ON {
         VALUES[s as usize].fetch_add(v, Relaxed);
+    }
+}
+
+/// Gauge up by one (a matching `leave` brings it down).
+#[inline(always)]
+pub(crate) fn enter(s: Stat) {
+    add(s, 1);
+}
+
+/// Gauge down by one.
+#[inline(always)]
+pub(crate) fn leave(s: Stat) {
+    if ON {
+        VALUES[s as usize].fetch_sub(1, Relaxed);
     }
 }
 

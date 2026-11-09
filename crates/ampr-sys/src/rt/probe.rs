@@ -7,7 +7,7 @@
 //! logs through `stats::fs_note`, so `/fsfail` lists each distinct
 //! (op, file) once. The op letters are documented at
 //! `FsEvents` in rt/stats.rs. Built only with `mem_report`; rt/hook.rs
-//! installs the observers into slots 110..=117, the game AIO submit hooks
+//! installs the observers into slots 112..=119, the game AIO submit hooks
 //! (rt/pack/aio.rs) log their served packed requests through
 //! `note_aio_submit`, and rt/index.rs
 //! calls `probe_path` from the libc path hooks it installs as observers.

@@ -9,6 +9,30 @@
 use super::*;
 use crate::rt::stats::{self, Stat};
 
+// ---- pool size ----
+//
+// The pool keeps PREAD_MIN_THREADS threads and grows by one thread per
+// queued task no idle thread takes, up to its ceiling (tune::pread_threads,
+// 16) and the thread budget (rt/thread_hooks.rs). A thread idle for
+// PREAD_IDLE_EXIT_US exits, down to the minimum. A game thread creation that
+// fails with EAGAIN makes the pool give threads back, down to none (reads
+// then go to kernel AIO), and the budget keeps it from growing back. A title
+// saw its own scePthreadCreate fail with EAGAIN after 94 creations while 32
+// pool threads were live.
+
+/// Stack of a pool thread: it only loops on pread (pread_worker), so 32 KiB,
+/// not libkernel's 64 KiB default. Stacks are the game's flexible memory,
+/// which a title can use up (32 threads with 64 KiB stacks took 3 MiB).
+const PREAD_STACK_BYTES: usize = 32 * 1024;
+/// Threads the pool starts with and keeps while the game has room.
+pub(crate) const PREAD_MIN_THREADS: u32 = 1;
+/// A thread with no task for this long exits (down to the minimum).
+const PREAD_IDLE_EXIT_US: u64 = 2_000_000;
+/// How long a yielding game thread waits for pool threads to exit; a busy
+/// thread exits after its current pread (~0.5 ms average, 15 ms max on a
+/// zstd title, debug /metrics).
+const PREAD_YIELD_WAIT_US: u64 = 50_000;
+
 impl AprAioReactor {
     unsafe extern "C" fn pread_worker_entry(arg: *mut c_void) -> *mut c_void {
         // Reactor priority, above the decode workers: a finished read is handed
@@ -25,7 +49,8 @@ impl AprAioReactor {
             }
         }
         if !arg.is_null() {
-            unsafe { Self::pread_worker(arg.cast()) };
+            let a = unsafe { *(arg as *const PreadThreadArg) };
+            unsafe { Self::pread_worker(a.reactor, a.slot) };
         }
         null_mut()
     }
@@ -33,12 +58,30 @@ impl AprAioReactor {
     /// Takes the highest-priority, oldest queued task, preads it in up to
     /// AMPR_EMU_PACK_PREAD_MAX_BYTES pieces, publishes the result and wakes
     /// the reactor (under `m`, so the epoch change cannot race its wait).
-    unsafe fn pread_worker(this: *mut Self) {
+    /// Leaves its loop (slot EXITED, under preadMutex) on stop, on an exit
+    /// asked by pread_pool_yield, or after PREAD_IDLE_EXIT_US idle, the last
+    /// two only above PREAD_MIN_THREADS.
+    unsafe fn pread_worker(this: *mut Self, thread_slot: usize) {
         let mutex = unsafe { &*addr_of!((*this).preadMutex) };
         let cv = unsafe { &*addr_of!((*this).preadCv) };
+        // Under preadMutex: this thread leaves the live set.
+        let exit = |this: *mut Self| unsafe {
+            (*this).preadThreadCount -= 1;
+            (*this).preadSlots[thread_slot] = PREAD_SLOT_EXITED;
+            (&*addr_of!((*this).preadExitCv)).notify_all();
+            // Wake the reactor to join it (not under `m`: no lock order with
+            // preadMutex; a missed wake only defers the join to the next pass).
+            (*addr_of!((*this).preadReapPending)).store(true, Ordering::Release);
+            (*addr_of!((*this).reactorWakeEpoch)).fetch_add(1, Ordering::Release);
+            (&*addr_of!((*this).reactorCv)).notify_one();
+        };
         loop {
             let (slot, request, queuedNs) = {
                 let mut guard = mutex.lock();
+                let mut woken = false;
+                // Idle time from when this thread last found a task, not
+                // from its last wake-up (`pread_wake_all` wakes them all).
+                let idle_since = time_counter_now();
                 loop {
                     let mut found: Option<usize> = None;
                     for index in 0..AMPR_EMU_PACK_PREAD_TASKS {
@@ -55,15 +98,45 @@ impl AprAioReactor {
                             found = Some(index);
                         }
                     }
+                    if woken {
+                        stats::add(Stat::PreadWakeups, 1);
+                        if found.is_none() {
+                            stats::add(Stat::PreadWakeupsIdle, 1);
+                        }
+                    }
+                    // Exits: an idle thread above PREAD_MIN_THREADS, or one
+                    // given back to the game (preadExitRequests, down to
+                    // none). The last thread leaves only with no task
+                    // queued, so no queued read is stranded.
+                    let live = unsafe { (*this).preadThreadCount };
+                    let may_exit = live > PREAD_MIN_THREADS as usize;
+                    let may_yield = live > 1 || found.is_none();
+                    if may_yield && unsafe { (*this).preadExitRequests } != 0 {
+                        unsafe { (*this).preadExitRequests -= 1 };
+                        exit(this);
+                        drop(guard);
+                        return;
+                    }
                     if let Some(slot) = found {
                         let task = unsafe { &*addr_of!((*this).preadTasks[slot]) };
                         task.state.store(PREAD_RUNNING, Ordering::Release);
                         break (slot, task.request, task.statQueuedNs);
                     }
-                    if unsafe { (*this).preadStop } {
+                    let idle_ns = time_counter_now().saturating_sub(idle_since);
+                    let idle_timeout = idle_ns >= PREAD_IDLE_EXIT_US * 1000;
+                    if unsafe { (*this).preadStop } || (idle_timeout && may_exit) {
+                        if idle_timeout {
+                            stats::add(Stat::PreadThreadsRetired, 1);
+                        }
+                        exit(this);
+                        drop(guard);
                         return;
                     }
-                    cv.wait(&mut guard);
+                    unsafe { (*this).preadIdle += 1 };
+                    let left_us = (PREAD_IDLE_EXIT_US * 1000).saturating_sub(idle_ns).div_ceil(1000);
+                    let _ = cv.wait_for_us(&mut guard, left_us.max(1));
+                    unsafe { (*this).preadIdle -= 1 };
+                    woken = true;
                 }
             };
             let readStartNs = stats::now();
@@ -105,29 +178,156 @@ impl AprAioReactor {
         }
     }
 
+    /// Starts the pool (PREAD_MIN_THREADS threads) on first use. Reactor
+    /// thread only; true when at least one thread is live.
     pub(super) fn ensure_pread_workers(&mut self) -> bool {
-        if self.preadThreadCount != 0 {
+        let started = {
+            let _g = self.preadMutex.lock();
+            if self.preadCeiling == 0 {
+                self.preadCeiling = crate::rt::tune::pread_threads()
+                    .min(AMPR_EMU_PACK_PREAD_WORKERS)
+                    .max(1) as u32;
+            }
+            self.preadThreadCount
+        };
+        if started != 0 {
             return true;
         }
-        let count = crate::rt::tune::pread_threads().min(AMPR_EMU_PACK_PREAD_WORKERS);
-        while self.preadThreadCount < count {
-            let mut thread: ScePthread = null_mut();
-            let rc = unsafe {
-                scePthreadCreate(
-                    &mut thread,
-                    null(),
-                    Self::pread_worker_entry,
-                    (self as *mut Self).cast(),
-                    c"ampr_pack_pread".as_ptr(),
-                )
-            };
-            if rc != 0 {
+        for _ in 0..PREAD_MIN_THREADS.min(self.preadCeiling) {
+            if !self.spawn_pread_thread() {
                 break;
             }
-            self.preadThreads[self.preadThreadCount] = thread;
-            self.preadThreadCount += 1;
         }
+        let _g = self.preadMutex.lock();
         self.preadThreadCount != 0
+    }
+
+    /// Adds one pool thread; false when at the ceiling or the creation
+    /// failed (the ceiling then drops to the live count). Reactor thread only.
+    fn spawn_pread_thread(&mut self) -> bool {
+        self.reap_pread_threads();
+        let slot = {
+            let _g = self.preadMutex.lock();
+            if self.preadThreadCount >= self.preadCeiling as usize {
+                return false;
+            }
+            let Some(slot) = self.preadSlots.iter().position(|&s| s == PREAD_SLOT_EMPTY) else {
+                return false;
+            };
+            // The runtime-wide thread budget (rt/thread_hooks.rs); the first
+            // thread is exempt unless the pool gave its last one away.
+            let first = self.preadThreadCount == 0 && !self.preadGaveLast;
+            if !crate::rt::thread_hooks::reserve(first) {
+                return false;
+            }
+            self.preadSlots[slot] = PREAD_SLOT_LIVE;
+            self.preadThreadCount += 1;
+            slot
+        };
+        self.preadArgs[slot] = PreadThreadArg {
+            reactor: self as *mut Self,
+            slot,
+        };
+        let mut thread: ScePthread = null_mut();
+        let arg = addr_of_mut!(self.preadArgs[slot]).cast();
+        let rc = unsafe {
+            crate::rt::thread_hooks::create_counted(
+                (&mut thread as *mut ScePthread).cast(),
+                Self::pread_worker_entry,
+                arg,
+                c"ampr_pack_pread".as_ptr(),
+                PREAD_STACK_BYTES,
+            )
+        };
+        let _g = self.preadMutex.lock();
+        if rc != 0 {
+            self.preadSlots[slot] = PREAD_SLOT_EMPTY;
+            self.preadThreadCount -= 1;
+            // A yield may have counted this slot; drop requests no live
+            // thread can meet, or make_room would wait on them forever. The
+            // budget, cut by the failed creation, limits growth.
+            self.preadExitRequests = self.preadExitRequests.min(self.preadThreadCount as u32);
+            stats::add(Stat::PreadThreadCreateFailed, 1);
+            return false;
+        }
+        self.preadThreads[slot] = thread;
+        // It may have left already (a yield asked it to): reap it now.
+        if self.preadSlots[slot] == PREAD_SLOT_EXITED {
+            self.preadReapPending.store(true, Ordering::Release);
+        }
+        stats::add(Stat::PreadThreadsStarted, 1);
+        stats::max(Stat::PreadThreadsMax, self.preadThreadCount as u64);
+        true
+    }
+
+    /// Joins every EXITED pool thread (any thread may call it).
+    pub(crate) fn reap_pread_threads(&self) {
+        loop {
+            let (slot, thread) = {
+                let this = self as *const Self as *mut Self;
+                let _g = self.preadMutex.lock();
+                // A slot whose handle is not published yet waits: its creator
+                // flags a reap once it is (spawn_pread_thread).
+                let Some(slot) = (0..self.preadSlots.len()).find(|&i| {
+                    self.preadSlots[i] == PREAD_SLOT_EXITED && !self.preadThreads[i].is_null()
+                }) else {
+                    return;
+                };
+                unsafe { (*this).preadSlots[slot] = PREAD_SLOT_JOINING };
+                (slot, self.preadThreads[slot])
+            };
+            let _ = unsafe { scePthreadJoin(thread, null_mut()) };
+            let this = self as *const Self as *mut Self;
+            let _g = self.preadMutex.lock();
+            unsafe {
+                (*this).preadThreads[slot] = null_mut();
+                (*this).preadSlots[slot] = PREAD_SLOT_EMPTY;
+            }
+        }
+    }
+
+    /// Asks up to `want` pool threads to exit, down to none (reads then go
+    /// to kernel AIO until the budget lets a thread back), waits up to
+    /// PREAD_YIELD_WAIT_US for them and joins them. Returns how many exited.
+    /// Called from a game thread whose creation failed.
+    pub(crate) fn yield_pread_threads(&self, want: u32) -> u32 {
+        let this = self as *const Self as *mut Self;
+        let target = {
+            let mut g = self.preadMutex.lock();
+            let live = self.preadThreadCount as u32;
+            // Exits other yields already asked for are not given twice.
+            let give = want.min(live.saturating_sub(self.preadExitRequests));
+            if give == 0 {
+                return 0;
+            }
+            // No ceiling change: the thread budget (rt/thread_hooks.rs)
+            // keeps the pool from growing back.
+            unsafe { (*this).preadExitRequests += give };
+            let target = live - self.preadExitRequests;
+            if target == 0 {
+                unsafe { (*this).preadGaveLast = true };
+            }
+            self.preadCv.notify_all();
+            let deadline = time_counter_now() + PREAD_YIELD_WAIT_US * 1000;
+            while (self.preadThreadCount as u32) > target {
+                let now = time_counter_now();
+                if now >= deadline {
+                    break;
+                }
+                let _ = self
+                    .preadExitCv
+                    .wait_for_us(&mut g, (deadline - now).div_ceil(1000));
+            }
+            (live, target)
+        };
+        self.reap_pread_threads();
+        let live = {
+            let _g = self.preadMutex.lock();
+            self.preadThreadCount as u32
+        };
+        let released = target.0.saturating_sub(live);
+        stats::add(Stat::PreadThreadsYielded, released as u64);
+        released
     }
 
     /// Queues all requests of external group `targetSlot` together, so the
@@ -161,6 +361,13 @@ impl AprAioReactor {
             return SCE_KERNEL_ERROR_ENOMEM;
         }
         let _guard = unsafe { (&*addr_of!(self.preadMutex)).lock() };
+        // No thread (all given to the game, or none could start): callers go
+        // to kernel AIO. Checked under preadMutex, and the last thread leaves
+        // only with no task queued (pread_worker), so no accepted read is
+        // left without a thread.
+        if self.preadThreadCount == 0 {
+            return SCE_KERNEL_ERROR_ENOMEM;
+        }
         let mut slots = [0usize; kAprExternalAioGroupMaxRequests];
         let mut found = 0usize;
         for (index, task) in self.preadTasks.iter().enumerate() {
@@ -190,13 +397,36 @@ impl AprAioReactor {
         }
         self.preadPendingCount += requests.len() as u32;
         stats::max(Stat::PreadPendingMax, self.preadPendingCount as u64);
-        self.preadCv.notify_all();
+        // One thread per task, not all of them: the threads run at the
+        // highest priority (256) on the game's cores, and with 32 threads and
+        // at most 4-5 tasks queued (debug /metrics) a broadcast woke ~27
+        // threads per submit for nothing. A busy thread rescans before it
+        // waits, so a signal that finds no sleeper loses no task.
+        if crate::rt::tune::pread_wake_all() {
+            self.preadCv.notify_all();
+        } else {
+            for _ in requests {
+                self.preadCv.notify_one();
+            }
+        }
+        // One new thread per task no idle thread takes, at once, up to the
+        // ceiling (spawn_pread_thread stops there).
+        let grow = requests.len().saturating_sub(self.preadIdle as usize);
+        drop(_guard);
+        for _ in 0..grow {
+            if !self.spawn_pread_thread() {
+                break;
+            }
+        }
         0
     }
 
     /// Retires finished tasks; the last one of a group completes it.
     /// Reactor thread only.
     pub(crate) fn drain_pread_completions(&mut self) -> bool {
+        if self.preadReapPending.swap(false, Ordering::AcqRel) {
+            self.reap_pread_threads();
+        }
         if self.preadPendingCount == 0 {
             return false;
         }
@@ -274,20 +504,31 @@ impl AprAioReactor {
         self.preadPendingCount -= 1;
     }
 
-    /// Joins the pool threads (reactor shutdown, after the worker loop ends).
+    /// Stops and joins the pool threads (reactor shutdown, after the worker
+    /// loop ends). Threads exit on preadStop; a yielding game thread may
+    /// join some of them meanwhile.
     pub(crate) fn stop_pread_workers(&mut self) -> c_int {
         {
-            let _guard = unsafe { (&*addr_of!(self.preadMutex)).lock() };
+            let mut g = self.preadMutex.lock();
             self.preadStop = true;
             self.preadCv.notify_all();
-        }
-        for index in 0..self.preadThreadCount {
-            if unsafe { scePthreadJoin(self.preadThreads[index], null_mut()) } != 0 {
-                return SCE_KERNEL_ERROR_EIO;
+            while self.preadThreadCount != 0 {
+                let _ = self.preadExitCv.wait_for_us(&mut g, 100_000);
             }
-            self.preadThreads[index] = null_mut();
         }
-        self.preadThreadCount = 0;
+        self.reap_pread_threads();
+        loop {
+            let busy = {
+                let _g = self.preadMutex.lock();
+                self.preadSlots.iter().any(|&s| s != PREAD_SLOT_EMPTY)
+            };
+            if !busy {
+                break;
+            }
+            // A game thread is still joining one: wait for it.
+            let mut spins = 0u32;
+            ampr_spin_pause_or_yield(&mut spins);
+        }
         0
     }
 }

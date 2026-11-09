@@ -321,8 +321,8 @@ unsafe fn read_on_workers(
 /// sceKernelAioSubmitReadCommandsMultiple 13,528 B, publish_virtual_jobs
 /// 6,600 B in the debug PRX), ~32 KB that a small game thread does not have.
 /// A UE5 title's `Bink IO` thread read a packed .bk2 and faulted
-/// on the guard page in publish_virtual_jobs. The thread stacks
-/// (READ_THREADS x READ_STACK = 4 x 256 KiB = 1 MiB) are libkernel memory,
+/// on the guard page in publish_virtual_jobs. The thread stacks (at most
+/// READ_THREADS x READ_STACK = 4 x 128 KiB = 512 KiB) are libkernel memory,
 /// outside the internal pool.
 /// ponytail: every virtual-fd read pays one handoff; check the caller's stack
 /// and read inline when it is large, if the handoff shows in read latency.
@@ -331,7 +331,10 @@ unsafe fn read_on_workers(
 /// batches, more submits) would let the caller's thread read and remove the
 /// handoff, if its latency shows.
 const READ_THREADS: usize = 4;
-const READ_STACK: usize = 256 * 1024;
+/// 128 KiB: read_on_workers needs ~32 KB (above). The stacks come from the
+/// game's flexible memory, which a title can use up (flex_free_bytes 0 of
+/// 312 MiB, debug /metrics).
+const READ_STACK: usize = 128 * 1024;
 const READ_QUEUE: usize = 64;
 
 /// One read handed to a read thread; lives on the waiting caller's stack.
@@ -404,20 +407,66 @@ static READ_STOP: AtomicBool = AtomicBool::new(false);
 static READ_HANDLES: SyncCell<[ScePthread; READ_THREADS]> =
     SyncCell::new([null_mut(); READ_THREADS]);
 
-unsafe extern "C" fn read_thread(_arg: *mut c_void) -> *mut c_void {
+// ---- read thread count ----
+// One read thread at first; another starts when a call is queued and none
+// waits, up to READ_THREADS and the thread budget (rt/thread_hooks.rs). An
+// idle one leaves after a window with a spare (thread_hooks::SpareWindow),
+// or when a game short of threads asks (`read_threads_yield`); never the last.
+
+/// Busy read threads per window: one spare for a whole window leaves.
+static READ_SPARE: super::super::thread_hooks::SpareWindow =
+    super::super::thread_hooks::SpareWindow::new();
+const READ_SLOT_EMPTY: u8 = 0;
+const READ_SLOT_LIVE: u8 = 1;
+const READ_SLOT_EXITED: u8 = 2;
+/// Per slot state, idle threads and exits asked, all under READ_M.
+static READ_SLOTS: SyncCell<[u8; READ_THREADS]> = SyncCell::new([READ_SLOT_EMPTY; READ_THREADS]);
+static READ_IDLE: AtomicU32 = AtomicU32::new(0);
+static READ_EXIT_REQUESTS: AtomicU32 = AtomicU32::new(0);
+/// A read thread left: the next thread or caller through READ_M joins it,
+/// so its slot is free at once (as WORKER_REAP_PENDING, worker.rs).
+static READ_REAP_PENDING: AtomicBool = AtomicBool::new(false);
+
+unsafe extern "C" fn read_thread(arg: *mut c_void) -> *mut c_void {
+    let slot = arg as usize;
+    // Under READ_M: this thread leaves the live set.
+    let leave = || {
+        READ_THREADS_UP.fetch_sub(1, Ordering::Release);
+        unsafe { (*READ_SLOTS.get())[slot] = READ_SLOT_EXITED };
+        READ_REAP_PENDING.store(true, Ordering::Release);
+        READ_CV.notify_all();
+    };
     loop {
         let call = {
             let mut g = READ_M.lock();
             loop {
+                if READ_REAP_PENDING.swap(false, Ordering::AcqRel) {
+                    unsafe { reap_read_threads_locked() };
+                }
+                let others = READ_THREADS_UP.load(Ordering::Relaxed) > 1;
+                if others && READ_EXIT_REQUESTS.load(Ordering::Relaxed) != 0 {
+                    READ_EXIT_REQUESTS.fetch_sub(1, Ordering::Relaxed);
+                    leave();
+                    return null_mut();
+                }
                 if let Some(call) = unsafe { (*READ_CALLS.get()).pop() } {
                     // A slot freed: wake callers waiting on a full queue.
                     READ_CV.notify_all();
+                    READ_SPARE.begin();
                     break call;
                 }
                 if READ_STOP.load(Ordering::Acquire) {
+                    leave();
                     return null_mut();
                 }
-                READ_CV.wait(&mut g);
+                // A spare thread for a whole window: this idle one leaves.
+                if READ_SPARE.spare_due(READ_THREADS_UP.load(Ordering::Relaxed)) {
+                    leave();
+                    return null_mut();
+                }
+                READ_IDLE.fetch_add(1, Ordering::Relaxed);
+                let _ = READ_CV.wait_for_us(&mut g, super::super::thread_hooks::SPARE_WINDOW_US);
+                READ_IDLE.fetch_sub(1, Ordering::Relaxed);
             }
         };
         let rc = unsafe {
@@ -425,43 +474,106 @@ unsafe extern "C" fn read_thread(_arg: *mut c_void) -> *mut c_void {
             read_on_workers(c.fd, core::slice::from_raw_parts(c.vector, c.count), c.offset, c.length)
         };
         let _g = READ_M.lock();
+        READ_SPARE.end();
         unsafe { ((*call).rc, (*call).done) = (rc, true) };
         READ_DONE_CV.notify_all();
     }
 }
 
-/// Starts the read threads once; false when none could start.
+/// Under READ_M: joins threads that left (they hold no lock any more) and
+/// frees their slots.
+unsafe fn reap_read_threads_locked() {
+    // `stop_read_threads` joins every thread itself; READ_STOP is set under
+    // READ_M, so no reap is in progress after it.
+    if READ_STOP.load(Ordering::Acquire) {
+        return;
+    }
+    let slots = unsafe { &mut *READ_SLOTS.get() };
+    let handles = unsafe { &mut *READ_HANDLES.get() };
+    for i in 0..READ_THREADS {
+        if slots[i] == READ_SLOT_EXITED {
+            let _ = unsafe { scePthreadJoin(handles[i], null_mut()) };
+            handles[i] = null_mut();
+            slots[i] = READ_SLOT_EMPTY;
+        }
+    }
+}
+
+/// Under READ_M: starts one read thread with a READ_STACK stack in a free
+/// slot; false when all are taken or the creation failed.
+unsafe fn spawn_read_thread_locked() -> bool {
+    unsafe { reap_read_threads_locked() };
+    let slots = unsafe { &mut *READ_SLOTS.get() };
+    let Some(slot) = slots.iter().position(|&s| s == READ_SLOT_EMPTY) else {
+        return false;
+    };
+    // The runtime-wide thread budget (rt/thread_hooks.rs).
+    if !super::super::thread_hooks::reserve(READ_THREADS_UP.load(Ordering::Relaxed) == 0) {
+        return false;
+    }
+    let mut thread: ScePthread = null_mut();
+    let rc = unsafe {
+        super::super::thread_hooks::create_counted(
+            (&mut thread as *mut ScePthread).cast(),
+            read_thread,
+            slot as *mut c_void,
+            c"ampr_fd_read".as_ptr(),
+            READ_STACK,
+        )
+    };
+    if rc != 0 {
+        return false;
+    }
+    unsafe { (*READ_HANDLES.get())[slot] = thread };
+    slots[slot] = READ_SLOT_LIVE;
+    READ_THREADS_UP.fetch_add(1, Ordering::Release);
+    true
+}
+
+/// Starts the first read thread once; false when none is running.
 unsafe fn start_read_threads() -> bool {
     READ_START.call_once(|| {
-        type AttrFn = unsafe extern "C" fn(*mut ScePthreadAttr) -> c_int;
-        type StackFn = unsafe extern "C" fn(*mut ScePthreadAttr, usize) -> c_int;
-        let init = unsafe { resolve_kernel::<AttrFn>(c"scePthreadAttrInit") };
-        let stack = unsafe { resolve_kernel::<StackFn>(c"scePthreadAttrSetstacksize") };
-        let destroy = unsafe { resolve_kernel::<AttrFn>(c"scePthreadAttrDestroy") };
-        let (Some(init), Some(stack)) = (init, stack) else {
-            return;
-        };
-        let mut attr: ScePthreadAttr = null_mut();
-        if unsafe { init(&mut attr) } != 0 {
-            return;
-        }
-        if unsafe { stack(&mut attr, READ_STACK) } == 0 {
-            for i in 0..READ_THREADS {
-                let mut thread: ScePthread = null_mut();
-                let rc = unsafe {
-                    scePthreadCreate(&mut thread, &attr, read_thread, null_mut(), c"ampr_fd_read".as_ptr())
-                };
-                if rc == 0 {
-                    unsafe { (*READ_HANDLES.get())[i] = thread };
-                    READ_THREADS_UP.fetch_add(1, Ordering::Release);
-                }
-            }
-        }
-        if let Some(destroy) = destroy {
-            let _ = unsafe { destroy(&mut attr) };
-        }
+        let _g = READ_M.lock();
+        let _ = unsafe { spawn_read_thread_locked() };
     });
     READ_THREADS_UP.load(Ordering::Acquire) != 0
+}
+
+/// Read thread exits asked (`read_threads_yield`) not yet done; none after
+/// `stop_read_threads`, which joins every thread without meeting them.
+pub(crate) fn read_threads_pending_exits() -> u32 {
+    if READ_STOP.load(Ordering::Acquire) {
+        return 0;
+    }
+    READ_EXIT_REQUESTS.load(Ordering::Relaxed)
+}
+
+/// Asks up to `want` read threads to leave (never the last), waits up to
+/// 50 ms and joins them. Returns how many left. Called from a game thread
+/// whose creation failed (rt/thread_hooks.rs).
+pub(crate) unsafe fn read_threads_yield(want: u32) -> u32 {
+    let (live, target) = {
+        let _g = READ_M.lock();
+        let live = READ_THREADS_UP.load(Ordering::Relaxed);
+        // Exits other yields already asked for are not given twice.
+        let pending = READ_EXIT_REQUESTS.load(Ordering::Relaxed);
+        let give = want.min(live.saturating_sub(1 + pending));
+        if give == 0 {
+            return 0;
+        }
+        READ_EXIT_REQUESTS.fetch_add(give, Ordering::Relaxed);
+        READ_CV.notify_all();
+        (live, live - give)
+    };
+    for _ in 0..50 {
+        if READ_THREADS_UP.load(Ordering::Acquire) <= target {
+            break;
+        }
+        unsafe { sceKernelUsleep(1000) };
+    }
+    let _g = READ_M.lock();
+    unsafe { reap_read_threads_locked() };
+    live.saturating_sub(READ_THREADS_UP.load(Ordering::Relaxed))
 }
 
 /// `read_on_workers` on a read thread; inline when no read thread started.
@@ -470,9 +582,8 @@ unsafe fn start_read_threads() -> bool {
 /// read threads and joins them; a read after this runs inline (READ_START
 /// does not start threads twice).
 unsafe fn stop_read_threads() {
-    if READ_THREADS_UP.load(Ordering::Acquire) == 0 {
-        return;
-    }
+    // No early return on READ_THREADS_UP == 0: threads that left but were
+    // not reaped still hold handles to join here.
     {
         let _g = READ_M.lock();
         READ_STOP.store(true, Ordering::Release);
@@ -484,6 +595,7 @@ unsafe fn stop_read_threads() {
             *thread = null_mut();
         }
     }
+    unsafe { *READ_SLOTS.get() = [READ_SLOT_EMPTY; READ_THREADS] };
     READ_THREADS_UP.store(0, Ordering::Release);
 }
 
@@ -493,8 +605,8 @@ unsafe fn read_on_read_thread(
     offset: u64,
     length: u64,
 ) -> ssize_t {
-    // No read thread started (attr or create failed once, or after
-    // shutdown): read inline. An error instead would fail every packed read,
+    // No read thread (its first creation failed and is not retried, or
+    // after shutdown): read inline. An error instead would fail every packed read,
     // also on the large-stack threads that read fine inline; only a
     // small-stack caller is at risk, as before the read threads existed.
     if !unsafe { start_read_threads() } {
@@ -513,6 +625,12 @@ unsafe fn read_on_read_thread(
     let mut g = READ_M.lock();
     loop {
         if unsafe { (*READ_CALLS.get()).push(p) } {
+            // No thread waits for it: one more, up to READ_THREADS.
+            if READ_IDLE.load(Ordering::Relaxed) == 0
+                && READ_THREADS_UP.load(Ordering::Relaxed) < READ_THREADS as u32
+            {
+                let _ = unsafe { spawn_read_thread_locked() };
+            }
             break;
         }
         // Full: READ_QUEUE calls wait for a read thread.
@@ -1141,6 +1259,9 @@ pub unsafe fn ampr_pack_shutdown() -> c_int {
         unsafe { sceKernelUsleep(100) };
     }
 
+    // A reap under PACK_M started before the stop flag finishes first; after
+    // it none starts (worker.rs `reap_workers_locked`).
+    drop(PACK_M.lock());
     let mut join_error = 0;
     for worker in (*state).workers.iter_mut() {
         if !worker.started {

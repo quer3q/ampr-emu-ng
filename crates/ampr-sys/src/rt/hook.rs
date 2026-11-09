@@ -32,11 +32,12 @@ const PROT_RX: c_int = sys::SCE_KERNEL_PROT_CPU_READ | sys::SCE_KERNEL_PROT_CPU_
 const _: () = {
     assert!(PAGE % TRAMP_SIZE == 0 && SLOTS_PER_PAGE <= 32);
     assert!(POOL_COPY_PAGES <= 64 && TRAMP_PAGES == 4);
-    // 10 game AIO slots 100..=109 in both builds, and in debug builds the 8
-    // probe slots 110..=117 (rt/probe.rs). With the 5 external equeue hooks
-    // and the loader hook that is 116 (release) or 124 (debug) trampolines,
-    // within the 4 pages x 32 slots = 128.
-    assert!(HOOK_COUNT == 110 + 8 * cfg!(feature = "mem_report") as usize);
+    // 10 game AIO slots 100..=109 and 2 thread-creation slots 110..=111 in
+    // both builds, and in debug builds the 8 probe slots 112..=119
+    // (rt/probe.rs). With the 5 external equeue hooks and the loader hook
+    // that is 118 (release) or 126 (debug) trampolines, within the 4 pages x
+    // 32 slots = 128.
+    assert!(HOOK_COUNT == 112 + 8 * cfg!(feature = "mem_report") as usize);
     assert!(HOOK_COUNT + EXT_COUNT + 1 <= TRAMP_PAGES * SLOTS_PER_PAGE);
 };
 
@@ -310,6 +311,11 @@ hook_table! {
     c"sceKernelAioDeleteRequests" => sceKernelAioDeleteRequests_emul, O;
     c"sceKernelAioCancelRequest" => sceKernelAioCancelRequest_emul, O;
     c"sceKernelAioCancelRequests" => sceKernelAioCancelRequests_emul, O;
+    // Both builds, every title: a game thread creation that fails with
+    // EAGAIN is retried after the runtime gives threads back
+    // (rt/thread_hooks.rs).
+    c"scePthreadCreate" => super::thread_hooks::scePthreadCreate_emul, O;
+    c"pthread_create" => super::thread_hooks::pthread_create_emul, O;
     // Debug, both pack formats: pass-through observers of APIs the runtime
     // does not serve for packed files (rt/probe.rs); each calls its own
     // original.
@@ -1505,11 +1511,18 @@ pub(crate) const fn observed_only(id: usize) -> bool {
 /// v0.2.0. Of the ids past 78, 84..96 also need their `ZSTD_LIBC_HOOKS`
 /// bit (or, in debug builds, `observed_only`), 96 and 97
 /// need `AMPR_ZSTD_MMAP` on, 98 and 99 need it at 1 (rt/pack/mmap.rs),
-/// 100..=109 (the game's kernel AIO, rt/pack/aio.rs) need nothing more, and
-/// 110..=117 exist only in debug builds (rt/probe.rs). The knobs keep their
-/// zstd names but apply to both formats.
+/// 100..=109 (the game's kernel AIO, rt/pack/aio.rs) need nothing more,
+/// 110..=111 (thread creation) install in every title, and 112..=119 exist
+/// only in debug builds (rt/probe.rs). The knobs keep their zstd names but
+/// apply to both formats.
 fn hook_enabled(id: usize) -> bool {
     if id < FALLBACK_SHARED.len() {
+        return true;
+    }
+    // Thread creation in every title: the read pool serves loose reads too,
+    // so a title with no packs needs the give-back as well (a title on loose
+    // files grew the pool to 23 threads and hung without it).
+    if id == id::scePthreadCreate || id == id::pthread_create {
         return true;
     }
     if !super::pack::packs_present() {
@@ -1577,6 +1590,10 @@ unsafe fn refresh(st: &mut State) {
 
     let h = |i: usize| st.hooks[i].installed;
     let local = h(51) && h(52) && h(53) && h(54);
+    // Classification also turns queue tracking on, so it must not depend on
+    // the local-wait knob (rt/tune.rs `equeue_local`): an untracked queue
+    // gets AMPR events from the kernel, which merges two of one id before the
+    // game reads them (a save load hung that way).
     let classification = h(50) && (55..=63).all(h) && st.loader.installed && st.ext_coverage_safe;
     unsafe { apr_equeue_overlay_set_hook_availability(local, classification) };
 }
@@ -1883,6 +1900,8 @@ mod tests {
             (id::dup, c"dup"),
             #[cfg(feature = "mem_report")]
             (id::readlink, c"readlink"),
+            (id::scePthreadCreate, c"scePthreadCreate"),
+            (id::pthread_create, c"pthread_create"),
         ];
         for &(i, sym) in named {
             assert_eq!(HOOK_SYMBOLS[i].0, sym, "hook id {i}");

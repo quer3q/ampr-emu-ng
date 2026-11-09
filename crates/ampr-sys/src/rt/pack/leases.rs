@@ -730,6 +730,7 @@ pub(crate) unsafe fn acquire_pack_fd(pack_id: u16, open_only: bool) -> c_int {
                 return SCE_KERNEL_ERROR_EAGAIN;
             }
             let evicted = &mut (*state).pack_handles[victim as usize];
+            stats::add(stats::Stat::PackFdEvictions, 1);
             victim_fd = evicted.fd;
             *evicted = PackHandle {
                 reopen: evicted.reopen.after_close(),
@@ -756,7 +757,10 @@ pub(crate) unsafe fn acquire_pack_fd(pack_id: u16, open_only: bool) -> c_int {
         (*state).opening_pack_count -= 1;
         return SCE_KERNEL_ERROR_EAGAIN;
     }
+    let open_start = stats::now();
     let mut fd = open_fn(path.as_ptr(), SCE_KERNEL_O_RDONLY | O_NONBLOCK, 0 as c_int);
+    stats::add(stats::Stat::PackFdOpens, 1);
+    stats::add(stats::Stat::PackFdOpenNs, stats::since(open_start));
     // A signal is not fd pressure: retry the open a few times instead of parking.
     let mut eintr_retries = 0;
     while fd == -1 && errno() == EINTR && eintr_retries < 3 {

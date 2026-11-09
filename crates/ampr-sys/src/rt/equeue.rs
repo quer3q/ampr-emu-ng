@@ -800,7 +800,8 @@ const fn ownership_allows_local_wait(ampr: bool, mixed: bool, amm: bool) -> bool
 }
 
 fn queue_would_be_exclusive_local_ignoring_amm_health_locked(q: &TrackedEqueue) -> bool {
-    HOOKS_AVAILABLE.load(Ordering::Relaxed)
+    super::tune::equeue_local()
+        && HOOKS_AVAILABLE.load(Ordering::Relaxed)
         && ownership_allows_local_wait(q.ampr_source_seen, q.mixed_source_seen, q.amm_source_seen)
         && q.registration_head < REGISTRATION_CAPACITY
         && CLASSIFICATION_HOOKS_AVAILABLE.load(Ordering::Relaxed)
@@ -1535,12 +1536,15 @@ unsafe fn begin_private_wake_locked(
 }
 
 fn wait_for_private_wake(queue_index: u32) {
+    use super::stats::{self, Stat};
     let mut spins = 0u32;
+    stats::enter(Stat::EqueuePrivateSpinNow);
     while queue_index < QUEUE_CAPACITY
         && WAKE_TRIGGER_STATE.0[queue_index as usize].load(Ordering::Acquire) != 0
     {
         spin_pause_or_yield(&mut spins);
     }
+    stats::leave(Stat::EqueuePrivateSpinNow);
 }
 
 /// Triggers the queue's private user event outside the overlay lock, then
@@ -2539,6 +2543,164 @@ pub unsafe extern "C" fn sceKernelDeleteEqueue_emul(eq: SceKernelEqueue) -> c_in
 }
 
 pub unsafe extern "C" fn sceKernelWaitEqueue_emul(
+    eq: SceKernelEqueue,
+    events: *mut SceKernelEvent,
+    num: c_int,
+    out: *mut c_int,
+    timeout: *mut SceKernelUseconds,
+) -> c_int {
+    use super::stats::{self, Stat};
+    stats::enter(Stat::EqueueWaitNow);
+    #[cfg(feature = "mem_report")]
+    let slot = wait_table_enter(eq, timeout);
+    let rc = unsafe { wait_equeue(eq, events, num, out, timeout) };
+    #[cfg(feature = "mem_report")]
+    wait_table_leave(slot);
+    stats::leave(Stat::EqueueWaitNow);
+    rc
+}
+
+// ---- debug wait table ----
+
+/// Debug /metrics (rt/exports.rs): the sceKernelWaitEqueue calls in progress
+/// and the overlay's state of their queue, plus every tracked queue holding
+/// pending events. A tracked queue with pending events and a waiter in the
+/// native call is an event published locally and never delivered.
+#[cfg(feature = "mem_report")]
+const WAIT_TABLE: usize = 32;
+#[cfg(feature = "mem_report")]
+static WAIT_EQ: [AtomicUsize; WAIT_TABLE] = [const { AtomicUsize::new(0) }; WAIT_TABLE];
+#[cfg(feature = "mem_report")]
+static WAIT_START_NS: [AtomicU64; WAIT_TABLE] = [const { AtomicU64::new(0) }; WAIT_TABLE];
+/// Timeout in us, u64::MAX for none.
+#[cfg(feature = "mem_report")]
+static WAIT_TIMEOUT_US: [AtomicU64; WAIT_TABLE] = [const { AtomicU64::new(0) }; WAIT_TABLE];
+
+#[cfg(feature = "mem_report")]
+fn wait_table_enter(eq: SceKernelEqueue, timeout: *mut SceKernelUseconds) -> usize {
+    for i in 0..WAIT_TABLE {
+        if WAIT_EQ[i]
+            .compare_exchange(0, eq as usize | 1, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
+        {
+            WAIT_START_NS[i].store(super::services::time_counter_now(), Ordering::Relaxed);
+            let t = if timeout.is_null() {
+                u64::MAX
+            } else {
+                unsafe { *timeout as u64 }
+            };
+            WAIT_TIMEOUT_US[i].store(t, Ordering::Relaxed);
+            // The real handle (bit 0 marks a used slot for a null eq).
+            WAIT_EQ[i].store(eq as usize | 1, Ordering::Release);
+            return i;
+        }
+    }
+    WAIT_TABLE
+}
+
+#[cfg(feature = "mem_report")]
+fn wait_table_leave(slot: usize) {
+    if slot < WAIT_TABLE {
+        WAIT_EQ[slot].store(0, Ordering::Release);
+    }
+}
+
+#[cfg(feature = "mem_report")]
+#[derive(Clone, Copy, Default)]
+pub(crate) struct EqueueView {
+    /// 0 for a tracked queue listed for its pending events alone.
+    pub(crate) waiting: bool,
+    pub(crate) eq: usize,
+    pub(crate) timeout_us: u64,
+    pub(crate) age_ms: u64,
+    pub(crate) tracked: bool,
+    pub(crate) pending: u32,
+    pub(crate) registrations: u32,
+    pub(crate) native_intent: u32,
+    pub(crate) parked: u32,
+    pub(crate) trigger: u8,
+    /// Bits: 1 ampr source, 2 mixed, 4 amm, 8 wake ready, 16 wake armed,
+    /// 32 wake triggering, 64 wake registered.
+    pub(crate) flags: u32,
+}
+
+#[cfg(feature = "mem_report")]
+unsafe fn fill_queue_view(v: &mut EqueueView, qidx: u32) {
+    let o = unsafe { ov() };
+    let q = &o.queues[qidx as usize];
+    v.tracked = true;
+    v.pending = q.pending_count;
+    v.native_intent = q.native_wait_intent;
+    v.parked = LOCAL_WAIT_PARKED.0[qidx as usize].load(Ordering::Relaxed);
+    v.trigger = WAKE_TRIGGER_STATE.0[qidx as usize].load(Ordering::Relaxed);
+    v.flags = q.ampr_source_seen as u32
+        | (q.mixed_source_seen as u32) << 1
+        | (q.amm_source_seen as u32) << 2
+        | (q.wake_ready as u32) << 3
+        | (q.wake_armed as u32) << 4
+        | (q.wake_triggering as u32) << 5
+        | (q.wake_registered as u32) << 6;
+    let mut r = q.registration_head;
+    let mut n = 0;
+    while r < REGISTRATION_CAPACITY && n < REGISTRATION_CAPACITY {
+        n += 1;
+        r = o.registrations[r as usize].next;
+    }
+    v.registrations = n;
+}
+
+/// Waits in progress, then tracked queues with pending events and no
+/// waiter listed; returns how many views are filled.
+#[cfg(feature = "mem_report")]
+pub(crate) fn equeue_views(out: &mut [EqueueView; 48]) -> usize {
+    let now = super::services::time_counter_now();
+    let mut n = 0;
+    let _g = overlay_lock();
+    for i in 0..WAIT_TABLE {
+        let tagged = WAIT_EQ[i].load(Ordering::Acquire);
+        if tagged == 0 || n == out.len() {
+            continue;
+        }
+        let eq = tagged & !1;
+        let mut v = EqueueView {
+            waiting: true,
+            eq,
+            timeout_us: WAIT_TIMEOUT_US[i].load(Ordering::Relaxed),
+            age_ms: now.saturating_sub(WAIT_START_NS[i].load(Ordering::Relaxed)) / 1_000_000,
+            ..EqueueView::default()
+        };
+        let qidx = unsafe { find_queue_index_locked(eq as SceKernelEqueue) };
+        if qidx < QUEUE_CAPACITY {
+            unsafe { fill_queue_view(&mut v, qidx) };
+        }
+        out[n] = v;
+        n += 1;
+    }
+    let o = unsafe { ov() };
+    if !o.initialized {
+        return n;
+    }
+    for qidx in 0..QUEUE_CAPACITY {
+        let q = &o.queues[qidx as usize];
+        if !q.used || q.pending_count == 0 || n == out.len() {
+            continue;
+        }
+        if out[..n].iter().any(|v| v.eq == q.eq as usize) {
+            continue;
+        }
+        let mut v = EqueueView {
+            eq: q.eq as usize,
+            ..EqueueView::default()
+        };
+        unsafe { fill_queue_view(&mut v, qidx) };
+        out[n] = v;
+        n += 1;
+    }
+    n
+}
+
+/// `sceKernelWaitEqueue_emul` without the debug gauge.
+unsafe fn wait_equeue(
     eq: SceKernelEqueue,
     events: *mut SceKernelEvent,
     num: c_int,

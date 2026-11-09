@@ -47,8 +47,12 @@ mod worker;
 pub(crate) use worker::{
     apr_reactor_notify_external_progress, apr_reactor_shutdown, apr_reactor_submit,
     apr_reactor_submit_external_aio_read, apr_reactor_submit_external_aio_read_group,
-    apr_reactor_wait_synthetic_submit_id,
+    apr_reactor_wait_synthetic_submit_id, pread_pool_pending_exits, pread_pool_yield,
 };
+#[cfg(feature = "mem_report")]
+pub(crate) use worker::pread_pool_state;
+#[cfg(feature = "mem_report")]
+pub(crate) use native::EQUEUE_TARGETS;
 mod lane_overlap;
 mod loose_pread;
 mod pread_pool;
@@ -127,17 +131,10 @@ pub(crate) const AMPR_EMU_APR_READ_CREDIT_GRANULE_BYTES: u64 = 0x10000;
 pub(crate) const AMPR_EMU_APR_READ_PASS_MAX_BYTES: u64 = 0x80000;
 /// Blocking pread pool for the pack's physical reads (pread_pool.rs). Kernel AIO on BFS
 /// serves 1-2 requests at a time; 32 parallel preads reached 1.6-2.0 GB/s on
-/// a console (bench). Release: 32 threads (tune::RELEASE_PREAD_THREADS),
-/// shared by pack groups (console peak 1.9 busy, 8 queued) and split loose reads
-/// (24-28 parts pending at 32 threads). The threads use libkernel's
-/// default stacks, not the internal pool: pool_peak stayed 72.0 MiB with 16 and
-/// 32 threads. The debug build has room for 64 and starts `tune::pread_threads()`
-/// (default 32), so 48 or 64 threads can be A/B tested without a rebuild.
-pub(crate) const AMPR_EMU_PACK_PREAD_WORKERS: usize = if crate::rt::tune::ON {
-    64
-} else {
-    crate::rt::tune::RELEASE_PREAD_THREADS as usize
-};
+/// a console (bench). 16 threads in both builds (tune::RELEASE_PREAD_THREADS
+/// has the measurements), shared by pack groups and split loose reads. Their
+/// 32 KiB stacks are libkernel memory, not the internal pool.
+pub(crate) const AMPR_EMU_PACK_PREAD_WORKERS: usize = crate::rt::tune::RELEASE_PREAD_THREADS as usize;
 pub(crate) const AMPR_EMU_PACK_PREAD_TASKS: usize = 128;
 /// Loose APR reads (the game's real-fd reads) through the pread pool
 /// (loose_pread.rs). Release default; the debug build reads `loose_pread`.
@@ -174,8 +171,8 @@ const _: () = assert!(
     (AMPR_EMU_APR_LOOSE_PREAD_TASKS_MAX as usize) < AMPR_EMU_PACK_PREAD_TASKS,
     "loose reads must leave pread tasks for pack groups"
 );
-/// pread threads loose reads never take: 4 of the 32 release threads
-/// (tune::RELEASE_PREAD_THREADS; debug `pread_threads`, default 32, max 64)
+/// pread threads loose reads never take: 4 of the 16 threads
+/// (tune::RELEASE_PREAD_THREADS; debug `pread_threads`, default and max 16)
 /// stay for pack tasks (console peak was 1.9 busy pack threads).
 pub(crate) const AMPR_EMU_APR_LOOSE_PREAD_PACK_RESERVE: usize = 4;
 pub(crate) const AMPR_EMU_APR_COMMAND_BUFFER_LIVE_MAX: usize = 4096;
@@ -1584,6 +1581,20 @@ pub(crate) const PREAD_QUEUED: u32 = 1;
 pub(crate) const PREAD_RUNNING: u32 = 2;
 pub(crate) const PREAD_DONE: u32 = 3;
 
+pub(crate) const PREAD_SLOT_EMPTY: u8 = 0;
+pub(crate) const PREAD_SLOT_LIVE: u8 = 1;
+/// Returned from its loop; its handle still needs a join.
+pub(crate) const PREAD_SLOT_EXITED: u8 = 2;
+/// A thread is joining it (the reactor or a yielding game thread).
+pub(crate) const PREAD_SLOT_JOINING: u8 = 3;
+
+/// A pool thread's start argument: its reactor and its slot.
+#[derive(Clone, Copy)]
+pub(crate) struct PreadThreadArg {
+    pub(crate) reactor: *mut AprAioReactor,
+    pub(crate) slot: usize,
+}
+
 /// One request of a pread-backed external group. Only the reactor publishes
 /// or retires a slot; a pool thread claims it under preadMutex and publishes
 /// completion with Release.
@@ -1641,7 +1652,25 @@ pub(crate) struct AprAioReactor {
     pub(crate) preadMutex: Mutex,
     pub(crate) preadCv: Condvar,
     pub(crate) preadThreads: [ScePthread; AMPR_EMU_PACK_PREAD_WORKERS],
+    /// Per thread slot, under preadMutex: PREAD_SLOT_EMPTY/LIVE/EXITED/JOINING.
+    pub(crate) preadSlots: [u8; AMPR_EMU_PACK_PREAD_WORKERS],
+    pub(crate) preadArgs: [PreadThreadArg; AMPR_EMU_PACK_PREAD_WORKERS],
+    /// Live pool threads (started, not exited), under preadMutex.
     pub(crate) preadThreadCount: usize,
+    /// Idle threads, exits asked of the pool, and the most threads it may
+    /// grow to (0 until started); all under preadMutex.
+    pub(crate) preadIdle: u32,
+    pub(crate) preadExitRequests: u32,
+    pub(crate) preadCeiling: u32,
+    /// Signalled when a pool thread exits (pread_pool_yield waits on it).
+    pub(crate) preadExitCv: Condvar,
+    /// The pool gave its last thread to the game, so its next first thread
+    /// is not exempt from the thread budget (spawn_pread_thread). Under
+    /// preadMutex.
+    pub(crate) preadGaveLast: bool,
+    /// A pool thread left: the reactor joins it on its next pass, since an
+    /// exited thread not yet joined may still count against the game's limit.
+    pub(crate) preadReapPending: AtomicBool,
     pub(crate) preadStop: bool,
     pub(crate) preadPendingCount: u32,
     pub(crate) preadNextSequence: u64,

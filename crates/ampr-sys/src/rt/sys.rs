@@ -458,28 +458,33 @@ pub mod hook {
     pub const sceKernelAioDeleteRequests: usize = 107;
     pub const sceKernelAioCancelRequest: usize = 108;
     pub const sceKernelAioCancelRequests: usize = 109;
-    // 110..=117: debug-only pass-through probes of fully packed games, both
+    // 110..=111: thread creation, both builds, every title: a game creation
+    // that fails with EAGAIN is retried after the runtime gives threads back
+    // (rt/thread_hooks.rs).
+    pub const scePthreadCreate: usize = 110;
+    pub const pthread_create: usize = 111;
+    // 112..=119: debug-only pass-through probes of fully packed games, both
     // formats (rt/probe.rs); release builds have no such slots.
     #[cfg(feature = "mem_report")]
-    pub const dup: usize = 110;
+    pub const dup: usize = 112;
     #[cfg(feature = "mem_report")]
-    pub const dup2: usize = 111;
+    pub const dup2: usize = 113;
     #[cfg(feature = "mem_report")]
-    pub const poll: usize = 112;
+    pub const poll: usize = 114;
     #[cfg(feature = "mem_report")]
-    pub const select: usize = 113;
+    pub const select: usize = 115;
     #[cfg(feature = "mem_report")]
-    pub const openat: usize = 114;
+    pub const openat: usize = 116;
     #[cfg(feature = "mem_report")]
-    pub const fstatat: usize = 115;
+    pub const fstatat: usize = 117;
     #[cfg(feature = "mem_report")]
-    pub const faccessat: usize = 116;
+    pub const faccessat: usize = 118;
     #[cfg(feature = "mem_report")]
-    pub const readlink: usize = 117;
+    pub const readlink: usize = 119;
     #[cfg(feature = "mem_report")]
-    pub const COUNT: usize = 118;
+    pub const COUNT: usize = 120;
     #[cfg(not(feature = "mem_report"))]
-    pub const COUNT: usize = 110;
+    pub const COUNT: usize = 112;
 }
 
 /// Original (pre-detour) libkernel entry points, indexed by `hook::*`, and
@@ -603,9 +608,17 @@ pub unsafe fn real_mapper_get_usage_stats_data(data: *mut u64) -> c_int {
 /// The `_open` original while `_open` is detoured, else `open`: libkernel's
 /// `open` calls `_open`, and a runtime open through it re-entered the
 /// `_open` hook's routing (see `pack::libkernel::real_open`).
+/// Before the hooks install the slots are empty, so fall back to dynamic
+/// `open`, as `real_physical_close` does; tune::load in module_start runs
+/// before the hooks and failed with EIO without it.
 pub unsafe fn real_posix_open(path: *const c_char, flags: c_int, mode: SceKernelMode) -> c_int {
     type F = unsafe extern "C" fn(*const c_char, c_int, ...) -> c_int;
-    match unsafe { kernel_slot::<F>(hook::_open).or_else(|| kernel_slot::<F>(hook::open)) } {
+    let f = unsafe {
+        kernel_slot::<F>(hook::_open)
+            .or_else(|| kernel_slot::<F>(hook::open))
+            .or_else(|| resolve_kernel::<F>(c"open"))
+    };
+    match f {
         Some(f) => unsafe { f(path, flags, mode as c_int) },
         None => {
             set_errno(EIO);

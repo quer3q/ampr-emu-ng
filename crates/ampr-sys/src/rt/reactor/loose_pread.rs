@@ -361,9 +361,16 @@ impl AprAioReactor {
         if !self.ensure_pread_workers() {
             return false;
         }
-        let looseCap = (self
-            .preadThreadCount
-            .saturating_sub(AMPR_EMU_APR_LOOSE_PREAD_PACK_RESERVE))
+        // Threads the pool has or may still start (its ceiling and the thread
+        // budget's room, rt/thread_hooks.rs): the pool grows from
+        // PREAD_MIN_THREADS when tasks queue, so the live count alone would
+        // keep it at 1; after a budget cut it is the live count.
+        let reachable = {
+            let _g = self.preadMutex.lock();
+            (self.preadThreadCount + crate::rt::thread_hooks::budget_room() as usize)
+                .min(self.preadCeiling as usize)
+        };
+        let looseCap = (reachable.saturating_sub(AMPR_EMU_APR_LOOSE_PREAD_PACK_RESERVE))
         .max(1)
         .min(AMPR_EMU_APR_LOOSE_PREAD_TASKS_MAX as usize) as u32;
         if self.preadLooseCount >= looseCap {
