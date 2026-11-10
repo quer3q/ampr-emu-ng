@@ -1741,6 +1741,31 @@ pub(crate) unsafe fn probe_packed_path(path: *const c_char) -> Option<u8> {
     unsafe { lookup_directory_key(key) }.map(|_| b'd')
 }
 
+/// True when `path` is an /app0 file the published index says is packed, for
+/// both pack formats. Unlike `probe_packed_path` this is compiled into release
+/// too: rt/save.rs uses it to tell a save icon that needs handing over from
+/// one the save service can open itself.
+pub(crate) unsafe fn is_packed_file(path: *const c_char) -> bool {
+    if !unsafe { has_app0_root(path) } || !is_resident_ready() {
+        return false;
+    }
+    let mut buf = [0u8; RUNTIME_PATH_CAPACITY];
+    let Ok((len, trailing)) = (unsafe { normalize_key_result(path, &mut buf) }) else {
+        return false;
+    };
+    let key = &buf[..len];
+    if !is_app0_key(key) || trailing || len <= 5 {
+        return false;
+    }
+    let Some((_, id)) = (unsafe { lookup_key_view(key, false) }) else {
+        return false;
+    };
+    let Some(reader) = super::pack::ManifestReader::enter() else {
+        return false;
+    };
+    super::pack::file_id_is_packed(&reader, id)
+}
+
 /// Copies the indexed path of one-based file `id` into `out` (truncated,
 /// NUL-terminated) and returns its length; None when the index is not
 /// published or `id` is unknown. Lock-free, like `probe_packed_path`.
@@ -1892,7 +1917,11 @@ unsafe fn copy_dir_path(l: &Lookup, out: &mut [u8]) -> bool {
 /// `posix_open_impl`: the published index answers /app0; an authoritative
 /// miss returns at once (see `miss_is_authoritative`), other misses and
 /// indexed loose files reach the physical open.
-unsafe fn open_impl(path: *const c_char, flags: c_int, mode: SceKernelMode) -> c_int {
+pub(crate) unsafe fn open_impl(
+    path: *const c_char,
+    flags: c_int,
+    mode: SceKernelMode,
+) -> c_int {
     unsafe { open_with(path, flags, mode, real_posix_open, b'o') }
 }
 
