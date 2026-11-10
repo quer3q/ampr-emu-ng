@@ -61,7 +61,9 @@ runtime-wide budget of 16 worker threads is cut and regrows by one per
 (the loader observer finds it outside `sceKernelGetModuleList`):
 `sceSaveDataMount3` retries a BUSY mount once after unmounting every save
 point the service returned earlier, and `sceSaveDataSaveIconByPath` hands a
-packed icon to `sceSaveDataSaveIcon` as bytes.
+packed icon to `sceSaveDataSaveIcon` as bytes. The pread pool's last thread waits a full
+idle period instead of polling every microsecond once its exit timeout
+passes.
 CI (`.github/workflows/build.yml`) runs the same commands; a pushed `v*` tag creates a draft release with both `.sprx` and `SHA256SUMS`.
 
 ## Conventions
