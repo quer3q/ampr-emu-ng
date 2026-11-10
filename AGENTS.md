@@ -56,7 +56,14 @@ they install in every title, packs or not. A game thread creation that
 fails with EAGAIN makes the runtime give threads back and is retried; the
 runtime-wide budget of 16 worker threads is cut and regrows by one per
 30 s quiet. The runtime creates its own threads through `create_internal`
-(the pre-detour slot).
+(the pre-detour slot). Save data (`rt/save.rs`) is hooked by NID in a loaded
+`libSceSaveData` module, not through the libkernel table, in every title
+(the loader observer finds it outside `sceKernelGetModuleList`):
+`sceSaveDataMount3` retries a BUSY mount once after unmounting every save
+point the service returned earlier, and `sceSaveDataSaveIconByPath` hands a
+packed icon to `sceSaveDataSaveIcon` as bytes. The pread pool's last thread waits a full
+idle period instead of polling every microsecond once its exit timeout
+passes.
 CI (`.github/workflows/build.yml`) runs the same commands; a pushed `v*` tag creates a draft release with both `.sprx` and `SHA256SUMS`.
 
 ## Conventions

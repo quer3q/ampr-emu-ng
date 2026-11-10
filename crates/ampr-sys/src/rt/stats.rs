@@ -87,6 +87,17 @@ stats! {
     /// game creation failed, and growths back by one after 30 s quiet.
     ThreadBudgetCuts = "thread_budget_cuts",
     ThreadBudgetRegrows = "thread_budget_regrows",
+    /// Save data (rt/save.rs): mounts, a mount refused with SAVE_DATA_ERROR_BUSY
+    /// that was retried after unmounting the old copy, the retries that
+    /// succeeded, forced unmounts the save service answered, icon bytes handed
+    /// over through sceSaveDataSaveIcon, and packed icons the runtime could not
+    /// handle (the original path call is left to fail as before).
+    SaveMounts = "save_mounts",
+    SaveBusyRetries = "save_busy_retries",
+    SaveBusyRetriesOk = "save_busy_retries_ok",
+    SaveUmountsAnswered = "save_umounts_answered",
+    SaveIconBytes = "save_icon_bytes",
+    SaveIconSkipped = "save_icon_skipped",
     /// Read pool size (reactor/pread_pool.rs): threads started, the most
     /// live at once, exits after idle time, threads given back to the
     /// game, and our own creations that failed (the pool stops growing).
@@ -402,8 +413,9 @@ pub(crate) fn now() -> u64 {
 /// the debug `zstd_verify` knob also a zstd frame checksum mismatch),
 /// lookup b'-', path "decode fid=<hex> chunk=<hex> pack=<hex> off=<hex>
 /// size=<hex>".
-/// b'V' a save data mount (rt/probe.rs `save_probe`, debug), lookup b'-',
-/// path the call name, rc its result.
+/// b'V' a save data icon the runtime handed over from a pack (rt/save.rs),
+/// lookup b'-', path "save icon <packed path> rc=0x<result>". Logged through
+/// `fs_note`, so `/fsfail` lists each distinct icon path whatever the result.
 /// b'P' thread creation (rt/thread_hooks.rs): a game creation that failed,
 /// lookup b's' scePthreadCreate (rc the SCE error) or b'p' pthread_create
 /// (rc minus its errno), path "<call> <thread name>"; b'r' its retry after

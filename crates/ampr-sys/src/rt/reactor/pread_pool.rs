@@ -33,6 +33,20 @@ const PREAD_IDLE_EXIT_US: u64 = 2_000_000;
 /// zstd title, debug /metrics).
 const PREAD_YIELD_WAIT_US: u64 = 50_000;
 
+/// Next sleep of an idle pool thread. When the idle period is over but the
+/// thread may not exit (the last one, PREAD_MIN_THREADS), a full new period
+/// is waited: the old `remaining` was 0 and floored to 1 us, so the thread
+/// re-scanned the empty table thousands of times a second while idle.
+fn idle_wait_us(idle_ns: u64, may_exit: bool) -> u64 {
+    let period = PREAD_IDLE_EXIT_US * 1000;
+    let left = if idle_ns >= period && !may_exit {
+        period
+    } else {
+        period.saturating_sub(idle_ns)
+    };
+    left.div_ceil(1000).max(1)
+}
+
 impl AprAioReactor {
     unsafe extern "C" fn pread_worker_entry(arg: *mut c_void) -> *mut c_void {
         // Reactor priority, above the decode workers: a finished read is handed
@@ -81,7 +95,7 @@ impl AprAioReactor {
                 let mut woken = false;
                 // Idle time from when this thread last found a task, not
                 // from its last wake-up (`pread_wake_all` wakes them all).
-                let idle_since = time_counter_now();
+                let mut idle_since = time_counter_now();
                 loop {
                     let mut found: Option<usize> = None;
                     for index in 0..AMPR_EMU_PACK_PREAD_TASKS {
@@ -132,9 +146,19 @@ impl AprAioReactor {
                         drop(guard);
                         return;
                     }
+                    // The last thread may not exit (PREAD_MIN_THREADS), so a
+                    // timeout that could not retire it starts a new idle
+                    // period. Without this reset the remaining wait stayed at
+                    // its 1 us floor and the thread woke thousands of times a
+                    // second while the game was idle. A fixed-build run of a
+                    // zstd title (261 s, debug /metrics) reported
+                    // pread_wakeups_idle 147, 0.6 per second.
+                    if idle_timeout {
+                        idle_since = time_counter_now();
+                    }
                     unsafe { (*this).preadIdle += 1 };
-                    let left_us = (PREAD_IDLE_EXIT_US * 1000).saturating_sub(idle_ns).div_ceil(1000);
-                    let _ = cv.wait_for_us(&mut guard, left_us.max(1));
+                    let left_us = idle_wait_us(idle_ns, may_exit);
+                    let _ = cv.wait_for_us(&mut guard, left_us);
                     unsafe { (*this).preadIdle -= 1 };
                     woken = true;
                 }
@@ -652,5 +676,17 @@ mod tests {
         );
         assert_eq!(rc, (10, 10));
         assert_eq!(seen, [(0, 4, 100), (3, 4, 103), (5, 4, 105), (9, 1, 109)]);
+    }
+
+    #[test]
+    fn a_thread_that_cannot_exit_waits_a_full_idle_period() {
+        let period_us = PREAD_IDLE_EXIT_US;
+        // Before the timeout the remaining time is what is left.
+        assert_eq!(idle_wait_us(0, false), period_us);
+        assert_eq!(idle_wait_us(period_us * 1000 / 2, false), period_us / 2);
+        // Past it, the last thread sleeps another whole period instead of
+        // spinning on the 1 us floor.
+        assert_eq!(idle_wait_us(period_us * 1000, false), period_us);
+        assert_eq!(idle_wait_us(period_us * 1000 * 3, false), period_us);
     }
 }
