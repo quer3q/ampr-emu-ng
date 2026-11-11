@@ -18,12 +18,13 @@ being notified (`job_notify_ns`).
 |---|---|---|
 | Loose APR reads through the blocking pread pool | on | `AMPR_EMU_APR_LOOSE_PREAD`, reactor/loose_pread.rs |
 | Split each loose read into parallel parts | 64 KiB | `AMPR_EMU_APR_LOOSE_PREAD_PART_KIB` |
-| pread pool threads | 32 (4 kept for pack reads) | `tune::RELEASE_PREAD_THREADS` |
+| pread pool threads | at most 6, grown by backlog, retired by load | `tune::RELEASE_PREAD_THREADS` |
 | Lane EOP overlap | off | `AMPR_EMU_APR_LANE_EOP_OVERLAP` |
 | Read pass / per-read active limits | 512 KiB / 4 chunks, 2 MiB (unchanged) | reactor/mod.rs |
 
-With these defaults a read takes 1.09 ms, against 2.53 ms with kernel AIO
-(-57%). Read time per session drops from 61.0 s to 27.9 s, a job takes about
+With these defaults (measured with the earlier 32 pool threads) a read
+takes 1.09 ms, against 2.53 ms with kernel AIO (-57%). Game wait per read
+did not change between 8 and 32 threads (Makefile comment). Read time per session drops from 61.0 s to 27.9 s, a job takes about
 5.9 ms, and there are 0 errors.
 
 ## What helped

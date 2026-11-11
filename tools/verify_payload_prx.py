@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import re
 import struct
+import sys
 from pathlib import Path
 
 from generate_payload_exports import METADATA_SYMBOLS, defined_exports, name_to_nid
@@ -49,7 +50,46 @@ def fself_versions(data: bytes) -> tuple[int, int]:
     return app_version, fw_version
 
 
+MIB = 1 << 20
+# The release and debug PRX must have the same size (Makefile
+# AMPR_INTERNAL_POOL_SIZE / AMPR_DEBUG_POOL_SIZE), below 128 MiB.
+PRX_TOTAL_LIMIT = 128 * MIB
+PRX_TOTAL_SLACK = 64 << 10
+
+
+def pt_load_total(data: bytes) -> int:
+    """Sum of PT_LOAD p_memsz: the PRX's memory once loaded."""
+    phoff = struct.unpack_from("<Q", data, 0x20)[0]
+    phentsize, phnum = struct.unpack_from("<HH", data, 0x36)
+    total = 0
+    for i in range(phnum):
+        p_type = struct.unpack_from("<I", data, phoff + i * phentsize)[0]
+        if p_type == 1:
+            total += struct.unpack_from("<Q", data, phoff + i * phentsize + 0x28)[0]
+    return total
+
+
+def check_prx_totals(release: Path, debug: Path) -> int:
+    """Fails unless both PRX totals match within 64 KiB and stay below 128 MiB."""
+    rel, dbg = pt_load_total(release.read_bytes()), pt_load_total(debug.read_bytes())
+    gap = abs(rel - dbg)
+    print(
+        f"prx_totals release={rel} ({rel / MIB:.2f} MiB) "
+        f"debug={dbg} ({dbg / MIB:.2f} MiB) diff={gap}"
+    )
+    if gap > PRX_TOTAL_SLACK or max(rel, dbg) >= PRX_TOTAL_LIMIT:
+        raise ValueError(
+            "release and debug PRX totals must match within 64 KiB and stay "
+            "below 128 MiB: update the pool gap in the Makefile (debug - release "
+            f"= {dbg - rel:+d} B; move that, in 16 KiB pages, from "
+            "AMPR_DEBUG_POOL_SIZE to AMPR_INTERNAL_POOL_SIZE)"
+        )
+    return 0
+
+
 def main() -> int:
+    if len(sys.argv) == 4 and sys.argv[1] == "--prx-totals":
+        return check_prx_totals(Path(sys.argv[2]), Path(sys.argv[3]))
     parser = argparse.ArgumentParser()
     parser.add_argument("--prx", type=Path, required=True)
     parser.add_argument("--linked", type=Path, required=True)

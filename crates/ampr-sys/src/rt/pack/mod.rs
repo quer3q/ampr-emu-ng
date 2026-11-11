@@ -51,7 +51,6 @@ pub(crate) use super::index::{
     ampr_pack_core_mount, ampr_pack_core_task_count, ampr_pack_core_validate_logical_file,
     ampr_pack_crc32, AmprPackBlockReadTask, AmprPackChunkView, AmprPackCoreView, Stat,
 };
-pub(crate) use super::runtime_memory::{ampr_internal_amm_pool_alloc, ampr_internal_amm_pool_free};
 pub(crate) use crate::cache_ffi::{
     ampr_rust_cache_chunk_key_hash, ampr_rust_cache_find_page_run, ampr_rust_cache_mark_pages,
     ampr_rust_cache_wait_bucket, ampr_rust_physical_cache_key_hash,
@@ -588,11 +587,14 @@ pub(crate) const AMPR_EMU_PACK_ROOT_PATH: &CStr = c"/app0";
 pub(crate) const AMPR_EMU_PACK_LOGICAL_ROOT_PATH: &CStr = c"/app0";
 
 pub(crate) const AMPR_EMU_PACK_VIRTUAL_DIRECTORY_SLOTS: usize = 256;
-/// Decode workers, from the Makefile's `AMPR_PACK_WORKERS` (Makefile default
-/// 4; 8 when built outside the Makefile).
+/// Decode workers, from the Makefile's `AMPR_PACK_WORKERS` (default 4, also
+/// outside the Makefile): each has a 1 MiB decode buffer from prepare to
+/// shutdown; threads start at 1 and grow on demand (worker.rs). Decode took
+/// ~0.21 cores on a zstd title, and 4 against 8 workers gave the same game
+/// wait per read, 312 vs 315 us (debug /metrics).
 pub(crate) const AMPR_EMU_PACK_WORKERS: u32 = match option_env!("AMPR_PACK_WORKERS") {
     Some(s) => super::runtime_memory::parse_size(s.as_bytes()) as u32,
-    None => 8,
+    None => 4,
 };
 const _: () = assert!(
     AMPR_EMU_PACK_WORKERS >= 1 && AMPR_EMU_PACK_WORKERS as usize <= AMPR_EMU_PACK_WORKER_CAPACITY
@@ -621,15 +623,27 @@ pub(crate) const AMPR_EMU_PACK_READAHEAD_MAX_DISK_INFLIGHT: u32 =
     };
 pub(crate) const AMPR_EMU_PACK_DECODED_CACHE_MAX_BYTES: u64 = 512 * 1024 * 1024;
 pub(crate) const AMPR_EMU_PACK_PHYSICAL_CACHE_MAX_BYTES: u64 = 128 * 1024 * 1024;
-/// 16 in release: each pipeline keeps a 2 MiB I/O window once used and the
-/// cache reserve keeps room for all of them (manifest.rs), so a window never fails to
-/// allocate; work waits in the queue while all pipelines are busy (schedule.rs). The
-/// debug build has 32 slots and starts `tune::pipelines()` of them (worker.rs).
-pub(crate) const AMPR_EMU_PACK_PIPELINE_SLOTS: usize = if super::tune::ON {
-    32
-} else {
-    super::tune::RELEASE_PIPELINES as usize
-};
+/// Pipeline slots, from the Makefile's `AMPR_PACK_PIPELINES` (default 12,
+/// at most AMPR_EMU_PACK_PIPELINE_MAX) in both builds: each pipeline keeps a
+/// 2 MiB I/O window from its first use to shutdown, from the pool under the
+/// Buffer ledger, which holds 12 of them (rt/index_memory.rs; a refused one
+/// degrades, page_plan.rs); work waits
+/// in the queue while all pipelines are busy (schedule.rs). The debug build
+/// starts `tune::pipelines()` of them (worker.rs); built outside the
+/// Makefile it keeps room for 32.
+pub(crate) const AMPR_EMU_PACK_PIPELINE_SLOTS: usize =
+    if super::tune::ON && option_env!("AMPR_PACK_PIPELINES").is_none() {
+        AMPR_EMU_PACK_PIPELINE_MAX
+    } else {
+        super::tune::RELEASE_PIPELINES as usize
+    };
+/// Most pipeline slots a build can have (the debug `high` profile's 32).
+pub(crate) const AMPR_EMU_PACK_PIPELINE_MAX: usize = 32;
+const _: () = assert!(
+    super::tune::RELEASE_PIPELINES >= 1
+        && super::tune::RELEASE_PIPELINES as usize <= AMPR_EMU_PACK_PIPELINE_SLOTS
+        && AMPR_EMU_PACK_PIPELINE_SLOTS <= AMPR_EMU_PACK_PIPELINE_MAX
+);
 pub(crate) const AMPR_EMU_PACK_WORKER_PRIORITY: c_int = 384;
 pub(crate) const AMPR_EMU_PACK_WORKER_AFFINITY: u64 = 0x3f;
 pub(crate) const AMPR_EMU_PACK_LATENCY_RESERVE_WORKERS: u32 = 0;
@@ -667,26 +681,30 @@ pub(crate) const AMPR_EMU_PACK_MAX_PACKS: usize = 1024;
 /// may span (PACK_MANDATORY_GROUP_MAX_REQUESTS). A zstd title with 28
 /// volumes kept all 18 of the old cap busy (debug /metrics).
 pub(crate) const AMPR_EMU_PACK_OPEN_PACK_FD_CAP: u32 = 32;
-/// 32 MiB. At 16 MiB a zstd title (debug /metrics, 150 s) re-decoded an
-/// evicted chunk in 73% of its misses: 29.9 GB decoded for 6.56 GB read.
-/// Before, at 16 MiB: a fully packed LZ4 UE3 title (debug /metrics, 75 s from launch,
+/// 16 MiB (both builds; debug `decoded_mib`). Larger caches
+/// did not pay on the console: 16 + 16 MiB caches gave a game wait per read
+/// of 312 us against 314 us with 128 + 224 MiB (debug /metrics,
+/// 2026-11-10). At 16 MiB a zstd title (debug /metrics, 150 s) re-decoded
+/// an evicted chunk in 73% of its misses: 29.9 GB decoded for 6.56 GB read.
+/// Earlier, at 16 MiB: a fully packed LZ4 UE3 title (debug /metrics, 75 s from launch,
 /// 128 MiB pool) re-decodes a third of its chunks: 16 MiB served 14% of
 /// chunk reads, cut repeat decodes 34.7k -> 20.7k and the pack job
 /// 1.44-1.46 -> 1.40 ms (two runs without it differ by ~2%), for 16 MiB of
 /// pool (peak 113.6 MiB of 128).
 /// Other titles, same build: a fully packed LZ4 UE5 title 2.6% hits, a
 /// REDengine title (zstd) 59.6%, an RE Engine title (zstd) 20.9%.
-/// It is carved after the physical cache (manifest.rs); in a short pool it
-/// halves down to the 16 MiB minimum, then stays off.
-pub(crate) const AMPR_EMU_PACK_DECODED_CACHE_BYTES: u64 = 32 * 1024 * 1024;
+/// It is carved after the physical cache (manifest.rs `cache_region`) and is
+/// off when less than its 16 MiB minimum is left under the Cache cap.
+pub(crate) const AMPR_EMU_PACK_DECODED_CACHE_BYTES: u64 = 16 * 1024 * 1024;
 pub(crate) const AMPR_EMU_PACK_DECODED_CACHE_MIN_BYTES: u64 = 16 * 1024 * 1024;
-pub(crate) const AMPR_EMU_PACK_MEMORY_RESERVE_BYTES: u64 = 4 * 1024 * 1024;
-/// 64 MiB, carved before the decoded cache (manifest.rs): besides its hits
+/// 16 MiB like the decoded cache (same console runs), carved before
+/// the decoded cache (manifest.rs): besides its hits
 /// it is where the read planner (page_plan.rs) joins neighbouring pages
 /// into one large read; with it off reads fell to 66 KB (one chunk) and
 /// load APR rose 1.65 -> 2.50 ms. zstd: 64 MiB against 32 gave APR read
-/// 1.11 -> 1.08/1.09 ms and -10% disk bytes at 8.9 GB read.
-pub(crate) const AMPR_EMU_PACK_PHYSICAL_CACHE_BYTES: u64 = 64 * 1024 * 1024;
+/// 1.11 -> 1.08/1.09 ms and -10% disk bytes at 8.9 GB read, not seen in
+/// game wait per read.
+pub(crate) const AMPR_EMU_PACK_PHYSICAL_CACHE_BYTES: u64 = 16 * 1024 * 1024;
 pub(crate) const AMPR_EMU_PACK_PHYSICAL_CACHE_MIN_BYTES: u64 = 8 * 1024 * 1024;
 pub(crate) const AMPR_EMU_PACK_PHYSICAL_CACHE_ENTRY_CAP: usize = 4096;
 pub(crate) const AMPR_EMU_PACK_PHYSICAL_CACHE_HASH_BUCKETS: usize = 8192;

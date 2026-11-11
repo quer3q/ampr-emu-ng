@@ -9,39 +9,39 @@ BUILD_MAKEFILE := $(lastword $(MAKEFILE_LIST))
 
 # 1 = debug build: TCP metrics endpoint on port 9090 (rt/exports.rs, rt/stats.rs).
 AMPR_MEM_REPORT ?= 0
-# Internal pool size in bytes, read by rt/runtime_memory.rs.
-# 192 MiB: startup peak = cache-reserve 40 (4 + 16 pipeline I/O windows x
-# 2 MiB + 4 worker buffers x 1 MiB) + physical cache 64 + decoded cache 32
-# (rt/pack/mod.rs) + the index, which grows with file count. The reserve is
-# released once the caches are carved, so play uses less. Measured with
-# the earlier 32 + 16 MiB caches, debug build with a 128 MiB pool, default
-# knobs, folder installs, debug /metrics ~75 s after launch, pool peak
-# (index): a fully packed LZ4 UE3 title 113.6 MiB (25.2), 81.6 MiB in use
-# while it plays; a fully packed LZ4 UE5 title 93.2 MiB (5.2); a REDengine
-# title (zstd) 95.6 MiB (7.6); an RE Engine title (zstd) 90.7 MiB (2.6).
-# All four play and save with 0 job, decode or address errors. The caches
-# grew by 48 MiB (a zstd title re-decoded 73% of its decoded cache misses
-# at 16 MiB), so the UE3 title should peak near 161.6 MiB; not measured
-# yet. The pool is .bss: release runtime memory (PRX segments) is
-# 200.7 MiB; the original C++ ampr_emu ran with a 384 MiB pool. The .bss
-# does not count against the game's flexible memory (debug /metrics
-# flex_at_start_bytes).
-AMPR_INTERNAL_POOL_SIZE ?= 0xC000000
-# Debug build pool: 256 MiB, 64 MiB above the release pool, so a title with a
-# larger index, or the low and medium tune profiles, runs with the full
-# cache targets; high (~262 MiB, rt/tune.rs PROFILES) still shrinks. The
-# cache targets do not grow with the pool, so the debug /metrics pool peak
-# is the memory at those targets. Only the startup carve adapts to a
-# short release pool: the caches halve, and each turns off below its
-# minimum, until index + reserve + caches fit (rt/pack/manifest.rs
-# alloc_cache_region). Pool use above 192 MiB after the carve (e.g. the
-# zstd projection, rt/pack/zstd.rs) fails in release. Debug runtime memory (PRX segments, program headers
-# of out/debug/libSceAmpr.prx) is 266.4 MiB, release 200.7 MiB.
-AMPR_DEBUG_POOL_SIZE ?= 0x10000000
-# Pread pool threads: at most 16 (tune::RELEASE_PREAD_THREADS), within the
-# runtime-wide budget of 16 worker threads (rt/thread_hooks.rs); the pool
-# peak did not change with 16 to 64 threads (debug /metrics). Their 32 KiB
-# stacks are libkernel memory outside the pool. Static reactor storage, also
+# Internal pool size in bytes, read by rt/runtime_memory.rs: all runtime
+# memory. It holds the Index 55 (a 52 MiB index file plus 3 MiB of tables) +
+# Cache 32 + Buffer 28 MiB ledger caps (rt/index_memory.rs; buffers are
+# 4 x 1 MiB decode + 12 x 2 MiB I/O) and a 2 MiB budget for the fixed sites
+# (1.56 MiB used); a pool below that fails the build. Both builds have the
+# same PRX size T (PT_LOAD memsz total) = 127 MiB, the smallest 1 MiB
+# multiple holding the 117 MiB of debug ledgers and budget plus the debug
+# build's non-pool part, below 128 MiB. Each pool is T minus its build's
+# non-pool part (code, data, reactor storage), rounded down to a 16 KiB
+# page. Non-pool parts: release 9027322 B (8.61 MiB), debug 10443938 B
+# (9.96 MiB; more code, /fsfail and retry records, rt/stats.rs), so the
+# release pool is 1.36 MiB (87 pages) larger: 118.39 vs 117.03 MiB. `dist` checks both totals
+# (tools/verify_payload_prx.py --prx-totals): they must match within 64 KiB
+# and stay below 128 MiB, else update the gap here.
+# The first pool allocation publishes the pool: the startup cache carve ran
+# before it was published and failed (pool_alloc_failed 1, caches off).
+# Nothing comes from the game's direct or flexible memory: the pool is .bss
+# and did not lower the game's free direct memory, while direct allocations
+# did (a title had 42 MiB of direct memory free during play), and flexible
+# memory had 0-28 MiB free in another title (debug /metrics flex_* and the
+# former direct memory lines).
+AMPR_INTERNAL_POOL_SIZE ?= 0x7664000
+# Debug build pool (passed to it as AMPR_INTERNAL_POOL_SIZE by `dist`):
+# T minus the debug non-pool part, 117.03 MiB, the same ledger caps as
+# release; host tests build with it (rt/runtime_memory.rs).
+AMPR_DEBUG_POOL_SIZE ?= 0x7508000
+# Pread pool threads: at most 6 (tune::RELEASE_PREAD_THREADS), grown by
+# backlog and retired by load within the runtime-wide budget of 16 worker
+# threads (rt/thread_hooks.rs); a zstd title peaked at 5-6, two titles at
+# 4-5, and game wait per read did not change between 8 and 32 (debug
+# /metrics). 6 instead of 8 shrinks AprAioReactor by 72 B (release, host
+# size_of). Their 32 KiB stacks are libkernel memory outside the pool.
+# Static reactor storage, also
 # outside the pool (host size_of vs commit 52ef644): AprAioReactor
 # 1985736 -> 1988440 B release (+2.6 KiB), 1985864 -> 2054232 B debug
 # (+66.8 KiB); ActiveRead 264 -> 280 B. Debug only (host size_of): the
@@ -49,15 +49,25 @@ AMPR_DEBUG_POOL_SIZE ?= 0x10000000
 # and AprAioReactor 2054232 -> 2152536 B (+96 KiB, 4096 slots), and the
 # /fsfail table adds ~14 KiB of .bss; release sizes unchanged.
 # One runtime reads LZ4 (AMPRPAK4) and zstd (AMPRZPK1) packs, picked at load,
-# from one pool (peaks above). The at most 4 virtual-fd read threads
+# with the same pool and ledgers (above). The at most 4 virtual-fd read threads
 # (rt/pack/fd_read.rs) have 128 KiB libkernel stacks outside the pool.
 # Virtual fds, the libc hooks and mmap below serve both formats, in a title
 # that ships packs only (a plain title keeps the v0.2.0 hooks, rt/hook.rs
 # `hook_enabled`).
-# Pack decode worker threads (1..16), read by rt/pack/mod.rs.
-# 4: decode takes 14-29 us per chunk, 1.6% of 4 workers on average and 0.16
-# cores in the busiest second; 4 keeps a wide margin.
+# Pack decode workers (1..16), read by rt/pack/mod.rs. Each has a 1 MiB
+# decode buffer from startup to shutdown; its thread starts at 1, grows
+# while jobs queue and retires by load, so the game gets thread slots back.
+# 4: decode takes 14-29 us per chunk and ~0.21 cores on a zstd title, and
+# 4 vs 8 gave 312 vs 315 us game wait per read (debug /metrics).
 AMPR_PACK_WORKERS ?= 4
+# Pack read pipelines (1..32), read by rt/pack/mod.rs and rt/tune.rs: the
+# slot count and the default pipeline count, debug build too, so the debug
+# `pipelines` knob and profiles stop at it (build with 32 to tune above 12).
+# Each pipeline has a 2 MiB I/O window under the Buffer ledger, allocated
+# on first use and kept to shutdown. 12: a
+# zstd title used at most 9-10 of 16, and 12 vs 16 gave 312 vs 315 us game
+# wait per read; at 6 it used all 6, 333 vs 345 us at 16 (debug /metrics).
+AMPR_PACK_PIPELINES ?= 12
 # Both formats (the knob keeps its zstd name), titles with packs only:
 # libkernel internal-entry hooks that route through the index, bit i = hook
 # id 84 + i (rt/sys.rs: _open .. sceKernelFcntl, 12 bits). The measurements
@@ -94,8 +104,9 @@ AMPR_ZSTD_LIBC_HOOKS ?= 0xfff
 # packed file takes the disk cache), opt-in and not run on a console: none
 # of the three measured fully packed games mmapped a packed file
 # (mmap_virtual 0), so it has never served a game.
-# It adds 2 MiB persistent pool scratch (4 slots of 512 KiB) plus 4 libzstd
-# DCtx on the libc heap and one byte per mapped 256 KiB chunk, and its known
+# It adds 2 MiB of index memory scratch (4 slots of 512 KiB) plus 4 libzstd
+# DCtx on the libc heap and one pool byte per mapped 256 KiB chunk (a
+# mapping over 512 MiB takes the disk cache), and its known
 # limits (mprotect not tracked, handler on the faulting thread's stack,
 # handler kept after module_stop; module doc of mmap_fault.rs) are unsolved.
 AMPR_ZSTD_MMAP ?= 2
@@ -111,6 +122,16 @@ AMPR_PACK_READAHEAD_MAX_DISK_INFLIGHT ?= 2
 # short hash, "-dirty" with uncommitted tracked changes. ps5/build-docker.sh
 # sets it from the host, since the Docker image has no git.
 AMPR_GIT_REV ?= unknown
+
+# Each knob is one word. `build-docker.sh dist "A=1 B=2"` (one argument)
+# sets A to "1 B=2": B keeps its default and the shell splits A when it runs
+# cargo, so a dist run with the pool knobs in one argument built a debug
+# PRX identical to the default one (out/*/obj/build-config.txt).
+BUILD_KNOBS := AMPR_MEM_REPORT AMPR_INTERNAL_POOL_SIZE AMPR_DEBUG_POOL_SIZE \
+  AMPR_PACK_WORKERS AMPR_PACK_PIPELINES AMPR_ZSTD_LIBC_HOOKS AMPR_ZSTD_MMAP \
+  AMPR_PACK_READAHEAD_CHUNKS AMPR_PACK_READAHEAD_MAX_DISK_INFLIGHT AMPR_GIT_REV
+$(foreach k,$(BUILD_KNOBS),$(if $(filter 1,$(words $($(k)))),,\
+  $(error $(k) must be one word, got '$($(k))'; pass each knob as its own argument)))
 
 include $(PS5_PAYLOAD_SDK)/toolchain/prospero.mk
 
@@ -170,6 +191,7 @@ $(BUILD_CONFIG): FORCE
 	  printf '%s\n' 'AMPR_MEM_REPORT=$(AMPR_MEM_REPORT)'; \
 	  printf '%s\n' 'AMPR_INTERNAL_POOL_SIZE=$(AMPR_INTERNAL_POOL_SIZE)'; \
 	  printf '%s\n' 'AMPR_PACK_WORKERS=$(AMPR_PACK_WORKERS)'; \
+	  printf '%s\n' 'AMPR_PACK_PIPELINES=$(AMPR_PACK_PIPELINES)'; \
 	  printf '%s\n' 'AMPR_ZSTD_LIBC_HOOKS=$(AMPR_ZSTD_LIBC_HOOKS)'; \
 	  printf '%s\n' 'AMPR_ZSTD_MMAP=$(AMPR_ZSTD_MMAP)'; \
 	  printf '%s\n' 'AMPR_PACK_READAHEAD_CHUNKS=$(AMPR_PACK_READAHEAD_CHUNKS)'; \
@@ -190,7 +212,7 @@ RUST_SOURCES := $(wildcard crates/*/src/*.rs crates/*/src/*/*.rs crates/*/src/*/
 
 $(RUST_STATICLIB): Cargo.toml Cargo.lock $(RUST_SOURCES) $(RUST_TARGET) $(BUILD_MAKEFILE) $(BUILD_CONFIG)
 	CC_x86_64_ps5_freebsd=$(PS5_PAYLOAD_SDK)/bin/prospero-clang AR_x86_64_ps5_freebsd=$(PS5_PAYLOAD_SDK)/bin/prospero-ar CRATE_CC_NO_DEFAULTS=1 CFLAGS_x86_64_ps5_freebsd="$(ZSTD_CFLAGS)" \
-	RUSTC_BOOTSTRAP=1 AMPR_INTERNAL_POOL_SIZE=$(AMPR_INTERNAL_POOL_SIZE) AMPR_PACK_WORKERS=$(AMPR_PACK_WORKERS) AMPR_ZSTD_LIBC_HOOKS=$(AMPR_ZSTD_LIBC_HOOKS) AMPR_ZSTD_MMAP=$(AMPR_ZSTD_MMAP) AMPR_PACK_READAHEAD_CHUNKS=$(AMPR_PACK_READAHEAD_CHUNKS) AMPR_PACK_READAHEAD_MAX_DISK_INFLIGHT=$(AMPR_PACK_READAHEAD_MAX_DISK_INFLIGHT) AMPR_GIT_REV=$(AMPR_GIT_REV) CARGO_TARGET_DIR=$(abspath $(OUT)/cargo) \
+	RUSTC_BOOTSTRAP=1 AMPR_INTERNAL_POOL_SIZE=$(AMPR_INTERNAL_POOL_SIZE) AMPR_PACK_WORKERS=$(AMPR_PACK_WORKERS) AMPR_PACK_PIPELINES=$(AMPR_PACK_PIPELINES) AMPR_ZSTD_LIBC_HOOKS=$(AMPR_ZSTD_LIBC_HOOKS) AMPR_ZSTD_MMAP=$(AMPR_ZSTD_MMAP) AMPR_PACK_READAHEAD_CHUNKS=$(AMPR_PACK_READAHEAD_CHUNKS) AMPR_PACK_READAHEAD_MAX_DISK_INFLIGHT=$(AMPR_PACK_READAHEAD_MAX_DISK_INFLIGHT) AMPR_GIT_REV=$(AMPR_GIT_REV) CARGO_TARGET_DIR=$(abspath $(OUT)/cargo) \
 	  $(RUST_CARGO) build -Z build-std=core,alloc -Z json-target-spec \
 	    --release --target $(RUST_TARGET) -p ampr-sys $(if $(filter 1,$(AMPR_MEM_REPORT)),--features mem_report)
 
@@ -284,6 +306,7 @@ verify: all
 dist:
 	$(MAKE) verify OUT=out/release AMPR_MEM_REPORT=0
 	$(MAKE) verify OUT=out/debug AMPR_MEM_REPORT=1 AMPR_INTERNAL_POOL_SIZE=$(AMPR_DEBUG_POOL_SIZE)
+	$(PYTHON) tools/verify_payload_prx.py --prx-totals out/release/libSceAmpr.prx out/debug/libSceAmpr.prx
 	cp out/release/libSceAmpr.sprx libSceAmpr.sprx
 	cp out/debug/libSceAmpr.sprx libSceAmpr-debug.sprx
 

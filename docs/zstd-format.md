@@ -173,8 +173,8 @@ submits in `/fsfail` (op `I`, once per file).
 Three fully packed zstd games were tested on a console with release and
 debug builds: boot, video, load, save and play, with 0 errors. Two fully
 packed LZ4 games (a UE3 and a UE5 title) were tested with the debug build
-and the current cache defaults (16 MiB decoded cache) on the 128 MiB
-release pool size: both play
+in an earlier build (128 MiB pool, 32 MiB physical + 16 MiB decoded
+caches): both play
 and save with 0 job, decode or address errors; README.md
 [Performance](../README.md#performance) has their numbers. The debug build's
 `/metrics` gave these numbers for the zstd games, with the profile above and
@@ -187,8 +187,9 @@ an earlier build (before the 16 MiB decoded cache):
 | UE5 | .exfat image | 5 | 103 s | 3.84 ms | 3.11 ms | 2.59 ms |
 | Northlight | folder | 1 | 216 s | 8.68 ms | 6.50 ms | 1.46 ms |
 
-With the current cache defaults (debug build with the 128 MiB release
-pool, folder installs, `/metrics` about 75 s after launch), a REDengine title read through virtual fds: pack job
+With that earlier build (debug, 128 MiB pool, 32 + 16 MiB caches, folder
+installs, `/metrics` about 75 s after launch), a REDengine title read
+through virtual fds: pack job
 0.36 ms, disk read 0.47 ms, 59.6% decoded cache hits, pool peak 95.6 MiB of
 128 MiB with a 7.6 MiB index. An RE Engine title read through APR: game
 wait per read 1.35 ms, pack job 1.11 ms, disk read 0.50 ms, 20.9% decoded

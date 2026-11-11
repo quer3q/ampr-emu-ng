@@ -538,9 +538,7 @@ pub(crate) unsafe fn save_original<F: Copy>(i: usize) -> Option<F> {
     if i >= SAVE_COUNT {
         return None;
     }
-    let slot = unsafe {
-        &*(addr_of!(g_amprOriginalSaveDataById[i]) as *const AtomicPtr<c_void>)
-    };
+    let slot = unsafe { &*(addr_of!(g_amprOriginalSaveDataById[i]) as *const AtomicPtr<c_void>) };
     unsafe { sys::fn_from_ptr(slot.load(Acquire)) }
 }
 
@@ -1812,7 +1810,17 @@ pub unsafe extern "C" fn sceKernelLoadStartModule_equeue_observer(
     opt: *const c_void,
     result: *mut c_int,
 ) -> SceKernelModule {
-    unsafe { load_observe(&ORIGINAL_LOAD_START_MODULE, name, args, argp, flags, opt, result) }
+    unsafe {
+        load_observe(
+            &ORIGINAL_LOAD_START_MODULE,
+            name,
+            args,
+            argp,
+            flags,
+            opt,
+            result,
+        )
+    }
 }
 
 /// `sceKernelLoadStartModuleForSysmodule`: the loader path for native system
@@ -1826,7 +1834,17 @@ pub unsafe extern "C" fn sceKernelLoadStartModuleForSysmodule_observer(
     opt: *const c_void,
     result: *mut c_int,
 ) -> SceKernelModule {
-    unsafe { load_observe(&ORIGINAL_LOAD_FOR_SYSMODULE, name, args, argp, flags, opt, result) }
+    unsafe {
+        load_observe(
+            &ORIGINAL_LOAD_FOR_SYSMODULE,
+            name,
+            args,
+            argp,
+            flags,
+            opt,
+            result,
+        )
+    }
 }
 
 unsafe fn load_observe(

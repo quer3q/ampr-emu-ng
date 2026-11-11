@@ -55,15 +55,23 @@ the symbol by name, which would re-enter the hook. The exception is ids
 they install in every title, packs or not. A game thread creation that
 fails with EAGAIN makes the runtime give threads back and is retried; the
 runtime-wide budget of 16 worker threads is cut and regrows by one per
-30 s quiet. The runtime creates its own threads through `create_internal`
+10 s quiet. The groups are capped at 4 decode workers (`AMPR_PACK_WORKERS`),
+6 disk read threads (`tune::RELEASE_PREAD_THREADS`) and 4 fd read threads
+(`READ_THREADS` in `rt/pack/fd_read.rs`). Runtime threads retire by load,
+not by idle time (no idle timer): each group keeps its last 8192
+busy-thread counts (`LOAD_SAMPLES`), and a thread that finishes its work
+leaves after 8 such finishes in a row with more live than one above the load
+target (ceil(median x 1.5) + 1, at least 1). That EAGAIN
+starts pressure mode: idle threads leave at once, each group runs at most
+one thread while it has work and none without, until 10 s pass with no
+new failure (`LoadGroup`, `pressure` in `rt/thread_hooks.rs`). The
+runtime creates its own threads through `create_internal`
 (the pre-detour slot). Save data (`rt/save.rs`) is hooked by NID in a loaded
 `libSceSaveData` module, not through the libkernel table, in every title
 (the loader observer finds it outside `sceKernelGetModuleList`):
 `sceSaveDataMount3` retries a BUSY mount once after unmounting every save
 point the service returned earlier, and `sceSaveDataSaveIconByPath` hands a
-packed icon to `sceSaveDataSaveIcon` as bytes. The pread pool's last thread waits a full
-idle period instead of polling every microsecond once its exit timeout
-passes.
+packed icon to `sceSaveDataSaveIcon` as bytes.
 CI (`.github/workflows/build.yml`) runs the same commands; a pushed `v*` tag creates a draft release with both `.sprx` and `SHA256SUMS`.
 
 ## Conventions
@@ -73,16 +81,29 @@ CI (`.github/workflows/build.yml`) runs the same commands; a pushed `v*` tag cre
 - No new dependencies without a stated reason. Runtime dependencies use
   `default-features = false`, and `lz4_flex`, `zstd-sys`, `iced-x86` are
   pinned (`=x.y.z`); follow that.
-- Memory budget: the release pool is 192 MiB (`0xC000000`); the debug
-  build's is 256 MiB (`AMPR_DEBUG_POOL_SIZE`). The cache defaults are 64 MiB
-  physical and 32 MiB decoded. With the earlier 32 + 16 MiB caches (debug
-  build at a 128 MiB pool, ~75 s after launch) the measured peaks were
-  113.6 MiB (a fully packed LZ4 UE3 title, 25.2 MiB index), 93.2 MiB (a
-  fully packed LZ4 UE5 title), 95.6 MiB (a REDengine title, zstd) and
-  90.7 MiB (an RE Engine title, zstd); the 48 MiB larger caches put the UE3
-  title near 161.6 MiB, not measured yet. The peak grows with the index.
-  Release runtime memory (PRX segments) is 200.7 MiB. Any change that grows
-  runtime memory needs a measurement and an updated Makefile comment.
+- Memory budget: all runtime memory is in the PRX's static .bss pool;
+  nothing comes from the game's direct or flexible memory (the pool did not
+  lower the game's free direct memory, direct allocations did; flexible
+  memory had 0-28 MiB free during play). Ledgers (`rt/index_memory.rs`):
+  Index 55 MiB (a 52 MiB index file plus 3 MiB for the tables built from
+  it, walk build buffers, the save icon buffer), Cache 32 MiB (16 MiB
+  physical + 16 MiB decoded, carved at startup), Buffer 28 MiB (4 x 1 MiB
+  decode + 12 x 2 MiB I/O windows), plus a 2 MiB budget for the fixed sites
+  listed at `STATIC_POOL_SIZE` in `rt/runtime_memory.rs` (1.56 MiB used; a
+  host test fails on a new pool call). A build-time assert checks that the
+  caps plus the budget fit the pool. Both PRX builds load to the same
+  127 MiB (PT_LOAD memsz, below 128 MiB): the release pool is 118.39 MiB
+  (`AMPR_INTERNAL_POOL_SIZE` `0x7664000`), the debug one 117.03 MiB
+  (`AMPR_DEBUG_POOL_SIZE` `0x7508000`), the gap being the debug build's
+  larger non-pool part (9.96 vs 8.61 MiB). `dist` fails when the two totals
+  differ by more than 64 KiB or reach 128 MiB
+  (`tools/verify_payload_prx.py --prx-totals`); then update the gap in the
+  Makefile. A refused allocation degrades (index: one notice, packs
+  unserved; cache off; window slow path; icon skipped). The compact index
+  costs 104-124 bytes per file at 48-byte paths, so the Index cap holds
+  524,288 files. Pool peak outside the ledgers 0.56 MiB on a zstd title;
+  the largest index measured is 25.2 MiB. Any change that grows runtime
+  memory needs a measurement and an updated Makefile comment.
 - Comments: plain prose `//!` and `///`, saying why, with the measured numbers
   and the source they come from (e.g. `rt/stats.rs`). Large files group items under
   `// ---- topic ----` section lines; keep that style.

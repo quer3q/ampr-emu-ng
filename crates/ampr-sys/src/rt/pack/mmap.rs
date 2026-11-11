@@ -15,7 +15,9 @@
 //! unchanged. Pool use: one transient 256 KiB buffer while a cache file is
 //! written; unmeasured on a console (Makefile).
 
-use super::super::index::{sdk_alloc, sdk_release, write_all, MEM_TRANSIENT};
+use super::super::index::{
+    sdk_alloc, sdk_release, title_alloc, title_free, write_all, MEM_TRANSIENT,
+};
 use super::*;
 
 // ---- knob ---------------------------------------------------------------------
@@ -259,7 +261,7 @@ const CACHE_DIR: &CStr = c"/data/ampr_cache";
 /// new one, and a later map of it decodes it again.
 const CACHE_FILES: usize = 64;
 /// Largest piece read from the virtual fd and written per step.
-const PIECE: usize = 256 * 1024;
+pub(crate) const PIECE: usize = 256 * 1024;
 /// "/data/ampr_cache/" + 8 hex digits + ".tmp" + NUL is 30 bytes.
 const PATH_LEN: usize = 32;
 
@@ -459,7 +461,8 @@ unsafe fn create_cache_file(vfd: c_int, file_id: u32) -> Result<c_int, c_int> {
 
 /// Writes the whole decoded file behind `vfd` into `fd` in pieces of at
 /// most PIECE bytes, through the virtual pread path (rt/pack/fd_read.rs).
-/// Returns the bytes written.
+/// Returns the bytes written. The piece is a fixed pool site: one at a
+/// time, under CACHE_M (`disk_fd`).
 unsafe fn copy_virtual_file(vfd: c_int, fd: c_int) -> Result<u64, c_int> {
     let buf = unsafe { sdk_alloc(PIECE, MEM_TRANSIENT) }.cast::<u8>();
     if buf.is_null() {
@@ -484,6 +487,69 @@ unsafe fn copy_virtual_file(vfd: c_int, fd: c_int) -> Result<u64, c_int> {
     };
     unsafe { sdk_release(buf.cast(), PIECE, MEM_TRANSIENT) };
     rc
+}
+
+/// Largest packed file `read_packed` reads whole. The buffer comes from the
+/// Index ledger's free room, which can be less (3 MiB of tables room when
+/// the index file is near its 52 MiB, rt/index_memory.rs): a larger icon is
+/// then skipped like one over this size, counted in `save_icon_skipped`
+/// without the index notice (rt/save.rs `save_icon_by_path_emul`).
+pub(crate) const READ_PACKED_MAX: usize = 8 * 1024 * 1024;
+
+/// For a system service that opens a path itself, past the path hooks (the
+/// save data icon, rt/save.rs): when `path` opens as a packed file of at
+/// most READ_PACKED_MAX bytes, `use_bytes` gets its decoded bytes in a
+/// transient buffer from the pool's Index ledger (sized by the file, so not
+/// a fixed pool site).
+/// None for a loose or missing file; Some(Err) for a packed file it could
+/// not read (too large, no buffer, a failed read).
+pub(crate) unsafe fn read_packed<R>(
+    path: *const c_char,
+    use_bytes: impl FnOnce(&[u8]) -> R,
+) -> Option<Result<R, ()>> {
+    let vfd = unsafe { super::super::index::posix_open_emul(path, 0, 0) };
+    if vfd < 0 {
+        return None;
+    }
+    let out = if unsafe { virtual_fd_file_id(vfd) }.is_some() {
+        Some(unsafe { read_whole(vfd) }.ok_or(()).map(|(buf, len)| {
+            let r = use_bytes(unsafe { core::slice::from_raw_parts(buf, len) });
+            unsafe { title_free(buf, c"apr.read-packed") };
+            r
+        }))
+    } else {
+        None
+    };
+    unsafe { posix_close_emul(vfd) };
+    out
+}
+
+/// The whole decoded file behind `vfd` in an index memory buffer of its
+/// size; None when refused (the save icon is then skipped, rt/save.rs).
+unsafe fn read_whole(vfd: c_int) -> Option<(*mut u8, usize)> {
+    let mut st: SceKernelStat = unsafe { core::mem::zeroed() };
+    if unsafe { posix_fstat_emul(vfd, &mut st) } != 0 {
+        return None;
+    }
+    let len = usize::try_from(st.st_size).ok().filter(|&n| n > 0 && n <= READ_PACKED_MAX)?;
+    let buf = unsafe { title_alloc(len, c"apr.read-packed") };
+    if buf.is_null() {
+        return None;
+    }
+    let mut off = 0usize;
+    while off < len {
+        let mut handled = false;
+        let want = (len - off).min(PIECE);
+        let n = unsafe {
+            ampr_pack_try_pread_fd(vfd, buf.add(off).cast(), want, off as off_t, &mut handled)
+        };
+        if n <= 0 || n as usize > want {
+            unsafe { title_free(buf, c"apr.read-packed") };
+            return None;
+        }
+        off += n as usize;
+    }
+    Some((buf, len))
 }
 
 /// At module_start (rt/pack/mod.rs `select_pack_format`): unlinks every

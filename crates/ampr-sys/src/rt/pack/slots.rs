@@ -231,10 +231,17 @@ pub(crate) unsafe fn ampr_pack_try_open_indexed_impl(
         *handled = true;
         return SCE_KERNEL_ERROR_EIO;
     }
-    *handled = true;
     if !pack_open_flags_supported(flags) {
-        return sce_errno_from_posix(EACCES);
+        // A write open stays unhandled and reaches the physical path, as in a
+        // plain folder: a title that opens a packed log file for writing
+        // retried an EACCES refusal ~700 times and crashed. A read-only
+        // mount fails it with the FS's own error.
+        // ponytail: later reads of that path still serve the packed bytes,
+        // not what the game wrote; route them to the loose file if a title
+        // reads back what it writes into /app0.
+        return SCE_KERNEL_ERROR_ENOENT;
     }
+    *handled = true;
     let _lock = PACK_M.lock();
     // Shutdown closes the gate before its PACK_M section that closes
     // submissions, so this check under PACK_M refuses every open that

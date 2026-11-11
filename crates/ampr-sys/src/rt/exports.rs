@@ -109,13 +109,17 @@ extern "C" {
 }
 
 /// Best effort system notification; errors are ignored.
-unsafe fn notify(text: &[u8]) {
+pub(crate) unsafe fn notify(text: &[u8]) {
     let mut req = NotifyRequest {
         head: [0; 45],
         message: [0; 3075],
     };
     let len = text.len().min(req.message.len() - 1);
     req.message[..len].copy_from_slice(&text[..len]);
+    // Host tests reach this through the ledgers and have no libkernel.
+    if cfg!(test) {
+        return;
+    }
     let _ = unsafe { sceKernelSendNotificationRequest(0, &mut req, size_of::<NotifyRequest>(), 0) };
 }
 
@@ -335,7 +339,7 @@ mod mem_report {
         bench_volume_path, real_aio_delete_single, real_aio_submit_single, real_aio_wait_single,
         scePthreadJoin, SceKernelAioRWRequest, SceKernelAioResult, SceKernelAioSubmitId,
     };
-    use super::super::runtime_memory::{ampr_internal_amm_pool_alloc, ampr_internal_amm_pool_free};
+    use super::super::index_memory::{index_free, index_scratch_alloc};
     use super::super::runtime_memory::{pool_tags, pool_usage, TagTotals};
     use super::super::stats::{read, NAMES};
     use super::super::sys::{
@@ -584,15 +588,14 @@ mod mem_report {
         None
     }
 
-    /// Bench buffer from the internal pool: 8 MiB, halved down to `min`.
+    /// Bench buffer from the index ledger (rt/index_memory.rs): 8 MiB,
+    /// halved down to `min`, held under the index cap.
     unsafe fn alloc_buf(min: usize) -> Option<(*mut c_void, usize)> {
-        let (mut cap, mut got) = (8 * MIB, 0usize);
+        let mut cap = 8 * MIB;
         while cap >= min {
-            let buf = unsafe {
-                ampr_internal_amm_pool_alloc(cap, &mut got, c"bench".as_ptr(), false, 16 * KIB)
-            };
+            let buf = unsafe { index_scratch_alloc(cap, 16 * KIB, c"bench".as_ptr()) };
             if !buf.is_null() {
-                return Some((buf, cap));
+                return Some((buf.cast(), cap));
             }
             cap /= 2;
         }
@@ -834,7 +837,7 @@ mod mem_report {
             }
         }
         if let Some((buf, _)) = buf {
-            let _ = unsafe { ampr_internal_amm_pool_free(buf, c"bench".as_ptr()) };
+            unsafe { index_free(buf, c"bench".as_ptr()) };
         }
         for fd in [fd_a, fd_b] {
             if fd >= 0 {
@@ -931,14 +934,15 @@ mod mem_report {
             }
             let _ = unsafe { real_physical_close(fd) };
         }
-        let _ = unsafe { ampr_internal_amm_pool_free(buf, c"bench".as_ptr()) };
+        unsafe { index_free(buf, c"bench".as_ptr()) };
     }
 
     /// `GET /threads?hold=N` holds up to N more idle threads, stopping at the
     /// first failed creation; `?release=1` frees them; `?yield=N` makes the
     /// read pool give N threads back as a failed game creation would (N at
     /// least the live count turns the pool off); `?yield_workers=N` does the
-    /// same for the pack workers (down to 1); no argument reports.
+    /// same for the pack workers (the last only with no pack work); no
+    /// argument reports.
     /// Measures the game's thread limit (rt/thread_hooks.rs `limit_probe`).
     unsafe fn threads(req: &[u8], out: &mut Text) {
         use super::super::thread_hooks::limit_probe as lp;
@@ -956,7 +960,7 @@ mod mem_report {
             out.kv("threads_yielded_now", given as u64);
         } else if let Some(n) = bench_args::param(q, b"yield_workers") {
             // As a failed game creation once the pool has none: the pack
-            // workers give n back (down to 1).
+            // workers give n back (the last only with no pack work).
             let given = unsafe { super::super::pack::pack_workers_yield(number(n) as u32) };
             out.kv("threads_yielded_now", given as u64);
         } else if let Some(n) = bench_args::param(q, b"hold") {
@@ -1131,8 +1135,8 @@ mod mem_report {
             out.kv("hooks_installed_lo", super::super::hook::installed_bits(0))
                 .kv("hooks_installed_hi", super::super::hook::installed_bits(64));
         }
-        // What the pack runtime actually got at startup (caches may be halved
-        // when the pool is short), then the knobs as set now.
+        // What the pack runtime actually got at startup (caches are cut to
+        // what is left under the Cache cap), then the knobs as set now.
         let state = super::super::pack::g_pack_state.load(core::sync::atomic::Ordering::Acquire);
         if !state.is_null() {
             // Raw place reads only: other threads mutate PackState, so no
@@ -1172,6 +1176,21 @@ mod mem_report {
                     "flex_configured_bytes",
                     flex(c"sceKernelConfiguredFlexibleMemorySize"),
                 );
+            // Pool ledgers (rt/index_memory.rs), all inside the static pool.
+            // ledger_mem_bytes is the sum of the three; an allocation
+            // refused by a cap counts in ledger_alloc_refused, a failed
+            // pool one in pool_alloc_failed.
+            use super::super::index_memory as im;
+            out.kv("index_mem_bytes", im::index_mem_bytes() as u64)
+                .kv("index_mem_cap_bytes", im::INDEX_MEMORY_MAX as u64);
+            out.kv("cache_mem_bytes", im::cache_mem_bytes() as u64)
+                .kv("cache_mem_cap_bytes", im::CACHE_MEMORY_MAX as u64);
+            out.kv("buffer_mem_bytes", im::buffer_mem_bytes() as u64)
+                .kv("buffer_mem_cap_bytes", im::BUFFER_MEMORY_MAX as u64);
+            out.kv("ledger_mem_bytes", im::ledger_mem_bytes() as u64)
+                .kv("ledger_mem_cap_bytes", im::LEDGER_MEMORY_MAX as u64)
+                .kv("ledger_alloc_refused", im::ledger_alloc_refused())
+                .kv("pool_alloc_failed", im::pool_alloc_failed());
         }
         {
             // The descriptor table limit (getrlimit RLIMIT_NOFILE, 0 when
@@ -1216,14 +1235,35 @@ mod mem_report {
         }
         {
             let (live, ceiling, idle) = super::super::reactor::pread_pool_state();
-            out.kv("pread_threads_live", live)
-                .kv("pread_threads_ceiling", ceiling)
+            out.kv("pread_threads_ceiling", ceiling)
                 .kv("pread_threads_idle", idle);
             let (counted, budget) = super::super::thread_hooks::budget_state();
             out.kv("runtime_threads_live", counted.into()).kv("thread_budget", budget.into());
+            out.kv("thread_mode", super::super::thread_hooks::pressure() as u64);
             let (workers, worker_ceiling) = super::super::pack::pack_workers_state();
-            out.kv("pack_workers_live", workers as u64)
-                .kv("pack_workers_ceiling", worker_ceiling as u64);
+            out.kv("pack_workers_ceiling", worker_ceiling as u64);
+            let (fd_live, fd_load) = super::super::pack::read_threads_load();
+            // Per group (rt/thread_hooks.rs LoadGroup): live, peak, target,
+            // busy median (rounded up), retired by load, under pressure.
+            let groups = [
+                (&b"decode"[..], workers as u64, super::super::pack::pack_workers_load()),
+                (b"pread", live, super::super::reactor::pread_pool_load()),
+                (b"fdread", fd_live as u64, fd_load),
+            ];
+            const KEYS: [&[u8]; 6] = [
+                b"_threads_live ",
+                b"_threads_peak ",
+                b"_target ",
+                b"_busy_median ",
+                b"_retired_load ",
+                b"_retired_pressure ",
+            ];
+            for (name, live, load) in groups {
+                let values = [live, load[0], load[1], load[2], load[3], load[4]];
+                for (key, v) in KEYS.iter().zip(values) {
+                    out.s(name).s(key).u(v).s(b"\n");
+                }
+            }
         }
         tune_lines(b"tune_", out);
         let (now, peak) = pool_tags();
@@ -1277,9 +1317,8 @@ mod mem_report {
         }
         out.s(b"knobs (").s(tune::TUNE_PATH.to_bytes()).s(b"):\n");
         for knob in tune::KNOBS.iter() {
-            out.s(knob.name.as_bytes())
-                .s(b"=")
-                .u(tune::value(knob) as u64);
+            out.s(knob.name.as_bytes()).s(b"=");
+            out.u(tune::value(knob) as u64);
             out.s(b" [")
                 .u(knob.min as u64)
                 .s(b"..")
@@ -1291,7 +1330,7 @@ mod mem_report {
                 b"next launch\n"
             });
         }
-        out.s(b"profile=low|medium|high sets decoded_mib, physical_mib, workers, pipelines, reserve_mib\n");
+        out.s(b"profile=low|medium|high sets decoded_mib, physical_mib, workers, pipelines\n");
     }
 
     unsafe fn serve(listener: c_int, start_ns: u64) -> ! {
@@ -1445,6 +1484,9 @@ pub unsafe extern "C" fn module_stop(_args: usize, _argp: *const c_void) -> c_in
     }
     // shutdownCommandLog/shutdownDebugLog are no-ops returning 0.
     let rc = unsafe { hook::amprUninstallLibkernelHooks() };
+    if rc == 0 {
+        unsafe { super::index::release_resident_index() };
+    }
     #[cfg(feature = "mem_report")]
     super::blackbox::close();
     rc

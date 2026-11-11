@@ -167,21 +167,14 @@ pub(crate) unsafe fn ensure_pipeline_io_scratch(pipeline: &mut ReadPipelineConte
     if !pipeline.io_scratch.is_null() {
         return pipeline.io_scratch_size >= PACK_PIPELINE_IO_BYTES;
     }
-    let mut actual = 0usize;
-    let scratch = ampr_internal_amm_pool_alloc(
+    // The pool, under the Buffer ledger (rt/index_memory.rs). Refused,
+    // LZ4 reads each page into the cache and zstd plans without gap
+    // reads (callers below); the window is retried on the next group.
+    let (scratch, actual) = crate::rt::index_memory::buffer_alloc(
         PACK_PIPELINE_IO_BYTES,
-        &mut actual,
         c"apr.pack.pipeline.io-window".as_ptr(),
-        false,
-        64,
-    ) as *mut u8;
-    if scratch.is_null() || actual < PACK_PIPELINE_IO_BYTES {
-        if !scratch.is_null() {
-            ampr_internal_amm_pool_free(
-                scratch.cast(),
-                c"apr.pack.pipeline.io-window.fail".as_ptr(),
-            );
-        }
+    );
+    if scratch.is_null() {
         return false;
     }
     pipeline.io_scratch = scratch;

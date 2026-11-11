@@ -184,7 +184,8 @@ pub(crate) unsafe fn state() -> &'static mut FileIndexState {
 }
 
 /// `FileIndexPublishState`; a release store of `PUB_AVAILABLE` makes every
-/// `Compact` pointer and count immutable for the module lifetime.
+/// `Compact` pointer and count immutable for the life of the module
+/// (`release_resident_index` does not free it).
 pub(crate) const PUB_PENDING: u8 = 0;
 pub(crate) const PUB_AVAILABLE: u8 = 1;
 pub(crate) const PUB_UNAVAILABLE: u8 = 2;
@@ -193,6 +194,16 @@ pub(crate) static PUBLISH: AtomicU8 = AtomicU8::new(PUB_PENDING);
 /// The published image for lock-free readers, once `PUB_AVAILABLE`.
 pub(crate) fn published() -> Option<&'static Compact> {
     (PUBLISH.load(Acquire) == PUB_AVAILABLE).then(|| unsafe { &(*INDEX.get()).compact })
+}
+
+/// module_stop, after the hooks are gone: lookups after this see no index.
+/// The resident image is not freed: `published()` hands out a reference
+/// without a lock or count, so a thread still inside a lookup may read it,
+/// and the pool is the PRX's .bss, gone with the module.
+pub(crate) unsafe fn release_resident_index() {
+    let _g = INDEX_LOCK.lock();
+    PUBLISH.store(PUB_UNAVAILABLE, Release);
+    unsafe { state() }.available = false;
 }
 
 /// `App0IndexBuildWorkspace`: key/path scratch for the single runtime builder.
@@ -318,6 +329,7 @@ pub(crate) unsafe fn sdk_alloc(size: usize, class: u8) -> *mut c_void {
         unsafe { ampr_internal_amm_pool_ready_has_capacity(mapped, MAX_ALIGN) }
     };
     if !usable {
+        super::index_memory::note_pool_failure();
         return null_mut();
     }
     let mut got = 0usize;
@@ -333,6 +345,26 @@ pub(crate) unsafe fn sdk_release(base: *mut c_void, size: usize, class: u8) {
     if !unsafe { ampr_small_slab_free(base, name, null_mut()) } {
         unsafe { ampr_internal_amm_pool_free(base, name) };
     }
+}
+
+/// A transient buffer sized by the title (save icon, decode-on-access
+/// slots) from the pool's Index ledger, not a fixed pool site
+/// (rt/index_memory.rs); null when refused, counted without the index
+/// notice.
+pub(crate) unsafe fn title_alloc(bytes: usize, tag: &CStr) -> *mut u8 {
+    unsafe { super::index_memory::index_scratch_alloc(bytes, MAX_ALIGN, tag.as_ptr()) }
+}
+
+/// A file index build buffer (file count, path bytes, directories) from the
+/// pool's Index ledger; null when refused, after the one-time index notice:
+/// the build fails and the title runs without the index.
+unsafe fn build_alloc(bytes: usize, tag: &CStr) -> *mut u8 {
+    unsafe { super::index_memory::index_alloc(bytes, MAX_ALIGN, tag.as_ptr()) }
+}
+
+/// Frees a `title_alloc` or `build_alloc` result (null is a no-op).
+pub(crate) unsafe fn title_free(base: *mut u8, tag: &CStr) {
+    unsafe { super::index_memory::index_free(base.cast(), tag.as_ptr()) };
 }
 
 /// `AmprSdkCpuScratchBuffer`: an owned SDK CPU allocation, released on drop.
@@ -384,7 +416,8 @@ impl Drop for ScratchBuffer {
 }
 
 /// `AmprIndexPathStack`: LIFO of NUL-terminated paths in fixed 4 KiB slots,
-/// grown by doubling (from 256) in transient SDK CPU memory.
+/// grown by doubling (from 256, 1 MiB) in index memory (rt/index_memory.rs):
+/// it grows with the directories waiting to be scanned.
 pub(crate) struct PathStack {
     base: *mut u8,
     bytes: usize,
@@ -451,7 +484,7 @@ impl PathStack {
             return false;
         }
         let bytes = cap * Self::SLOT;
-        let base: *mut u8 = unsafe { sdk_alloc(bytes, MEM_TRANSIENT) }.cast();
+        let base = unsafe { build_alloc(bytes, c"apr.index.build.dirs") };
         if base.is_null() {
             return false;
         }
@@ -463,9 +496,7 @@ impl PathStack {
         true
     }
     fn release(&mut self) {
-        if !self.base.is_null() {
-            unsafe { sdk_release(self.base.cast(), self.bytes, MEM_TRANSIENT) };
-        }
+        unsafe { title_free(self.base, c"apr.index.build.dirs") };
         (self.base, self.bytes, self.capacity) = (null_mut(), 0, 0);
     }
 }
@@ -480,10 +511,12 @@ impl Drop for PathStack {
 // ---- resident image helpers ----------------------------------------------------
 
 impl Compact {
-    /// `clear_compact_file_index_locked`: frees the image (persistent class).
+    /// `clear_compact_file_index_locked`: frees the image (`read_compact`).
     pub unsafe fn clear(&mut self) {
         if !self.map_base.is_null() {
-            unsafe { sdk_release(self.map_base, self.map_size, MEM_PERSISTENT) };
+            unsafe {
+                super::index_memory::index_free(self.map_base, c"apr.index.full.release".as_ptr())
+            };
         }
         *self = Self::EMPTY;
     }
@@ -566,8 +599,11 @@ pub(crate) struct BufWriter {
     used: usize,
 }
 
+/// The index writer's buffer, a fixed pool site (rt/runtime_memory.rs).
+pub(crate) const BUF_WRITER_SIZE: usize = 256 * 1024;
+
 impl BufWriter {
-    const SIZE: usize = 256 * 1024;
+    const SIZE: usize = BUF_WRITER_SIZE;
 
     pub const fn new() -> Self {
         Self {
@@ -797,7 +833,8 @@ impl RuntimeBuilder {
         let Some(bytes) = cap.checked_mul(size_of::<CompactEntry>()) else {
             return false;
         };
-        let base: *mut CompactEntry = unsafe { sdk_alloc(bytes, MEM_TRANSIENT) }.cast();
+        let base: *mut CompactEntry =
+            unsafe { build_alloc(bytes, c"apr.index.build.records") }.cast();
         if base.is_null() {
             return false;
         }
@@ -818,7 +855,7 @@ impl RuntimeBuilder {
         let Some(cap) = Self::grown(self.path_capacity, 1024 * 1024, min) else {
             return false;
         };
-        let base: *mut u8 = unsafe { sdk_alloc(cap, MEM_TRANSIENT) }.cast();
+        let base = unsafe { build_alloc(cap, c"apr.index.build.paths") };
         if base.is_null() {
             return false;
         }
@@ -834,7 +871,7 @@ impl RuntimeBuilder {
         if self.records.is_null() {
             return;
         }
-        unsafe { sdk_release(self.records.cast(), self.record_bytes, MEM_TRANSIENT) };
+        unsafe { title_free(self.records.cast(), c"apr.index.build.records") };
         (self.records, self.record_bytes, self.record_capacity) = (null_mut(), 0, 0);
     }
 
@@ -842,7 +879,7 @@ impl RuntimeBuilder {
         if self.paths.is_null() {
             return;
         }
-        unsafe { sdk_release(self.paths.cast(), self.path_capacity, MEM_TRANSIENT) };
+        unsafe { title_free(self.paths, c"apr.index.build.paths") };
         (self.paths, self.path_capacity) = (null_mut(), 0);
     }
 
@@ -909,42 +946,21 @@ impl RuntimeBuilder {
         self.entry_count = kept as u64;
         let count = kept;
 
-        let slot_count = ampr_format::index::slot_count_for(count).unwrap_or(0);
-        if slot_count == 0
-            || slot_count > u32::MAX as usize
-            || slot_count > usize::MAX / size_of::<HashSlot>()
-        {
+        let Some(l) = image_layout(count, self.path_bytes) else {
             return false;
-        }
-        let header_bytes = size_of::<CompactHeader>() as u64;
-        let records_bytes = self.entry_count * size_of::<CompactEntry>() as u64;
-        let path_at = header_bytes + records_bytes;
-        let hash_at = align_up_u64(path_at + self.path_bytes, align_of::<HashSlot>() as u64);
-        let hash_bytes = slot_count as u64 * size_of::<HashSlot>() as u64;
-        let file_bytes = hash_at.wrapping_add(hash_bytes);
-        if hash_at < path_at || file_bytes < hash_at || file_bytes > usize::MAX as u64 {
-            return false;
-        }
-        let map_bytes = round_up_page(file_bytes as usize);
-        if map_bytes == usize::MAX {
-            return false;
-        }
-        let image: *mut u8 = unsafe { sdk_alloc(map_bytes, MEM_TRANSIENT) }.cast();
+        };
+        let image = unsafe { build_alloc(l.map_bytes, c"apr.index.build.image") };
         if image.is_null() {
             return false;
         }
         let built = unsafe {
-            self.write_image(
-                image,
-                map_bytes,
-                records_bytes as usize,
-                path_at as usize,
-                hash_at as usize,
-                slot_count,
-            )
+            let out = core::slice::from_raw_parts_mut(image, l.map_bytes);
+            let records = core::slice::from_raw_parts(self.records.cast::<u8>(), l.records_bytes);
+            let paths = core::slice::from_raw_parts(self.paths, self.path_bytes as usize);
+            fill_image(out, &l, records, paths)
         };
         self.release_buffers();
-        let file = unsafe { core::slice::from_raw_parts(image, file_bytes as usize) };
+        let file = unsafe { core::slice::from_raw_parts(image, l.file_bytes) };
         let ok = built
             && install
             && unsafe { write_temp_index(file) }
@@ -952,53 +968,88 @@ impl RuntimeBuilder {
         if built && !ok {
             unsafe { adopt_compact_index(idx, file) };
         }
-        unsafe { sdk_release(image.cast(), map_bytes, MEM_TRANSIENT) };
+        unsafe { title_free(image, c"apr.index.build.image") };
         ok
     }
+}
 
-    /// Zeroes `image` and fills header, records, paths and hash slots.
-    unsafe fn write_image(
-        &self,
-        image: *mut u8,
-        map_bytes: usize,
-        records_bytes: usize,
-        path_at: usize,
-        hash_at: usize,
-        slot_count: usize,
-    ) -> bool {
-        let header = CompactHeader {
-            magic: INDEX_MAGIC,
-            version: INDEX_VERSION,
-            entry_size: size_of::<CompactEntry>() as u32,
-            entry_count: self.entry_count,
-            path_bytes: self.path_bytes,
-            hash_offset: hash_at as u64,
-            hash_slot_size: size_of::<HashSlot>() as u32,
-            hash_slot_count: slot_count as u32,
-        };
-        let path_bytes = self.path_bytes as usize;
-        unsafe {
-            core::ptr::write_bytes(image, 0, map_bytes);
-            core::ptr::copy_nonoverlapping(
-                (&raw const header).cast::<u8>(),
-                image,
-                size_of::<CompactHeader>(),
-            );
-            core::ptr::copy_nonoverlapping(
-                self.records.cast::<u8>(),
-                image.add(size_of::<CompactHeader>()),
-                records_bytes,
-            );
-            core::ptr::copy_nonoverlapping(self.paths, image.add(path_at), path_bytes);
-            let records = core::slice::from_raw_parts(self.records.cast::<u8>(), records_bytes);
-            let paths = core::slice::from_raw_parts(self.paths, path_bytes);
-            let slots = core::slice::from_raw_parts_mut(
-                image.add(hash_at),
-                slot_count * size_of::<HashSlot>(),
-            );
-            ampr_format::index::fill_slots(records, paths, slots).is_ok()
-        }
+/// Geometry of a compact index image of `count` records and `path_bytes`
+/// path bytes, as `save_image` builds it and `read_compact` maps it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ImageLayout {
+    pub count: usize,
+    pub path_bytes: usize,
+    pub records_bytes: usize,
+    pub path_at: usize,
+    pub hash_at: usize,
+    pub slot_count: usize,
+    pub file_bytes: usize,
+    /// `file_bytes` page-rounded: the build buffer.
+    pub map_bytes: usize,
+}
+
+/// None when the counts overflow the format.
+pub(crate) fn image_layout(count: usize, path_bytes: u64) -> Option<ImageLayout> {
+    let slot_count = ampr_format::index::slot_count_for(count)?;
+    if slot_count > u32::MAX as usize || slot_count > usize::MAX / size_of::<HashSlot>() {
+        return None;
     }
+    let records_bytes = count.checked_mul(size_of::<CompactEntry>())?;
+    let path_at = size_of::<CompactHeader>().checked_add(records_bytes)?;
+    let path_end = (path_at as u64).checked_add(path_bytes)?;
+    let hash_at = align_up_u64(path_end, align_of::<HashSlot>() as u64);
+    let hash_bytes = slot_count as u64 * size_of::<HashSlot>() as u64;
+    let file_bytes = hash_at.checked_add(hash_bytes)?;
+    if hash_at < path_end || file_bytes > usize::MAX as u64 {
+        return None;
+    }
+    let map_bytes = round_up_page(file_bytes as usize);
+    (map_bytes != usize::MAX).then_some(ImageLayout {
+        count,
+        path_bytes: path_bytes as usize,
+        records_bytes,
+        path_at,
+        hash_at: hash_at as usize,
+        slot_count,
+        file_bytes: file_bytes as usize,
+        map_bytes,
+    })
+}
+
+/// Zeroes `image` and fills header, records, paths and hash slots; false
+/// (nothing written) when `image` or the inputs do not match `l`.
+pub(crate) fn fill_image(image: &mut [u8], l: &ImageLayout, records: &[u8], paths: &[u8]) -> bool {
+    if image.len() != l.map_bytes || records.len() != l.records_bytes || paths.len() != l.path_bytes
+    {
+        return false;
+    }
+    let header = CompactHeader {
+        magic: INDEX_MAGIC,
+        version: INDEX_VERSION,
+        entry_size: size_of::<CompactEntry>() as u32,
+        entry_count: l.count as u64,
+        path_bytes: l.path_bytes as u64,
+        hash_offset: l.hash_at as u64,
+        hash_slot_size: size_of::<HashSlot>() as u32,
+        hash_slot_count: l.slot_count as u32,
+    };
+    // SAFETY: CompactHeader is repr(C) plain data.
+    let header = unsafe {
+        core::slice::from_raw_parts((&raw const header).cast::<u8>(), size_of::<CompactHeader>())
+    };
+    image.fill(0);
+    image[..header.len()].copy_from_slice(header);
+    image[header.len()..l.path_at].copy_from_slice(records);
+    image[l.path_at..l.path_at + l.path_bytes].copy_from_slice(paths);
+    let slots = &mut image[l.hash_at..l.file_bytes];
+    ampr_format::index::fill_slots(records, paths, slots).is_ok()
+}
+
+/// Index memory `read_compact` maps for an image: records, paths and hash
+/// slots, page-rounded.
+pub(crate) fn resident_bytes(l: &ampr_format::index::Layout) -> usize {
+    let slots_rel = (l.slots_at - ampr_format::IDX_HEADER as u64) as usize;
+    round_up_page(slots_rel + l.slots_len as usize)
 }
 
 /// Writes `image` to a fresh INDEX_TEMP_PATH; unlinks it on failure.
@@ -1155,12 +1206,25 @@ unsafe fn scan_dir(
     if unsafe { real_physical_fstat(fd, (&raw mut st).cast()) } == 0 && st.st_blksize > 0 {
         size = size.max(st.st_blksize as usize);
     }
-    let mut dents = ScratchBuffer::new();
-    let ok = dents.allocate(size, MEM_TRANSIENT)
-        && unsafe { scan_dents(fd, dents.data(), size, ws, dirs, builder) };
+    // getdents needs at least st_blksize bytes. Up to DENTS_POOL_MAX the
+    // buffer is a fixed pool site (rt/runtime_memory.rs); a larger block
+    // size takes index memory, so the pool never holds more.
+    let ok = if size <= DENTS_POOL_MAX {
+        let mut dents = ScratchBuffer::new();
+        dents.allocate(size, MEM_TRANSIENT)
+            && unsafe { scan_dents(fd, dents.data(), size, ws, dirs, builder) }
+    } else {
+        let dents = unsafe { build_alloc(size, c"apr.index.build.dents") };
+        let ok = !dents.is_null() && unsafe { scan_dents(fd, dents, size, ws, dirs, builder) };
+        unsafe { title_free(dents, c"apr.index.build.dents") };
+        ok
+    };
     unsafe { real_physical_close(fd) };
     ok
 }
+
+/// Largest getdents buffer taken from the pool.
+pub(crate) const DENTS_POOL_MAX: usize = 64 * 1024;
 
 /// getdents loop over `fd` with validated record bounds.
 unsafe fn scan_dents(
@@ -1409,9 +1473,12 @@ unsafe fn read_compact(
         .filter(|l| l.file_len <= file_len)
         .ok_or(LoadResult::Invalid)?;
     let slots_rel = (l.slots_at - HDR as u64) as usize;
-    let mapped_bytes = round_up_page(slots_rel + l.slots_len as usize);
-    unsafe { ampr_internal_amm_pool_ensure(mapped_bytes, c"apr.index.full".as_ptr()) };
-    let mapped: *mut u8 = unsafe { sdk_alloc(mapped_bytes, MEM_PERSISTENT) }.cast();
+    let mapped_bytes = resident_bytes(&l);
+    // Index memory like the pack index (rt/index_memory.rs), never the
+    // pool: a fully packed LZ4 title's index is 25.2 MiB.
+    let mapped: *mut u8 = unsafe {
+        super::index_memory::index_alloc(mapped_bytes, MAX_ALIGN, c"apr.index.full".as_ptr())
+    };
     if mapped.is_null() {
         return Err(LoadResult::Memory);
     }
@@ -1741,31 +1808,6 @@ pub(crate) unsafe fn probe_packed_path(path: *const c_char) -> Option<u8> {
     unsafe { lookup_directory_key(key) }.map(|_| b'd')
 }
 
-/// True when `path` is an /app0 file the published index says is packed, for
-/// both pack formats. Unlike `probe_packed_path` this is compiled into release
-/// too: rt/save.rs uses it to tell a save icon that needs handing over from
-/// one the save service can open itself.
-pub(crate) unsafe fn is_packed_file(path: *const c_char) -> bool {
-    if !unsafe { has_app0_root(path) } || !is_resident_ready() {
-        return false;
-    }
-    let mut buf = [0u8; RUNTIME_PATH_CAPACITY];
-    let Ok((len, trailing)) = (unsafe { normalize_key_result(path, &mut buf) }) else {
-        return false;
-    };
-    let key = &buf[..len];
-    if !is_app0_key(key) || trailing || len <= 5 {
-        return false;
-    }
-    let Some((_, id)) = (unsafe { lookup_key_view(key, false) }) else {
-        return false;
-    };
-    let Some(reader) = super::pack::ManifestReader::enter() else {
-        return false;
-    };
-    super::pack::file_id_is_packed(&reader, id)
-}
-
 /// Copies the indexed path of one-based file `id` into `out` (truncated,
 /// NUL-terminated) and returns its length; None when the index is not
 /// published or `id` is unknown. Lock-free, like `probe_packed_path`.
@@ -1917,11 +1959,7 @@ unsafe fn copy_dir_path(l: &Lookup, out: &mut [u8]) -> bool {
 /// `posix_open_impl`: the published index answers /app0; an authoritative
 /// miss returns at once (see `miss_is_authoritative`), other misses and
 /// indexed loose files reach the physical open.
-pub(crate) unsafe fn open_impl(
-    path: *const c_char,
-    flags: c_int,
-    mode: SceKernelMode,
-) -> c_int {
+unsafe fn open_impl(path: *const c_char, flags: c_int, mode: SceKernelMode) -> c_int {
     unsafe { open_with(path, flags, mode, real_posix_open, b'o') }
 }
 
@@ -2837,5 +2875,75 @@ mod tests {
             next_unreadable_loads(u32::MAX, LoadResult::Unreadable),
             u32::MAX
         );
+    }
+
+    // ---- index room (rt/index_memory.rs `INDEX_FILE_MAX`) ----
+
+    /// An AMPRIDX3 image of `n` files and exactly `file_bytes` bytes: the
+    /// paths take what records and hash slots leave.
+    fn sized_image(n: usize, file_bytes: usize) -> Vec<u8> {
+        let fixed = image_layout(n, 0).unwrap();
+        let slots = fixed.slot_count * size_of::<HashSlot>();
+        let path_bytes = file_bytes - fixed.path_at - slots;
+        let (base, extra) = (path_bytes / n, path_bytes % n);
+        let (mut records, mut paths) = (Vec::with_capacity(n * 24), Vec::new());
+        for i in 0..n {
+            let mut p = format!("/app0/d{:03}/f{i:07}", i % 997).into_bytes();
+            p.resize(base - 1 + usize::from(i < extra), b'a');
+            records.extend_from_slice(&(paths.len() as u32).to_le_bytes());
+            records.extend_from_slice(&(p.len() as u32).to_le_bytes());
+            records.extend_from_slice(&(i as u64).to_le_bytes());
+            records.extend_from_slice(&0i64.to_le_bytes());
+            paths.extend_from_slice(&p);
+            paths.push(0);
+        }
+        let l = image_layout(n, paths.len() as u64).unwrap();
+        assert_eq!(l.file_bytes, file_bytes);
+        let mut image = vec![0u8; l.map_bytes];
+        assert!(fill_image(&mut image, &l, &records, &paths));
+        image.truncate(l.file_bytes);
+        image
+    }
+
+    fn empty_state() -> FileIndexState {
+        FileIndexState {
+            loaded: false,
+            load_attempted: false,
+            loading: false,
+            available: false,
+            compact: Compact::EMPTY,
+        }
+    }
+
+    /// A 52 MiB AMPRIDX3 file loads through `adopt_compact_index` (the
+    /// `read_compact` path) under the index cap; one whose image is a page
+    /// over the cap is refused with the index notice.
+    #[test]
+    fn a_52_mib_file_index_loads_and_one_over_the_cap_is_refused() {
+        use super::super::index_memory as im;
+        let _pool = im::POOL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let n = 200_000;
+        let image = sized_image(n, im::INDEX_FILE_MAX);
+        let mut idx = empty_state();
+        let used = im::test_index_used();
+        assert!(unsafe { adopt_compact_index(&mut idx, &image) } == LoadResult::Loaded);
+        assert_eq!(idx.compact.count, n);
+        let resident = im::test_index_used() - used;
+        assert_eq!(
+            resident,
+            round_up_page(im::INDEX_FILE_MAX - ampr_format::IDX_HEADER)
+        );
+        assert!(used + resident <= im::INDEX_MEMORY_MAX);
+        unsafe { idx.compact.clear() };
+        assert_eq!(im::test_index_used(), used);
+
+        im::test_take_index_notice();
+        let over = im::INDEX_MEMORY_MAX + SCE_KERNEL_PAGE_SIZE + ampr_format::IDX_HEADER;
+        let image = sized_image(n, over);
+        let mut idx = empty_state();
+        assert!(unsafe { adopt_compact_index(&mut idx, &image) } == LoadResult::Memory);
+        assert!(!idx.available && idx.compact.map_base.is_null());
+        assert!(im::test_take_index_notice(), "no index notice");
+        assert_eq!(im::test_index_used(), used);
     }
 }

@@ -2,6 +2,7 @@
 //! and decoded-cache hash table.
 
 use super::*;
+use crate::rt::index_memory::{cache_alloc, cache_room, index_alloc, index_free};
 
 /// The mounted index image: AMPRZPK1 in zstd mode, else AMPRPAK4.
 fn manifest_path() -> &'static CStr {
@@ -61,49 +62,30 @@ unsafe fn validate_manifest_layout_lz4(
     true
 }
 
-/// Shared halving allocator of initialize_physical_cache/initialize_decoded_cache:
-/// returns (memory, candidate) of the first candidate the pool fully satisfies.
-unsafe fn alloc_cache_region(
-    target: usize,
-    min_bytes: usize,
-    tag: &CStr,
-    short_tag: &CStr,
-) -> Option<(*mut u8, usize)> {
-    let mut candidate = align_up_size(target, PACK_CACHE_PAGE_BYTES);
-    let minimum = align_up_size(target.min(min_bytes), PACK_CACHE_PAGE_BYTES);
-    while candidate != usize::MAX && candidate >= minimum && candidate != 0 {
-        let mut actual = 0usize;
-        let memory = unsafe {
-            ampr_internal_amm_pool_alloc(
-                candidate,
-                &mut actual,
-                tag.as_ptr(),
-                false,
-                PACK_CACHE_PAGE_BYTES,
-            )
-        };
-        if !memory.is_null() && actual >= candidate {
-            return Some((memory as *mut u8, candidate));
-        }
-        if !memory.is_null() {
-            unsafe { ampr_internal_amm_pool_free(memory, short_tag.as_ptr()) };
-        }
-        candidate /= 2;
-        candidate &= !(PACK_CACHE_PAGE_BYTES - 1);
+/// The target from the pool under the cache cap, cut to what is left under
+/// it (rt/index_memory.rs `cache_room`) but not below `min_bytes`. Freed by
+/// `cache_free`.
+unsafe fn cache_region(target: usize, min_bytes: usize, tag: &CStr) -> Option<(*mut u8, usize)> {
+    let room = cache_room() & !(PACK_CACHE_PAGE_BYTES - 1);
+    let bytes = align_up_size(target, PACK_CACHE_PAGE_BYTES).min(room);
+    if bytes == 0 || bytes < target.min(min_bytes) {
+        return None;
     }
-    None
+    let memory = unsafe { cache_alloc(bytes, tag.as_ptr()) };
+    (!memory.is_null()).then_some((memory, bytes))
 }
 
-pub(crate) unsafe fn initialize_physical_cache(state: *mut PackState) {
+/// Allocates the physical cache, or leaves it off: a 0 target, or refused
+/// under the cache cap.
+unsafe fn initialize_physical_cache(state: *mut PackState) {
     if (*state).physical_cache_target_bytes == 0 || PACK_PHYSICAL_CACHE_MAX_PAGES == 0 {
         return;
     }
     let Some((memory, candidate)) = (unsafe {
-        alloc_cache_region(
+        cache_region(
             (*state).physical_cache_target_bytes,
             AMPR_EMU_PACK_PHYSICAL_CACHE_MIN_BYTES as usize,
             c"apr.pack.physical-page-cache",
-            c"apr.pack.physical-page-cache.short",
         )
     }) else {
         return;
@@ -186,30 +168,17 @@ pub(crate) unsafe fn load_runtime_profile(state: *mut PackState) -> bool {
     true
 }
 
-pub(crate) unsafe fn runtime_cache_reserve_bytes(state: *const PackState) -> usize {
-    let mut reserve = super::super::tune::reserve_bytes();
-    let pipelines = super::super::tune::pipelines();
-    if pipelines > (usize::MAX - reserve) / PACK_PIPELINE_IO_BYTES {
-        return usize::MAX;
-    }
-    reserve += pipelines * PACK_PIPELINE_IO_BYTES;
-    if (*state).requested_workers as usize > (usize::MAX - reserve) / PACK_MAX_BLOCK_BYTES {
-        return usize::MAX;
-    }
-    reserve += (*state).requested_workers as usize * PACK_MAX_BLOCK_BYTES;
-    align_up_size(reserve, PACK_CACHE_PAGE_BYTES)
-}
-
-pub(crate) unsafe fn initialize_decoded_cache(state: *mut PackState) {
+/// Allocates the decoded cache, or leaves it off: a 0 target, or refused
+/// under the cache cap.
+unsafe fn initialize_decoded_cache(state: *mut PackState) {
     if (*state).decoded_cache_target_bytes == 0 || PACK_CACHE_MAX_PAGES == 0 {
         return;
     }
     let Some((memory, candidate)) = (unsafe {
-        alloc_cache_region(
+        cache_region(
             (*state).decoded_cache_target_bytes,
             AMPR_EMU_PACK_DECODED_CACHE_MIN_BYTES as usize,
             c"apr.pack.decoded-cache",
-            c"apr.pack.decoded-cache.short",
         )
     }) else {
         return;
@@ -231,35 +200,15 @@ pub(crate) unsafe fn initialize_decoded_cache(state: *mut PackState) {
     }
 }
 
-/// Holds a reserve for pipelines/workers while the caches are carved out, so
-/// they cannot take the memory the runtime needs later.
+/// Carves the 16 + 16 MiB caches from the pool at startup. No reserve is
+/// held for the pipelines and workers: their windows and decode buffers
+/// have their own Buffer ledger, and the Index, Cache and Buffer caps plus
+/// the fixed sites fit the pool (rt/index_memory.rs), so a cache cannot
+/// take their room. A refused cache stays off.
 pub(crate) unsafe fn initialize_caches(state: *mut PackState) {
-    let reserve_bytes = runtime_cache_reserve_bytes(state);
-    let mut reserve_actual = 0usize;
-    let mut reserve: *mut c_void = null_mut();
-    if reserve_bytes != 0 && reserve_bytes != usize::MAX {
-        reserve = unsafe {
-            ampr_internal_amm_pool_alloc(
-                reserve_bytes,
-                &mut reserve_actual,
-                c"apr.pack.cache-reserve".as_ptr(),
-                false,
-                PACK_CACHE_PAGE_BYTES,
-            )
-        };
-    }
-    if reserve.is_null() || reserve_actual < reserve_bytes {
-        if !reserve.is_null() {
-            unsafe {
-                ampr_internal_amm_pool_free(reserve, c"apr.pack.cache-reserve.short".as_ptr())
-            };
-        }
-        return;
-    }
     unsafe {
         initialize_physical_cache(state);
         initialize_decoded_cache(state);
-        ampr_internal_amm_pool_free(reserve, c"apr.pack.cache-reserve.release".as_ptr());
     }
 }
 
@@ -285,7 +234,7 @@ pub(crate) unsafe fn release_manifest_storage(state: *mut PackState) {
     }
     if !(*state).packed_file_order.is_null() {
         unsafe {
-            ampr_internal_amm_pool_free(
+            index_free(
                 (*state).packed_file_order as *mut c_void,
                 c"apr.pack.directory-index.release".as_ptr(),
             )
@@ -296,7 +245,7 @@ pub(crate) unsafe fn release_manifest_storage(state: *mut PackState) {
     let manifest = (*state).manifest_base;
     clear_manifest_view(state);
     if !manifest.is_null() {
-        unsafe { ampr_internal_amm_pool_free(manifest, c"apr.pack.index.release".as_ptr()) };
+        unsafe { index_free(manifest, c"apr.pack.index.release".as_ptr()) };
     }
 }
 
@@ -334,27 +283,23 @@ pub(crate) unsafe fn load_manifest(state: *mut PackState, absent: *mut bool) -> 
         return false;
     }
     let bytes = stat.st_size as usize;
-    let mut actual = 0usize;
-    let memory = unsafe {
-        ampr_internal_amm_pool_alloc(
+    let memory: *mut c_void = unsafe {
+        index_alloc(
             bytes,
-            &mut actual,
-            c"apr.pack.index".as_ptr(),
-            true,
             core::mem::align_of::<AmprPackIndexHeader>(),
+            c"apr.pack.index".as_ptr(),
         )
-    };
-    if memory.is_null() || actual < bytes || !unsafe { pread_exact(fd, memory, bytes, 0) } {
-        if !memory.is_null() {
-            unsafe { ampr_internal_amm_pool_free(memory, c"apr.pack.index.fail".as_ptr()) };
-        }
+    }
+    .cast();
+    if memory.is_null() || !unsafe { pread_exact(fd, memory, bytes, 0) } {
+        unsafe { index_free(memory, c"apr.pack.index.fail".as_ptr()) };
         unsafe { close_fn(fd) };
         return false;
     }
     unsafe { close_fn(fd) };
 
     if !unsafe { validate_manifest_layout(state, memory, bytes) } {
-        unsafe { ampr_internal_amm_pool_free(memory, c"apr.pack.index.invalid".as_ptr()) };
+        unsafe { index_free(memory, c"apr.pack.index.invalid".as_ptr()) };
         clear_manifest_view(state);
         return false;
     }

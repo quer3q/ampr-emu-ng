@@ -14,7 +14,13 @@ pub fn spin_pause_or_yield(spins: &mut u32) {
         core::hint::spin_loop();
         return;
     }
-    unsafe { sceKernelUsleep(1) };
+    // Host tests (the pool's first publish) have no libkernel.
+    #[cfg(test)]
+    std::thread::yield_now();
+    #[cfg(not(test))]
+    unsafe {
+        sceKernelUsleep(1)
+    };
 }
 
 /// `UnsafeCell` that is `Sync`; for static state guarded by an external lock.

@@ -10,16 +10,38 @@ use core::ptr::{null, null_mut};
 
 // ---- internal AMM pool ---------------------------------------------------
 
-/// Pool size from the Makefile's `AMPR_INTERNAL_POOL_SIZE` (decimal or 0x hex,
-/// optional C `ull` suffix); 256 MiB if unset, for a build outside the
-/// Makefile (which sets 192 MiB). Rounded up to a page multiple.
-const STATIC_POOL_SIZE: usize = {
+/// Pool size from the Makefile's `AMPR_INTERNAL_POOL_SIZE` (release) and
+/// `AMPR_DEBUG_POOL_SIZE` (debug), decimal or 0x hex, optional C `ull`
+/// suffix; `DEFAULT_POOL_SIZE` if unset. Rounded up to a page multiple.
+/// All runtime memory is in it: the pool is .bss and did not lower the
+/// game's free direct memory (measured with the former debug /metrics
+/// direct memory lines).
+///
+/// Layout: the Index, Cache and Buffer ledgers (rt/index_memory.rs,
+/// 55 + 32 + 28 MiB caps) and `POOL_SITES_BUDGET` (2 MiB) for these fixed
+/// sites with their largest live size:
+/// - small slab (`sdk_alloc` up to a page): at most 64 blocks of 16 KiB,
+///   1 MiB; its users are the getdents buffer up to 16 KiB and the
+///   decode-on-access chunk states, 2 KiB per mapping (pack/mmap_fault.rs
+///   `STATES_MAX`, 64 mappings, 128 KiB);
+/// - the index writer's buffer, 256 KiB, one (rt/index.rs `BufWriter`);
+/// - a getdents buffer over 16 KiB, at most 64 KiB, one (rt/index.rs
+///   `DENTS_POOL_MAX`; a larger st_blksize takes index memory);
+/// - the disk cache copy piece, 256 KiB, one under CACHE_M
+///   (pack/mmap.rs `PIECE`).
+/// Sites sum: 1.56 MiB (`POOL_SITES_MAX`); the caps plus the budget, 117 MiB,
+/// are checked against the pool at build time (index_memory.rs).
+pub(crate) const STATIC_POOL_SIZE: usize = {
     let v = match option_env!("AMPR_INTERNAL_POOL_SIZE") {
         Some(s) => parse_size(s.as_bytes()),
-        None => 0x1000_0000,
+        None => DEFAULT_POOL_SIZE,
     };
     (v + SCE_KERNEL_PAGE_SIZE - 1) / SCE_KERNEL_PAGE_SIZE * SCE_KERNEL_PAGE_SIZE
 };
+
+/// The Makefile's `AMPR_DEBUG_POOL_SIZE`, the smaller of the two pools, so
+/// host tests check the tighter fit.
+pub(crate) const DEFAULT_POOL_SIZE: usize = 0x750_8000;
 
 /// Compile-time number parser (Makefile knobs); a malformed value fails the build.
 pub(crate) const fn parse_size(s: &[u8]) -> usize {
@@ -50,6 +72,27 @@ pub(crate) const fn parse_size(s: &[u8]) -> usize {
     v
 }
 const _: () = assert!(STATIC_POOL_SIZE % SCE_KERNEL_PAGE_SIZE == 0);
+
+/// The fixed pool sites above, largest live bytes each.
+pub(crate) const POOL_SITES: [(&str, usize); 4] = [
+    ("small slab", SMALL_SLAB_BLOCKS * SCE_KERNEL_PAGE_SIZE),
+    ("index writer", super::index::BUF_WRITER_SIZE),
+    ("getdents", super::index::DENTS_POOL_MAX),
+    ("disk cache piece", super::pack::mmap::PIECE),
+];
+pub(crate) const POOL_SITES_MAX: usize = {
+    let mut sum = 0;
+    let mut i = 0;
+    while i < POOL_SITES.len() {
+        sum += POOL_SITES[i].1;
+        i += 1;
+    }
+    sum
+};
+/// Pool room set aside for the fixed sites: 2 MiB, 1.56 MiB used, the rest
+/// for page rounding and fragmentation between them.
+pub(crate) const POOL_SITES_BUDGET: usize = 2 << 20;
+const _: () = assert!(POOL_SITES_MAX <= POOL_SITES_BUDGET);
 const MAX_CHUNKS: usize = 512;
 const NIL: i32 = -1;
 
@@ -115,7 +158,7 @@ static POOL: SyncCell<Pool> = SyncCell::new(Pool {
 });
 
 /// (bytes in use, peak bytes in use, pool size); read by the mem_report build.
-#[cfg(feature = "mem_report")]
+#[cfg(any(test, feature = "mem_report"))]
 pub(crate) fn pool_usage() -> (usize, usize, usize) {
     let _g = POOL_LOCK.lock();
     let p = unsafe { pool() };
@@ -419,7 +462,12 @@ pub unsafe fn ampr_internal_amm_pool_ensure(required: usize, _reason: *const c_c
         spin_pause_or_yield(&mut spins);
     }
     let prot = SCE_KERNEL_PROT_CPU_RW | SCE_KERNEL_PROT_AMPR_ALL;
-    let rc = unsafe { real_mprotect(static_pool_base() as *const c_void, STATIC_POOL_SIZE, prot) };
+    // Host tests have no kernel; the .bss is already read-write there.
+    let rc = if cfg!(test) {
+        0
+    } else {
+        unsafe { real_mprotect(static_pool_base() as *const c_void, STATIC_POOL_SIZE, prot) }
+    };
     let _g = POOL_LOCK.lock();
     let p = unsafe { pool() };
     p.initializing = false;
@@ -446,7 +494,28 @@ pub unsafe fn ampr_internal_amm_pool_prepare_static_storage(reason: *const c_cha
 }
 
 /// Page-aligned (or stricter) pool allocation; `*out_size` = rounded size.
+/// A null result counts in /metrics `pool_alloc_failed`
+/// (rt/index_memory.rs `note_pool_failure`).
 pub unsafe fn ampr_internal_amm_pool_alloc(
+    size: usize,
+    out_size: *mut usize,
+    tag: *const c_char,
+    may_create: bool,
+    align: usize,
+) -> *mut c_void {
+    let p = unsafe { ampr_internal_amm_pool_try_alloc(size, out_size, tag, may_create, align) };
+    if p.is_null() && size != 0 {
+        super::index_memory::note_pool_failure();
+    }
+    p
+}
+
+/// `ampr_internal_amm_pool_alloc` without the failure count. Publishes the
+/// pool on first use: the eager pack index load and the cache carve run
+/// before anything else asks for it, and an unpublished pool failed the
+/// startup carve (pool_alloc_failed 1, caches off, 12 of 64 MiB used;
+/// debug /metrics).
+unsafe fn ampr_internal_amm_pool_try_alloc(
     size: usize,
     out_size: *mut usize,
     tag: *const c_char,
@@ -465,7 +534,7 @@ pub unsafe fn ampr_internal_amm_pool_alloc(
     } else {
         usize::MAX
     };
-    if mapped == usize::MAX {
+    if mapped == usize::MAX || !unsafe { ampr_internal_amm_pool_prepare_static_storage(null()) } {
         return null_mut();
     }
     let ptr = {
@@ -753,7 +822,8 @@ unsafe fn alloc_block(slot: usize, min_block: usize, may_create: bool) -> Option
 // ---- small slab (SDK CPU allocations up to a page) -------------------------
 
 const SMALL_CLASSES: [usize; 4] = [256, 1024, 2048, SCE_KERNEL_PAGE_SIZE];
-static SMALL_SLAB: ExactSlab<64> = ExactSlab::new();
+const SMALL_SLAB_BLOCKS: usize = 64;
+static SMALL_SLAB: ExactSlab<SMALL_SLAB_BLOCKS> = ExactSlab::new();
 
 pub unsafe fn ampr_small_slab_alloc(
     size: usize,
@@ -793,4 +863,99 @@ pub unsafe fn ampr_small_slab_free(
         unsafe { *out_slot = r.unwrap_or(0) };
     }
     r.is_some()
+}
+
+#[cfg(test)]
+mod pool_site_tests {
+    /// Every pool allocation call in the runtime, with why it is fixed in
+    /// size or held under a ledger cap.
+    const ALLOWED: [(&str, &str); 10] = [
+        // The Index, Cache and Buffer ledgers, each under its cap.
+        (
+            "rt/index_memory.rs",
+            "ampr_internal_amm_pool_alloc(mapped, &mut got, tag, false, SCE_KERNEL_PAGE_SIZE)",
+        ),
+        // sdk_alloc itself: the small slab, then the pool.
+        ("rt/index.rs", "ampr_small_slab_alloc(size, MAX_ALIGN"),
+        (
+            "rt/index.rs",
+            "ampr_internal_amm_pool_alloc(mapped, &mut got, name",
+        ),
+        // ScratchBuffer, used by the two sites below.
+        ("rt/index.rs", "sdk_alloc(size, class)"),
+        ("rt/index.rs", "self.buf.allocate(Self::SIZE"),
+        ("rt/index.rs", "dents.allocate(size"),
+        // The pool's own plumbing: the counted wrapper and slab blocks.
+        (
+            "rt/runtime_memory.rs",
+            "ampr_internal_amm_pool_try_alloc(size, out_size",
+        ),
+        ("rt/runtime_memory.rs", "ampr_internal_amm_pool_alloc("),
+        ("rt/pack/mmap.rs", "sdk_alloc(PIECE"),
+        ("rt/pack/mmap_fault.rs", "sdk_alloc(count"),
+    ];
+    const CALLS: [&str; 5] = [
+        "sdk_alloc(",
+        "ampr_internal_amm_pool_alloc(",
+        "ampr_internal_amm_pool_try_alloc(",
+        "ampr_small_slab_alloc(",
+        ".allocate(",
+    ];
+
+    fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        for e in std::fs::read_dir(dir).unwrap() {
+            let p = e.unwrap().path();
+            if p.is_dir() {
+                walk(&p, out);
+            } else if p.extension().is_some_and(|x| x == "rs") {
+                out.push(p);
+            }
+        }
+    }
+
+    /// A new pool allocation call fails this test until it is shown to be
+    /// fixed in size and added to the sites in the pool's doc comment.
+    #[test]
+    fn the_pool_only_has_the_listed_fixed_size_sites() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        walk(&root, &mut files);
+        let mut seen = Vec::new();
+        for f in files {
+            let rel = f
+                .strip_prefix(&root)
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/");
+            let text = std::fs::read_to_string(&f).unwrap();
+            let body = text.split("#[cfg(test)]\nmod ").next().unwrap();
+            for line in body.lines() {
+                let l = line.trim();
+                if l.starts_with("//") || l.contains("fn ") || !CALLS.iter().any(|c| l.contains(c))
+                {
+                    continue;
+                }
+                let hit = ALLOWED
+                    .iter()
+                    .position(|(file, s)| *file == rel && l.contains(s));
+                assert!(hit.is_some(), "unlisted pool allocation: {rel}: {l}");
+                seen.push(hit.unwrap());
+            }
+        }
+        seen.sort_unstable();
+        assert_eq!(seen, (0..ALLOWED.len()).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn the_ledgers_and_the_sites_budget_fit_the_pool() {
+        use super::{POOL_SITES, POOL_SITES_BUDGET, POOL_SITES_MAX, STATIC_POOL_SIZE};
+        use crate::rt::index_memory::LEDGER_MEMORY_MAX;
+        assert_eq!(
+            POOL_SITES_MAX,
+            (1 << 20) + (256 << 10) + (64 << 10) + (256 << 10)
+        );
+        assert!(POOL_SITES_MAX <= POOL_SITES_BUDGET);
+        assert!(LEDGER_MEMORY_MAX + POOL_SITES_BUDGET <= STATIC_POOL_SIZE);
+        assert_eq!(POOL_SITES.len(), 4);
+    }
 }

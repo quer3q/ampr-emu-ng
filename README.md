@@ -26,8 +26,9 @@ until the level is loaded, read from the debug build's `/metrics`.
 
 | Memory and size | Original C++ | ampr-emu-ng LZ4 | ampr-emu-ng zstd |
 | --- | --- | --- | --- |
-| Pool size / peak (ampr-emu-ng: highest peak, measured with the earlier 32 + 16 MiB caches) | 384 / 267.9 MiB | 192 / 113.6 MiB (-50% / -58%) | 192 / 95.6 MiB (-50% / -64%) |
-| Runtime memory (release, PRX segments) | 397.2 MiB | 200.7 MiB (-49%) | 200.7 MiB (-49%) |
+| Pool size (release) | 384 MiB | 118.39 MiB (-69%) | 118.39 MiB (-69%) |
+| Pool peak (ampr-emu-ng: highest, measured with an earlier build: 128 MiB pool, 32 + 16 MiB caches) | 267.9 MiB | 113.6 MiB (-58%) | 95.6 MiB (-64%) |
+| Runtime memory (PRX segments, release and debug) | 397.2 MiB | 127 MiB (-68%) | 127 MiB (-68%) |
 | Pack on disk | 32.43 GiB (LZ4) | 32.43 GiB (LZ4) | 23.61 GiB (zstd level 5, -27%) |
 
 ## How to
@@ -62,9 +63,10 @@ copies two files to the project root:
 
 - `libSceAmpr.sprx`, the release build;
 - `libSceAmpr-debug.sprx`, the same runtime plus the metrics endpoint
-  described below, with a 256 MiB pool instead of 128 MiB, so its pool
-  peak shows the memory at the default cache sizes (release shrinks its
-  caches when its pool is short).
+  described below, with the same ledgers and PRX size as release (127 MiB:
+  a 117.03 MiB pool, the rest is debug code and tables). Both builds keep
+  16 MiB physical and 16 MiB decoded pack caches, at most 4 decode workers,
+  6 disk read threads and 4 fd read threads.
 
 ### Debug build metrics
 

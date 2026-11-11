@@ -9,6 +9,7 @@ pub(crate) mod exports;
 mod fd_cache;
 mod hook;
 mod index;
+pub(crate) mod index_memory;
 mod libc_exports;
 #[cfg(feature = "mem_report")]
 mod probe;

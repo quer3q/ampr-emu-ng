@@ -51,6 +51,7 @@
 
 use super::*;
 use ampr_format::zstd::Index;
+use crate::rt::index_memory::{index_alloc, index_free};
 
 pub(crate) const AMPR_EMU_ZSTD_INDEX_PATH: &CStr = c"/app0/ampr_zstd.index";
 // The index paths here spell the format crate's `INDEX_NAME`.
@@ -119,7 +120,7 @@ const PROJECTION_READY: u32 = 2;
 const PROJECTION_INVALID: u32 = 3;
 
 struct ZstdMount {
-    /// Borrows the pool allocation at `PackState::manifest_base`.
+    /// Borrows the index memory at `PackState::manifest_base` (rt/index_memory.rs).
     index: Option<Index<'static>>,
     entries: *mut ZstdEntry,
     ampr_count: u32,
@@ -252,7 +253,7 @@ pub(crate) unsafe fn zstd_mount_release() {
     let mount = unsafe { &mut *ZSTD_MOUNT.get() };
     if !mount.order.is_null() {
         unsafe {
-            ampr_internal_amm_pool_free(
+            index_free(
                 mount.order as *mut c_void,
                 c"apr.zstd.directory-index.release".as_ptr(),
             )
@@ -261,7 +262,7 @@ pub(crate) unsafe fn zstd_mount_release() {
     }
     if !mount.entries.is_null() {
         unsafe {
-            ampr_internal_amm_pool_free(
+            index_free(
                 mount.entries as *mut c_void,
                 c"apr.zstd.projection.release".as_ptr(),
             )
@@ -361,22 +362,10 @@ unsafe fn build_projection() -> bool {
     let mut entries: *mut ZstdEntry = null_mut();
     if ampr_count != 0 {
         let bytes = count * size_of::<ZstdEntry>();
-        let mut actual = 0usize;
         let memory = unsafe {
-            ampr_internal_amm_pool_alloc(
-                bytes,
-                &mut actual,
-                c"apr.zstd.projection".as_ptr(),
-                true,
-                align_of::<ZstdEntry>(),
-            )
+            index_alloc(bytes, align_of::<ZstdEntry>(), c"apr.zstd.projection".as_ptr())
         };
-        if memory.is_null() || actual < bytes {
-            if !memory.is_null() {
-                unsafe {
-                    ampr_internal_amm_pool_free(memory, c"apr.zstd.projection.short".as_ptr())
-                };
-            }
+        if memory.is_null() {
             return false;
         }
         entries = memory as *mut ZstdEntry;
@@ -407,7 +396,7 @@ unsafe fn build_projection() -> bool {
     let Some((packed, (order, order_count))) = order else {
         if !entries.is_null() {
             unsafe {
-                ampr_internal_amm_pool_free(
+                index_free(
                     entries as *mut c_void,
                     c"apr.zstd.projection.invalid".as_ptr(),
                 )
@@ -423,8 +412,8 @@ unsafe fn build_projection() -> bool {
     true
 }
 
-/// The directory order of the `packed` projected ids in `entries`: a pool
-/// array of distinct zstd ids sorted by `zstd_sort_order` (null when no
+/// The directory order of the `packed` projected ids in `entries`: an
+/// index memory array of distinct zstd ids sorted by `zstd_sort_order` (null when no
 /// id is packed). None on allocation failure.
 unsafe fn build_order(
     index: &Index<'_>,
@@ -435,22 +424,10 @@ unsafe fn build_order(
         return Some((null_mut(), 0));
     }
     let bytes = packed as usize * size_of::<u32>();
-    let mut actual = 0usize;
     let memory = unsafe {
-        ampr_internal_amm_pool_alloc(
-            bytes,
-            &mut actual,
-            c"apr.zstd.directory-index".as_ptr(),
-            true,
-            align_of::<u32>(),
-        )
+        index_alloc(bytes, align_of::<u32>(), c"apr.zstd.directory-index".as_ptr())
     };
-    if memory.is_null() || actual < bytes {
-        if !memory.is_null() {
-            unsafe {
-                ampr_internal_amm_pool_free(memory, c"apr.zstd.directory-index.short".as_ptr())
-            };
-        }
+    if memory.is_null() {
         return None;
     }
     let order = unsafe { core::slice::from_raw_parts_mut(memory as *mut u32, packed as usize) };
@@ -1363,5 +1340,67 @@ mod tests {
             [s("a.bin", r), s("B.bin", r), s("empty", r), s("sub", d)]
         );
         assert_eq!(children(&index, &order, b"/app0/data/sub"), [s("d.bin", r)]);
+    }
+
+    // ---- index room (rt/index_memory.rs `INDEX_FILE_MAX`) ----
+
+    /// A 52 MiB AMPRZPK1 index of 156,672 one-chunk files loads with its
+    /// AMPRIDX3 projection and directory order at exactly the index cap;
+    /// one more file at the same size needs a page past it and is refused
+    /// with the index notice.
+    #[test]
+    fn a_52_mib_zstd_index_and_its_tables_fit_and_more_files_are_refused() {
+        use crate::rt::index_memory as im;
+        let _pool = im::POOL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        for (n, fits) in [(156_672usize, true), (156_673, false)] {
+            // Header, a 32 B record and one 8 B chunk per file, one volume
+            // record; the paths take the rest.
+            let paths = im::INDEX_FILE_MAX - 128 - 40 * n - 8;
+            let (base, extra) = (paths / n, paths % n);
+            let names: Vec<String> = (0..n)
+                .map(|i| {
+                    let mut p = format!("d{:03}/f{i:07}", i % 997);
+                    p.extend(core::iter::repeat_n(
+                        'a',
+                        base + usize::from(i < extra) - p.len(),
+                    ));
+                    p
+                })
+                .collect();
+            let files: Vec<(&str, u64)> = names.iter().map(|p| (p.as_str(), 1)).collect();
+            let image = build_index(&files, ("", u32::MAX));
+            assert_eq!(image.len(), im::INDEX_FILE_MAX);
+            let ampr: Vec<(Vec<u8>, u64)> = names
+                .iter()
+                .map(|p| (format!("/app0/{p}").into_bytes(), 1))
+                .collect();
+            let used = im::test_index_used();
+            im::test_take_index_notice();
+            unsafe {
+                let mem = index_alloc(image.len(), 8, c"test.zstd.index".as_ptr());
+                assert!(!mem.is_null());
+                core::ptr::copy_nonoverlapping(image.as_ptr(), mem, image.len());
+                let index = Index::open(core::slice::from_raw_parts(mem, image.len())).unwrap();
+                let bytes = n * size_of::<ZstdEntry>();
+                let entries = index_alloc(bytes, 4, c"test.zstd.projection".as_ptr());
+                assert!(!entries.is_null());
+                let out = core::slice::from_raw_parts_mut(entries.cast::<ZstdEntry>(), n);
+                let packed = project_ids(&index, out, |id| {
+                    ampr.get(id as usize - 1).map(|(p, s)| (p.as_slice(), *s))
+                });
+                assert_eq!(packed, Ok(n as u32));
+                let order = build_order(&index, out, n as u32);
+                assert_eq!(order.is_some(), fits, "{n} files");
+                assert_eq!(im::test_take_index_notice(), !fits);
+                if let Some((order, count)) = order {
+                    assert_eq!(count as usize, n);
+                    assert_eq!(im::test_index_used() - used, im::INDEX_MEMORY_MAX);
+                    index_free(order.cast(), c"test.zstd.order.free".as_ptr());
+                }
+                index_free(entries.cast(), c"test.zstd.projection.free".as_ptr());
+                index_free(mem.cast(), c"test.zstd.index.free".as_ptr());
+            }
+            assert_eq!(im::test_index_used(), used);
+        }
     }
 }

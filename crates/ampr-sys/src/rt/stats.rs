@@ -84,7 +84,7 @@ stats! {
     ThreadCreateRetried = "thread_create_retried",
     ThreadCreateRescued = "thread_create_rescued",
     /// The runtime-wide thread budget (rt/thread_hooks.rs): cuts after a
-    /// game creation failed, and growths back by one after 30 s quiet.
+    /// game creation failed, and growths back by one after 10 s quiet.
     ThreadBudgetCuts = "thread_budget_cuts",
     ThreadBudgetRegrows = "thread_budget_regrows",
     /// Save data (rt/save.rs): mounts, a mount refused with SAVE_DATA_ERROR_BUSY
@@ -99,11 +99,11 @@ stats! {
     SaveIconBytes = "save_icon_bytes",
     SaveIconSkipped = "save_icon_skipped",
     /// Read pool size (reactor/pread_pool.rs): threads started, the most
-    /// live at once, exits after idle time, threads given back to the
-    /// game, and our own creations that failed (the pool stops growing).
+    /// live at once, threads given back to the game, and our own creations
+    /// that failed (the pool stops growing). Exits by load are
+    /// pread_retired_load (rt/thread_hooks.rs LoadGroup).
     PreadThreadsStarted = "pread_threads_started",
     PreadThreadsMax = "pread_threads_max",
-    PreadThreadsRetired = "pread_threads_retired",
     PreadThreadsYielded = "pread_threads_yielded",
     PreadThreadCreateFailed = "pread_thread_create_failed",
     /// Pack volume descriptors (rt/pack/leases.rs): opens, time spent in
@@ -112,10 +112,9 @@ stats! {
     PackFdOpens = "pack_fd_opens",
     PackFdOpenNs = "pack_fd_open_ns",
     PackFdEvictions = "pack_fd_evictions",
-    /// Pack workers (rt/pack/worker.rs): threads started, idle exits, given
-    /// back to the game, own creations that failed.
+    /// Pack workers (rt/pack/worker.rs): threads started, given back to the
+    /// game, own creations that failed. Exits by load are decode_retired_load.
     PackWorkersStarted = "pack_workers_started",
-    PackWorkersRetired = "pack_workers_retired",
     PackWorkersYielded = "pack_workers_yielded",
     PackWorkerCreateFailed = "pack_worker_create_failed",
     /// Loose APR reads (real fds) through the pread pool (reactor/loose_pread.rs):
@@ -574,8 +573,8 @@ pub(crate) fn fs_event(op: u8, how: u8, rc: i64, path: *const core::ffi::c_char)
 /// written to the black box (rt/blackbox.rs) whatever `rc` is, once each:
 /// a probe that succeeds (issue #22, `I v 0x0 ... noloc.larc`) is still in
 /// the trace when the game dies before :9090 answers (issue #18), and a
-/// repeat costs no file write. Debug only, like `fs_event`; release builds
-/// have no probes to call it.
+/// repeat costs no file write. Also called by rt/save.rs and
+/// rt/pack/mmap_fault.rs; a no-op in release builds, like `fs_event`.
 #[inline(always)]
 #[cfg_attr(not(feature = "mem_report"), allow(dead_code))]
 pub(crate) fn fs_note(op: u8, how: u8, rc: i64, path: *const core::ffi::c_char) {

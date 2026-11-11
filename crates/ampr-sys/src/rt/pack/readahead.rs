@@ -234,6 +234,7 @@ pub(crate) unsafe fn prefetch_queue_push_locked(state: *mut PackState, index: u3
     }
     (*state).prefetch_tail = index;
     (*state).virtual_aio[index as usize].phase = VirtualAioPhase::Queued;
+    unsafe { super::worker::start_first_worker_locked(state) };
 }
 
 pub(crate) unsafe fn prefetch_queue_remove_locked(state: *mut PackState, index: u32) -> bool {

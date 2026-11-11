@@ -64,7 +64,7 @@
 //! libc heap, persistent; one byte per mapped chunk, transient, released
 //! on munmap. Unmeasured on a console (Makefile).
 
-use super::super::index::{sdk_alloc, sdk_release, MEM_PERSISTENT, MEM_TRANSIENT};
+use super::super::index::{sdk_alloc, sdk_release, title_alloc, title_free, MEM_TRANSIENT};
 use super::zstd::{zstd_entry, zstd_index};
 use super::*;
 use core::sync::atomic::{AtomicI32, AtomicU8, AtomicUsize};
@@ -215,6 +215,9 @@ unsafe fn open_volumes(first: u16, last: u16) -> bool {
 
 // ---- scratch slots ------------------------------------------------------------
 
+/// Most chunk states of one mapping, one byte per 256 KiB chunk: 512 MiB.
+pub(crate) const STATES_MAX: usize = 2048;
+
 /// Concurrent fills; a fault with every slot busy spins for one.
 const SLOTS: usize = 4;
 /// Stored bytes (at most one chunk) then the decoded chunk.
@@ -237,22 +240,23 @@ static SLOT_TABLE: [Slot; SLOTS] = [const {
 /// 0 not made, 1 ready, 2 allocation failed (every mapping goes to disk).
 static SLOTS_STATE: AtomicU8 = AtomicU8::new(0);
 
-/// Under FAULT_M, on the first fault-path map: the scratch buffers (pool,
-/// persistent) and a warmed-up decoder per slot, so a fill allocates
-/// nothing. False when any allocation fails; what was made is released.
+/// Under FAULT_M, on the first fault-path map: the scratch buffers (one
+/// 2 MiB index memory block, rt/index_memory.rs, too large for the 4 MiB
+/// pool) and a warmed-up decoder per slot, so a fill allocates nothing.
+/// False when any allocation fails; what was made is released.
 unsafe fn make_slots() -> bool {
     match SLOTS_STATE.load(Ordering::Acquire) {
         1 => return true,
         2 => return false,
         _ => {}
     }
-    let mut ok = true;
-    for slot in &SLOT_TABLE {
-        let buf = unsafe { sdk_alloc(SLOT_BYTES, MEM_PERSISTENT) }.cast::<u8>();
-        if buf.is_null() {
-            ok = false;
+    let block = unsafe { title_alloc(SLOTS * SLOT_BYTES, c"apr.mmap.fault-slots") };
+    let mut ok = !block.is_null();
+    for (i, slot) in SLOT_TABLE.iter().enumerate() {
+        if !ok {
             break;
         }
+        let buf = unsafe { block.add(i * SLOT_BYTES) };
         let mut decoder = alloc::boxed::Box::new(ampr_codec::ZstdDecoder::new());
         if crate::rt::tune::zstd_verify() {
             let _ = decoder.set_verify_checksum(true);
@@ -262,7 +266,6 @@ unsafe fn make_slots() -> bool {
         // would fail its first fill; fail the setup instead, so every map
         // takes the disk cache (Codex review).
         if decoder.warm_up(out).is_err() {
-            unsafe { sdk_release(buf.cast(), SLOT_BYTES, MEM_PERSISTENT) };
             ok = false;
             break;
         }
@@ -270,9 +273,9 @@ unsafe fn make_slots() -> bool {
         slot.decoder.store(alloc::boxed::Box::into_raw(decoder), Ordering::Relaxed);
     }
     if !ok {
+        unsafe { title_free(block, c"apr.mmap.fault-slots") };
         for slot in &SLOT_TABLE {
-            let buf = slot.buf.swap(null_mut(), Ordering::Relaxed);
-            unsafe { sdk_release(buf.cast(), SLOT_BYTES, MEM_PERSISTENT) };
+            slot.buf.store(null_mut(), Ordering::Relaxed);
             let decoder = slot.decoder.swap(null_mut(), Ordering::Relaxed);
             if !decoder.is_null() {
                 drop(unsafe { alloc::boxed::Box::from_raw(decoder) });
@@ -553,6 +556,11 @@ pub(crate) unsafe fn try_map(
         return MapResult::Fallback;
     }
     let (chunk_base, count) = mapping_chunks(off as u64, len, file.logical_size);
+    // The chunk states are a fixed pool site (rt/runtime_memory.rs): at most
+    // a 2 KiB slab slot per mapping; a longer mapping takes the disk cache.
+    if count as usize > STATES_MAX {
+        return MapResult::Fallback;
+    }
     let _guard = FAULT_M.lock();
     let ready = unsafe { install_handler() && make_slots() }
         && unsafe { open_volumes(entry.first_volume, entry.last_volume) }

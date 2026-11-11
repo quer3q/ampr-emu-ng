@@ -13,6 +13,9 @@
 //!   service runs outside the game's mount namespace, so it cannot open
 //!   /app0/images/icon0.png when that file is packed; the game then never
 //!   finishes saving. A loose path goes to the original call unchanged.
+//!   The bytes are read by rt/pack/mmap.rs `read_packed` into transient
+//!   memory from the pool's Index ledger (rt/index_memory.rs), not a fixed
+//!   pool site.
 //!
 //! The hooks are installed by rt/hook.rs when a loaded module exports the
 //! NID (13.00 libSceSaveData.native: sceSaveDataMount3 ZP4e7rlzOUk,
@@ -20,9 +23,7 @@
 //! sceSaveDataSaveIconByPath Z7z6HXWORJY).
 
 use super::hook::{save_original, SAVE_ICON, SAVE_ICON_PATH, SAVE_MOUNT3, SAVE_UMOUNT2};
-use super::index::{is_packed_file, open_impl};
-use super::pack::{posix_close_emul, posix_fstat_emul, posix_read_emul, SceKernelStat};
-use super::runtime_memory::{ampr_internal_amm_pool_alloc, ampr_internal_amm_pool_free};
+use super::pack::mmap::read_packed;
 use super::stats::{self, Stat};
 use super::sync::{SpinLock, SyncCell};
 use super::sys::SCE_KERNEL_ERROR_ENOSYS;
@@ -34,8 +35,6 @@ use core::ffi::{c_char, c_int, c_void};
 const SAVE_DATA_ERROR_BUSY: c_int = 0x809F_0003u32 as c_int;
 /// SCE_SAVE_DATA_ERROR_NOT_MOUNTED: that point is already gone.
 const SAVE_DATA_ERROR_NOT_MOUNTED: c_int = 0x809F_0004u32 as c_int;
-/// A save icon larger than this is not an icon; refuse before allocating.
-const ICON_MAX_BYTES: usize = 16 * 1024 * 1024;
 
 /// `SceSaveDataMountPoint`: char[16], e.g. "/savedata2".
 const POINT_BYTES: usize = 16;
@@ -210,55 +209,20 @@ pub unsafe extern "C" fn umount2_emul(flags: u32, point: *const c_void) -> c_int
 
 // ---- save icon by path ------------------------------------------------------
 
-/// Reads `path` through the runtime (a packed file gets a virtual fd), then
-/// hands the bytes to the save service with sceSaveDataSaveIcon. None when the
-/// file is empty, too large, or the read fails; the caller then leaves the
-/// original path call in place.
-unsafe fn packed_icon(path: *const c_char) -> Option<(*mut c_void, usize)> {
-    let fd = unsafe { open_impl(path, 0, 0) };
-    if fd < 0 {
-        return None;
-    }
-    let mut st = SceKernelStat::default();
-    if unsafe { posix_fstat_emul(fd, &mut st) } != 0 {
-        unsafe { posix_close_emul(fd) };
-        return None;
-    }
-    let size = st.st_size;
-    if size <= 0 || size as usize > ICON_MAX_BYTES {
-        unsafe { posix_close_emul(fd) };
-        return None;
-    }
-    let size = size as usize;
-    let buf = unsafe {
-        ampr_internal_amm_pool_alloc(
-            size,
-            core::ptr::null_mut(),
-            c"apr.save.icon".as_ptr(),
-            false,
-            0,
-        )
+/// Hands the decoded bytes of a packed icon to sceSaveDataSaveIcon; returns
+/// its result and the byte count, None when that entry is not hooked. The
+/// bytes come from rt/pack/mmap.rs `read_packed`: a transient buffer from the
+/// pool's Index ledger sized by the file, never flexible memory, freed when
+/// this returns.
+unsafe fn save_icon_bytes(mount_point: *const c_void, bytes: &[u8]) -> Option<(c_int, usize)> {
+    let save_icon = unsafe { save_original::<SaveIconFn>(SAVE_ICON) }?;
+    let icon = SceSaveDataIcon {
+        buf: bytes.as_ptr() as *mut c_void,
+        buf_size: bytes.len(),
+        data_size: bytes.len(),
+        reserved: [0; 32],
     };
-    if buf.is_null() {
-        unsafe { posix_close_emul(fd) };
-        return None;
-    }
-    let mut done = 0usize;
-    while done < size {
-        let n = unsafe {
-            posix_read_emul(fd, (buf as *mut u8).add(done).cast(), size - done)
-        };
-        if n <= 0 || n as usize > size - done {
-            break;
-        }
-        done += n as usize;
-    }
-    unsafe { posix_close_emul(fd) };
-    if done != size {
-        unsafe { ampr_internal_amm_pool_free(buf, c"apr.save.icon".as_ptr()) };
-        return None;
-    }
-    Some((buf, size))
+    Some((unsafe { save_icon(mount_point, &icon) }, bytes.len()))
 }
 
 /// Passthrough: installed so `save_original` has the real SaveIcon entry the
@@ -280,34 +244,30 @@ pub unsafe extern "C" fn save_icon_by_path_emul(
     let Some(orig) = (unsafe { save_original::<SaveIconByPathFn>(SAVE_ICON_PATH) }) else {
         return SCE_KERNEL_ERROR_ENOSYS;
     };
-    if mount_point.is_null() || path.is_null() || !unsafe { is_packed_file(path) } {
+    if mount_point.is_null() || path.is_null() {
         return unsafe { orig(mount_point, path) };
     }
-    let Some((buf, size)) = (unsafe { packed_icon(path) }) else {
-        stats::add(Stat::SaveIconSkipped, 1);
-        let rc = unsafe { orig(mount_point, path) };
-        unsafe { note_icon(path, rc) };
-        return rc;
-    };
-    let icon = SceSaveDataIcon {
-        buf,
-        buf_size: size,
-        data_size: size,
-        reserved: [0; 32],
-    };
-    let rc = match unsafe { save_original::<SaveIconFn>(SAVE_ICON) } {
-        Some(save_icon) => unsafe { save_icon(mount_point, &icon) },
-        None => {
+    // None: a loose or missing file, which the save service opens itself.
+    // A packed icon that cannot be read (empty, over READ_PACKED_MAX, no
+    // buffer, a failed read) or handed over is skipped and the call answers
+    // 0: the service cannot open a packed path (0x809f000e), and that error
+    // stalled a title's save; the icon is cosmetic.
+    let rc = match unsafe { read_packed(path, |bytes| save_icon_bytes(mount_point, bytes)) } {
+        None => return unsafe { orig(mount_point, path) },
+        Some(Ok(Some((0, size)))) => {
+            stats::add(Stat::SaveIconBytes, size as u64);
+            0
+        }
+        Some(Ok(Some((rc, _)))) => {
             stats::add(Stat::SaveIconSkipped, 1);
-            unsafe { orig(mount_point, path) }
+            unsafe { note_icon(path, rc) };
+            return 0;
+        }
+        Some(Ok(None)) | Some(Err(())) => {
+            stats::add(Stat::SaveIconSkipped, 1);
+            0
         }
     };
-    if rc == 0 {
-        stats::add(Stat::SaveIconBytes, size as u64);
-    } else {
-        stats::add(Stat::SaveIconSkipped, 1);
-    }
-    unsafe { ampr_internal_amm_pool_free(buf, c"apr.save.icon".as_ptr()) };
     unsafe { note_icon(path, rc) };
     rc
 }

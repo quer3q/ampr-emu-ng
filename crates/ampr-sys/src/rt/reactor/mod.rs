@@ -47,10 +47,15 @@ mod worker;
 pub(crate) use worker::{
     apr_reactor_notify_external_progress, apr_reactor_shutdown, apr_reactor_submit,
     apr_reactor_submit_external_aio_read, apr_reactor_submit_external_aio_read_group,
-    apr_reactor_wait_synthetic_submit_id, pread_pool_pending_exits, pread_pool_yield,
+    apr_reactor_wait_synthetic_submit_id, pread_pool_pending_exits,
 };
 #[cfg(feature = "mem_report")]
+pub(crate) use worker::pread_pool_yield;
+#[cfg(feature = "mem_report")]
 pub(crate) use worker::pread_pool_state;
+pub(crate) use pread_pool::{pread_pool_ask, pread_pool_live, pread_pool_reap};
+#[cfg(feature = "mem_report")]
+pub(crate) use pread_pool::pread_pool_load;
 #[cfg(feature = "mem_report")]
 pub(crate) use native::EQUEUE_TARGETS;
 mod lane_overlap;
@@ -131,9 +136,11 @@ pub(crate) const AMPR_EMU_APR_READ_CREDIT_GRANULE_BYTES: u64 = 0x10000;
 pub(crate) const AMPR_EMU_APR_READ_PASS_MAX_BYTES: u64 = 0x80000;
 /// Blocking pread pool for the pack's physical reads (pread_pool.rs). Kernel AIO on BFS
 /// serves 1-2 requests at a time; 32 parallel preads reached 1.6-2.0 GB/s on
-/// a console (bench). 16 threads in both builds (tune::RELEASE_PREAD_THREADS
-/// has the measurements), shared by pack groups and split loose reads. Their
-/// 32 KiB stacks are libkernel memory, not the internal pool.
+/// a console (bench). At most 6 threads in both builds, grown by backlog and
+/// retired by load (`LoadGroup` in rt/thread_hooks.rs;
+/// tune::RELEASE_PREAD_THREADS has the measurements), shared by pack groups
+/// and split loose reads. Their 32 KiB stacks are libkernel memory, not the
+/// internal pool.
 pub(crate) const AMPR_EMU_PACK_PREAD_WORKERS: usize = crate::rt::tune::RELEASE_PREAD_THREADS as usize;
 pub(crate) const AMPR_EMU_PACK_PREAD_TASKS: usize = 128;
 /// Loose APR reads (the game's real-fd reads) through the pread pool
@@ -156,9 +163,8 @@ pub(crate) const AMPR_EMU_APR_LOOSE_PREAD_PART_KIB: u32 = 64;
 /// Pool tasks (parts) loose reads may hold at once. Release: 32 =
 /// AMPR_EMU_APR_AIO_INFLIGHT, the most loose reads admission lets in flight;
 /// the cap in effect is min(this, threads - AMPR_EMU_APR_LOOSE_PREAD_PACK_RESERVE)
-/// = 28 at 32 threads. Debug: AMPR_EMU_PACK_PREAD_WORKERS (64), so the thread
-/// count alone sets the cap (28 at the default 32 threads, 60 at
-/// `pread_threads=64`). So at least 96 (release) or 64 (debug) of the 128
+/// = 2 at 6 threads. Debug: AMPR_EMU_PACK_PREAD_WORKERS (6), so the thread
+/// count alone sets the cap. So at least 96 (release) or 120 (debug) of the 128
 /// AMPR_EMU_PACK_PREAD_TASKS stay free for pack groups, 100 at 32 threads
 /// (console peak 8 queued); a full table returns EAGAIN and the
 /// read goes unsplit or to kernel AIO (loose_pread.rs).
@@ -171,8 +177,8 @@ const _: () = assert!(
     (AMPR_EMU_APR_LOOSE_PREAD_TASKS_MAX as usize) < AMPR_EMU_PACK_PREAD_TASKS,
     "loose reads must leave pread tasks for pack groups"
 );
-/// pread threads loose reads never take: 4 of the 16 threads
-/// (tune::RELEASE_PREAD_THREADS; debug `pread_threads`, default and max 16)
+/// pread threads loose reads never take: 4 of the 6 threads
+/// (tune::RELEASE_PREAD_THREADS; debug `pread_threads`, default and max 6)
 /// stay for pack tasks (console peak was 1.9 busy pack threads).
 pub(crate) const AMPR_EMU_APR_LOOSE_PREAD_PACK_RESERVE: usize = 4;
 pub(crate) const AMPR_EMU_APR_COMMAND_BUFFER_LIVE_MAX: usize = 4096;
@@ -1662,11 +1668,11 @@ pub(crate) struct AprAioReactor {
     pub(crate) preadIdle: u32,
     pub(crate) preadExitRequests: u32,
     pub(crate) preadCeiling: u32,
-    /// Signalled when a pool thread exits (pread_pool_yield waits on it).
+    /// Signalled when a pool thread exits (yield_pread_threads waits on it).
     pub(crate) preadExitCv: Condvar,
     /// The pool gave its last thread to the game, so its next first thread
-    /// is not exempt from the thread budget (spawn_pread_thread). Under
-    /// preadMutex.
+    /// is not exempt from the thread budget (spawn_pread_thread); cleared
+    /// when pressure mode ends. Under preadMutex.
     pub(crate) preadGaveLast: bool,
     /// A pool thread left: the reactor joins it on its next pass, since an
     /// exited thread not yet joined may still count against the game's limit.

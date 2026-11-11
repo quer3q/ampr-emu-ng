@@ -67,6 +67,8 @@ pub(crate) unsafe fn queue_push_locked(state: *mut PackState, index: u32, _queue
     }
     (*state).queue_depth[work_class] += 1;
     (*state).virtual_aio[index as usize].phase = VirtualAioPhase::Queued;
+    // Tells a spinning idle worker (worker.rs idle_spin) to re-check.
+    super::worker::QUEUE_EPOCH.fetch_add(1, Ordering::Relaxed);
     unsafe { super::worker::maybe_grow_workers_locked(state) };
 }
 
@@ -382,5 +384,9 @@ pub(crate) unsafe fn release_pipeline_locked(state: *mut PackState, owner: u32) 
         abort();
     }
     (*state).pipeline_active_count -= 1;
-    QUEUE_CV.notify_one();
+    // A free pipeline admits one new read: one worker, unless a latency
+    // reserve could hand the signal to a worker that may not take the job.
+    super::worker::QUEUE_EPOCH.fetch_add(1, Ordering::Relaxed);
+    let single = unsafe { super::worker::single_wake_locked(state, 1) };
+    super::worker::wake_queue_workers(single);
 }

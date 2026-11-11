@@ -538,7 +538,9 @@ pub unsafe fn apr_reactor_submit_external_aio_read_group(
 }
 
 /// A game thread creation failed (rt/thread_hooks.rs): asks the read pool
-/// to give up to `want` threads back. Returns how many exited.
+/// to give up to `want` threads back. Returns how many exited. Only the
+/// debug /threads page calls it; make_room uses the ask/reap split.
+#[cfg(feature = "mem_report")]
 pub unsafe fn pread_pool_yield(want: u32) -> u32 {
     let reactor = g_apr_aio_reactor.load(Ordering::Acquire);
     if reactor.is_null() {

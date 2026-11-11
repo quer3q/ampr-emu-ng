@@ -352,23 +352,15 @@ pub(crate) unsafe fn build_packed_file_order(state: *mut PackState) -> bool {
     if count == 0 {
         return true;
     }
-    let mut actual = 0usize;
     let bytes = count as usize * size_of::<u32>();
     let memory = unsafe {
-        ampr_internal_amm_pool_alloc(
+        crate::rt::index_memory::index_alloc(
             bytes,
-            &mut actual,
-            c"apr.pack.directory-index".as_ptr(),
-            true,
             align_of::<u32>(),
+            c"apr.pack.directory-index".as_ptr(),
         )
     };
-    if memory.is_null() || actual < bytes {
-        if !memory.is_null() {
-            unsafe {
-                ampr_internal_amm_pool_free(memory, c"apr.pack.directory-index.short".as_ptr())
-            };
-        }
+    if memory.is_null() {
         return false;
     }
     (*state).packed_file_order = memory as *mut u32;
@@ -732,5 +724,91 @@ mod tests {
         assert!(slot.holds(base as c_int));
         assert!(!slot.holds(base as c_int + 1));
         assert!(!VirtualFdSlot::EMPTY.holds(-1));
+    }
+
+    // ---- index room (rt/index_memory.rs `INDEX_FILE_MAX`) ----
+
+    /// An AMPRPAK4 image of `n` empty packed files and exactly `bytes`
+    /// bytes: the paths take what the records leave. No chunks, no packs.
+    fn lz4_index(n: usize, bytes: usize) -> Vec<u8> {
+        use ampr_format::{crc32, header_crc, pak_path_hash};
+        const HEADER: usize = 128;
+        let strings_at = HEADER + n * 48;
+        let (base, extra) = ((bytes - strings_at) / n, (bytes - strings_at) % n);
+        let mut b = vec![0u8; strings_at];
+        let put32 =
+            |b: &mut Vec<u8>, at: usize, v: u32| b[at..at + 4].copy_from_slice(&v.to_le_bytes());
+        let put64 =
+            |b: &mut Vec<u8>, at: usize, v: u64| b[at..at + 8].copy_from_slice(&v.to_le_bytes());
+        for i in 0..n {
+            let mut path = format!("/app0/d{:03}/f{i:07}", i % 997).into_bytes();
+            path.resize(base - 1 + usize::from(i < extra), b'a');
+            let at = HEADER + i * 48;
+            put64(&mut b, at, pak_path_hash(&path));
+            let off = (b.len() - strings_at) as u32;
+            put32(&mut b, at + 32, off);
+            put32(&mut b, at + 36, path.len() as u32);
+            put32(&mut b, at + 40, 1); // FILE_PACKED, empty: no chunks
+            b[at + 44] = 14; // block_shift
+            b.extend_from_slice(&path);
+            b.push(0);
+        }
+        assert_eq!(b.len(), bytes);
+        b[..8].copy_from_slice(b"AMPRPAK4");
+        put32(&mut b, 8, 4);
+        put32(&mut b, 12, HEADER as u32);
+        put32(&mut b, 20, 0x0102_0304);
+        put64(&mut b, 40, n as u64);
+        put32(&mut b, 60, 48);
+        put32(&mut b, 64, 12);
+        put32(&mut b, 68, 32);
+        put64(&mut b, 72, HEADER as u64);
+        for at in [80, 88, 96] {
+            put64(&mut b, at, strings_at as u64);
+        }
+        put64(&mut b, 104, (bytes - strings_at) as u64);
+        let payload = crc32(&b[HEADER..]);
+        put32(&mut b, 112, payload);
+        let crc = header_crc(&b, HEADER, 116).unwrap();
+        put32(&mut b, 116, crc);
+        b
+    }
+
+    /// A 52 MiB AMPRPAK4 index of 786,432 packed files loads with its
+    /// directory order at exactly the index cap; one more file at the same
+    /// size needs a page past it and is refused with the index notice.
+    #[test]
+    fn a_52_mib_lz4_index_and_its_order_fit_and_more_files_are_refused() {
+        use crate::rt::index_memory as im;
+        let _pool = im::POOL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        for (n, fits) in [(786_432usize, true), (786_433, false)] {
+            let image = lz4_index(n, im::INDEX_FILE_MAX);
+            let layout = std::alloc::Layout::new::<PackState>();
+            let state = unsafe { std::alloc::alloc_zeroed(layout) }.cast::<PackState>();
+            assert!(!state.is_null());
+            let used = im::test_index_used();
+            im::test_take_index_notice();
+            unsafe {
+                let mem = im::index_alloc(image.len(), 8, c"test.pack.index".as_ptr());
+                assert!(!mem.is_null());
+                core::ptr::copy_nonoverlapping(image.as_ptr(), mem, image.len());
+                assert!(super::super::manifest::validate_manifest_layout(
+                    state,
+                    mem.cast(),
+                    image.len()
+                ));
+                (*state).manifest_base = mem.cast();
+                (*state).manifest_bytes = image.len();
+                assert_eq!(build_packed_file_order(state), fits, "{n} files");
+                assert_eq!(im::test_take_index_notice(), !fits);
+                if fits {
+                    assert_eq!((*state).packed_file_count as usize, n);
+                    assert_eq!(im::test_index_used() - used, im::INDEX_MEMORY_MAX);
+                }
+                super::super::manifest::release_manifest_storage(state);
+                std::alloc::dealloc(state.cast(), layout);
+            }
+            assert_eq!(im::test_index_used(), used);
+        }
     }
 }
