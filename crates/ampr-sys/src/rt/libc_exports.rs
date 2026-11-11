@@ -93,7 +93,7 @@ pub extern "C" fn ampr_libc_udivti3(a: u128, b: u128) -> u128 {
 }
 
 /// `_Fltrounds`: FLT_ROUNDS. 1 is round-to-nearest.
-/// ponytail: returns the default mode instead of reading MXCSR; titles do not
+/// Returns the default mode instead of reading MXCSR: titles do not
 /// change the SSE rounding mode in practice.
 #[no_mangle]
 pub extern "C" fn ampr_libc_fltrounds() -> c_int {
@@ -367,7 +367,7 @@ pub unsafe extern "C" fn ampr_libc_mbstowcs(
 
 /// `wcstombs_s` (C11 K.3.6.5.2) in the "C" locale: a wide char above 0xff
 /// is an encoding error.
-/// ponytail: no multibyte locales; Dinkumware's "C" locale maps 0..=0xff 1:1.
+/// No multibyte locales: Dinkumware's "C" locale maps 0..=0xff 1:1.
 #[no_mangle]
 pub unsafe extern "C" fn ampr_libc_wcstombs_s(
     retval: *mut usize,
@@ -512,7 +512,7 @@ static GMTIME_R: ModuleSym = ModuleSym::new(c"gmtime_r");
 /// `ctime_s(buf, size, time)` (AnyPS5 SonyCtimeS): local time through libc's
 /// localtime_r, found at run time (a static import would add a NID to the
 /// PRX import table; this path is rare enough to resolve lazily).
-/// ponytail: falls back to UTC (gmtime_r) when localtime_r is not found.
+/// Falls back to UTC (gmtime_r) when localtime_r is not found.
 #[no_mangle]
 pub unsafe extern "C" fn ampr_libc_ctime_s(
     buf: *mut c_char,
@@ -593,14 +593,14 @@ pub unsafe extern "C" fn ampr_libc_cnd_init_with_name(
 }
 
 /// `std::time_get<char>::get(...)`: stub returning 0, as AnyPS5.
-/// ponytail: not implemented; no title is known to reach it through libSceAmpr.
+/// Not implemented: no title is known to reach it through libSceAmpr.
 #[no_mangle]
 pub extern "C" fn ampr_libc_time_get_get() -> c_int {
     0
 }
 
 /// `std::time_get<char>::_Getcat(...)`: stub returning 0, as AnyPS5.
-/// ponytail: not implemented; see ampr_libc_time_get_get.
+/// Not implemented; see ampr_libc_time_get_get.
 #[no_mangle]
 pub extern "C" fn ampr_libc_time_get_getcat() -> c_int {
     0

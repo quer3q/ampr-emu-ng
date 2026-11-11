@@ -1,5 +1,5 @@
-//! PRX startup/shutdown contract, formerly ps5/crt (crti.S, crtbeginS.c,
-//! crtendS.c, crtn.S). Same sections, symbols and init/fini order; the data
+//! PRX startup/shutdown contract of the SDK crt objects (crti, crtbeginS,
+//! crtendS, crtn): same sections, symbols and init/fini order. The data
 //! that needs section placement or weak references lives in the asm block,
 //! the loops are Rust. Relies on ampr-sys being one codegen unit, so the
 //! `.hidden` directives see the Rust definitions of `_init`/`_fini`.

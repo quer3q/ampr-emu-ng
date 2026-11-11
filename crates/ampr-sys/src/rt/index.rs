@@ -1,7 +1,6 @@
-//! The resident AMPRIDX3 /app0 file index,
-//! its runtime builder and the /app0 file hooks (include/ampr_emu_index.h).
-//! Pure AMPRIDX3 parsing/lookup lives in ampr_format::index{,_key}; the
-//! AMPRPAK4 core shim (src/ampr_emu_pack_core.cpp) is at the end.
+//! The resident AMPRIDX3 /app0 file index, its runtime builder and the
+//! /app0 file hooks. Pure AMPRIDX3 parsing/lookup lives in
+//! ampr_format::index{,_key}; the AMPRPAK4 core shim is at the end.
 //!
 //! Layout:
 //! 1. constants, on-disk types, global state: `INDEX_LOCK` + `INDEX_CV` guard
@@ -649,7 +648,7 @@ impl BufWriter {
         }
         true
     }
-    /// (C++ lines 622-634, ported here to keep the class whole.)
+    /// Writes the buffered bytes; they stay buffered when the write fails.
     pub fn flush(&mut self) -> bool {
         if !self.valid() {
             return false;
@@ -2203,7 +2202,7 @@ unsafe fn rename_impl(from: *const c_char, to: *const c_char) -> c_int {
     unsafe { real_posix_rename(rf, rt) }
 }
 
-// ---- exports (include/ampr_emu_index.h, include/ampr_libkernel_hook_targets.h) ----
+// ---- exports ----
 
 /// `int posix_open_emul(const char*, int, ...)`. Stable Rust cannot define a
 /// variadic; on SysV x86-64 the first variadic int arrives in the same
@@ -2489,7 +2488,7 @@ pub unsafe fn ampr_index_get_entry_view(id: u32, out: *mut FileEntryView) -> c_i
     0
 }
 
-// ---- AMPRPAK4 core shim (src/ampr_emu_pack_core.cpp, include/ampr_emu_pack_core.h) ----
+// ---- AMPRPAK4 core shim ----
 
 // zstd mode routes the five `ampr_pack_core_*` bodies to rt/pack/zstd.rs
 // (same ABI); the AMPRPAK4 helpers below serve LZ4 mode.
@@ -2656,7 +2655,7 @@ pub unsafe fn ampr_pack_core_validate_logical_file(
     path_len: usize,
     logical_size: u64,
 ) -> c_int {
-    // zstd: `file_id` is an AMPRIDX3 id; the index comes from the R4 mount.
+    // zstd: `file_id` is an AMPRIDX3 id, checked against the zstd pack index.
     if zstd_mode() {
         return unsafe {
             zstd::zstd_core_validate_logical_file(file_id, path, path_len, logical_size)

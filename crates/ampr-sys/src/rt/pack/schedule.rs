@@ -45,8 +45,6 @@ pub(crate) unsafe fn worker_is_latency_reserved_locked(
     worker_index < effective_latency_reserve_locked(state)
 }
 
-// update_queue_depth_peak: telemetry, dropped.
-
 pub(crate) unsafe fn queue_push_locked(state: *mut PackState, index: u32, _queued_at_usec: u64) {
     let job = &mut (*state).virtual_aio[index as usize];
     if job.parked_ns != 0 && job.requeued_ns == 0 {

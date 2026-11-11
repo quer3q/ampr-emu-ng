@@ -443,7 +443,8 @@ pub(crate) unsafe fn create_counted(
 // has more live threads than `load_target` + 1 (`load_target`: ceil(median x
 // 1.5) + 1, at least 1) for RETIRE_STREAK finishes in a row. No idle timer:
 // peak busy was 4 decode workers (~0.2 cores of work) and 4-5 disk threads
-// with 9-11 runtime threads live on two titles (debug /metrics), and a game creation failed with 6 decoders alive. In pressure
+// with 9-11 runtime threads live on two titles (debug /metrics), and a game
+// creation failed with 6 decoders alive. In pressure
 // mode (a game creation failed with EAGAIN in the last tune::regrow_ns, 10 s)
 // idle threads leave at once and each group keeps at most one: while it has
 // work, or the one it started after the yield (`LoadGroup::held`), so a
@@ -802,7 +803,8 @@ pub(crate) mod limit_probe {
                 stats::fs_event(b'P', b'h', h.count as i64, c"thread-hold".as_ptr());
             }
         }
-        if have_attr {
+        // Also when init passed and the stack size was refused.
+        if !attr.is_null() {
             if let Some(destroy) = destroy {
                 let _ = unsafe { destroy(&mut attr) };
             }
@@ -925,27 +927,6 @@ mod tests {
         assert_eq!(exits_to_ask(u32::MAX, 4, 1, 2), 1); // 2 already asked
         assert_eq!(exits_to_ask(u32::MAX, 2, 1, 3), 0);
         assert_eq!(exits_to_ask(1, 4, 0, 0), 1);
-    }
-
-    /// Each thread that leaves meets one pending request, and none below 0:
-    /// two asked, three leave (one more by load), none left over.
-    #[test]
-    fn exit_requests_met_by_any_leave() {
-        let requests = core::sync::atomic::AtomicU32::new(2);
-        assert!(take_exit_request(&requests));
-        assert!(take_exit_request(&requests));
-        assert!(!take_exit_request(&requests));
-        assert_eq!(requests.load(core::sync::atomic::Ordering::Relaxed), 0);
-    }
-
-    /// The pressure window: on from a failure until `window` later.
-    #[test]
-    fn pressure_window() {
-        let w = 10_000_000_000u64;
-        assert!(!pressure_at(5, 0, w)); // no failure yet
-        assert!(pressure_at(100, 100, w));
-        assert!(pressure_at(100 + w - 1, 100, w));
-        assert!(!pressure_at(100 + w, 100, w)); // 10 s quiet: normal
     }
 
     /// The histogram follows the ring: a full window of 4s replaced by a

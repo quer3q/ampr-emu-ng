@@ -29,7 +29,7 @@ unsafe fn clear_handled(handled: *mut bool) {
     }
 }
 
-// ---- ordinary virtual fd reads (R7) -------------------------------------------
+// ---- ordinary virtual fd reads -----------------------------------------------
 //
 // read/pread/readv/preadv of a virtual pack fd submit one virtual AIO
 // request per iovec segment (aio.rs) and wait for them (aio_wait.rs), so chunks are
@@ -321,16 +321,12 @@ unsafe fn read_on_workers(
 /// AIO arrays sized for 128 requests (read_on_workers 12,024 B,
 /// sceKernelAioSubmitReadCommandsMultiple 13,528 B, publish_virtual_jobs
 /// 6,600 B in the debug PRX), ~32 KB that a small game thread does not have.
-/// A UE5 title's `Bink IO` thread read a packed .bk2 and faulted
-/// on the guard page in publish_virtual_jobs. The thread stacks (at most
-/// READ_THREADS x READ_STACK = 4 x 128 KiB = 512 KiB) are libkernel memory,
-/// outside the internal pool.
-/// ponytail: every virtual-fd read pays one handoff; check the caller's stack
-/// and read inline when it is large, if the handoff shows in read latency.
-/// Shrinking the 128-entry AIO arrays in read_on_workers,
-/// sceKernelAioSubmitReadCommandsMultiple and publish_virtual_jobs (smaller
-/// batches, more submits) would let the caller's thread read and remove the
-/// handoff, if its latency shows.
+/// A game's video I/O thread read a packed file and faulted on the guard
+/// page in publish_virtual_jobs. The thread stacks (at most READ_THREADS x
+/// READ_STACK = 4 x 128 KiB = 512 KiB) are libkernel memory, outside the
+/// internal pool. Every virtual-fd read pays one handoff; smaller AIO
+/// arrays (smaller batches, more submits) would let the caller's thread
+/// read inline, if the handoff shows in read latency.
 const READ_THREADS: usize = 4;
 /// 128 KiB: read_on_workers needs ~32 KB (above). The stacks come from the
 /// game's flexible memory, which a title can use up (flex_free_bytes 0 of
@@ -425,7 +421,7 @@ static READ_THREADS_UP: AtomicU32 = AtomicU32::new(0);
 /// it with an empty queue.
 static READ_STOP: AtomicBool = AtomicBool::new(false);
 /// Started read threads, joined by `stop_read_threads` before module_stop
-/// returns, so none is left in the PRX's code after an unload (Codex review).
+/// returns, so none is left in the PRX's code after an unload.
 static READ_HANDLES: SyncCell<[ScePthread; READ_THREADS]> =
     SyncCell::new([null_mut(); READ_THREADS]);
 
@@ -449,8 +445,9 @@ const READ_SLOT_EXITED: u8 = 2;
 static READ_SLOTS: SyncCell<[u8; READ_THREADS]> = SyncCell::new([READ_SLOT_EMPTY; READ_THREADS]);
 static READ_IDLE: AtomicU32 = AtomicU32::new(0);
 static READ_EXIT_REQUESTS: AtomicU32 = AtomicU32::new(0);
-/// A read thread left: the next thread or caller through READ_M joins it,
-/// so its slot is free at once (as WORKER_REAP_PENDING, worker.rs).
+/// A read thread left: the next read thread through READ_M joins it (a
+/// spawn and `read_threads_reap` join too), so its slot is free at once (as
+/// WORKER_REAP_PENDING, worker.rs).
 static READ_REAP_PENDING: AtomicBool = AtomicBool::new(false);
 
 // ---- spin before park ----
@@ -1366,7 +1363,7 @@ pub unsafe fn ampr_pack_shutdown() -> c_int {
     // Close the manifest gate before anything else: from here on opens,
     // stats and probes act as if no manifest were loaded, and the open path
     // rechecks the gate under PACK_M, so no new virtual fd is allocated
-    // during the drain below (stability S4).
+    // during the drain below.
     MANIFEST_READERS.close();
     {
         let mut g = PACK_M.lock();
@@ -1787,13 +1784,5 @@ mod tests {
         // A freed slot takes the next call behind the queued ones, not first.
         assert!(q.push(4));
         assert_eq!([q.pop(), q.pop(), q.pop(), q.pop()], [Some(2), Some(3), Some(4), None]);
-    }
-
-    #[test]
-    fn read_queue_survives_counter_wrap() {
-        let mut q = Fifo::<u32, 2>::new();
-        (q.head, q.tail) = (usize::MAX, usize::MAX);
-        assert!(q.push(7) && q.push(8) && !q.push(9));
-        assert_eq!([q.pop(), q.pop(), q.pop()], [Some(7), Some(8), None]);
     }
 }

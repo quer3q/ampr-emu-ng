@@ -1,33 +1,30 @@
 # zstd packs (ampr_zstd.index + ampr_zstd-NNN.pak)
 
-The ampr-emu-ng zstd pack format is an `AMPRZPK1` index plus `AMPRZDT1`
-volumes. It is a general container of its own, separate from AMPRPAK4.
-[ps5-dump-forge](https://github.com/quer3q/ps5-dump-forge) builds the packs
-and this repo only decodes them: `crates/ampr-zstd` (constants, layout, volume header) and
-`crates/ampr-format/src/zstd.rs` (index reader) hold the format, and
-the runtime (`crates/ampr-sys`) mounts it. The same runtime also reads LZ4
-(AMPRPAK4) packs and picks the format at load by whether
-`/app0/ampr_zstd.index` exists.
+ampr-emu-ng zstd packs are an `AMPRZPK1` index plus `AMPRZDT1` volumes,
+separate from AMPRPAK4.
+[ps5-dump-forge](https://github.com/quer3q/ps5-dump-forge) builds them;
+this repo only decodes them (`crates/ampr-zstd`: constants, layout, volume
+header; `crates/ampr-format/src/zstd.rs`: index reader). When
+`/app0/ampr_zstd.index` exists, `libSceAmpr.sprx` mounts it instead of the
+LZ4 `ampr_assets.index`, decodes with libzstd (`ampr-codec`) and serves
+AMPR/APR reads and the file calls under What is packed.
 
-All integers are little-endian. CRC means CRC-32 (IEEE, as in `crc32fast`).
-The path hash is FNV-1a 64 (basis 14695981039346656037, prime
-1099511628211) over the UTF-8 path relative to the game root, with `/`
-separators, no leading slash and case kept (for example `data/level1.bin`).
+Integers are little-endian. CRC is CRC-32 (IEEE, as in `crc32fast`). The
+path hash is FNV-1a 64 (basis 14695981039346656037, prime 1099511628211)
+over the UTF-8 path relative to the game root: `/` separators, no leading
+slash, case kept (`data/level1.bin`), no `\`, NUL, or empty, `.` or `..`
+component.
 
 ## Files on disk
 
-- `ampr_zstd.index` is the index of the whole archive, loose at the game
-  root.
-- `ampr_zstd-000.pak`, `ampr_zstd-001.pak`, ... are the volumes, numbered
-  with at least three digits (more past 999), like LZ4's
-  `ampr_assets-NNN.pak`. Volume id 0 is `ampr_zstd-000.pak`. A volume file
-  is at most 4 GiB less 64 KiB (4,294,901,760 bytes, the same as the LZ4
-  packs), header included. That keeps every chunk offset below 2^32 (the
-  u32 chunk offset) and every volume under FAT32's 4 GiB file limit. The
-  number of volumes does not affect read speed (23 fd-budget waits in a
-  whole session).
-- `ampr_emu.index` (AMPRIDX3) stays as the dump tooling writes it. It lists
-  every game file, loose and packed, so AMPR path ids keep working.
+- `ampr_zstd.index`: the archive index, loose at the game root.
+- `ampr_zstd-000.pak`, `ampr_zstd-001.pak`, ...: up to 4096
+  volumes, id 0 first, numbered with at least three digits. A volume is at most 4 GiB less
+  64 KiB (4,294,901,760 bytes, as for LZ4 packs) with its header, so chunk
+  offsets fit a u32 and volumes fit FAT32. The volume count does not affect
+  read speed (23 fd-budget waits in a whole session).
+- `ampr_emu.index` (AMPRIDX3) stays as the dump tooling writes it. It
+  lists every file, loose and packed, so AMPR path ids keep working.
 
 ## ampr_zstd.index
 
@@ -44,7 +41,7 @@ Header, 128 bytes:
 | 20 | u32 | volume_count |
 | 24 | [16] | archive_id (random; repeated in every volume header) |
 | 40 | u64 | file_count |
-| 48 | u64 | chunk_count |
+| 48 | u64 | chunk_count (at most 2^32 - 1) |
 | 56 | u64 | files_off (= 128) |
 | 64 | u64 | chunks_off |
 | 72 | u64 | volumes_off |
@@ -56,6 +53,9 @@ Header, 128 bytes:
 | 116 | u32 | CRC of the header with bytes 112..120 zeroed |
 | 120 | u64 | reserved 0 |
 
+The tables follow back to back in this order with no gaps; chunk_count and
+volume_count are both 0 or both non-zero.
+
 File record, 32 bytes, sorted by (path_hash, path bytes) for binary search:
 
 | off | type | field |
@@ -65,7 +65,7 @@ File record, 32 bytes, sorted by (path_hash, path bytes) for binary search:
 | 16 | u32 | first_chunk: the chunks of all earlier records (chunk_count = ceil(size / 256 KiB), 0 for an empty file) |
 | 20 | u32 | path_off (into strings) |
 | 24 | u16 | path_len (bytes, no NUL) |
-| 26 | u16 | flags: bit0 = store-only (all chunks raw) |
+| 26 | u16 | flags: bit0 = store-only (all chunks raw); other bits 0 |
 | 28 | u32 | reserved 0 |
 
 Chunk record, 8 bytes (u64), one per 256 KiB of a file, flat array:
@@ -79,106 +79,91 @@ Chunk record, 8 bytes (u64), one per 256 KiB of a file, flat array:
 
 Volume record, 8 bytes: u64 file size of that volume.
 
-Strings: path bytes, back to back.
+Strings: path bytes back to back, in file-record order. The tables follow
+the header in this order with no gaps; chunk_count and volume_count are
+both 0 or both non-zero.
 
-Chunk `i` of a file decodes to `min(262144, size - i * 262144)` bytes. A raw
-chunk has a stored_size equal to that. A zstd chunk is strictly smaller,
-because the pack builder stores a chunk raw when zstd does not shrink it, so
-stored_size never exceeds the raw size. A zstd chunk is exactly one zstd
-frame with the content size in the frame header, the frame checksum on, no
-dictionary and a window of at most 256 KiB (the runtime decoder's limit).
-The packer writes the checksum; the runtime skips verifying it for speed.
-
-Indexes written with 64 KiB chunks (chunk_shift 16, from older test builds)
-keep version 1 but fail to mount. Repack them.
+Chunk `i` decodes to `min(262144, size - i * 262144)` bytes. A raw chunk
+stores exactly that; a zstd chunk is strictly smaller, since the builder
+stores raw any chunk zstd does not shrink. A zstd chunk is one frame with
+the content size in its header, the checksum on (release skips
+checking it; the debug build checks it, knob `zstd_verify`), no dictionary and a window of at most 256 KiB (the decoder's
+limit). Indexes with 64 KiB chunks (chunk_shift 16, older test builds)
+fail to mount; repack them.
 
 ## Volume file
 
-The header is 64 bytes: magic `AMPRZDT1` (8), u32 version = 1, u32 header
-size = 64, u32 volume id, u32 volume_count, [16] archive_id, u64 payload
-bytes, [12] reserved 0, and at 60 a u32 CRC of the header with that field
-zeroed. Chunks follow from offset 64, back to back with no padding, in index
-order: files in file-record order, chunks in file order. A file may
-continue in the next volume.
+The 64-byte header: magic `AMPRZDT1` (8), u32 version = 1, u32 header size
+= 64, u32 volume id, u32 volume_count, [16] archive_id, u64 payload bytes
+(volume size less 64), [12] reserved 0, and at 60 a u32 CRC of the header
+with that field zeroed. Chunks follow from offset 64 without padding, in
+index order (files in record order, chunks in file order), filling each
+volume to its recorded size. A file may continue in the next volume.
 
 ## Parallel reads
 
-Every chunk is independent: it has its own frame and an absolute offset, and
-the index finds it in O(1). Readers split a chunk range into batches.
-Contiguous chunks are a contiguous byte range in one volume, so a batch is
-one large pread, after which the runtime's decode workers decode the chunks
-in parallel.
+Each chunk has its own frame and absolute offset, found in O(1).
+Contiguous chunks are one byte range in one volume, so a batch is one
+pread whose chunks the decode workers decode in parallel. A game read
+spanning several chunks is split into chunk-aligned child jobs
+(`rt/pack/zstd_split.rs`).
 
 ## What is packed
 
-The pack builder (ps5-dump-forge) decides which files go into the pack.
-These always stay loose: `eboot.bin`, `*.elf`, `*.self`, `*.prx`, `*.sprx`,
-`sce_sys/`, `sce_module/`, `fakelib*/`, and the pack's own
-`ampr_zstd.index`, `ampr_zstd-*.pak` and `ampr_emu.index`. The system loads
-executables and modules itself, outside the runtime. Forge's built-in
-strategy also keeps the files a game reads with plain file calls loose.
+The builder (ps5-dump-forge) picks the packed files. Always loose, since
+the system loads executables and modules itself: `eboot.bin`, `*.elf`,
+`*.self`, `*.prx`, `*.sprx`, `sce_sys/`, `sce_module/`, `fakelib*/`, and
+`ampr_zstd.index`, `ampr_zstd-*.pak` and `ampr_emu.index`. Forge's
+built-in strategy also keeps loose the files a game reads with plain file
+calls. Each 256 KiB chunk is compressed at the chosen level (1..=22,
+default 5) and stored raw if the frame is not smaller. A file saving less
+than 1% (`stored * 100 > size * 99`) is stored raw whole (store-only).
 
-Per file, the builder compresses every 256 KiB chunk with zstd at the chosen
-level (1..=22, default 5) and stores raw any chunk whose frame is not
-smaller than the raw data. If a file's stored bytes save less than 1% of its
-size (`stored * 100 > size * 99`), the whole file is stored raw
-(store-only).
+`[pack] default_action = "compress"` packs everything outside the
+always-loose list, and the runtime serves such a game. The
+hooks below serve zstd and LZ4 packs alike (the knobs keep their zstd
+names) and install only when the zstd index or the LZ4 manifest is in
+`/app0`; a title without packs keeps the v0.2.0 hook set (`hook_enabled`,
+`rt/hook.rs`). Served:
 
-A profile with `[pack] default_action = "compress"` packs every file outside
-the always-loose list, and the runtime serves such a fully packed game. The
-hooks below install for zstd and LZ4 (`AMPRPAK4`) packs alike, so a plain
-open of a packed file gets a virtual fd in either format; the knobs keep
-their zstd names. They install only in a title that ships packs (the zstd
-index or the LZ4 manifest is in `/app0`); a title with no packs gets the
-v0.2.0 hook set (`hook_enabled` in `crates/ampr-sys/src/rt/hook.rs`). For a
-fully packed game the runtime serves:
-
-- plain `open`/`read`/`pread`/`readv`/`preadv`/`lseek`/`fstat`/`close`,
-  `stat`, `getdents`/`getdirentries` and their `sceKernel*` forms on
-  virtual pack fds and indexed directories;
-- a virtual pack fd is a synthetic number in `512..1024` (`512 + slot`, 512
-  slots), not a kernel descriptor. The range is above the kernel's effective
-  fd table (259 measured on PPSA03671 and PPSA30601: 248 `open("/dev/null")`
-  calls succeeded, highest fd 258, despite `RLIMIT_NOFILE` 13,952) and below
-  the strictest title limit: PPSA30601 rejects fd >= 1024 (base 1000 failed
-  on `CHARACTERS_STRUCTURE.PS5.PCK` at fd 1024, while base 768 and 512 boot),
-  and PPSA03671 accepted 170 packed fds at 1024..1193. Because no kernel
-  descriptor is used, the title keeps its whole fd table for real files; a
-  previous design reserved one `/dev/null` descriptor per packed fd, which
-  left PPSA03671 only ~49 of its 259 descriptors and made its own
-  `/dev/urandom`, ACM device and save opens fail with EMFILE. A closed slot
-  is reused, so the slot count is the number of packed files open at once
-  (512, shared with the runtime's cached packed opens in `rt/fd_cache.rs`),
-  not a lifetime limit. The runtime serves reads, seeks, fstat, close, AIO
-  and mmap on the synthetic number;
-- a read-only open of an indexed directory, with or without `O_DIRECTORY`,
-  gets the virtual directory. The kernel accepts a read-only open of a
-  directory, and a title that scans a packed directory can pass plain
-  read-only flags: a measured packed install opened `/app0/input/` 8 times
-  with flags 0 and got ENOENT before this, and loaded no input map. A
-  physical directory that really exists (a folder install) keeps its own
-  fd and entries;
+- `open`/`read`/`pread`/`readv`/`preadv`/`lseek`/`fstat`/`close`, `stat`,
+  `getdents`/`getdirentries` and their `sceKernel*` forms on virtual pack
+  fds and indexed directories.
+- Virtual pack fds are synthetic numbers `512 + slot` in `512..1024` (512
+  slots), with no kernel descriptor behind them, so the title keeps its
+  whole fd table. The kernel table tops out at 259 on two measured titles
+  (248 `open("/dev/null")` calls succeeded, highest fd 258, despite
+  `RLIMIT_NOFILE` 13,952). One title rejects fd >= 1024 (base 1000 failed
+  at fd 1024; 768 and 512 boot); another accepted 170 packed fds at
+  1024..1193. Holding a `/dev/null` fd per packed fd, as an earlier design did,
+  left one title ~49 of 259 descriptors, and its own `/dev/urandom`, ACM
+  device and save opens failed with EMFILE. Closed slots are reused:
+  512 packed files can be open at once, including up to 45 held by the APR
+  fd cache (`rt/fd_cache.rs`).
+- A read-only open of an indexed directory, with or without
+  `O_DIRECTORY`, gets the virtual directory. One packed install opened
+  `/app0/input/` 8 times with flags 0, got ENOENT before this, and loaded
+  no input map. A directory that exists on disk keeps its own fd and
+  entries.
 - libc stdio and dirent (`fopen`, `fread`, `opendir`, ...) through the
-  libkernel internal-entry hooks `_open` .. `sceKernelFcntl`, all routing
-  by default (Makefile `AMPR_ZSTD_LIBC_HOOKS = 0xfff`);
-- `mmap`/`sceKernelMmap`, through the disk cache or decoded on access (see
-  below).
+  libkernel internal-entry hooks `_open` .. `sceKernelFcntl`, all on by
+  default (Makefile `AMPR_ZSTD_LIBC_HOOKS = 0xfff`).
+- `mmap`/`sceKernelMmap` (below).
+- The game's own kernel AIO (`sceKernelAioSubmitReadCommands*`, poll,
+  wait, delete, cancel) on a packed file, by the runtime's AIO emulation
+  (`rt/pack/aio.rs`, `rt/pack/aio_wait.rs`); other fds go to the kernel.
+  The debug build lists these submits in `/fsfail` (op `I`, once per
+  file).
 
-The game's own kernel AIO (`sceKernelAioSubmitReadCommands*` and the
-matching poll, wait, delete and cancel calls) on a packed file is served
-by the runtime's AIO emulation (`rt/pack/aio.rs`, `rt/pack/aio_wait.rs`);
-requests on other fds go to the kernel. The debug build lists the served packed
-submits in `/fsfail` (op `I`, once per file).
+## Measurements
 
-Three fully packed zstd games were tested on a console with release and
-debug builds: boot, video, load, save and play, with 0 errors. Two fully
-packed LZ4 games (a UE3 and a UE5 title) were tested with the debug build
-in an earlier build (128 MiB pool, 32 MiB physical + 16 MiB decoded
-caches): both play
-and save with 0 job, decode or address errors; README.md
-[Performance](../README.md#performance) has their numbers. The debug build's
-`/metrics` gave these numbers for the zstd games, with the profile above and
-an earlier build (before the 16 MiB decoded cache):
+Three fully packed zstd games ran on a console with release and debug
+builds (boot, video, load, save, play) with 0 errors. Two fully packed LZ4
+games (UE3, UE5) ran on an earlier debug build (128 MiB pool, 32 MiB
+physical + 16 MiB decoded caches) and play and save with 0 job, decode or
+address errors; see README.md [Performance](../README.md#performance).
+Debug `/metrics` for the zstd games, with the profile above, on a build
+before the 16 MiB decoded cache:
 
 | Engine | Install | Level | Run | Wait/read | Pack job | Disk read |
 |---|---|---|---|---|---|---|
@@ -187,69 +172,51 @@ an earlier build (before the 16 MiB decoded cache):
 | UE5 | .exfat image | 5 | 103 s | 3.84 ms | 3.11 ms | 2.59 ms |
 | Northlight | folder | 1 | 216 s | 8.68 ms | 6.50 ms | 1.46 ms |
 
-With that earlier build (debug, 128 MiB pool, 32 + 16 MiB caches, folder
-installs, `/metrics` about 75 s after launch), a REDengine title read
-through virtual fds: pack job
-0.36 ms, disk read 0.47 ms, 59.6% decoded cache hits, pool peak 95.6 MiB of
-128 MiB with a 7.6 MiB index. An RE Engine title read through APR: game
-wait per read 1.35 ms, pack job 1.11 ms, disk read 0.50 ms, 20.9% decoded
-cache hits, pool peak 90.7 MiB with a 2.6 MiB index.
+On the earlier build (debug, 128 MiB pool, 32 + 16 MiB caches, folder
+installs, about 75 s after launch) a REDengine title read through virtual
+fds: pack job 0.36 ms, disk read 0.47 ms, 59.6% decoded cache hits, pool
+peak 95.6 of 128 MiB, 7.6 MiB index. An RE Engine title through APR: wait
+per read 1.35 ms, pack job 1.11 ms, disk read 0.50 ms, 20.9% decoded cache
+hits, pool peak 90.7 MiB, 2.6 MiB index.
 
-The RE Engine title takes 90.6 GB on disk unpacked and 38.4 GB packed, and
-it was served 85.6 GB from 41.5 GB of disk reads. The .exfat image mount
-caps at about 350 MB/s. The Northlight title opened 371 virtual fds and has
-no unpacked baseline.
+The RE Engine title is 90.6 GB unpacked, 38.4 GB packed, served 85.6 GB
+from 41.5 GB of disk reads. The .exfat image mount caps at about
+350 MB/s. The Northlight title opened 371 virtual fds and has no unpacked
+baseline.
 
 ## mmap of packed files
 
-A packed file has no physical copy, so `mmap`/`sceKernelMmap` of its
-virtual fd would fail on its own. The Makefile knob `AMPR_ZSTD_MMAP` picks
-how the runtime serves it; 0 leaves the call unhooked. A map with MAP_ANON
-set, or of any other fd, goes to the original unchanged. A packed file is
-read-only, so at 1 and 2 a MAP_SHARED map of it with PROT_WRITE fails with
-EACCES, as it would for any O_RDONLY fd.
+A packed file has no physical copy, so mmap of its virtual fd fails on
+its own. Makefile `AMPR_ZSTD_MMAP` picks the fix; 0 leaves the call
+unhooked. MAP_ANON maps and other fds go to the original. At 1 and 2 a
+MAP_SHARED map with PROT_WRITE fails with EACCES, as for any O_RDONLY fd.
 
-At 2, the default and the value used when the variable is absent, the
-runtime uses a disk cache. On the first map of a packed file it decodes the
-whole file once, inside that mmap call and under one lock, into a temp file
-under `/data/ampr_cache`, in 256 KiB pieces. That needs as much free space on
-`/data` as the file's decoded size. The runtime then unlinks the temp file,
-keeps its fd open and maps it with the caller's arguments. Later maps of the
-same file reuse that fd. Up to 64 cache files stay open at once; mapping a
-65th closes the oldest, whose data lives on while it is still mapped, and a
-later map of that file decodes it again. Because this is a kernel file
-mapping, mprotect, write faults and thread stacks behave as they do for any
-file. The only memory it takes is one transient 256 KiB pool buffer while
-the file is written. The disk cache serves LZ4 packed files too. The
-directory is emptied at module_start while `AMPR_ZSTD_MMAP` is not 0, in a
-title with packs of either format (`select_pack_format` in
-`crates/ampr-sys/src/rt/pack/mod.rs`, `crates/ampr-sys/src/rt/pack/mmap.rs`).
+2 (default, also when the variable is absent): disk cache, for zstd and
+LZ4 packs. The first map decodes the whole file once, inside that mmap
+call and under one lock, in 256 KiB pieces into a temp file under
+`/data/ampr_cache` (`/data` needs the decoded size free). The file is
+unlinked, its fd kept, and a dup of it mapped with the caller's arguments;
+later maps reuse it. Up to 64 cache files stay open; a 65th closes the
+oldest, whose data lives while mapped, and a later map decodes it again.
+mprotect, write faults and thread stacks behave as for any file mapping.
+Memory: one transient 256 KiB pool buffer per write. The
+directory is emptied at module_start when the knob is not 0 in a title
+with packs (`select_pack_format`, `rt/pack/mod.rs`; `rt/pack/mmap.rs`).
 
-At 1, which is opt-in and has not run on a console, a map of a zstd packed
-file is served by decode on access; a map of an LZ4 packed file takes the
-disk cache, since the fault path reads zstd chunk records. The range is
-reserved as anonymous PROT_NONE memory and nothing is decoded until a page
-is touched. A SIGSEGV/SIGBUS handler then reads the 256 KiB chunks behind the
-faulting page, decodes them and opens their pages with the caller's prot
-(`crates/ampr-sys/src/rt/pack/mmap_fault.rs`). A page partly past the end of
-the file opens with a zero tail. A fault on a page wholly past the end goes
-to the previous handler, as SIGBUS would for a real file mapping. Maps the
-fault path cannot serve (GPU prot, an offset not 4 KiB aligned, a full
-mapping table, or no sigaction) take the disk cache instead. None of the
-three measured games mmapped a packed file (`mmap_virtual` 0), so this path
-has never served a game. It adds 2 MiB of persistent pool scratch. A
-disallowed access, such as a write or exec on an open page, retries once
-and then goes to the previous handler.
-
-These limits are not solved: a syscall given an untouched page gets EFAULT,
-mprotect on the range is not tracked, the handler runs on the faulting
-thread's stack, ranges replaced by VM calls the runtime does not hook stay
+1 (opt-in, never run on a console): zstd packed files decode on access;
+LZ4 ones take the disk cache, since the fault path reads zstd chunk
+records. The range is reserved PROT_NONE and nothing decodes until a page
+is touched. A SIGSEGV/SIGBUS handler then decodes the 256 KiB chunks
+behind the page and opens it with the caller's prot
+(`rt/pack/mmap_fault.rs`). A page partly past EOF gets a zero tail; a
+fault wholly past EOF goes to the previous handler, as SIGBUS would. A
+write or exec on an open page retries once, then goes to the previous
+handler. The disk cache takes maps this path cannot serve: GPU prot, an
+offset not 4 KiB aligned, more volumes than its volume fds, a full table,
+over 512 MiB, or no sigaction. No measured game mmapped a packed file
+(`mmap_virtual` 0), so it has never served one. Cost: 2 MiB of Index
+ledger scratch (4 x 512 KiB), 4 libzstd DCtx on the libc heap, one pool
+byte per mapped chunk. Unsolved: a syscall given an untouched page gets
+EFAULT, mprotect on the range is not tracked, the handler runs on the
+faulting thread's stack, ranges replaced by unhooked VM calls stay
 registered, and the handler stays installed after module_stop.
-
-## Runtime
-
-`./ps5/build-docker.sh` builds `libSceAmpr.sprx` from `crates/ampr-sys`.
-When `/app0/ampr_zstd.index` is present, that build mounts it in place of
-`ampr_assets.index`, opens the `ampr_zstd-NNN.pak` volumes, decodes zstd
-(libzstd, `ampr-codec`), and serves AMPR/APR reads plus the plain file
-calls listed under What is packed.

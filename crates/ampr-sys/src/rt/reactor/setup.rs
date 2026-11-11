@@ -76,8 +76,6 @@ impl AprAioReactor {
                 if getRc != 0 || oldPrio != targetPrio {
                     let _ = scePthreadSetprio(this, targetPrio);
                 }
-                let mut newPrio: c_int = -1;
-                let _ = scePthreadGetprio(this, &mut newPrio);
             }
             if AMPR_EMU_APR_REACTOR_THREAD_AFFINITY != 0 {
                 let _ = scePthreadSetaffinity(

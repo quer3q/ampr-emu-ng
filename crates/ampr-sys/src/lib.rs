@@ -79,8 +79,7 @@ fn panic(_: &PanicInfo<'_>) -> ! {
     }
 }
 
-// Marker the SDK link uses to record the libSceLibcInternal dependency
-// (formerly src/ampr_libc_internal_link.cpp).
+// Marker the SDK link uses to record the libSceLibcInternal dependency.
 #[no_mangle]
 #[used]
 static Need_sceLibcInternal: core::ffi::c_int = 0;

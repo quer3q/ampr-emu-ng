@@ -164,7 +164,6 @@ pub(crate) unsafe fn load_runtime_profile(state: *mut PackState) -> bool {
         physical.min(AMPR_EMU_PACK_PHYSICAL_CACHE_MAX_BYTES) as usize;
     (*state).requested_workers = workers.min(AMPR_EMU_PACK_WORKER_CAPACITY as u32);
     (*state).latency_reserve_workers = reserve.min((*state).requested_workers - 1);
-    (*state).runtime_profile_loaded = true;
     true
 }
 
@@ -306,7 +305,7 @@ pub(crate) unsafe fn load_manifest(state: *mut PackState, absent: *mut bool) -> 
     (*state).manifest_base = memory;
     (*state).manifest_bytes = bytes;
     // zstd keeps the cache defaults; its directory order and AMPRIDX3
-    // projection come later (zstd::ensure_zstd_projection, R6).
+    // projection come later (zstd::ensure_zstd_projection).
     if !zstd_mode()
         && (!unsafe { load_runtime_profile(state) } || !unsafe { build_packed_file_order(state) })
     {
@@ -314,8 +313,6 @@ pub(crate) unsafe fn load_manifest(state: *mut PackState, absent: *mut bool) -> 
         return false;
     }
     unsafe { initialize_caches(state) };
-    (*state).profile_decoded_bytes = (*state).cache_bytes;
-    (*state).profile_physical_bytes = (*state).physical_cache_bytes;
     true
 }
 

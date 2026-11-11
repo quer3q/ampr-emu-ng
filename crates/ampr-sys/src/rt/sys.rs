@@ -446,8 +446,8 @@ pub mod hook {
     pub const sceKernelMunmap: usize = 99;
     // 100..=109: the game's own kernel AIO, both formats, both builds: a
     // request on a packed fd or an id from such a submit is served by the
-    // runtime's AIO emulation (rt/pack/aio.rs, rt/pack/aio_wait.rs, GitHub
-    // issue #22); every other request and id goes to the original.
+    // runtime's AIO emulation (rt/pack/aio.rs, rt/pack/aio_wait.rs); every
+    // other request and id goes to the original.
     pub const sceKernelAioSubmitReadCommands: usize = 100;
     pub const sceKernelAioSubmitReadCommandsMultiple: usize = 101;
     pub const sceKernelAioPollRequest: usize = 102;
@@ -631,8 +631,8 @@ pub unsafe fn real_posix_open(path: *const c_char, flags: c_int, mode: SceKernel
 /// dynamic `close`, else -1/EIO. `_close` first, as `real_posix_open` takes
 /// the `_open` original:
 /// libkernel's `close` calls `_close`, which is hooked in titles with packs.
-/// Through `close`, the debug build's tune::load (inside pack_state_create,
-/// in module_start) closed its file into the `_close` hook, whose
+/// Through `close`, the debug build's tune::load (then called inside
+/// pack_state_create) closed its file into the `_close` hook, whose
 /// `pack_state()` spun forever on the state it was creating: the game hung
 /// on its loading screen whenever /data/ampr_emu_tune.txt existed.
 pub unsafe fn real_physical_close(fd: c_int) -> c_int {

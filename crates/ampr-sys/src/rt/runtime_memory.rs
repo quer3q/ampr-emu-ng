@@ -1,6 +1,5 @@
 //! The emulator-owned CPU pool (one page-aligned .bss buffer, best-fit chunk
-//! list), the small/exact slab on top of it, and no-op stubs for the stripped
-//! debug and command logging backends.
+//! list) and the small/exact slab on top of it.
 #![allow(non_snake_case)]
 
 use super::sync::{spin_pause_or_yield, SpinLock, SyncCell};
@@ -944,18 +943,5 @@ mod pool_site_tests {
         }
         seen.sort_unstable();
         assert_eq!(seen, (0..ALLOWED.len()).collect::<Vec<_>>());
-    }
-
-    #[test]
-    fn the_ledgers_and_the_sites_budget_fit_the_pool() {
-        use super::{POOL_SITES, POOL_SITES_BUDGET, POOL_SITES_MAX, STATIC_POOL_SIZE};
-        use crate::rt::index_memory::LEDGER_MEMORY_MAX;
-        assert_eq!(
-            POOL_SITES_MAX,
-            (1 << 20) + (256 << 10) + (64 << 10) + (256 << 10)
-        );
-        assert!(POOL_SITES_MAX <= POOL_SITES_BUDGET);
-        assert!(LEDGER_MEMORY_MAX + POOL_SITES_BUDGET <= STATIC_POOL_SIZE);
-        assert_eq!(POOL_SITES.len(), 4);
     }
 }

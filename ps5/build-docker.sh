@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Builds libSceAmpr.sprx and libSceAmpr-debug.sprx into the project root.
-# Extra args go to make, e.g. `./ps5/build-docker.sh verify AMPR_PACK_WORKERS=4`.
+# Extra args go to make, e.g. `./ps5/build-docker.sh verify AMPR_PACK_WORKERS=8`.
 # One runtime reads LZ4 and zstd packs. Copy libSceAmpr.sprx into
 # the game's fakelib/ directory.
 set -euo pipefail

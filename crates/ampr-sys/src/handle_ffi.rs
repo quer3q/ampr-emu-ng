@@ -1,5 +1,5 @@
-//! Scalar C ABI for virtual handle encoding (`src/ampr_emu_pack.cpp`
-//! `encode_virtual_*` / `decode_virtual_*` shims). Called on every fd/AIO op.
+//! Scalar shims over `ampr_format::handles` for virtual fd and AIO handle
+//! encoding (`rt/pack/state.rs`). Called on every fd/AIO op.
 
 use ampr_format::handles::{self, Kind};
 

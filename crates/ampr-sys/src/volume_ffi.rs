@@ -1,4 +1,5 @@
-//! AMPRDAT3 volume-header check at the caller-owned C++ boundary.
+//! AMPRDAT3 volume-header check over raw pointers, for the LZ4 pack lease
+//! code (`rt/pack/leases.rs`), which owns the header bytes.
 
 use ampr_lz4::manifest::check_volume_header;
 

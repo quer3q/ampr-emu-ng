@@ -3,8 +3,6 @@
 use super::*;
 use core::sync::atomic::AtomicI64;
 
-// ampr_pack_runtime_stats: telemetry, not implemented (see mod.rs).
-
 pub unsafe fn sceKernelClose(fd: c_int) -> c_int {
     let mut handled = false;
     let rc = unsafe { ampr_pack_try_close_fd(fd, &mut handled) };
@@ -133,8 +131,8 @@ pub(crate) unsafe fn has_virtual_fd(requests: *const SceKernelAioRWRequest, coun
     (0..count as usize).any(|i| decode_virtual_fd(unsafe { (*requests.add(i)).fd }).is_some())
 }
 
-/// Hook id 100: the game's own single-id submit (issue #22: Ghost of Yotei
-/// reads packed files with it). Debug builds log a served packed request
+/// Hook id 100: the game's own single-id submit (some games read packed
+/// files with it). Debug builds log a served packed request
 /// as b'I' in `/fsfail` (rt/probe.rs `note_aio_submit`).
 pub unsafe extern "C" fn sceKernelAioSubmitReadCommands_emul(
     requests: *mut SceKernelAioRWRequest,
@@ -211,10 +209,9 @@ pub(crate) unsafe fn game_ids_emulated(ids: *const SceKernelAioSubmitId, count: 
         && (0..count as usize).any(|i| runtime_aio_id(unsafe { *ids.add(i) }))
 }
 
-/// Serves the game's own single-id submit on packed fds (issue #22: Ghost
-/// of Yotei reads packed files with it). One plain virtual AIO group id
-/// covers the batch; its children are the `Multiple` ids, which can be
-/// native kernel ids, virtual jobs or zstd split group ids.
+/// Serves the game's own single-id submit on packed fds. One plain virtual
+/// AIO group id covers the batch; its children are the `Multiple` ids,
+/// which can be native kernel ids, virtual jobs or zstd split group ids.
 #[inline(never)]
 pub unsafe fn sceKernelAioSubmitReadCommands(
     requests: *mut SceKernelAioRWRequest,
@@ -783,10 +780,10 @@ pub unsafe extern "C" fn sceKernelAioCancelRequests_emul(
     }
 }
 
-/// Serves the game's own cancel of ids from the packed submits above
-/// (issue #22). Virtual jobs not yet picked up complete as aborted here;
-/// running ones get `cancel_requested` and report PROCESSING; native ids go
-/// to the kernel.
+/// Serves the game's own cancel of ids from the packed submits above.
+/// Virtual jobs not yet picked up complete as aborted here; running ones
+/// get `cancel_requested` and report PROCESSING; native ids go to the
+/// kernel.
 #[inline(never)]
 pub unsafe fn sceKernelAioCancelRequests(
     ids: *mut SceKernelAioSubmitId,

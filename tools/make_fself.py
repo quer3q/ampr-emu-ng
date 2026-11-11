@@ -127,7 +127,7 @@ class ElfPHdr(object):
 	PT_TLS = 0x7
 	PT_GNU_EH_FRAME = 0x6474E550
 	PT_GNU_STACK = 0x6474E551
-	PT_SCE_RELA = 0x60000000,
+	PT_SCE_RELA = 0x60000000
 	PT_SCE_DYNLIBDATA = 0x61000000
 	PT_SCE_PROCPARAM = 0x61000001
 	PT_SCE_MODULE_PARAM = 0x61000002
@@ -253,9 +253,9 @@ class ElfFile(object):
 				shdr = ElfSHdr(i)
 				shdr.load(f)
 				self.shdrs.append(shdr)
-				if phdr.filesz > 0:
+				if shdr.size > 0:
 					f.seek(start_offset + shdr.offset)
-					data = f.read(phdr.filesz)
+					data = f.read(shdr.size)
 				else:
 					data = b''
 				self.sections.append(data)
@@ -784,7 +784,7 @@ if __name__ == '__main__':
         if ptype is None:
             ptype = try_parse_int(args.ptype)
         if ptype is None:
-            parser.error('invalid program type: 0x{0:016X}'.format(ptype))
+            parser.error('invalid program type: {0}'.format(args.ptype))
     if not (0 <= ptype <= 0xFFFFFFFFFFFFFFFF):
         parser.error('invalid program type: 0x{0:016X}'.format(ptype))
 
@@ -819,6 +819,6 @@ if __name__ == '__main__':
     except Exception as err:
         traceback.print_exc()
         print('')
-        parser.error('unable to save fself file: {0} ({1})'.format(elf_file_path, err))
+        parser.error('unable to save fself file: {0} ({1})'.format(fself_file_path, err))
 
     print('done')

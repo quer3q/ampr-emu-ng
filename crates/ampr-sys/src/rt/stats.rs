@@ -151,7 +151,7 @@ stats! {
     /// ahead unchecked; a wait fails at once and also counts in
     /// apr_address_faults. A title that signals a read batch with a
     /// WriteAddress to such a target hung on the loading screen while the
-    /// write was refused (issue #9).
+    /// write was refused.
     AprAddressQueryDenied = "apr_address_query_denied",
     /// Pack volume fds closed for a reopen after a read failed with EBADF,
     /// EIO or ENXIO (pack/leases.rs PackFdReopen; e.g. a USB image remounted
@@ -250,9 +250,9 @@ stats! {
     /// (`gatherScatterStates[prioIndex]`) after a first resolution of the
     /// same command did not issue, counted per retry (a command parked and
     /// retried n times counts n), and those whose file id or offset differed
-    /// from that first resolution (job_state.rs `GsPrepRecord`). A mismatch is
-    /// upstream issue #7: another job advanced the shared lane cursor and the
-    /// retry would read another file's bytes. Each is also logged as a 'G'
+    /// from that first resolution (job_state.rs `GsPrepRecord`). A mismatch
+    /// means another job advanced the shared lane cursor and the retry would
+    /// read another file's bytes. Each is also logged as a 'G'
     /// event in /fsfail (`gs_retry_mismatch`). Release can reach neither
     /// while cross-EOP read-ahead is stubbed and lane overlap is off.
     GsRetryChecks = "gs_retry_checks",
@@ -571,9 +571,8 @@ pub(crate) fn fs_event(op: u8, how: u8, rc: i64, path: *const core::ffi::c_char)
 /// `/fsfail` lists every distinct (op, path) a game used on packed files,
 /// and in the FS_LOG ring. A note that adds a new (op, path) entry is also
 /// written to the black box (rt/blackbox.rs) whatever `rc` is, once each:
-/// a probe that succeeds (issue #22, `I v 0x0 ... noloc.larc`) is still in
-/// the trace when the game dies before :9090 answers (issue #18), and a
-/// repeat costs no file write. Also called by rt/save.rs and
+/// a probe that succeeds is still in the trace when the game dies before
+/// :9090 answers, and a repeat costs no file write. Also called by rt/save.rs and
 /// rt/pack/mmap_fault.rs; a no-op in release builds, like `fs_event`.
 #[inline(always)]
 #[cfg_attr(not(feature = "mem_report"), allow(dead_code))]

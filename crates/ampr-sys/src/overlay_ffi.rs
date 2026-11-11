@@ -1,6 +1,7 @@
-//! C ABI for the directory overlay (`src/ampr_emu_pack.cpp` shims). C++ keeps
-//! PackState, slots and locking; it passes the manifest bytes from a
-//! successful `ampr_pack_core_mount` plus the fields each helper needs.
+//! Pointer-level shims for the directory overlay, called from
+//! `rt/pack/state.rs` and `rt/pack/directories.rs`. Those keep PackState,
+//! slots and locking; they pass the manifest bytes from a successful
+//! `ampr_pack_core_mount` plus the fields each helper needs.
 //!
 //! zstd mode has no AMPRPAK4 manifest: the manifest arguments are
 //! ignored and the helpers read the mounted zstd index and its directory

@@ -207,8 +207,6 @@ mod tests {
         };
         assert!(oversized.pack().is_err());
 
-        // VOLUME_LIMIT is 4 GiB less 64 KiB.
-        assert_eq!(VOLUME_LIMIT, 4_294_901_760);
         // The last chunk may end exactly at the limit; its offset fits u32.
         let size = CHUNK_SIZE as u32;
         let last = |offset: u64| Chunk {

@@ -19,8 +19,8 @@
 //! - `AprAioReactor::construct(this: *mut Self)` (worker.rs) builds the reactor in
 //!   place; it must call `AprAioReactor::init_members(this)` (below) first.
 //! - By-reference params are `&mut T` / `&T`; `JobPtr` stays a raw pointer.
-//! - There is no logging, telemetry counters or log-summary code.
-//!   `abort()` terminates the process.
+//! - There is no logging. Counters go through rt/stats.rs, which compiles
+//!   them out of the release build. `abort()` terminates the process.
 #![allow(non_snake_case, non_upper_case_globals, non_camel_case_types)]
 
 mod helpers;
@@ -161,13 +161,13 @@ pub(crate) const AMPR_EMU_APR_LANE_EOP_OVERLAP: bool = false;
 /// 256 KiB 2.09 ms, no split 2.51 ms (docs/read-path-tuning.md).
 pub(crate) const AMPR_EMU_APR_LOOSE_PREAD_PART_KIB: u32 = 64;
 /// Pool tasks (parts) loose reads may hold at once. Release: 32 =
-/// AMPR_EMU_APR_AIO_INFLIGHT, the most loose reads admission lets in flight;
-/// the cap in effect is min(this, threads - AMPR_EMU_APR_LOOSE_PREAD_PACK_RESERVE)
-/// = 2 at 6 threads. Debug: AMPR_EMU_PACK_PREAD_WORKERS (6), so the thread
-/// count alone sets the cap. So at least 96 (release) or 120 (debug) of the 128
-/// AMPR_EMU_PACK_PREAD_TASKS stay free for pack groups, 100 at 32 threads
-/// (console peak 8 queued); a full table returns EAGAIN and the
-/// read goes unsplit or to kernel AIO (loose_pread.rs).
+/// AMPR_EMU_APR_AIO_INFLIGHT, the most loose reads admission lets in flight.
+/// Debug: AMPR_EMU_PACK_PREAD_WORKERS (6), so the thread count alone sets
+/// the cap. The cap in effect is
+/// min(this, max(threads - AMPR_EMU_APR_LOOSE_PREAD_PACK_RESERVE, 1)), 2 at
+/// 6 threads, so at least 96 of the 128 AMPR_EMU_PACK_PREAD_TASKS stay free
+/// for pack groups; a full table returns EAGAIN and the read goes unsplit or
+/// to kernel AIO (loose_pread.rs).
 pub(crate) const AMPR_EMU_APR_LOOSE_PREAD_TASKS_MAX: u32 = if crate::rt::tune::ON {
     AMPR_EMU_PACK_PREAD_WORKERS as u32
 } else {
@@ -1742,8 +1742,8 @@ pub(crate) struct AprAioReactor {
 }
 
 impl AprAioReactor {
-    /// Field initial values, applied in place (the object is ~2.5 MB,
-    /// so it is never built on the stack). `construct` (worker.rs) calls this first.
+    /// Field initial values, applied in place (the object is ~2 MiB, see
+    /// the Makefile, so it is never built on the stack). `construct` (worker.rs) calls this first.
     pub(crate) unsafe fn init_members(this: *mut Self) {
         unsafe { ptr::write_bytes(this, 0, 1) };
         // All-zero is a valid value for every field (Mutex/Condvar zero == new()).

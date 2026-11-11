@@ -521,9 +521,9 @@ pub(crate) unsafe fn service_name_hidden(
     name: *const c_char,
     name_length: usize,
 ) -> bool {
-    const FIXED_PATHS: [&CStr; 5] = [
+    // AMPR_EMU_PACK_INDEX_PATH is /app0/ampr_assets.index.
+    const FIXED_PATHS: [&CStr; 4] = [
         c"/app0/ampr_emu.index",
-        c"/app0/ampr_assets.index",
         c"/app0/ampr_commands.bin",
         c"/app0/ampr_emu.log",
         AMPR_EMU_PACK_INDEX_PATH,

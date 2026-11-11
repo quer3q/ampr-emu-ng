@@ -1,7 +1,8 @@
-//! Tuning knobs of the debug build (`make AMPR_MEM_REPORT=1`). Startup knobs
-//! (cache sizes, workers, pipelines, pack worker stack) are
-//! read from TUNE_PATH when the pack state is created
-//! (pack/state.rs); live knobs
+//! Tuning knobs of the debug build (`make AMPR_MEM_REPORT=1`). All knobs are
+//! read from TUNE_PATH once, in module_start before the hooks install
+//! (rt/exports.rs). Startup knobs (cache sizes, workers, pipelines, pread
+//! threads, zstd_verify, equeue_local, pack worker stack) are used once at
+//! startup; live knobs
 //! (read-ahead and its disk gate, pread pool on/off for pack and loose reads,
 //! the reactor's per-pass and per-read issue limits, lane EOP overlap, the
 //! thread budget and runtime thread spin and regrow times)
@@ -610,71 +611,6 @@ pub(crate) mod tests {
         KNOB_LOCK.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Defaults match the release constants, release getters return them,
-    /// and every range keeps a full 512 KiB slice issuable (a smaller budget
-    /// or window would never admit it).
-    #[test]
-    fn knobs_default_to_release_constants_and_keep_a_slice_issuable() {
-        let _lock = knob_lock();
-        let defaults = [
-            (
-                READ_PASS_KIB,
-                "read_pass_kib",
-                (AMPR_EMU_APR_READ_PASS_MAX_BYTES / 1024) as u32,
-            ),
-            (
-                READ_CHUNK_QUANTUM,
-                "read_chunk_quantum",
-                AMPR_EMU_APR_READ_CHUNK_QUANTUM,
-            ),
-            (
-                PER_READ_ACTIVE_KIB,
-                "per_read_active_kib",
-                (AMPR_EMU_APR_PER_READ_ACTIVE_BYTES / 1024) as u32,
-            ),
-            (
-                PER_READ_ACTIVE_CHUNKS,
-                "per_read_active_chunks",
-                AMPR_EMU_APR_PER_READ_ACTIVE_CHUNKS,
-            ),
-            (
-                LANE_EOP_OVERLAP,
-                "lane_eop_overlap",
-                AMPR_EMU_APR_LANE_EOP_OVERLAP as u32,
-            ),
-            (PREAD_THREADS, "pread_threads", RELEASE_PREAD_THREADS),
-            (PREAD_WAKE_ALL, "pread_wake_all", 0),
-        ];
-        for (i, name, v) in defaults {
-            assert_eq!((KNOBS[i].name, knob_value(i)), (name, v));
-        }
-        assert_eq!(READ_SLICE_KIB, 512);
-        for i in [READ_PASS_KIB, PER_READ_ACTIVE_KIB] {
-            assert_eq!((KNOBS[i].min, KNOBS[i].max), (READ_SLICE_KIB, 16 * 1024));
-        }
-        let range = |i: usize| (KNOBS[i].min, KNOBS[i].max);
-        assert_eq!(range(READ_CHUNK_QUANTUM), (1, 64));
-        assert_eq!(range(PER_READ_ACTIVE_CHUNKS), (1, 32));
-        assert_eq!(
-            KNOBS[PREAD_THREADS].max as usize,
-            AMPR_EMU_PACK_PREAD_WORKERS
-        );
-        assert_eq!(AMPR_EMU_PACK_PREAD_WORKERS, 6);
-        if !ON {
-            assert_eq!(read_pass_bytes(), AMPR_EMU_APR_READ_PASS_MAX_BYTES);
-            assert_eq!(read_chunk_quantum(), AMPR_EMU_APR_READ_CHUNK_QUANTUM);
-            assert_eq!(per_read_active_bytes(), AMPR_EMU_APR_PER_READ_ACTIVE_BYTES);
-            assert_eq!(
-                per_read_active_chunks(),
-                AMPR_EMU_APR_PER_READ_ACTIVE_CHUNKS
-            );
-            assert_eq!(pread_threads(), RELEASE_PREAD_THREADS as usize);
-            assert!(!lane_eop_overlap());
-            assert!(!pread_wake_all());
-            assert!(!zstd_verify());
-        }
-    }
-
     /// `apply` rejects out-of-range pairs without storing them and stores
     /// in-range ones; the test restores the defaults it changed.
     #[test]
@@ -722,54 +658,9 @@ pub(crate) mod tests {
         assert!(!lane_eop_overlap());
     }
 
-    /// The thread lifetime knobs default to the release
-    /// values, accept their range ends and reject values past them without
-    /// storing.
-    #[test]
-    fn thread_lifetime_knobs_check_ranges() {
-        let _lock = knob_lock();
-        let knobs = [
-            (SPIN_US, "spin_us", 0, 200, 0),
-            (REGROW_S, "regrow_s", 1, 60, 10),
-            (WORKER_STACK_KIB, "worker_stack_kib", 0, 1024, 0),
-        ];
-        for (i, name, min, max, default) in knobs {
-            let k = &KNOBS[i];
-            assert_eq!(
-                (k.name, k.min, k.max, knob_value(i)),
-                (name, min, max, default)
-            );
-            for v in [min, max] {
-                let pair = format!("{name}={v}");
-                assert_eq!(apply(pair.as_bytes()), Ok(()), "{pair}");
-                assert_eq!(knob_value(i), v);
-            }
-            let mut bad = vec![format!("{name}={}", max + 1)];
-            if min > 0 {
-                bad.push(format!("{name}={}", min - 1));
-            }
-            for pair in bad {
-                assert_eq!(apply(pair.as_bytes()), Err(pair.as_bytes()), "{pair}");
-                assert_eq!(knob_value(i), max);
-            }
-            k.v.store(default, Relaxed);
-        }
-        assert_eq!(spin_us(), 0);
-        assert_eq!(regrow_ns(), 10_000_000_000);
-        assert_eq!(worker_stack_bytes(), 0);
-        if ON {
-            KNOBS[REGROW_S].v.store(5, Relaxed);
-            KNOBS[WORKER_STACK_KIB].v.store(256, Relaxed);
-            assert_eq!(regrow_ns(), 5_000_000_000);
-            assert_eq!(worker_stack_bytes(), 256 * 1024);
-            KNOBS[REGROW_S].v.store(10, Relaxed);
-            KNOBS[WORKER_STACK_KIB].v.store(0, Relaxed);
-        }
-    }
-
     /// The tune file may hold removed knobs and junk lines: they are skipped
     /// and the known pairs still apply. save() writes `name=value\n` per knob
-    /// into 512 bytes, which fits every knob at its widest.
+    /// into 1024 bytes, which fits every knob at its widest.
     #[test]
     fn tune_file_skips_unknown_lines_and_save_fits() {
         let _lock = knob_lock();

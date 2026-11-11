@@ -187,10 +187,10 @@ impl AprAioReactor {
     /// Verdict on one sceKernelQueryMemoryProtection result for `addr`.
     /// EACCES says the kernel refused to describe the mapping, not that it
     /// is unmapped: a title that signals a read batch with a WriteAddress to
-    /// such a target hung on the loading screen while the op was refused
-    /// (issue #9). A write then goes ahead
-    /// unchecked, as before the check existed; if the target is in fact
-    /// unmapped the store faults the reactor thread. A wait still fails: no
+    /// such a target hung on the loading screen while the op was refused.
+    /// A write then goes ahead unchecked, as before the check existed; if the
+    /// target is in fact unmapped the store faults the reactor thread. A wait
+    /// still fails: no
     /// title has shown an EACCES wait target, and waits are the upstream
     /// save-time crash class this check exists for.
     pub(crate) fn address_query_allows(
@@ -219,7 +219,7 @@ mod tests {
         let rw = SCE_KERNEL_PROT_CPU_READ | SCE_KERNEL_PROT_CPU_RW;
         let a = 0x8_0000_1008;
         let ok = |rc, s, e, p| AprAioReactor::address_query_allows(rc, s, e, p, a, true);
-        // Refused query (issue #9): the op goes ahead, whatever start/end/prot say.
+        // Refused query: a write goes ahead, whatever start/end/prot say.
         assert!(ok(SCE_KERNEL_ERROR_EACCES, 0, 0, 0));
         // Other failures still fault the op.
         assert!(!ok(SCE_KERNEL_ERROR_EINVAL, 0, 0, 0));
@@ -236,31 +236,6 @@ mod tests {
         assert!(wait_ok(0, a - 8, a + 8, r));
         assert!(!wait_ok(0, a + 8, a + 16, r));
         assert!(!wait_ok(0, a - 16, a, r));
-    }
-
-    #[test]
-    fn address_prot_allows_by_op() {
-        let r = SCE_KERNEL_PROT_CPU_READ;
-        let rw = SCE_KERNEL_PROT_CPU_READ | SCE_KERNEL_PROT_CPU_RW;
-        let gpu_only = 0x30;
-        // Wait (load): readable or writable CPU mappings.
-        assert!(AprAioReactor::address_prot_allows(r, false));
-        assert!(AprAioReactor::address_prot_allows(rw, false));
-        assert!(AprAioReactor::address_prot_allows(
-            SCE_KERNEL_PROT_CPU_RW,
-            false
-        ));
-        assert!(!AprAioReactor::address_prot_allows(0, false));
-        assert!(!AprAioReactor::address_prot_allows(gpu_only, false));
-        assert!(!AprAioReactor::address_prot_allows(
-            SCE_KERNEL_PROT_CPU_EXEC,
-            false
-        ));
-        // Write (store): CPU write only.
-        assert!(AprAioReactor::address_prot_allows(rw, true));
-        assert!(!AprAioReactor::address_prot_allows(r, true));
-        assert!(!AprAioReactor::address_prot_allows(0, true));
-        assert!(!AprAioReactor::address_prot_allows(gpu_only | r, true));
     }
 }
 

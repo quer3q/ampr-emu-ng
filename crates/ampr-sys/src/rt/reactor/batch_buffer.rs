@@ -1,5 +1,4 @@
 //! Native APR batch buffers: reset, submit, progress sampling, sealing and deferred EOPs.
-//! `reset_software_gs_cursor` is already defined in software.rs.
 
 use super::*;
 
@@ -227,7 +226,8 @@ impl AprAioReactor {
         true
     }
 
-    /// Default `releaseGroup = true`.
+    /// `releaseGroup = false` seals the group but leaves its gate closed; a
+    /// deferred EOP opens it later (`release_deferred_native_eop`).
     pub(crate) fn seal_native_apr_batch_group(
         &mut self,
         laneIndex: u32,

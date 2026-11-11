@@ -198,9 +198,9 @@ pub(crate) unsafe fn close_real_fd(real_fd: c_int) {
 /// Whether an open may name a directory, so the overlay serves it: an
 /// explicit `O_DIRECTORY` open, or any read-only open, which the kernel
 /// accepts for a directory too. A packed directory has no physical copy to
-/// fall back to: PPSA30601 opened `/app0/input/` 8 times with flags 0, got
-/// ENOENT every time and loaded no input map (issue #14). Also the gate of
-/// the rt/index.rs open hooks.
+/// fall back to: a title opened `/app0/input/` 8 times with flags 0, got
+/// ENOENT every time and loaded no input map. Also the gate of the
+/// rt/index.rs open hooks.
 pub(crate) fn directory_open_flags(flags: c_int) -> bool {
     flags & O_DIRECTORY != 0 || flags & O_ACCMODE == O_RDONLY
 }
@@ -693,7 +693,8 @@ fn physical_dirent_bounds(rest: &[u8]) -> Option<(usize, usize)> {
     Some((record_size, name_length))
 }
 
-/// `finishSynthetic` lambda.
+/// Ends a synthetic batch of `result` bytes: reports `synthetic_base` and
+/// advances the slot's directory offset past it.
 fn finish_synthetic(
     slot: &mut VirtualDirectorySlot,
     basep: *mut c_long,
@@ -709,7 +710,7 @@ fn finish_synthetic(
     result
 }
 
-/// `emitDot` lambda.
+/// Emits the `.` or `..` entry once (`emitted`); 0, or the emit error.
 unsafe fn emit_dot(
     buffer: *mut c_char,
     size: c_int,
@@ -866,6 +867,8 @@ pub(crate) unsafe fn ampr_pack_try_directory_read_fd(
             }
         }
 
+        // The slot path is fixed while the slot is open: hash it once.
+        let path_hash = folded_hash(slot.path.as_ptr(), slot.path_length as usize);
         while slot.virtual_cursor < slot.range_end {
             let mut name = [0u8; 256];
             let mut name_length = 0u8;
@@ -915,8 +918,7 @@ pub(crate) unsafe fn ampr_pack_try_directory_read_fd(
                 output,
                 &name[..usize::from(name_length)],
                 type_,
-                folded_hash(slot.path.as_ptr(), slot.path_length as usize)
-                    ^ folded_hash(name.as_ptr().cast(), name_length as usize),
+                path_hash ^ folded_hash(name.as_ptr().cast(), name_length as usize),
             );
             if rc < 0 {
                 return if output == 0 {

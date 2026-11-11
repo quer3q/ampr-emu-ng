@@ -194,16 +194,11 @@ impl<'a> Index<'a> {
                 high = mid;
             }
         }
-        Ok(
-            if low < self.file_count()
-                && self.file(low)?.path == path
-                && self.file(low)?.path_hash == hash
-            {
-                Some(low)
-            } else {
-                None
-            },
-        )
+        if low >= self.file_count() {
+            return Ok(None);
+        }
+        let record = self.file(low)?;
+        Ok((record.path_hash == hash && record.path == path).then_some(low))
     }
 
     fn validate(&self) -> Result<()> {

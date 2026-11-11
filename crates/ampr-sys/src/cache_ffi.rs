@@ -1,5 +1,6 @@
-//! C ABI for pure cache bookkeeping (`src/ampr_emu_pack.cpp` decoded and
-//! physical caches). C++ owns the bitmaps and holds the cache lock.
+//! Pointer-level shims over `ampr_format::cache` for the LZ4 pack decoded
+//! and physical caches. `rt/pack/caches.rs` owns the bitmaps and calls the
+//! bitmap shims with the cache lock held.
 
 use ampr_format::cache;
 

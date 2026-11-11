@@ -3,7 +3,7 @@ use crate::index_key::{
     compare, compare_dir_prefix, is_descendant, NAME_MAX, PATH_MAX, RUNTIME_KEY_CAPACITY,
 };
 use crate::{
-    i64_at, idx_path_hash, logical_path, section, terminated_slice, u32_at, u64_at, Error, Result,
+    folded, i64_at, idx_path_hash, logical_path, section, terminated_slice, u32_at, u64_at, Error, Result,
     IDX_HEADER, IDX_MAGIC, IDX_RECORD, IDX_SLOT,
 };
 use core::cmp::Ordering;
@@ -346,13 +346,5 @@ impl<'a> Index<'a> {
 }
 
 fn folded_eq(a: &[u8], b: &[u8]) -> bool {
-    a.len() == b.len()
-        && a.iter().zip(b).all(|(&x, &y)| {
-            let fold = |v| match v {
-                b'\\' => b'/',
-                b'A'..=b'Z' => v + 32,
-                _ => v,
-            };
-            fold(x) == fold(y)
-        })
+    a.len() == b.len() && a.iter().zip(b).all(|(&x, &y)| folded(x) == folded(y))
 }

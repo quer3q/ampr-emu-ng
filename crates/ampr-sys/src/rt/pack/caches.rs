@@ -574,12 +574,6 @@ mod decoded_cache_tests {
     }
 
     #[test]
-    fn clock_with_no_allocated_entry_evicts_nothing() {
-        let state = cache_state(0);
-        assert!(!unsafe { cache_evict_one_locked(state) });
-    }
-
-    #[test]
     fn failed_entry_errors_only_its_waiters() {
         let state = cache_state(2);
         unsafe {

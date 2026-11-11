@@ -1,4 +1,5 @@
-//! External AIO read submission, native AIO readiness, `shutdown` and `ReadIssueBudget`.
+//! External AIO read submission, external progress wakeups, `shutdown` and
+//! `ReadIssueBudget`.
 
 use super::*;
 

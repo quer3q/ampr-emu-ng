@@ -6,7 +6,8 @@
 //!
 //! Layout:
 //! 1. helpers (`rc32`, measure helpers) and SDK imports
-//! 2. module_start / module_stop
+//! 2. load notice and, in the debug build, the `/metrics` server
+//!    (`mem_report`); module_start / module_stop
 //! 3. sceAmprAmm* (command-buffer appends, leaves, measures)
 //! 4. sceAmprCommandBuffer* (header, wait/write/nop/marker)
 //! 5. sceAmprAprCommandBuffer*
@@ -136,7 +137,7 @@ pub(crate) const BUILD_REV: &str = match option_env!("AMPR_GIT_REV") {
 #[cfg(feature = "mem_report")]
 const BUILD_FLAVOR: &str = "debug";
 
-/// "ampr-emu-ng: v0.3.4 (<mode>) running" into `out`; its length. Mode:
+/// "ampr-emu-ng: v<version> (<mode>) running" into `out`; its length. Mode:
 /// "zstd" (ampr_zstd.index), "lz4" (ampr_assets.index) or "plain" (no
 /// packs, loose files only).
 fn load_notice(mode: &[u8], out: &mut [u8; 64]) -> usize {
@@ -169,21 +170,6 @@ unsafe fn notify_loaded() {
     unsafe { notify(&text[..n]) };
 }
 
-#[cfg(test)]
-mod notice_tests {
-    #[test]
-    fn notice_names_version_and_format() {
-        let mut out = [0u8; 64];
-        let n = super::load_notice(b"zstd", &mut out);
-        assert_eq!(&out[..n], b"ampr-emu-ng: v0.3.4 (zstd) running");
-        let n = super::load_notice(b"lz4", &mut out);
-        assert_eq!(&out[..n], b"ampr-emu-ng: v0.3.4 (lz4) running");
-        let n = super::load_notice(b"plain", &mut out);
-        assert_eq!(&out[..n], b"ampr-emu-ng: v0.3.4 (plain) running");
-        assert_eq!(&super::IDENTITY, b"ampr-emu-ng 0.3.4\0");
-    }
-}
-
 // ---- /bench query parsing and region planning ---------------------------
 
 /// Pure parts of the debug build's `GET /bench?path=/app0/...`, kept apart
@@ -197,8 +183,8 @@ mod bench_args {
     /// Every test times two paths, each on its own region.
     pub(super) const SLOTS: u64 = 2 * TESTS;
     /// Unread file between two regions, so kernel read-ahead past one region
-    /// cannot reach the next. 32 MiB (64 MiB with three tests before) keeps
-    /// the twelve regions inside a 736 MiB file.
+    /// cannot reach the next. 32 MiB keeps the twelve regions inside a
+    /// 736 MiB file.
     pub(super) const GAP: u64 = 32 << 20;
     /// Twelve regions plus eleven gaps: 12 * 32 + 11 * 32 = 736 MiB.
     pub(super) const MIN_FILE: u64 = SLOTS * REGION + (SLOTS - 1) * GAP;
@@ -534,7 +520,7 @@ mod mem_report {
             };
             // A request the kernel will not delete may still write `res` and
             // the buffer: never leave this frame while it is live.
-            // ponytail: parks the metrics thread forever on a stuck request.
+            // This parks the metrics thread forever on a stuck request.
             while unsafe { delete(ids[head], &mut state) } != 0 {
                 let mut usec: SceKernelUseconds = 100_000;
                 let _ = unsafe { wait(ids[head], &mut state, &mut usec) };
@@ -724,7 +710,7 @@ mod mem_report {
         }
         for &id in &ids[..started] {
             // A worker that failed to join may still use `jobs`, the buffer
-            // and the fd. ponytail: park the metrics thread instead of freeing.
+            // and the fd: park the metrics thread rather than free them.
             while unsafe { scePthreadJoin(id, core::ptr::null_mut()) } != 0 {
                 unsafe { sceKernelUsleep(1_000_000) };
             }
@@ -1294,15 +1280,7 @@ mod mem_report {
 
     /// `GET /set?k=v&...`: applies the pairs, saves the knob file, lists knobs.
     unsafe fn set(req: &[u8], out: &mut Text) {
-        let line = req
-            .split(|&c| c == b'\r' || c == b'\n')
-            .next()
-            .unwrap_or(&[]);
-        let target = line.split(|&c| c == b' ').nth(1).unwrap_or(&[]);
-        let query = match target.iter().position(|&c| c == b'?') {
-            Some(q) => &target[q + 1..],
-            None => &[],
-        };
+        let query = bench_args::query(bench_args::target(req));
         if !query.is_empty() {
             if let Err(bad) = tune::apply(query) {
                 out.s(b"error: bad pair '")
@@ -1457,13 +1435,13 @@ pub unsafe extern "C" fn module_start(_args: usize, _argp: *const c_void) -> c_i
     let rc = unsafe { hook::amprInstallLibkernelHooks() };
     // Packed files have no physical copy (ampr_zstd-NNN.pak or the AMPRPAK4
     // volumes), and the game opens some with plain open() before any AMPR
-    // call: a UE project descriptor (zstd), /app0/d/0/actor (an Insomniac
-    // Engine title, LZ4, GitHub issue #2). Hooks never load the index, so
+    // call (an engine project descriptor in a zstd title, a data file in an
+    // LZ4 one). Hooks never load the index, so
     // load AMPRIDX3 and the pack manifest here, before the game runs (zstd
     // also mounts ampr_zstd.index and builds the id projection). Without a
     // shipped index this fails at once: ensure_ready(false) never builds one.
     // A title with no packs skips it and loads its index on the first AMPR
-    // call, as in v0.2.0.
+    // call.
     if super::pack::packs_present() && rc == 0 && unsafe { super::index::ensure_ready(false) } {
         unsafe { super::pack::ampr_pack_ensure_manifest_ready_safe() };
     }

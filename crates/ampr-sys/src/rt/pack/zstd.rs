@@ -3,7 +3,7 @@
 //! ids. AMPRIDX3 stays the path and file-id authority; a zstd record number
 //! is never an AMPR id.
 //!
-//! Public accessors (R5-R8 build on these). Each returns `None`/`0`/`false`
+//! Public accessors. Each returns `None`/`0`/`false`
 //! until the projection is ready (`zstd_projection_ready`):
 //! - `zstd_index() -> Option<&'static Index<'static>>`: the mounted, fully
 //!   validated zstd index (bytes live in `PackState::manifest_base`).
@@ -27,7 +27,7 @@
 //! - `try_zstd_projection() -> bool`: as `ensure_zstd_projection`, but
 //!   never waits for another builder (hooks; slots.rs resident-ready check).
 //!
-//! R6 directory overlay: `zstd_packed_order() -> &[u32]` holds the distinct
+//! Directory overlay: `zstd_packed_order() -> &[u32]` holds the distinct
 //! zstd ids of the packed AMPRIDX3 ids sorted by the folded directory
 //! comparator (built with the projection; zstd index order is hash order).
 //! `zstd_directory_range`, `zstd_next_child`, `zstd_service_name_hidden`
@@ -37,9 +37,9 @@
 //! Mount lifecycle, called only from manifest.rs: `zstd_mount_validate`,
 //! `zstd_mount_clear`, `zstd_mount_release`.
 //!
-//! R5 core tasks: `zstd_core_{mount,validate_logical_file,task_count,
-//! make_task}` are the bodies of the `ampr_pack_core_*` exports
-//! in rt/index.rs; `zstd_task_count`/`zstd_read_task` hold the task math.
+//! Core tasks: `zstd_core_{validate_logical_file,task_count,make_task}` are
+//! the bodies of the `ampr_pack_core_*` exports in rt/index.rs;
+//! `zstd_task_count`/`zstd_read_task` hold the task math.
 //!
 //! Why the projection is deferred: the AMPRIDX3 loader calls
 //! `ampr_pack_ensure_manifest_ready_safe` before it publishes the image, so
@@ -521,7 +521,7 @@ fn zstd_entry_at(file: *const u8) -> Option<ZstdEntry> {
         .flatten()
 }
 
-// ---- directory overlay (R6) ---------------------------------------------------
+// ---- directory overlay ------------------------------------------------------
 //
 // zstd holds packed files only, in (path hash, path) order. Listings use the
 // AMPRPAK4 directory order instead: ASCII-folded bytes of the logical path
@@ -680,7 +680,7 @@ pub(crate) fn zstd_packed_file_matches(ampr_id: u32, size: u64) -> bool {
     }
 }
 
-// ---- core tasks and decode (R5) -----------------------------------------------
+// ---- core tasks -------------------------------------------------------------
 //
 // zstd bodies of the `ampr_pack_core_*` exports in rt/index.rs (same ABI).
 // Their `file` argument is `zstd_task_file(ampr_id)`; the `AmprPackCoreView`

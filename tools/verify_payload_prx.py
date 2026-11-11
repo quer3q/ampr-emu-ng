@@ -116,7 +116,9 @@ def main() -> int:
     phoff = struct.unpack_from("<Q", data, 0x20)[0]
     phentsize, phnum = struct.unpack_from("<HH", data, 0x36)
     if phentsize < 56 or phnum != len(EXPECTED_PHDR_TYPES):
-        raise ValueError(f"unexpected PRX program-header count: {phnum}")
+        raise ValueError(
+            f"unexpected PRX program headers: phentsize={phentsize} phnum={phnum}"
+        )
     phdr_types = [
         struct.unpack_from("<I", data, phoff + index * phentsize)[0]
         for index in range(phnum)

@@ -1,8 +1,8 @@
 //! Bounded x86-64 instruction decoder for the libkernel hooks.
 //!
 //! A thin safe wrapper over iced-x86 that fills the subset of the old
-//! Hacker Disassembler Engine 64 (`hde64s`) result that
-//! src/ampr_libkernel_hook.cpp reads. Decoding reads at most
+//! Hacker Disassembler Engine 64 (`hde64s`) result that the hook
+//! trampoline builder in `ampr-sys` (`rt/hook.rs`) reads. Decoding reads at most
 //! `MAX_INSN_LEN` bytes of the slice it is given.
 #![no_std]
 #![forbid(unsafe_code)]
@@ -49,7 +49,7 @@ pub const META_RIP_REL_CMP_PTR_R64: u8 = 7;
 /// low bytes, exactly as the C union member store did.
 ///
 /// Unlike the C decoder, `rex` holds the REX byte for legacy encodings (the
-/// C code left it 0). Its only reader, clear_rex_b_for_copied_instruction,
+/// C code left it 0). Its only reader, `clear_rex_b` in `rt/hook.rs`,
 /// then clears REX.B when a RIP-relative operand is rewritten to
 /// `[scratch+0]`, where REX.B would otherwise select r8-r15 as the base.
 /// VEX encodings leave all `rex*` fields 0, as the C decoder did.
@@ -339,7 +339,7 @@ fn error(mut hs: Hde64) -> Hde64 {
     hs
 }
 
-/// Port of `hde64_fill_meta` from the removed src/hde64.cpp.
+/// Port of the C decoder's `hde64_fill_meta`.
 fn fill_meta(hs: &mut Hde64) {
     if hs.flags & F_RELATIVE != 0 {
         if hs.opcode == 0xe8 && hs.flags & F_IMM32 != 0 {

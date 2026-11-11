@@ -1,6 +1,6 @@
 # AGENTS.md
 
-Notes for coding agents working on ampr-emu-ng (version 0.3.4, GPL-3.0-or-later).
+Notes for coding agents working on ampr-emu-ng (version 0.3.5, GPL-3.0-or-later).
 
 ## Project
 
@@ -26,6 +26,8 @@ index, `AMPRZDT1` volumes), picked at load by whether
 - `tools/`: Python PRX post-processing and `verify_payload_prx.py`.
 - `docs/zstd-format.md`: the zstd pack format. Keep it in sync with
   `crates/ampr-zstd` and `crates/ampr-format/src/zstd.rs`.
+- `docs/debug-build.md`: the debug build (metrics server, tune file, op
+  letters, black box).
 
 ## Build and test
 
@@ -38,14 +40,15 @@ cargo test --workspace                         # host tests
 ```
 
 Knobs and their defaults are at the top of the `Makefile`
-(`AMPR_INTERNAL_POOL_SIZE`, `AMPR_PACK_WORKERS`, read-ahead,
+(`AMPR_INTERNAL_POOL_SIZE`, `AMPR_DEBUG_POOL_SIZE`, `AMPR_PACK_WORKERS`,
+`AMPR_PACK_PIPELINES`, read-ahead,
 `AMPR_ZSTD_LIBC_HOOKS`, `AMPR_ZSTD_MMAP`, `AMPR_MEM_REPORT`). A knob change
 rebuilds through `out/*/obj/build-config.txt`. The two `AMPR_ZSTD_*` knobs
 keep their zstd names but apply to LZ4 packs too; only `AMPR_ZSTD_MMAP=1`
 (decode on access) is zstd only. Those hooks (hook ids 78 and up), the
 eager index load and the mmap cache sweep apply only to a title that ships
 packs, zstd or LZ4 (`packs_present` in `rt/pack/mod.rs`, `hook_enabled` in
-`rt/hook.rs`); a title with no packs keeps the v0.2.0 hook set. Among them,
+`rt/hook.rs`); a title with no packs gets the shared ids 0..=77. Among them,
 ids 100..=109 route the game's own kernel AIO (`sceKernelAioSubmitReadCommands*`,
 poll, wait, delete, cancel) to the runtime's AIO emulation
 (`rt/pack/aio.rs`, `rt/pack/aio_wait.rs`); the runtime's own native AIO
@@ -55,7 +58,9 @@ the symbol by name, which would re-enter the hook. The exception is ids
 they install in every title, packs or not. A game thread creation that
 fails with EAGAIN makes the runtime give threads back and is retried; the
 runtime-wide budget of 16 worker threads is cut and regrows by one per
-10 s quiet. The groups are capped at 4 decode workers (`AMPR_PACK_WORKERS`),
+10 s quiet. The groups are capped at 4 decode workers (`AMPR_PACK_WORKERS`;
+an LZ4 title's `ampr_assets.index.runtime` profile can ask for up to 16,
+`AMPR_EMU_PACK_WORKER_CAPACITY`, within the Buffer ledger),
 6 disk read threads (`tune::RELEASE_PREAD_THREADS`) and 4 fd read threads
 (`READ_THREADS` in `rt/pack/fd_read.rs`). Runtime threads retire by load,
 not by idle time (no idle timer): each group keeps its last 8192
@@ -63,8 +68,11 @@ busy-thread counts (`LOAD_SAMPLES`), and a thread that finishes its work
 leaves after 8 such finishes in a row with more live than one above the load
 target (ceil(median x 1.5) + 1, at least 1). That EAGAIN
 starts pressure mode: idle threads leave at once, each group runs at most
-one thread while it has work and none without, until 10 s pass with no
-new failure (`LoadGroup`, `pressure` in `rt/thread_hooks.rs`). The
+one thread while it has work and none without (decode workers never go
+below one, `LoadGroup::floor`), until 10 s pass with no new failure
+(`LoadGroup`, `pressure` in `rt/thread_hooks.rs`). Ids 112..=119 (dup,
+dup2, poll, select, openat, fstatat, faccessat, readlink) exist only in the
+debug build, as pass-through probes in titles with packs (`rt/probe.rs`). The
 runtime creates its own threads through `create_internal`
 (the pre-detour slot). Save data (`rt/save.rs`) is hooked by NID in a loaded
 `libSceSaveData` module, not through the libkernel table, in every title
@@ -81,10 +89,14 @@ CI (`.github/workflows/build.yml`) runs the same commands; a pushed `v*` tag cre
 - No new dependencies without a stated reason. Runtime dependencies use
   `default-features = false`, and `lz4_flex`, `zstd-sys`, `iced-x86` are
   pinned (`=x.y.z`); follow that.
-- Memory budget: all runtime memory is in the PRX's static .bss pool;
+- Memory budget: runtime memory is in the PRX's static .bss pool;
   nothing comes from the game's direct or flexible memory (the pool did not
   lower the game's free direct memory, direct allocations did; flexible
-  memory had 0-28 MiB free during play). Ledgers (`rt/index_memory.rs`):
+  memory had 0-28 MiB free during play). The one exception is the Rust
+  global allocator (`LibcAlloc` in `lib.rs`), which uses the game's libc
+  heap: iced-x86 and, in zstd titles, one zstd decoder per live pack
+  worker (`rt/pack/worker.rs`) and per decode-on-access slot
+  (`rt/pack/mmap_fault.rs`, `AMPR_ZSTD_MMAP=1` only). Keep it to those. Ledgers (`rt/index_memory.rs`):
   Index 55 MiB (a 52 MiB index file plus 3 MiB for the tables built from
   it, walk build buffers, the save icon buffer), Cache 32 MiB (16 MiB
   physical + 16 MiB decoded, carved at startup), Buffer 28 MiB (4 x 1 MiB
@@ -119,34 +131,25 @@ CI (`.github/workflows/build.yml`) runs the same commands; a pushed `v*` tag cre
    `tools/verify_payload_prx.py` on the linked PRX and SPRX.
 3. Runtime behavior changes need a run on a console with
    `libSceAmpr-debug.sprx`: read `http://<ps5-ip>:9090/metrics` before and
-   after and compare game wait per read, pack job and disk read latency.
+   after and compare game wait per read, pack job and disk read time
+   ([docs/debug-build.md](docs/debug-build.md#comparing-runs-and-installs)).
 
 ## Debugging on a console
 
-- The debug build's `/fsfail` lists failed calls (path hooks, the runtime's
-  own loose opens `L`, APR resolves `R`, APR jobs `E`, module loads `K`,
-  gather/scatter retry mismatches `G`, packed-fd and open failures `Q`, the
-  upstream #7 wrong-file class) and
-  `/modules` lists loaded modules; the op letters are documented at
-  `FsEvents` in `rt/stats.rs`. When one install of a game works and another
-  does not, run the same build on both and diff the two outputs.
-  The debug build also logs (op letters `D W T F C N`, and `O A a l`
-  with how `p`/`d` when an `AMPR_ZSTD_LIBC_HOOKS` bit is cleared) when a
-  packed file (zstd or LZ4) or a virtual fd reaches an API the runtime does
-  not serve; `I` logs a game's own AIO submit on a packed fd, which the
-  runtime serves; `X`/`Y` log mmap of a virtual fd (how `k` disk cache, `f`
-  decode on access, `F` failed decode-on-access fill, `v` other failure).
-- When the game dies before `:9090` answers, read the debug build's black
-  box `/data/ampr_emu_trace.txt` (`rt/blackbox.rs`): the loaded modules with
-  segment addresses (at start and after each module load), to map a crash
-  RIP to a module, and every failed file event plus module loads. It is
-  rewritten at each start, so copy it off before relaunching.
-- Folder installs on the internal SSD are case-sensitive; retail pfs and
-  exFAT are not, and games depend on that (e.g. Wwise plugins loaded as
-  `AkSineTone.prx`, stored `aksinetone.prx`). Paths that reach the
-  filesystem without the index (unhooked libc calls) fail there only. The
-  system module loader opens files itself, so it is routed through the index
-  in `rt/hook.rs` (`sceKernelLoadStartModule_equeue_observer`).
+`docs/debug-build.md` covers the debug build: the pages on port 9090
+(`/metrics`, `/set`, `/bench`, `/fsfail`, `/modules`, `/queues`,
+`/threads`), the tune file, the op letters and the black box
+`/data/ampr_emu_trace.txt`. Keep it in sync with `serve` in
+`rt/exports.rs`, `FsEvents` in `rt/stats.rs`, `KNOBS` in `rt/tune.rs` and
+`rt/blackbox.rs`. When one install works and another does not, run the
+same debug build on both and diff `/fsfail` and `/modules`.
+
+Folder installs on the internal SSD are case-sensitive; retail pfs and
+exFAT are not, and games depend on that (e.g. a plugin loaded as
+`AkSineTone.prx`, stored `aksinetone.prx`). Paths that reach the
+filesystem without the index (unhooked libc calls) fail there only. The
+system module loader opens files itself, so it is routed through the index
+in `rt/hook.rs` (`sceKernelLoadStartModule_equeue_observer`).
 
 ## Benchmark data
 

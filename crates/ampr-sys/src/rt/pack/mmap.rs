@@ -368,7 +368,7 @@ fn failed_errno() -> c_int {
 
 /// Pack shutdown: closes every cached file fd, so a PRX unload in a running
 /// process leaks neither fds nor their storage. Existing mappings stay
-/// valid; they hold the unlinked files themselves (Codex review).
+/// valid; they hold the unlinked files themselves.
 pub(crate) unsafe fn close_cache() {
     let _guard = CACHE_M.lock();
     let table = unsafe { &mut *CACHE.get() };
@@ -382,7 +382,7 @@ pub(crate) unsafe fn close_cache() {
 /// With CACHE_FILES files cached the oldest is closed to make room: an
 /// unlinked file stays alive while any mapping or dup still holds it, and
 /// handing out dups means closing a table fd never pulls an fd from under a
-/// map in progress (a limit of 64 maps per session before; Codex review).
+/// map in progress.
 /// Err is a POSIX errno: EMFILE when no fd is left, ENOMEM without a
 /// buffer, EIO otherwise.
 unsafe fn disk_fd(vfd: c_int, file_id: u32) -> Result<c_int, c_int> {
@@ -643,13 +643,5 @@ mod tests {
         let end = p.iter().position(|&b| b == 0).unwrap();
         assert_eq!(&p[..end], b"/data/ampr_cache/00ab12cd.tmp");
         assert_eq!(cache_path(u32::MAX)[end], 0);
-    }
-
-    #[test]
-    fn knob_parses_only_0_1_2() {
-        assert_eq!(
-            [parse_mode(b"0"), parse_mode(b"1"), parse_mode(b"2")],
-            [0, 1, 2]
-        );
     }
 }

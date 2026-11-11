@@ -1,20 +1,18 @@
 //! Debug-only crash black box: `/data/ampr_emu_trace.txt`, written as
 //! things happen so it survives a crash that kills the process before the
-//! metrics server answers (a UE5 title with every libc hook
-//! routing died ~1 s after start, SIGSEGV write to an unmapped page, no
-//! :9090; it was the `_open` hook re-entering itself through libkernel
-//! `open`, see `pack::libkernel::real_open`). It holds the loaded modules
-//! with their segment addresses (all of them at module_start, then each
-//! module a load returns), so a crash RIP from ShadowMount+'s log maps to a
-//! module, and the failed path hook events (`stats::fs_event`, rc < 0) that
-//! `/fsfail` would keep (`stats::fail_kept`) plus every module load (op b'K').
+//! metrics server answers (one such crash, ~1 s after start with no :9090,
+//! was the `_open` hook re-entering itself through libkernel `open`, see
+//! `pack::libkernel::real_open`). It holds the loaded modules with their
+//! segment addresses (all of them at module_start, then each module a load
+//! returns), so a crash RIP from the loader's log maps to a module, and the
+//! failed path hook events (`stats::fs_event`, rc < 0) that `/fsfail` would
+//! keep (`stats::fail_kept`) plus every module load (op b'K').
 //! Probe events (`stats::fs_note`, rt/probe.rs) are written whatever their
 //! rc, once per distinct (op, path) as `/fsfail` lists them: a probe that
-//! succeeds (issue #22, `I v 0x0 ... noloc.larc`) shows what a game used on
-//! packed files before it died. Other successful file calls are not written:
-//! a write per file call would slow the debug build, and a crash is placed by
-//! the module list and the last failures. The file is truncated at each
-//! start.
+//! succeeds (e.g. `I v 0x0 ...`) shows what a game used on packed files
+//! before it died. Other successful file calls are not written: a write per
+//! file call would slow the debug build, and a crash is placed by the module
+//! list and the last failures. The file is truncated at each start.
 
 use super::sys;
 use core::ffi::{c_char, c_int};

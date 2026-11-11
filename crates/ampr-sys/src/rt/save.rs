@@ -162,14 +162,26 @@ unsafe fn retry_busy_mount(mount: *const c_void, result: *mut c_void) -> Option<
     Some(rc)
 }
 
+/// A `SceSaveDataMountPoint` up to its NUL, zero after it: points are
+/// compared as whole arrays, and a game's own buffer may hold stale bytes
+/// past the terminator, which would keep a point it unmounted on the list.
+unsafe fn read_point(src: *const u8) -> [u8; POINT_BYTES] {
+    let mut point = [0u8; POINT_BYTES];
+    for (i, b) in point.iter_mut().enumerate() {
+        let v = unsafe { *src.add(i) };
+        if v == 0 {
+            break;
+        }
+        *b = v;
+    }
+    point
+}
+
 unsafe fn remember_mount(result: *mut c_void) {
     if result.is_null() {
         return;
     }
-    let mut point = [0u8; POINT_BYTES];
-    for (i, b) in point.iter_mut().enumerate() {
-        *b = unsafe { *(result as *const u8).add(i) };
-    }
+    let point = unsafe { read_point(result.cast()) };
     let _g = SAVE_LOCK.lock();
     let st = unsafe { &mut *SAVE_STATE.get() };
     st.last = point;
@@ -194,10 +206,7 @@ pub unsafe extern "C" fn umount2_emul(flags: u32, point: *const c_void) -> c_int
     };
     let rc = unsafe { orig(flags, point) };
     if rc == 0 && !point.is_null() {
-        let mut p = [0u8; POINT_BYTES];
-        for (i, b) in p.iter_mut().enumerate() {
-            *b = unsafe { *(point as *const u8).add(i) };
-        }
+        let p = unsafe { read_point(point.cast()) };
         let _g = SAVE_LOCK.lock();
         let st = unsafe { &mut *SAVE_STATE.get() };
         if let Some(entry) = st.points.iter_mut().find(|e| e.used && e.point == p) {
@@ -274,7 +283,7 @@ pub unsafe extern "C" fn save_icon_by_path_emul(
 
 // ---- debug event text -------------------------------------------------------
 
-/// "/fsfail: save icon <path> rc=0x<8 hex>", as the shared build showed it.
+/// The /fsfail line "save icon <path> rc=0x<8 hex>".
 #[cfg(feature = "mem_report")]
 unsafe fn note_icon(path: *const c_char, rc: c_int) {
     let mut buf = [0u8; 128];
@@ -314,16 +323,12 @@ unsafe fn note_icon(_path: *const c_char, _rc: c_int) {}
 mod tests {
     use super::*;
 
+    /// Bytes past the NUL do not make two names of one point differ.
     #[test]
-    fn the_fallback_mount_point_has_a_terminator() {
-        let p = default_point();
-        assert_eq!(&p[..10], b"/savedata0");
-        assert_eq!(p[10], 0);
-    }
-
-    #[test]
-    fn the_icon_descriptor_matches_the_firmware_abi() {
-        // sceSaveDataSaveIcon copies 0x38 bytes of this struct.
-        assert_eq!(core::mem::size_of::<SceSaveDataIcon>(), 0x38);
+    fn read_point_drops_bytes_past_the_terminator() {
+        let mut a = *b"/savedata1\0XYZW\0";
+        a[15] = 0x7f;
+        assert_eq!(unsafe { read_point(a.as_ptr()) }[..11], *b"/savedata1\0");
+        assert_eq!(unsafe { read_point(a.as_ptr()) }[11..], [0u8; 5]);
     }
 }

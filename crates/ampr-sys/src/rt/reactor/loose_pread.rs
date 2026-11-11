@@ -19,9 +19,11 @@
 //! A read longer than `loose_pread_part_kib` (64 KiB release) is queued as
 //! parallel part tasks into the same destination, all or none; their results
 //! fold (`LoosePartResult`) into what one pread of the range returns, and
-//! the read finishes when the last part is in. Unmeasured: the hypothesis
-//! is that the FS serves a ~510 KB pread as sequential 64 KiB I/Os (2.50 ms
-//! per read, pread_pending_max <= 6 on 16-32 threads, on a console).
+//! the read finishes when the last part is in. On a console, 64 KiB parts
+//! took 1.10 ms per read against 2.51 ms unsplit (debug /metrics,
+//! `AMPR_EMU_APR_LOOSE_PREAD_PART_KIB` in mod.rs). The loose task cap
+//! (threads minus `AMPR_EMU_APR_LOOSE_PREAD_PACK_RESERVE`) is 2 at 6 threads,
+//! so only reads of up to two parts split there.
 
 use super::*;
 use crate::rt::stats::{self, Stat};
@@ -30,7 +32,7 @@ use crate::rt::stats::{self, Stat};
 
 /// log2 of the region size: 2 MiB, the direct memory page size.
 pub(crate) const LOOSE_GPU_REGION_SHIFT: u32 = 21;
-/// ponytail: 32 regions, 64 MiB of GPU-only read targets. Past that the oldest
+/// 32 regions, 64 MiB of GPU-only read targets. Past that the oldest
 /// entry is replaced (FIFO), and a read into an evicted region pays one more
 /// failed pread (a disk read thrown away) before it is remembered again.
 pub(crate) const LOOSE_GPU_REGION_CAPACITY: usize = 32;

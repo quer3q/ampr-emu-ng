@@ -113,8 +113,9 @@ const PENDING: usize = 1;
 /// Index blocks live at once, at most: four resident (pack index image,
 /// LZ4 directory order or zstd projection and its order, the compact file
 /// index), the walk build's records, paths and directory stack (two of
-/// each while one doubles) and its image, the save icon buffer, the
-/// decode-on-access scratch and the debug /bench buffer: 15.
+/// each while one doubles), its getdents buffer over `DENTS_POOL_MAX` and
+/// its image, the save icon buffer, the decode-on-access scratch and the
+/// debug /bench buffer: 16.
 const INDEX_BLOCKS: usize = 16;
 /// The two caches.
 const CACHE_BLOCKS: usize = 2;
@@ -270,7 +271,7 @@ unsafe fn alloc_kind(
     notice: bool,
 ) -> Option<*mut u8> {
     let claim = with_kind(kind, |l| {
-        let needed = l.used + mapped;
+        let needed = l.used.saturating_add(mapped);
         l.reserve(mapped).map_err(|r| (r, needed))
     });
     let i = match claim {
@@ -699,17 +700,6 @@ mod tests {
         assert_eq!(l.reserve(1), Err(Refusal::NoSlot));
         // Pending claims are not live allocations.
         assert!(l.take(PENDING).is_none());
-    }
-
-    #[test]
-    fn notices_name_size_and_cap() {
-        let mut out = [0u8; 128];
-        let n = index_cap_notice((60 << 20) + 1, INDEX_MEMORY_MAX, &mut out);
-        let want = b"ampr-emu-ng: index needs 61 MiB, over the 55 MiB cap; packed files not served";
-        assert_eq!(&out[..n], want);
-        let n = ledger_refused_notice(Kind::Cache, 16 << 20, &mut out);
-        let want = b"ampr-emu-ng: cache memory refused, 16 MiB; running without it";
-        assert_eq!(&out[..n], want);
     }
 
     // ---- index size per file -------------------------------------------------

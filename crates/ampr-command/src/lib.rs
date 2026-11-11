@@ -1,4 +1,5 @@
-//! Bounded APR command encoding for the first AMPR command-buffer ABI slice.
+//! AMPR command-buffer ops: the `OpRecord` layout, its packed retail words,
+//! and the decoder back from words. Validates sizes; never touches game memory.
 #![no_std]
 #![forbid(unsafe_code)]
 

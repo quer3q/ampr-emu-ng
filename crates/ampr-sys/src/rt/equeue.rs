@@ -42,7 +42,7 @@ const REGISTRATION_HASH_TOMBSTONE: u16 = u16::MAX;
 const AMM_QUEUE_HASH_TOMBSTONE: usize = usize::MAX;
 const USECONDS_PER_SECOND: u64 = 1_000_000;
 const MAX_SCALED_COUNTER_FREQUENCY: u64 = u64::MAX / USECONDS_PER_SECOND;
-/// `EVFILT_AMPR` (Makefile -DEVFILT_AMPR=-25).
+/// `EVFILT_AMPR`, the filter `sceKernelAddAmprEvent` registers.
 pub(crate) const SCE_KERNEL_EVFILT_AMPR: i16 = -25;
 /// SDK 10.000 sys/event.h assigns EVFILT_AMPR_SYSTEM the stable ABI value -30.
 pub(crate) const SCE_KERNEL_EVFILT_AMPR_SYSTEM: i16 = -30;
@@ -873,7 +873,6 @@ fn notify_local_waiters(queue_index: u32) {
 }
 
 // ---- queue control + mixed promotion --------------------------------------
-// log_queue_classification_change is an empty logging hook: its calls are dropped.
 
 unsafe fn mark_queue_mixed_locked(queue_index: u32) -> QueuePromotion {
     let q = unsafe { &mut ov().queues[queue_index as usize] };
@@ -1551,13 +1550,12 @@ fn wait_for_private_wake(queue_index: u32) {
 /// publishes (or drops) the reserved pending node under it.
 fn execute_private_wake(req: &PrivateWakeRequest) -> PrivateWakeCompletion {
     let mut r = PrivateWakeCompletion::default();
-    // udata is the TrackedEqueue slot address.
-    let udata = unsafe {
-        (*OV.get())
-            .queues
-            .as_mut_ptr()
-            .wrapping_add(req.queue_index as usize)
-    };
+    // udata is the TrackedEqueue slot address. Taken as a raw place, since
+    // the overlay lock is not held here and a `&mut` to `queues` would alias
+    // the lock holder's.
+    let udata = unsafe { core::ptr::addr_of_mut!((*OV.get()).queues) }
+        .cast::<TrackedEqueue>()
+        .wrapping_add(req.queue_index as usize);
     r.rc = unsafe { sceKernelTriggerUserEvent(req.eq, req.wake_id as c_int, udata.cast()) };
     let mut promotion = QueuePromotion::default();
     let mut notify_local = false;
@@ -2579,8 +2577,12 @@ static WAIT_TIMEOUT_US: [AtomicU64; WAIT_TABLE] = [const { AtomicU64::new(0) }; 
 #[cfg(feature = "mem_report")]
 fn wait_table_enter(eq: SceKernelEqueue, timeout: *mut SceKernelUseconds) -> usize {
     for i in 0..WAIT_TABLE {
+        // Handle + 1, so a null eq still marks the slot used. Not `| 1`:
+        // a handle may be a small fd, and an odd one would read back as its
+        // even neighbour.
+        let tagged = (eq as usize).wrapping_add(1);
         if WAIT_EQ[i]
-            .compare_exchange(0, eq as usize | 1, Ordering::AcqRel, Ordering::Relaxed)
+            .compare_exchange(0, tagged, Ordering::AcqRel, Ordering::Relaxed)
             .is_ok()
         {
             WAIT_START_NS[i].store(super::services::time_counter_now(), Ordering::Relaxed);
@@ -2590,8 +2592,8 @@ fn wait_table_enter(eq: SceKernelEqueue, timeout: *mut SceKernelUseconds) -> usi
                 unsafe { *timeout as u64 }
             };
             WAIT_TIMEOUT_US[i].store(t, Ordering::Relaxed);
-            // The real handle (bit 0 marks a used slot for a null eq).
-            WAIT_EQ[i].store(eq as usize | 1, Ordering::Release);
+            // Republish so a reader that sees the slot sees the fields above.
+            WAIT_EQ[i].store(tagged, Ordering::Release);
             return i;
         }
     }
@@ -2608,7 +2610,7 @@ fn wait_table_leave(slot: usize) {
 #[cfg(feature = "mem_report")]
 #[derive(Clone, Copy, Default)]
 pub(crate) struct EqueueView {
-    /// 0 for a tracked queue listed for its pending events alone.
+    /// False for a tracked queue listed for its pending events alone.
     pub(crate) waiting: bool,
     pub(crate) eq: usize,
     pub(crate) timeout_us: u64,
@@ -2661,7 +2663,7 @@ pub(crate) fn equeue_views(out: &mut [EqueueView; 48]) -> usize {
         if tagged == 0 || n == out.len() {
             continue;
         }
-        let eq = tagged & !1;
+        let eq = tagged.wrapping_sub(1);
         let mut v = EqueueView {
             waiting: true,
             eq,

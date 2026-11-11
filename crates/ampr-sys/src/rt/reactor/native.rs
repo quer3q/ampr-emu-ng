@@ -734,8 +734,8 @@ impl AprAioReactor {
             readRc = Self::resolve_software_read(gs, op, &mut read);
             // Debug only: the first resolution of a gather/scatter command is
             // its prepare record; a re-resolution here (no retained chain) is
-            // compared with it (job_state.rs stat_gs_resolved, issue #7). An
-            // empty inline in release builds, like the other stat_* helpers.
+            // compared with it (job_state.rs stat_gs_resolved). An empty
+            // inline in release builds, like the other stat_* helpers.
             if readRc == 0 && Self::software_read_op_is_stateful(op) {
                 jb.stat_gs_resolved(op.buf_offset_bytes, read.fileId, read.offset);
             }
@@ -968,8 +968,12 @@ impl AprAioReactor {
         let publish = unsafe {
             apr_equeue_try_publish(op.u64b as usize as SceKernelEqueue, op.u32b as i32, op.u64a)
         };
+        // Backpressure retries the same write on a later pass, so it is not
+        // counted as a write here.
         #[cfg(feature = "mem_report")]
-        note_equeue_target(op.u64b as usize, op.u32b, op.u64a);
+        if publish != AprEqueuePublishResult::Backpressure {
+            note_equeue_target(op.u64b as usize, op.u32b, op.u64a);
+        }
         crate::rt::stats::add(
             match publish {
                 AprEqueuePublishResult::Published => crate::rt::stats::Stat::EqueueLocalPublished,

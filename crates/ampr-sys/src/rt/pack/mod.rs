@@ -19,8 +19,9 @@
 //!   (see "sync state"), so lock guards never borrow PackState:
 //!   `PACK_M`, `CACHE_CVS[i]`, etc.
 //! - Detour targets (`*_emul`) keep the C ABI; runtime helpers use Rust calls.
-//! - Telemetry is not implemented: there are no pack stats counters or
-//!   runtime stats export, and `pack_telemetry_usecs()` returns 0.
+//! - Telemetry timestamps are not implemented: `pack_telemetry_usecs()`
+//!   returns 0. Debug counters go through `stats::*` (no-ops unless
+//!   `mem_report`).
 //! - Shared helpers: `sce_errno_from_posix`, `posix_errno_from_sce`,
 //!   `errno()`, `kernel_slot::<F>`, hook ids `sys::hook::x`,
 //!   `spin_pause_or_yield(&mut spins)`, and `ampr_lz4::decode_chunk`
@@ -169,7 +170,7 @@ pub(crate) fn packs_present() -> bool {
 
 /// True when one-based `file_id` names a packed file, one with no physical
 /// copy that only a virtual fd can serve. zstd: the id has a record in the
-/// R4 projection. LZ4: its AMPRPAK4 record (record index `file_id - 1`)
+/// AMPRIDX3 projection (zstd.rs). LZ4: its AMPRPAK4 record (record index `file_id - 1`)
 /// carries `AMPR_PACK_FILE_PACKED`. False when the manifest is not loaded or
 /// the id is out of range. Lock-free, so the open hooks and the debug
 /// probes can call it. `_reader` is the proof that the caller holds the
@@ -577,8 +578,7 @@ impl AmprPackCoreView {
 // ---- configuration (AMPR_PACK_ENABLE=1, AMPR_DIRECTORY_OVERLAY=1)
 // Plain read-only opens of packed files get a virtual fd in both formats
 // (slots.rs `pack_open_flags_supported`). Upstream 0.4.2.1 assumed LZ4 packs
-// hold only files the game reads through AMPR; GitHub issue #2 (an
-// Insomniac Engine title, LZ4 packs) showed plain open() of packed files too.
+// hold only files the game reads through AMPR; titles also plain open() them.
 
 pub(crate) const AMPR_EMU_PACK_INDEX_PATH: &CStr = c"/app0/ampr_assets.index";
 /// `AMPR_EMU_PACK_INDEX_PATH ".runtime"` (AMPRPAK4 only; zstd keeps the defaults).
@@ -656,19 +656,18 @@ pub(crate) const AMPR_EMU_PACK_PREAD_MAX_BYTES: u64 = AMPR_EMU_PACK_IO_STAGING_B
 /// the same allocator (rt/fd_cache.rs `open_indexed_or_real`), so up to
 /// `CACHE_CAP` (45) of these belong to the runtime. A closed slot is reused,
 /// so this is the number of packed files open at one time, not a lifetime
-/// limit. PPSA03671 held 220 during its world load; 512 is comfortable.
+/// limit. One title held 220 during its world load; 512 is comfortable.
 pub(crate) const AMPR_EMU_PACK_VIRTUAL_FD_SLOTS: usize = 512;
 /// First synthetic packed-file descriptor: a packed fd is `BASE + slot`, in
 /// `512..1024`. That range is above the kernel's effective fd table and below
 /// the strictest title limit:
-/// - the kernel's table tops out at 259 on PPSA03671 and PPSA30601 (248
+/// - the kernel's table tops out at 259 on the two titles measured (248
 ///   `open("/dev/null")` calls succeeded, highest fd 258), despite
 ///   `RLIMIT_NOFILE` reporting 13,952, so a real descriptor can never land in
 ///   the synthetic range;
-/// - PPSA30601 rejects fd >= 1024: base 1000 failed on
-///   `CHARACTERS_STRUCTURE.PS5.PCK` at fd 1024, while base 768 and 512 boot.
-///   PPSA03671 accepted 170 packed fds at 1024..1193, so 1024 is that title's
-///   own limit, not a system one.
+/// - one title rejects fd >= 1024: base 1000 failed on its first packed fd
+///   at 1024, while base 768 and 512 boot. Another accepted 170 packed fds
+///   at 1024..1193, so 1024 is that title's own limit, not a system one.
 ///
 /// The range needs no kernel descriptor, so the title keeps its whole fd table
 /// for real files. The runtime serves reads, seeks, fstat, close, AIO and mmap
@@ -1080,7 +1079,6 @@ pub(crate) struct TouchEntry {
     pub key_hash: u64,
     pub count: u8,
 }
-impl TouchEntry {}
 
 #[repr(u8)]
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1417,13 +1415,13 @@ pub(crate) struct PackSubmission {
 
 // ---- PackState, data only -----------------------------------------------------
 // Non-zero defaults `pack_state_create` (state.rs) must apply in place on the
-// zeroed storage: every array element = its type's `EMPTY` (virtual_directories,
-// virtual_aio, pipelines, pack_handles, cache_entries, physical_cache_entries;
-// the others are all-zero), queue_head/queue_tail =
-// prefetch_head/prefetch_tail = INVALID_INDEX,
-// decoded_cache_target_bytes = AMPR_EMU_PACK_DECODED_CACHE_BYTES,
-// physical_cache_target_bytes = AMPR_EMU_PACK_PHYSICAL_CACHE_BYTES,
-// requested_workers = AMPR_EMU_PACK_WORKERS, latency_reserve_workers =
+// zeroed storage: every array element = its type's `EMPTY` (virtual_fds,
+// virtual_directories, virtual_aio, pipelines, pack_handles, cache_entries,
+// physical_cache_entries; the others are all-zero), queue_head/queue_tail =
+// prefetch_head/prefetch_tail = INVALID_INDEX, decoded_cache_target_bytes,
+// physical_cache_target_bytes and requested_workers from `tune` (in release
+// AMPR_EMU_PACK_DECODED_CACHE_BYTES, AMPR_EMU_PACK_PHYSICAL_CACHE_BYTES and
+// AMPR_EMU_PACK_WORKERS), latency_reserve_workers =
 // AMPR_EMU_PACK_LATENCY_RESERVE_WORKERS, pipeline_free_head = cache_free_head =
 // physical_cache_free_head = INVALID_INDEX, tick = 1. Never build a whole
 // PackState by value (several MB; worker stacks are small).
@@ -1466,9 +1464,6 @@ pub(crate) struct PackState {
     pub physical_cache_target_bytes: usize,
     pub requested_workers: u32,
     pub latency_reserve_workers: u32,
-    pub runtime_profile_loaded: bool,
-    pub profile_decoded_bytes: usize, // Immutable after manifest publication.
-    pub profile_physical_bytes: usize,
     pub workers: [WorkerContext; AMPR_EMU_PACK_WORKER_CAPACITY],
     pub pipelines: [ReadPipelineContext; AMPR_EMU_PACK_PIPELINE_SLOTS],
     pub pipeline_free_head: u32,
@@ -1519,8 +1514,8 @@ pub(crate) static VIRTUAL_FD_MUTEXES: [Mutex; AMPR_EMU_PACK_VIRTUAL_FD_SLOTS] =
     [const { Mutex::new() }; AMPR_EMU_PACK_VIRTUAL_FD_SLOTS];
 /// Set while a slot is open. Written only under PACK_M; read lock-free by
 /// `decode_virtual_fd`, so a number in the synthetic range with no open slot
-/// goes to the kernel without taking PACK_M, as with the fd-to-slot table
-/// before #23. A real fd is not expected there (kernel table: 259).
+/// goes to the kernel without taking PACK_M. A real fd is not expected
+/// there (kernel table: 259).
 pub(crate) static VIRTUAL_FD_LIVE: [AtomicBool; AMPR_EMU_PACK_VIRTUAL_FD_SLOTS] =
     [const { AtomicBool::new(false) }; AMPR_EMU_PACK_VIRTUAL_FD_SLOTS];
 pub(crate) static CACHE_MUTEX: Mutex = Mutex::new();

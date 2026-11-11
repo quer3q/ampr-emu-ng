@@ -101,7 +101,7 @@ pub(crate) unsafe fn lookup_virtual_aio_group_locked(
 
 /// Takes a free slot and returns the synthetic packed fd `BASE + slot`.
 /// No kernel descriptor is involved: the range is above the kernel's
-/// effective fd table (259) and below the strictest title limit (PPSA30601
+/// effective fd table (259) and below the strictest title limit (one title
 /// rejects fd >= 1024). A closed slot is reused, so the number behaves like
 /// a reused OS fd. Returns an SCE error (never a positive value) when all
 /// slots are open.
@@ -172,8 +172,7 @@ pub unsafe fn ampr_pack_manifest_is_resident_ready() -> bool {
 
 /// Every read-only non-directory open, in both formats: a packed file has
 /// no physical copy to fall back to, so a plain `O_RDONLY` open must get a
-/// virtual fd too (GitHub issue #2: an Insomniac Engine title with LZ4 packs
-/// failed plain opens of /app0/d/0/actor).
+/// virtual fd too (an LZ4 title failed plain opens of its packed files).
 pub(crate) fn pack_open_flags_supported(flags: c_int) -> bool {
     (flags & O_ACCMODE) == O_RDONLY && (flags & O_DIRECTORY) == 0
 }
@@ -236,16 +235,16 @@ pub(crate) unsafe fn ampr_pack_try_open_indexed_impl(
         // plain folder: a title that opens a packed log file for writing
         // retried an EACCES refusal ~700 times and crashed. A read-only
         // mount fails it with the FS's own error.
-        // ponytail: later reads of that path still serve the packed bytes,
-        // not what the game wrote; route them to the loose file if a title
-        // reads back what it writes into /app0.
+        // Later reads of that path still serve the packed bytes, not what
+        // the game wrote; route them to the loose file if a title reads back
+        // what it writes into /app0.
         return SCE_KERNEL_ERROR_ENOENT;
     }
     *handled = true;
     let _lock = PACK_M.lock();
     // Shutdown closes the gate before its PACK_M section that closes
     // submissions, so this check under PACK_M refuses every open that
-    // would otherwise get an fd during the drain (stability S4). The result
+    // would otherwise get an fd during the drain. The result
     // is the one a refused enter gives: unhandled, as if no manifest.
     if MANIFEST_READERS.is_closed() {
         *handled = false;
@@ -261,7 +260,14 @@ pub unsafe fn ampr_pack_try_open_indexed(
     mode: SceKernelMode,
     handled: *mut bool,
 ) -> c_int {
-    unsafe { ampr_pack_try_open_indexed_impl(file_id, &*entry, flags, mode, handled) }
+    // A null entry is "no such file", not a deref.
+    let Some(entry) = (unsafe { entry.as_ref() }) else {
+        if !handled.is_null() {
+            unsafe { *handled = false };
+        }
+        return SCE_KERNEL_ERROR_ENOENT;
+    };
+    unsafe { ampr_pack_try_open_indexed_impl(file_id, entry, flags, mode, handled) }
 }
 
 /// Prefers an immediately available slot; waits on slot mutexes only when the

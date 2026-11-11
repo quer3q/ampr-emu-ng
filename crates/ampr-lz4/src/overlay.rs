@@ -11,11 +11,15 @@ pub fn file_path<'a>(m: &Manifest<'a>, index: u32) -> Option<&'a [u8]> {
     m.string(r.path_offset, r.path_length).ok()
 }
 
-/// Orders records by folded path, then record index.
+/// Orders records by folded path, then record index. A record without a
+/// path sorts last, as `lower_bound` expects; the order stays total, which
+/// `sort_unstable_by` needs to not panic.
 pub fn compare_paths(m: &Manifest<'_>, left: u32, right: u32) -> Ordering {
     match (file_path(m, left), file_path(m, right)) {
         (Some(a), Some(b)) => folded_compare(a, b).then(left.cmp(&right)),
-        _ => left.cmp(&right),
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => left.cmp(&right),
     }
 }
 
@@ -87,12 +91,11 @@ pub fn packed_file_matches(m: &Manifest<'_>, file_id: u32, indexed_size: u64) ->
 /// Emulator files, manifest pack volumes and stale default-named volumes
 /// never appear in directory listings.
 pub fn service_name_hidden(m: Option<&Manifest<'_>>, directory: &[u8], name: &[u8]) -> bool {
-    const FIXED: [&[u8]; 5] = [
+    const FIXED: [&[u8]; 4] = [
         b"/app0/ampr_emu.index",
-        b"/app0/ampr_assets.index",
+        INDEX_PATH,
         b"/app0/ampr_commands.bin",
         b"/app0/ampr_emu.log",
-        INDEX_PATH,
     ];
     if FIXED.iter().any(|t| joined_matches(directory, name, t)) {
         return true;

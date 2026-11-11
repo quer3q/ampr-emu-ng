@@ -471,9 +471,9 @@ impl JobState {
 }
 
 // ---- debug gather/scatter retry check (stats.rs gs_retry_*) ----
-// Upstream issue #7 (CONTROL, drakmor/ampr_emu): a retry re-resolved a
-// gather/scatter read from the per-lane cursor after another job had advanced
-// it, and read another file. The same shape is here: one GatherScatterState per
+// Upstream failure class: a retry re-resolved a gather/scatter read from the
+// per-lane cursor after another job had advanced it, and read another file.
+// The same shape is here: one GatherScatterState per
 // priority lane (mod.rs gatherScatterStates), and native.rs
 // progress_software_read_command re-resolves from it whenever no retained read
 // chain matches. Debug builds compare each re-resolution with the first one.
@@ -630,7 +630,7 @@ mod gs_retry_tests {
         assert_eq!(a.check(1, 0x40, retry.fileId, retry.offset), GsCheck::Match);
 
         // Job B advances the same lane (cross-EOP read-ahead or lane overlap,
-        // both off in release): the retry now resolves to B's file, issue #7.
+        // both off in release): the retry now resolves to B's file.
         let b0 = read_op(APR_READ_FILE, 9, 0x30000, 0x40, 0x5000);
         let r = resolve(&lane, &b0);
         AprAioReactor::update_software_gs_cursor(&mut lane, &r);

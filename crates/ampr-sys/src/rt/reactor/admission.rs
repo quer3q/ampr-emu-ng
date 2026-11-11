@@ -265,7 +265,8 @@ impl AprAioReactor {
         }
     }
 
-    /// Default `firstExternalInSubmitBatch = false`.
+    /// `firstExternalInSubmitBatch` is true only for the first external read
+    /// accepted by one kernel multiple-submit call.
     pub(crate) fn notify_external_aio(
         &self,
         external: &mut ExternalAioRead,

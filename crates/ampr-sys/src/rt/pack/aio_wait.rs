@@ -402,8 +402,8 @@ pub unsafe extern "C" fn sceKernelAioWaitRequest_emul(
     }
 }
 
-/// Serves the game's own single-id wait on a packed submit's id (issue
-/// #22); native ids go to the kernel.
+/// Serves the game's own single-id wait on a packed submit's id; native ids
+/// go to the kernel.
 #[inline(never)]
 pub unsafe fn sceKernelAioWaitRequest(
     id: SceKernelAioSubmitId,
@@ -443,8 +443,8 @@ pub unsafe extern "C" fn sceKernelAioCancelRequest_emul(
     }
 }
 
-/// Serves the game's own single-id cancel on a packed submit's id (issue
-/// #22). A group cancels its children and reports `cancel_group_state`.
+/// Serves the game's own single-id cancel on a packed submit's id. A group
+/// cancels its children and reports `cancel_group_state`.
 #[inline(never)]
 pub unsafe fn sceKernelAioCancelRequest(id: SceKernelAioSubmitId, state_out: *mut c_int) -> c_int {
     unsafe {

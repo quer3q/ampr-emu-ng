@@ -1,7 +1,8 @@
-//! Inline detours into libkernel (and the
-//! external equeue producers), the original/fallback slot tables, and the
-//! memory-protection `_emul` hooks that promote AMPR-write mappings to CPU_RW.
-//! APR equeue is always local (rt/equeue.rs). Logging is dropped.
+//! Inline detours into libkernel, the external equeue producers, the save
+//! data entries of a loaded libSceSaveData (rt/save.rs) and the two module
+//! loaders; the original/fallback slot tables; and the memory-protection
+//! `_emul` hooks that promote AMPR-write mappings to CPU_RW. APR equeue is
+//! always local (rt/equeue.rs).
 #![allow(non_snake_case, non_upper_case_globals)]
 
 use core::ffi::{c_char, c_int, c_void};
@@ -27,8 +28,10 @@ const HOOK_COUNT: usize = id::COUNT;
 const EXT_COUNT: usize = 5;
 /// Save data hooks in loaded system modules (rt/save.rs), not libkernel ids.
 const SAVE_COUNT: usize = 4;
+/// `sceKernelLoadStartModule` and `sceKernelLoadStartModuleForSysmodule`.
+const LOADER_COUNT: usize = 2;
 const TRAMP_PAGES: usize =
-    (HOOK_COUNT + EXT_COUNT + SAVE_COUNT + 1 + SLOTS_PER_PAGE - 1) / SLOTS_PER_PAGE;
+    (HOOK_COUNT + EXT_COUNT + SAVE_COUNT + LOADER_COUNT + SLOTS_PER_PAGE - 1) / SLOTS_PER_PAGE;
 const PROT_ALL: c_int = sys::SCE_KERNEL_PROT_CPU_ALL;
 const PROT_RX: c_int = sys::SCE_KERNEL_PROT_CPU_READ | sys::SCE_KERNEL_PROT_CPU_EXEC;
 
@@ -38,10 +41,10 @@ const _: () = {
     // 10 game AIO slots 100..=109 and 2 thread-creation slots 110..=111 in
     // both builds, and in debug builds the 8 probe slots 112..=119
     // (rt/probe.rs). With the 5 external equeue hooks, the 4 save data hooks
-    // (rt/save.rs) and the loader hook that is 122 (release) or 130 (debug)
+    // (rt/save.rs) and the 2 loader hooks that is 123 (release) or 131 (debug)
     // trampolines: 4 pages x 32 slots = 128 in release, 5 pages = 160 in debug.
     assert!(HOOK_COUNT == 112 + 8 * cfg!(feature = "mem_report") as usize);
-    assert!(HOOK_COUNT + EXT_COUNT + SAVE_COUNT + 1 <= TRAMP_PAGES * SLOTS_PER_PAGE);
+    assert!(HOOK_COUNT + EXT_COUNT + SAVE_COUNT + LOADER_COUNT <= TRAMP_PAGES * SLOTS_PER_PAGE);
 };
 
 // ---- detour state (guarded by HOOK_LOCK) -------------------------------------
@@ -1457,7 +1460,8 @@ pub unsafe extern "C" fn sceKernelMemoryPoolBatch_emul(
         return call(entries);
     }
     let lease = PoolLease::new(bytes);
-    unsafe { copy_bytes(lease.storage, entries.cast(), bytes) };
+    // Game memory, not live code: a plain copy, not the volatile byte loop.
+    unsafe { core::ptr::copy_nonoverlapping(entries.cast::<u8>(), lease.storage, bytes) };
     let copy = lease.storage.cast::<SceKernelMemoryPoolBatchEntry>();
     for i in first..n as usize {
         let e = unsafe { &mut *copy.add(i) };
@@ -1572,9 +1576,8 @@ pub(crate) const fn observed_only(id: usize) -> bool {
 /// Ids past the shared 78 install for both formats, but only in a title
 /// that ships packs (`packs_present`, decided in rt/pack/mod.rs
 /// `select_pack_format`): an LZ4 pack can hold files with no physical copy
-/// too, so a game's plain open(), libc and mmap calls must reach them
-/// (GitHub issue #2). A title with no packs gets the shared 78 only, as in
-/// v0.2.0. Of the ids past 78, 84..96 also need their `ZSTD_LIBC_HOOKS`
+/// too, so a game's plain open(), libc and mmap calls must reach them. A
+/// title with no packs gets the shared 78 only. Of the ids past 78, 84..96 also need their `ZSTD_LIBC_HOOKS`
 /// bit (or, in debug builds, `observed_only`), 96 and 97
 /// need `AMPR_ZSTD_MMAP` on, 98 and 99 need it at 1 (rt/pack/mmap.rs),
 /// 100..=109 (the game's kernel AIO, rt/pack/aio.rs) need nothing more,
@@ -1872,9 +1875,9 @@ unsafe fn load_observe(
     // /app0/prx/AkSineTone.prx, stored aksinetone.prx): retail pfs and exFAT
     // fold case, a folder install on the internal SSD does not and the load
     // fails with ENOENT. An indexed /app0 path goes in as its stored path.
-    // The index can disagree in case with the disk too (issue #15, Hollow
-    // Knight Silksong: indexed Il2cppUserAssemblies.prx, on disk and asked
-    // for as Il2CppUserAssemblies.prx), so an ENOENT on the stored path
+    // The index can disagree in case with the disk too (indexed
+    // Il2cppUserAssemblies.prx, on disk and asked for as
+    // Il2CppUserAssemblies.prx), so an ENOENT on the stored path
     // retries the name the game asked for. Only ENOENT, the error of a
     // missing file; other failures may come after the loader mapped or
     // started the module. An ENOENT for another reason (a missing import)

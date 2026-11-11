@@ -40,7 +40,7 @@ impl<T> SyncCell<T> {
 
 // ---- spin lock -----------------------------------------------------------
 
-/// `AmprSpinLock` / `AmprTrySpinLock` over a u32 word (0 = free, 1 = held).
+/// `AmprSpinLock` over a u32 word (0 = free, 1 = held). No try-lock.
 #[repr(transparent)]
 pub struct SpinLock(AtomicU32);
 

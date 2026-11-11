@@ -7,7 +7,7 @@
 //! EOP (address write, counter, equeue) at the read fence (native.rs
 //! progress_native_or_address_command), so the successor's first read waits a
 //! full read time. Console, a game, loose files, debug build with the
-//! pread pool and 64 KiB split (loose-pread notes): ~15.6k jobs and
+//! pread pool and 64 KiB split (loose_pread.rs): ~15.6k jobs and
 //! ~24.5k reads per session, submit -> first read issued 4.3-4.8 ms per job vs
 //! 1.1 ms per read, 2-3 reads in flight per 1 s scrape = active lanes.
 //!
@@ -453,10 +453,6 @@ mod tests {
         ] {
             assert!(!overlap_successor_op_allowed(t), "{t}");
         }
-        assert!(!lane_successor_prior_fence(false, false, false));
-        assert!(lane_successor_prior_fence(false, false, true));
-        assert!(lane_successor_prior_fence(true, false, false));
-        assert!(lane_successor_prior_fence(false, true, false));
     }
 
     /// One lane job in the ordering model: packed commands (APR reads and

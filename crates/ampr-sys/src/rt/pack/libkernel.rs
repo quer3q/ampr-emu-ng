@@ -58,7 +58,7 @@ real_fn!(
 /// The runtime's own physical open: the `_open` original while `_open` is
 /// detoured, else `open`. libkernel's `open` calls `_open`, so with the
 /// `_open` hook routing (`AMPR_ZSTD_LIBC_HOOKS` bit 0) an open through
-/// `open` re-entered the index routing: a UE5 title opens
+/// `open` re-entered the index routing: a title opens
 /// `/app0/..` as a directory, and `ampr_pack_open_directory`'s physical open
 /// looped `open` -> `_open` hook -> `ampr_pack_open_directory` until the main
 /// thread's stack ran out (0xA80 bytes a level; debug build trace
@@ -111,7 +111,7 @@ real_fn!(
     sys::hook::_getdirentries,
     sys::hook::getdirentries
 );
-// R7 read interposers: the pre-detour slot first, so a pack-internal read
+// Read originals: the pre-detour slot first, so a pack-internal read
 // never re-enters its own hook once `pread`/`read` are detoured.
 real_fn!(
     real_pread,

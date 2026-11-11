@@ -563,8 +563,9 @@ pub(crate) unsafe fn finish_pipeline_window_aio(pipeline: &mut ReadPipelineConte
     unsafe {
         let mut error = pipeline.native_io_error;
         let range = pipeline.io_range;
-        // zstd reads only part of the window into the scratch (prepare_pipeline_window_aio);
-        // anywhere inside the scratch is a scratch read, not a cache window.
+        // zstd reads only part of the window into the scratch
+        // (zstd_trim_window_read): anywhere inside the scratch is a scratch
+        // read, not a cache window.
         let buf = pipeline.native_request.buf as *mut u8;
         let direct_cache_window = pipeline.io_scratch.is_null()
             || buf < pipeline.io_scratch

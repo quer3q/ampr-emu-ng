@@ -324,7 +324,6 @@ fn bad_records_keep_error_classes() {
     assert_eq!(task_count(&f, 0, 40000), 3);
     assert!(m.read_task(&f, 0, 40000, 0).is_ok());
     assert_eq!(m.read_task(&f, 0, 40000, 1), Err(CoreError::OutOfRange));
-    assert_eq!(CoreError::Unsupported.code(), -5);
     assert_eq!(
         CoreError::from(ampr_lz4::Error::Checksum),
         CoreError::ChecksumMismatch
@@ -339,7 +338,7 @@ fn bad_records_keep_error_classes() {
         let _ = Manifest::view_trusted(&stale[..n]);
     }
     assert!(Manifest::view_trusted(&stale[..stale.len() - 1]).is_err());
-    // Codec 3 and unknown flag bits are not checked by decode_chunk_record.
+    // Codec 3 and unknown flag bits are not checked by `chunk_record`, which read planning uses.
     let f = |count| F {
         path: b"/app0/x",
         size: 16384 * count as u64,

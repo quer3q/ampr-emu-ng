@@ -15,10 +15,11 @@ use crate::rt::stats::{self, Stat};
 // queued task (not yet taken; running tasks hold their own thread) beyond
 // the idle and spinning threads, up to its ceiling (tune::pread_threads, 6)
 // and the thread budget (rt/thread_hooks.rs). A thread that finishes a task
-// exits when more are live than the load target (thread_hooks::LoadGroup),
-// down to one. A game thread creation that fails with EAGAIN makes the pool
-// give threads back, down to none (reads then go to kernel AIO); under the
-// pressure that follows it grows only a first thread. A title
+// exits after RETIRE_STREAK such finishes in a row with more live than one
+// above the load target (thread_hooks::LoadGroup). A game thread creation
+// that fails with EAGAIN makes the pool give threads back, down to none
+// (reads then go to kernel AIO); under the pressure that follows it grows
+// only a first thread and retires to the target, down to none. A title
 // saw its own scePthreadCreate fail with EAGAIN after 94 creations while 32
 // pool threads were live.
 
@@ -104,7 +105,7 @@ impl AprAioReactor {
     /// AMPR_EMU_PACK_PREAD_MAX_BYTES pieces, publishes the result and wakes
     /// the reactor (under `m`, so the epoch change cannot race its wait).
     /// Leaves its loop (slot EXITED, under preadMutex) on stop, on an exit
-    /// asked by pread_pool_yield, or after a task when the pool is above its
+    /// asked by ask_pread_exits, or after a task when the pool is above its
     /// load target. After a task it may spin for the next one
     /// (spin_for_task) before it parks.
     unsafe fn pread_worker(this: *mut Self, thread_slot: usize) {

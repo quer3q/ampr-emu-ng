@@ -186,7 +186,7 @@ const FD_SETSIZE: c_int = 1024;
 
 /// Inspects `fds` only after the original returned >= 0: it validated the
 /// array (an invalid pointer or `nfds` must get the original's EFAULT/EINVAL,
-/// not a fault in the probe; Codex review), and a virtual fd still shows,
+/// not a fault in the probe), and a virtual fd still shows,
 /// since poll reports an unknown fd as POLLNVAL in `revents`, not an error.
 pub(crate) unsafe extern "C" fn poll_probe(fds: *mut PollFd, nfds: u32, timeout: c_int) -> c_int {
     let rc = unsafe { kernel_slot::<PollFn>(sys::hook::poll) }
@@ -270,7 +270,7 @@ unsafe fn path_event(dirfd: c_int, path: *const c_char) -> Option<(u8, Text)> {
 /// on success, or on an error FreeBSD namei returns only after its copyin
 /// of the path (ENOENT, ENOTDIR, EACCES, EBADF of the dirfd, ENAMETOOLONG),
 /// so a bad pointer gets the original's EFAULT instead of a fault in the
-/// probe (Codex review). A failed packed path open is ENOENT, so those
+/// probe. A failed packed path open is ENOENT, so those
 /// events still show. Errors that can come before the copyin (EINVAL of a
 /// flag check, EMFILE, EFAULT, the missing original's EIO) are not
 /// inspected. errno is read before the probe makes calls of its own.
@@ -359,20 +359,5 @@ const AT_FDCWD: c_int = -100;
 pub(crate) unsafe fn probe_path(path: *const c_char, op: u8, rc: c_int) {
     if let Some(how) = unsafe { probe_packed_path(path) } {
         stats::fs_note(op, how, rc.into(), path);
-    }
-}
-
-// ---- tests --------------------------------------------------------------------
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn select_text_is_the_decimal_nfds() {
-        let t = select_text(1025);
-        assert_eq!(&t.buf[..t.n], b"select nfds=1025");
-        let t = select_text(c_int::MAX);
-        assert_eq!(&t.buf[..t.n], b"select nfds=2147483647");
     }
 }

@@ -23,8 +23,9 @@ AMPR_MEM_REPORT ?= 0
 # release pool is 1.36 MiB (87 pages) larger: 118.39 vs 117.03 MiB. `dist` checks both totals
 # (tools/verify_payload_prx.py --prx-totals): they must match within 64 KiB
 # and stay below 128 MiB, else update the gap here.
-# The first pool allocation publishes the pool: the startup cache carve ran
-# before it was published and failed (pool_alloc_failed 1, caches off).
+# The first pool allocation publishes the pool (mprotect), so the startup
+# cache carve can use it; a carve before the pool was published failed
+# (pool_alloc_failed 1, caches off).
 # Nothing comes from the game's direct or flexible memory: the pool is .bss
 # and did not lower the game's free direct memory, while direct allocations
 # did (a title had 42 MiB of direct memory free during play), and flexible
@@ -110,7 +111,7 @@ AMPR_ZSTD_LIBC_HOOKS ?= 0xfff
 # limits (mprotect not tracked, handler on the faulting thread's stack,
 # handler kept after module_stop; module doc of mmap_fault.rs) are unsolved.
 AMPR_ZSTD_MMAP ?= 2
-# Sequential read-ahead window in chunks (0 = off), read by rt/pack.
+# Sequential read-ahead window in chunks (0 = off), read by rt/pack/mod.rs.
 # 0: with the pread pool (reactor/pread_pool) read-ahead no longer cut load latency
 # (1.62 vs 1.60 ms) and off shortened the worst read (26.7 vs 36.2 ms). On a
 # second, lighter game it doubled disk bytes (1.69 vs 0.78 per game byte) and

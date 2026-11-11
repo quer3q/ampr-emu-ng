@@ -550,7 +550,7 @@ pub unsafe fn pread_pool_yield(want: u32) -> u32 {
     }
 }
 
-/// Pool thread exits asked (pread_pool_yield) not yet done.
+/// Pool thread exits asked (ask_pread_exits) not yet done.
 pub fn pread_pool_pending_exits() -> u32 {
     let reactor = g_apr_aio_reactor.load(Ordering::Acquire);
     if reactor.is_null() {
