@@ -245,7 +245,8 @@ static WORKER_EXIT_STATE: [core::sync::atomic::AtomicU8; AMPR_EMU_PACK_WORKER_CA
 /// worker chain in the debug PRX was ~30 KiB with the page read path, since
 /// removed (not re-measured): pack_worker_entry 17.5 KiB frame
 /// (advance_virtual_read_aio inlined), cleanup_pipeline_continuation 8 KiB,
-/// and zstd decode frames stay under 1 KiB each (DCtx is heap). 64 KiB, libkernel's default, keeps 2x margin
+/// and zstd decode frames stay under 1 KiB each (the DCtx is a pool workspace,
+/// not stack). 64 KiB, libkernel's default, keeps 2x margin
 /// for libkernel and libc calls below those frames.
 const WORKER_STACK_MIN: usize = 64 * 1024;
 

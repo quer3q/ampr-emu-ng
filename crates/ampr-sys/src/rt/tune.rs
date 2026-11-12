@@ -1,6 +1,6 @@
 //! Tuning knobs of the debug build (`make AMPR_MEM_REPORT=1`). All knobs are
 //! read from TUNE_PATH once, in module_start before the hooks install
-//! (rt/exports.rs). Startup knobs (cache sizes, workers, pipelines, pread
+//! (rt/exports.rs). Startup knobs (cache size, workers, pipelines, pread
 //! threads, zstd_verify, equeue_local, pack worker stack) are used once at
 //! startup; live knobs
 //! (read-ahead and its disk gate, pread pool on/off for pack and loose reads,
@@ -117,8 +117,9 @@ const READ_SLICE_KIB: u32 = (kSoftwareReadChunkMax / 1024) as u32;
 /// Largest pass budget and per-read active window, in KiB (16 MiB).
 const READ_LIMIT_MAX_KIB: u32 = 16 * 1024;
 
-/// Cache size: 0 turns the decoded cache off (reads bypass it); otherwise
-/// its 16 MiB minimum applies (pack/manifest.rs).
+/// Cache size: 0 turns the decoded cache off (reads bypass it); otherwise it is
+/// cut to the room under the Cache cap, and off when that leaves less than the
+/// smaller of the knob and 16 MiB (pack/manifest.rs `cache_region`).
 pub(crate) static KNOBS: [Knob; 21] = [
     knob(
         "decoded_mib",

@@ -1567,7 +1567,7 @@ unsafe fn close_pack_and_directory_fds(state: *mut PackState) {
 }
 
 /// Shutdown: frees the worker scratch and decoders, the pipeline io windows
-/// and both caches.
+/// and the decoded cache.
 unsafe fn free_worker_and_cache_memory(state: *mut PackState) {
     for worker in (*state).workers.iter_mut() {
         if !worker.decoded_scratch.is_null() {

@@ -666,6 +666,7 @@ pub unsafe fn real_physical_pread(fd: c_int, buf: *mut c_void, size: usize, off:
 }
 
 /// Monotonic clock in nanoseconds; 0 on failure.
+#[cfg(not(test))]
 pub fn monotonic_ns() -> u64 {
     let mut ts = SceKernelTimespec::default();
     if unsafe { sceKernelClockGettime(SCE_KERNEL_CLOCK_MONOTONIC, &mut ts) } != 0 {
@@ -674,6 +675,18 @@ pub fn monotonic_ns() -> u64 {
     (ts.tv_sec as u64)
         .wrapping_mul(1_000_000_000)
         .wrapping_add(ts.tv_nsec as u64)
+}
+
+/// Host tests link no libkernel (`sceKernelClockGettime` is undefined), so the
+/// process clock stands in. The debug build's `stats::now()` reaches this, and
+/// without it `cargo test -p ampr-sys --features mem_report` does not link.
+#[cfg(test)]
+pub fn monotonic_ns() -> u64 {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    START
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_nanos() as u64
 }
 
 // ---- libkernel imports for rt/hook.rs (dlsym + SDK fallback entry points) --
