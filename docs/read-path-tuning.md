@@ -49,7 +49,7 @@ AIO stays near 730 MB/s even 32 requests deep.
 | Larger read pass / per-read limits (4 MiB pass, 16 chunks / 8 MiB) | 1.10 vs 1.13 ms per read, first-issue wait unchanged | not the bottleneck; debug knobs remain |
 | Lane EOP overlap (next job in a lane starts while the head has only completion writes left) | about 7.7 ms per job on vs 6.1 off (32 threads); 6.4 vs 6.6 (64 threads) | off: lane wait drops from 4.8 to 1.8 ms, but the extra reads queue for the 28 loose tasks (32 threads) and completions still publish in lane order (0.5-1 ms). Debug knob `lane_eop_overlap` |
 | Reading the backing folder instead of `/app0` (`app0_direct`) | about 6.2 vs 6.4 ms per job; 14.8 ms without the split | removed: nullfs costs about 1% (256 KiB x 8 threads: 1,971 vs 2,045 MB/s), and libkernel exports neither `statfs` nor `fstatfs` to detect the folder |
-| Read-ahead (`AMPR_PACK_READAHEAD_CHUNKS`) | load latency 1.62 vs 1.60 ms; worst read 36.2 ms on vs 26.7 off. A lighter game read 1.69 vs 0.78 disk bytes per game byte, worst read 13.4 vs 5.6 ms | off (0). Earlier runs hit about 46% of prefetched data. Not re-measured since prefetched chunks land in the 16 MiB decoded cache |
+| Read-ahead (`AMPR_PACK_READAHEAD_CHUNKS`) | load latency 1.62 vs 1.60 ms; worst read 36.2 ms on vs 26.7 off. A lighter game read 1.69 vs 0.78 disk bytes per game byte, worst read 13.4 vs 5.6 ms | off (0). Earlier runs hit about 46% of prefetched data. Not re-measured since prefetched chunks land in the 64 MiB decoded cache |
 
 ## Known limits
 
