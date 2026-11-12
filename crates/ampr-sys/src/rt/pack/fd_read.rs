@@ -483,6 +483,21 @@ fn spin_for_call(us: u32) {
 
 unsafe extern "C" fn read_thread(arg: *mut c_void) -> *mut c_void {
     let slot = arg as usize;
+    // Same priority and cores as the pack workers (worker.rs
+    // `pack_worker_entry`). Created with default attributes, a read thread
+    // ran at priority 700 (a core dump of Kingdom Come 2, issue 37), below
+    // the game's main thread (404) and its job workers (552), the only
+    // unpinned link between a game thread blocked in read() and the worker
+    // that serves it. On zstd packs that game stopped loading after about
+    // 175k pack jobs with the runtime idle; with this change it loads (614k
+    // pack jobs, 31.5 GB in 162 s, debug /metrics), the same as reading
+    // inline on the game thread.
+    unsafe {
+        let _ = scePthreadSetprio(scePthreadSelf(), AMPR_EMU_PACK_WORKER_PRIORITY);
+        if AMPR_EMU_PACK_WORKER_AFFINITY != 0 {
+            let _ = scePthreadSetaffinity(scePthreadSelf(), AMPR_EMU_PACK_WORKER_AFFINITY);
+        }
+    }
     // Under READ_M: this thread leaves the live set.
     let leave = || {
         READ_THREADS_UP.fetch_sub(1, Ordering::Release);
