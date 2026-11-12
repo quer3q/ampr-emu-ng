@@ -27,7 +27,13 @@ const NIL: u32 = u32::MAX;
 
 // ---- shared types -----------------------------------------------------------
 
-/// `FileEntryView`: one resident file index entry.
+/// Caller storage for an entry's NUL-terminated path: the file index is
+/// read through the page cache, so `FileEntryView::path` cannot point into
+/// it. Index paths are shorter than `PATH_BUF` (the reader refuses longer).
+pub type EntryPath = [u8; ampr_format::source::PATH_BUF];
+
+/// `FileEntryView`: one file index entry. `path` points to the caller's
+/// `EntryPath` (null when none was given) and lives as long as that buffer.
 #[repr(C)]
 pub struct FileEntryView {
     pub path: *const c_char,
@@ -794,19 +800,18 @@ unsafe fn open_indexed_or_real(
 }
 
 /// Returns a pinned cached fd for file `id`, opening it when `allow_open`
-/// and the cache has room. Errors are negative POSIX errno (-EAGAIN when
-/// the caller should retry after a pin is released).
+/// and the cache has room. `entry` fills the file's entry view and path
+/// (0, or a negative POSIX errno) and runs only to open: a cached fd needs
+/// no index lookup or path copy. Errors are negative POSIX errno (-EAGAIN
+/// when the caller should retry after a pin is released).
 pub unsafe fn ampr_index_acquire_cached_fd(
     _job_id: u64,
     id: u32,
-    entry: *const FileEntryView,
+    entry: impl FnOnce(&mut FileEntryView, &mut EntryPath) -> c_int,
     flags: c_int,
     mode: c_int,
     allow_open: bool,
 ) -> c_int {
-    if unsafe { (*entry).path.is_null() } {
-        return -ENOENT;
-    }
     let mut out = CloseList::new();
     let (hit, may_open) = locked(|st| {
         if let Some(i) = st.find(id).filter(|&i| st.s[i].fd >= 0) {
@@ -830,7 +835,19 @@ pub unsafe fn ampr_index_acquire_cached_fd(
         return -EAGAIN;
     }
 
+    let mut view = FileEntryView {
+        path: core::ptr::null(),
+        path_length: 0,
+        size: 0,
+        mtime: 0,
+    };
+    let mut path: EntryPath = [0; ampr_format::source::PATH_BUF];
+    let rc = entry(&mut view, &mut path);
+    if rc != 0 || view.path.is_null() {
+        return if rc != 0 { rc } else { -ENOENT };
+    }
     let mut physical = false;
+    let entry = &raw const view;
     let Some(opened) =
         (unsafe { open_indexed_or_real(id, entry, flags, mode as SceKernelMode, &mut physical) })
     else {

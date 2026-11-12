@@ -217,6 +217,12 @@ pub(crate) unsafe fn ampr_pack_try_open_indexed_impl(
             entry.size as u64,
         )
     };
+    if validate_rc == zstd::VALIDATE_IO {
+        // A packed file whose index could not be read: not a miss, and it
+        // has no disk copy to fall back to.
+        *handled = true;
+        return SCE_KERNEL_ERROR_EIO;
+    }
     if validate_rc != AMPR_PACK_CORE_OK {
         // The AMPRIDX3 id names a pack record of another file, e.g. a walk
         // built index whose ids follow walk order. APR opens (rt/fd_cache.rs,

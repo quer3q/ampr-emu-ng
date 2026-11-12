@@ -3,6 +3,7 @@
 //! never by the submit call (aio.rs `publish_virtual_jobs`).
 
 use super::*;
+use crate::rt::index::IndexIo;
 use core::ptr::copy_nonoverlapping;
 
 /// A copy of decoded bytes into the caller's buffer, timed in debug builds.
@@ -14,37 +15,77 @@ unsafe fn timed_copy(src: *const u8, dst: *mut u8, len: usize) {
     stats::add(stats::Stat::CopyBytes, len as u64);
 }
 
-/// Packed one-based `file_id`: the `file` argument of `ampr_pack_core_task_count`
-/// and `ampr_pack_core_make_task`, its logical size and cache flags (none in
-/// zstd). None when the mount is not ready, the id is out of range, or the
-/// file is loose.
+/// The `file` argument of `ampr_pack_core_task_count` and
+/// `ampr_pack_core_make_task`: an AMPRPAK4 record copied out of the
+/// manifest (it is not resident), or the zstd projection record address.
+/// `ptr` is valid while this value lives.
+pub(crate) enum TaskFile {
+    Lz4(AmprPackFileRecord),
+    Zstd(*const u8),
+}
+
+impl TaskFile {
+    pub(crate) fn ptr(&self) -> *const u8 {
+        match self {
+            TaskFile::Lz4(f) => f as *const AmprPackFileRecord as *const u8,
+            TaskFile::Zstd(p) => *p,
+        }
+    }
+}
+
+/// Packed one-based `file_id`: its task file, logical size and cache flags
+/// (none in zstd). None when the mount is not ready, the id is out of
+/// range, the file is loose, or the index could not be read.
 pub(crate) unsafe fn packed_read_file(
     state: *const PackState,
     file_id: u32,
-) -> Option<(*const u8, u64, u32)> {
+) -> Option<(TaskFile, u64, u32)> {
+    unsafe { try_packed_read_file(state, file_id) }
+        .ok()
+        .flatten()
+}
+
+/// `packed_read_file` that reports a read error of a paged index as
+/// `Err(IndexIo)`: the read fails with EIO, not ENOENT.
+pub(crate) unsafe fn try_packed_read_file(
+    state: *const PackState,
+    file_id: u32,
+) -> Result<Option<(TaskFile, u64, u32)>, IndexIo> {
+    let io = |e| match e {
+        ampr_format::Error::Io => Err(IndexIo),
+        _ => Ok(None),
+    };
     if zstd_mode() {
-        let zstd_id = zstd::zstd_file_for_ampr_id(file_id)?;
-        let size = zstd::zstd_index()?.file(zstd_id).ok()?.logical_size;
-        return Some((zstd::zstd_task_file(file_id), size, 0));
+        let (Some(zstd_id), Some(index)) =
+            (zstd::zstd_file_for_ampr_id(file_id), zstd::zstd_index())
+        else {
+            return Ok(None);
+        };
+        // A paged index answers from its fast table: no index page read
+        // (aio.rs calls this under PACK_M).
+        let size = match index.logical_size(zstd_id) {
+            Ok(size) => size,
+            Err(e) => return io(e),
+        };
+        let file = TaskFile::Zstd(zstd::zstd_task_file(file_id));
+        return Ok(Some((file, size, 0)));
     }
-    unsafe {
-        if (*state).header.is_null()
-            || (*state).files.is_null()
-            || file_id == 0
-            || file_id as u64 > { (*(*state).header).file_count }
-        {
-            return None;
-        }
-        let file = &*(*state).files.add(file_id as usize - 1);
-        if file.flags & AMPR_PACK_FILE_PACKED == 0 {
-            return None;
-        }
-        Some((
-            file as *const AmprPackFileRecord as *const u8,
-            file.logical_size,
-            file.flags,
-        ))
+    if (*state).header.is_null() || file_id == 0 {
+        return Ok(None);
     }
+    let Some(manifest) = (*state).core_view.manifest else {
+        return Ok(None);
+    };
+    let raw = match manifest.file_record_raw(file_id - 1) {
+        Ok(raw) => raw,
+        Err(e) => return io(e),
+    };
+    let file: AmprPackFileRecord = unsafe { core::ptr::read_unaligned(raw.as_ptr().cast()) };
+    if file.flags & AMPR_PACK_FILE_PACKED == 0 {
+        return Ok(None);
+    }
+    let (size, flags) = (file.logical_size, file.flags);
+    Ok(Some((TaskFile::Lz4(file), size, flags)))
 }
 
 pub(crate) unsafe fn cleanup_pipeline_continuation(
@@ -256,10 +297,12 @@ pub(crate) unsafe fn advance_virtual_read_aio(
         if (job.request.result.is_null() && !prefetch) || job.request.offset < 0 {
             return set_error(SCE_KERNEL_ERROR_EINVAL);
         }
-        let Some((file_ptr, logical_size, file_flags)) = packed_read_file(state, job.file_id)
-        else {
-            return set_error(SCE_KERNEL_ERROR_ENOENT);
+        let (task_file, logical_size, file_flags) = match try_packed_read_file(state, job.file_id) {
+            Ok(Some(file)) => file,
+            Ok(None) => return set_error(SCE_KERNEL_ERROR_ENOENT),
+            Err(IndexIo) => return set_error(SCE_KERNEL_ERROR_EIO),
         };
+        let file_ptr = task_file.ptr();
         let offset = job.request.offset as u64;
         if job.request.nbyte == 0 || offset >= logical_size {
             return PipelineStep::Complete;

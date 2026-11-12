@@ -2,7 +2,8 @@
 //! virtual descriptors.
 
 use super::*;
-use ampr_lz4::{manifest::Manifest, overlay};
+use crate::rt::index::IndexIo;
+use ampr_lz4::overlay;
 
 pub(crate) unsafe fn directory_physical_name_seen(
     slot: &VirtualDirectorySlot,
@@ -30,6 +31,10 @@ pub(crate) unsafe fn directory_record_physical_name(
     }
 }
 
+/// The child at `cursor` of the slot's range, merged with the following
+/// entries of the same folded name; `Ok(false)` when there is none (the
+/// caller skips the entry), `Err(IndexIo)` when an index read failed (the
+/// listing fails, the cursor stays).
 pub(crate) unsafe fn next_virtual_child(
     state: *const PackState,
     slot: &VirtualDirectorySlot,
@@ -38,7 +43,7 @@ pub(crate) unsafe fn next_virtual_child(
     name_length: *mut u8,
     type_: *mut u8,
     next_cursor: *mut u32,
-) -> bool {
+) -> Result<bool, IndexIo> {
     if zstd_mode() {
         return unsafe {
             next_virtual_child_zstd(state, slot, cursor, name, name_length, type_, next_cursor)
@@ -49,21 +54,26 @@ pub(crate) unsafe fn next_virtual_child(
             *next_cursor = cursor;
         }
         if name.is_null() || name_length.is_null() || type_.is_null() || cursor >= slot.range_end {
-            return false;
+            return Ok(false);
         }
         let slot_len = slot.path_length as usize;
         let file_index = *(*state).packed_file_order.add(cursor as usize);
-        let file_len = { (*(*state).files.add(file_index as usize)).path_length } as usize;
-        let path = file_record_path(state, file_index);
-        if path.is_null() || file_len <= slot_len {
-            return false;
+        let mut path_buf = [0u8; SCE_KERNEL_PATH_MAX];
+        let path = match file_record_path(state, file_index, &mut path_buf) {
+            Ok(path) => path,
+            Err(ampr_format::Error::Io) => return Err(IndexIo),
+            Err(_) => return Ok(false),
+        };
+        let (path, file_len) = (path.as_ptr() as *const c_char, path.len());
+        if file_len <= slot_len {
+            return Ok(false);
         }
         let mut relative = slot_len;
         if *path.add(relative) == b'/' as c_char {
             relative += 1;
         }
         if relative >= file_len {
-            return false;
+            return Ok(false);
         }
         let mut end = relative;
         while end < file_len && *path.add(end) != b'/' as c_char {
@@ -71,7 +81,7 @@ pub(crate) unsafe fn next_virtual_child(
         }
         let child_length = end - relative;
         if child_length == 0 || child_length > 255 {
-            return false;
+            return Ok(false);
         }
         core::ptr::copy_nonoverlapping(path.add(relative), name, child_length);
         *name.add(child_length) = 0;
@@ -81,9 +91,16 @@ pub(crate) unsafe fn next_virtual_child(
         let mut group_end = cursor + 1;
         while group_end < slot.range_end {
             let other_index = *(*state).packed_file_order.add(group_end as usize);
-            let other_len = { (*(*state).files.add(other_index as usize)).path_length } as usize;
-            let other_path = file_record_path(state, other_index);
-            if other_path.is_null() || other_len <= slot_len {
+            let mut other_buf = [0u8; SCE_KERNEL_PATH_MAX];
+            // A read error here would end the group early and list its
+            // name twice.
+            let other = match file_record_path(state, other_index, &mut other_buf) {
+                Ok(other) => other,
+                Err(ampr_format::Error::Io) => return Err(IndexIo),
+                Err(_) => break,
+            };
+            let (other_path, other_len) = (other.as_ptr() as *const c_char, other.len());
+            if other_len <= slot_len {
                 break;
             }
             let mut other_relative = slot_len;
@@ -110,13 +127,14 @@ pub(crate) unsafe fn next_virtual_child(
         if !next_cursor.is_null() {
             *next_cursor = group_end;
         }
-        true
+        Ok(true)
     }
 }
 
 /// zstd `next_virtual_child`: the overlay helper walks the zstd-backed
 /// directory order (`packed_order`) of the slot's range. `name` must hold
-/// 256 bytes.
+/// 256 bytes. A read error of the paged index is `Err(IndexIo)`, not no
+/// child.
 unsafe fn next_virtual_child_zstd(
     state: *const PackState,
     slot: &VirtualDirectorySlot,
@@ -125,21 +143,43 @@ unsafe fn next_virtual_child_zstd(
     name_length: *mut u8,
     type_: *mut u8,
     next_cursor: *mut u32,
-) -> bool {
-    let (order, count) = packed_order(state);
+) -> Result<bool, IndexIo> {
     unsafe {
-        ampr_rust_overlay_next_child(
+        if !next_cursor.is_null() {
+            *next_cursor = cursor;
+        }
+        if name.is_null() || name_length.is_null() || type_.is_null() {
+            return Ok(false);
+        }
+        let Some(index) = zstd::zstd_index() else {
+            return Ok(false);
+        };
+        let (order, count) = packed_order(state);
+        let order: &[u32] = if order.is_null() || count == 0 {
+            &[]
+        } else {
+            core::slice::from_raw_parts(order, count as usize)
+        };
+        let name = core::slice::from_raw_parts_mut(name.cast::<u8>(), 256);
+        let child = match zstd::zstd_next_child_read(
+            index,
             order,
-            count,
             slot.range_end,
-            slot.path_length,
+            usize::from(slot.path_length),
             cursor,
-            name as *mut u8,
-            256,
-            name_length,
-            type_,
-            next_cursor,
-        )
+            name,
+        ) {
+            Ok(Some(child)) => child,
+            Ok(None) => return Ok(false),
+            Err(ampr_format::Error::Io) => return Err(IndexIo),
+            Err(_) => return Ok(false),
+        };
+        *name_length = child.len;
+        *type_ = child.kind;
+        if !next_cursor.is_null() {
+            *next_cursor = child.next;
+        }
+        Ok(true)
     }
 }
 
@@ -278,14 +318,23 @@ pub(crate) unsafe fn ampr_pack_open_directory_impl(
             return fallback;
         }
         let state = pack_state();
-        if !find_virtual_directory_range(
+        match find_virtual_directory_range(
             state,
             normalized.as_ptr(),
             normalized_length,
             &mut range_begin,
             &mut range_end,
         ) {
-            return fallback;
+            Ok(true) => {}
+            Ok(false) => return fallback,
+            // The index could not be read, so the directory may hold
+            // packed entries: EIO, never the physical fd (a listing that
+            // omits them) or ENOENT.
+            Err(IndexIo) => {
+                *handled = true;
+                close_real_fd(real_fd);
+                return SCE_KERNEL_ERROR_EIO;
+            }
         }
         *handled = true;
         if flags & O_ACCMODE != O_RDONLY {
@@ -332,15 +381,15 @@ pub unsafe fn ampr_pack_open_virtual_directory(
 }
 
 /// AMPRPAK4 `ampr_pack_try_stat_path` body: a packed file, else a
-/// directory with a packed descendant; true when `stat` was filled.
+/// directory with a packed descendant; true when `stat` was filled,
+/// `Err` when an index read failed (rt/pack/state.rs `resolve_packed_file`).
 unsafe fn manifest_stat_path(
     state: *const PackState,
     path: *const c_char,
     stat: *mut SceKernelStat,
-) -> bool {
+) -> Result<bool, IndexIo> {
     unsafe {
-        if let Some((file_id, PackedFile::Lz4(file))) = resolve_packed_file(state, path) {
-            let f = *file;
+        if let Some((file_id, PackedFile::Lz4(f))) = resolve_packed_file(state, path)? {
             fill_synthetic_stat(
                 stat,
                 false,
@@ -348,16 +397,11 @@ unsafe fn manifest_stat_path(
                 f.mtime,
                 f.path_hash ^ file_id as u64,
             );
-            return true;
+            return Ok(true);
         }
         let mut normalized = [0 as c_char; SCE_KERNEL_PATH_MAX];
         let mut length = 0u16;
-        if normalize_overlay_path(path, normalized.as_mut_ptr(), normalized.len(), &mut length)
-            && !(*state).core_view.base.is_null()
-            && (*state).core_view.size <= isize::MAX as usize
-        {
-            let bytes =
-                core::slice::from_raw_parts((*state).core_view.base, (*state).core_view.size);
+        if normalize_overlay_path(path, normalized.as_mut_ptr(), normalized.len(), &mut length) {
             let order = if (*state).packed_file_order.is_null() || (*state).packed_file_count == 0 {
                 &[][..]
             } else {
@@ -366,10 +410,14 @@ unsafe fn manifest_stat_path(
                     (*state).packed_file_count as usize,
                 )
             };
-            if let Ok(manifest) = Manifest::view_trusted(bytes) {
+            if let Some(manifest) = (*state).core_view.manifest {
                 let directory =
                     core::slice::from_raw_parts(normalized.as_ptr().cast::<u8>(), length as usize);
-                if overlay::directory_exists(&manifest, order, directory) {
+                let exists = match overlay::directory_exists(&manifest, order, directory) {
+                    Err(ampr_format::Error::Io) => return Err(IndexIo),
+                    found => found == Ok(true),
+                };
+                if exists {
                     fill_synthetic_stat(
                         stat,
                         true,
@@ -377,24 +425,25 @@ unsafe fn manifest_stat_path(
                         0,
                         folded_hash(normalized.as_ptr(), length as usize),
                     );
-                    return true;
+                    return Ok(true);
                 }
             }
         }
-        false
+        Ok(false)
     }
 }
 
 /// zstd `ampr_pack_try_stat_path` body: a packed AMPRIDX3 id (stat as the
 /// resident `file_stat`: AMPRIDX3 size and mtime, `st_ino` = id), else a
-/// directory with a packed descendant in the zstd directory order.
+/// directory with a packed descendant in the zstd directory order; `Err`
+/// as `manifest_stat_path`.
 unsafe fn zstd_stat_path(
     state: *const PackState,
     path: *const c_char,
     stat: *mut SceKernelStat,
-) -> bool {
+) -> Result<bool, IndexIo> {
     unsafe {
-        if let Some((file_id, PackedFile::Zstd(entry))) = resolve_packed_file(state, path) {
+        if let Some((file_id, PackedFile::Zstd(entry))) = resolve_packed_file(state, path)? {
             fill_synthetic_stat(
                 stat,
                 false,
@@ -403,7 +452,7 @@ unsafe fn zstd_stat_path(
                 u64::from(file_id),
             );
             (*stat).st_ino = file_id;
-            return true;
+            return Ok(true);
         }
         let mut normalized = [0 as c_char; SCE_KERNEL_PATH_MAX];
         let mut length = 0u16;
@@ -411,12 +460,14 @@ unsafe fn zstd_stat_path(
             zstd::zstd_index(),
             normalize_overlay_path(path, normalized.as_mut_ptr(), normalized.len(), &mut length),
         ) else {
-            return false;
+            return Ok(false);
         };
         let directory =
             core::slice::from_raw_parts(normalized.as_ptr().cast::<u8>(), length as usize);
-        if zstd::zstd_directory_range(index, zstd::zstd_packed_order(), directory).is_none() {
-            return false;
+        match zstd::zstd_directory_range(index, zstd::zstd_packed_order(), directory) {
+            Ok(Some(_)) => {}
+            Err(ampr_format::Error::Io) => return Err(IndexIo),
+            _ => return Ok(false),
         }
         fill_synthetic_stat(
             stat,
@@ -425,10 +476,13 @@ unsafe fn zstd_stat_path(
             0,
             folded_hash(normalized.as_ptr(), length as usize),
         );
-        true
+        Ok(true)
     }
 }
 
+/// A packed file or packed directory of `path` into `stat` (`handled`
+/// set). Unhandled, the result is ENOENT, or EIO when an index read
+/// failed (the caller then tries the real call).
 #[inline(never)]
 pub unsafe fn ampr_pack_try_stat_path(
     path: *const c_char,
@@ -454,11 +508,18 @@ pub unsafe fn ampr_pack_try_stat_path(
         } else {
             manifest_stat_path(state, path, stat)
         };
-        if found {
-            *handled = true;
-            return 0;
+        match found {
+            Ok(true) => {
+                *handled = true;
+                0
+            }
+            Ok(false) => SCE_KERNEL_ERROR_ENOENT,
+            // The index could not be read, so the file may be loose or
+            // packed: unhandled EIO. The caller tries the real call and
+            // turns only its ENOENT into EIO (rt/index.rs `io_miss`), as
+            // open does for a lookup that failed to read.
+            Err(IndexIo) => SCE_KERNEL_ERROR_EIO,
         }
-        SCE_KERNEL_ERROR_ENOENT
     }
 }
 
@@ -654,10 +715,15 @@ unsafe fn fstat_virtual_fd(
         return SCE_KERNEL_ERROR_EBADF;
     };
     let mut entry = MaybeUninit::<FileEntryView>::zeroed();
-    if !file_id_is_packed(&_reader, file_id)
-        || unsafe { ampr_index_get_entry_view(file_id, entry.as_mut_ptr()) } != 0
-    {
+    if !file_id_is_packed(&_reader, file_id) {
         return SCE_KERNEL_ERROR_EBADF;
+    }
+    // The fd is open and its file packed: a paged index that could not be
+    // read is EIO, not a bad fd.
+    match unsafe { ampr_index_get_entry_view(file_id, entry.as_mut_ptr()) } {
+        0 => {}
+        rc if rc == -EIO => return SCE_KERNEL_ERROR_EIO,
+        _ => return SCE_KERNEL_ERROR_EBADF,
     }
     let entry = unsafe { entry.assume_init() };
     unsafe {
@@ -874,7 +940,7 @@ pub(crate) unsafe fn ampr_pack_try_directory_read_fd(
             let mut name_length = 0u8;
             let mut type_ = DT_UNKNOWN;
             let mut next_cursor = slot.virtual_cursor;
-            if !next_virtual_child(
+            match next_virtual_child(
                 state,
                 slot,
                 slot.virtual_cursor,
@@ -883,8 +949,21 @@ pub(crate) unsafe fn ampr_pack_try_directory_read_fd(
                 &mut type_,
                 &mut next_cursor,
             ) {
-                slot.virtual_cursor = (slot.virtual_cursor + 1).max(next_cursor);
-                continue;
+                Ok(true) => {}
+                Ok(false) => {
+                    slot.virtual_cursor = (slot.virtual_cursor + 1).max(next_cursor);
+                    continue;
+                }
+                // The index could not be read: fail the listing (or end
+                // this batch early) with the cursor kept, so a later call
+                // lists the entry instead of skipping it.
+                Err(IndexIo) => {
+                    return if output == 0 {
+                        SCE_KERNEL_ERROR_EIO
+                    } else {
+                        finish_synthetic(slot, basep, synthetic_base, output as c_int)
+                    };
+                }
             }
             let mut duplicate =
                 directory_physical_name_seen(slot, name.as_ptr().cast(), name_length as usize);

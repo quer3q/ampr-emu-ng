@@ -48,9 +48,10 @@ pub(crate) use super::fd_cache::{
     ampr_index_fd_pack_note_open, FileEntryView,
 };
 pub(crate) use super::index::{
-    ampr_index_get_entry_view, ampr_index_resolve_path_to_id, ampr_pack_core_make_task,
-    ampr_pack_core_mount, ampr_pack_core_task_count, ampr_pack_core_validate_logical_file,
-    ampr_pack_crc32, AmprPackBlockReadTask, AmprPackChunkView, AmprPackCoreView, Stat,
+    ampr_index_get_entry_view, ampr_index_get_entry_view_path, ampr_index_resolve_path_to_id,
+    ampr_pack_core_make_task, ampr_pack_core_mount, ampr_pack_core_task_count,
+    ampr_pack_core_validate_logical_file, ampr_pack_crc32, AmprPackBlockReadTask,
+    AmprPackChunkView, AmprPackCoreView, Lz4Manifest, Stat,
 };
 pub(crate) use crate::cache_ffi::{
     ampr_rust_cache_chunk_key_hash, ampr_rust_cache_find_page_run, ampr_rust_cache_mark_pages,
@@ -61,7 +62,7 @@ pub(crate) use crate::handle_ffi::{
 };
 pub(crate) use crate::overlay_ffi::{
     ampr_rust_overlay_build_order, ampr_rust_overlay_directory_range,
-    ampr_rust_overlay_folded_hash, ampr_rust_overlay_next_child, ampr_rust_overlay_normalize_path,
+    ampr_rust_overlay_folded_hash, ampr_rust_overlay_normalize_path,
     ampr_rust_overlay_packed_count, ampr_rust_overlay_packed_file_matches,
     ampr_rust_overlay_service_name_hidden,
 };
@@ -184,14 +185,8 @@ pub(crate) fn file_id_is_packed(_reader: &ManifestReader, file_id: u32) -> bool 
     if file_id == 0 || state.is_null() || LOAD_STATE.load(Ordering::Acquire) != PACK_LOAD_READY {
         return false;
     }
-    unsafe {
-        let header = (*state).header;
-        if header.is_null() || (*state).files.is_null() || u64::from(file_id) > (*header).file_count
-        {
-            return false;
-        }
-        (*(*state).files.add(file_id as usize - 1)).flags & AMPR_PACK_FILE_PACKED != 0
-    }
+    unsafe { state::lz4_file(state, file_id - 1) }
+        .is_some_and(|f| f.flags & AMPR_PACK_FILE_PACKED != 0)
 }
 
 // ---- manifest reader guard ----
@@ -458,8 +453,9 @@ pub(crate) const AMPR_PACK_CHUNK_LZ4: u8 = 1;
 pub(crate) const AMPR_PACK_CHUNK_SHARED: u8 = 1 << 0;
 pub(crate) const AMPR_PACK_CHUNK_STREAMING: u8 = 1 << 1;
 
-// Packed records are read in place from the mounted manifest; read fields by
-// value (`{ rec.field }`), never take references to them.
+// Packed records are copied out of the mounted manifest (state.rs
+// `lz4_file`, `lz4_pack`); read fields by value (`{ rec.field }`), never
+// take references to them.
 #[repr(C, packed)]
 #[derive(Clone, Copy)]
 pub(crate) struct AmprPackIndexHeader {
@@ -564,14 +560,9 @@ pub(crate) const AMPR_PACK_CORE_OK: c_int = 0;
 
 impl AmprPackCoreView {
     pub(crate) const EMPTY: Self = Self {
-        base: null(),
-        size: 0,
-        header: null(),
-        files: null(),
-        chunks: null(),
-        packs: null(),
-        strings: null(),
-        strings_size: 0,
+        manifest: None,
+        // All-zero is a valid header value (plain integers and arrays).
+        header: unsafe { core::mem::zeroed() },
     };
 }
 
@@ -711,6 +702,13 @@ pub(crate) const AMPR_EMU_PACK_CACHE_ENTRY_CAP: usize = 8192;
 pub(crate) const AMPR_EMU_PACK_CACHE_PAGE_SHIFT: u32 = 14;
 pub(crate) const AMPR_EMU_PACK_CACHE_HASH_BUCKETS: usize = 16384;
 pub(crate) const AMPR_EMU_PACK_TOUCH_TABLE_SIZE: usize = 16384;
+/// Largest pack index file the loader registers (pack/manifest.rs
+/// `load_manifest`, fstat size). The file is paged, not loaded whole, but
+/// registering it still costs a page table of 2 B per 16 KiB page from the
+/// Index ledger (64 KiB at this size) and validation reads the whole payload
+/// for its CRC through the page cache before the file and chunk counts are
+/// checked; this bounds both for a corrupt or foreign file. The largest
+/// index measured is 25.2 MiB.
 pub(crate) const AMPR_EMU_PACK_INDEX_MAX_BYTES: u64 = 512 * 1024 * 1024;
 pub(crate) const AMPR_EMU_PACK_MAX_FILES: u64 = 2_000_000;
 pub(crate) const AMPR_EMU_PACK_MAX_CHUNKS: u64 = 16_000_000;
@@ -1251,8 +1249,9 @@ pub(crate) struct WorkerContext {
     pub thread: ScePthread,
     pub decoded_scratch: *mut u8,
     pub decoded_scratch_size: usize,
-    /// zstd: this worker's zstd decoder, made with the worker and kept until
-    /// pack shutdown, so there is one per worker and no other decoder.
+    /// zstd: this worker's zstd decoder, at the start of its 112 KiB
+    /// workspace from the Buffer ledger; made when the thread starts and
+    /// freed when it leaves (worker.rs `release_worker_decoder`).
     pub decoder: *mut ampr_codec::ZstdDecoder,
     pub started: bool,
 }
@@ -1429,15 +1428,10 @@ pub(crate) struct PackState {
     pub active_submissions: u32, // PACK_M, including singular groups.
     pub submissions_closed: bool,
 
-    pub manifest_base: *mut c_void,
-    pub manifest_bytes: usize,
+    /// The mounted AMPRPAK4 manifest (read through the index page cache)
+    /// and a copy of its header; `header` points at that copy when mounted.
     pub core_view: AmprPackCoreView,
     pub header: *const AmprPackIndexHeader,
-    pub files: *const AmprPackFileRecord,
-    pub chunks: *const AmprPackChunkRecord,
-    pub packs: *const AmprPackDataRecord,
-    pub strings: *const c_char,
-    pub strings_bytes: usize,
     pub packed_file_order: *mut u32,
     pub packed_file_count: u32,
 

@@ -1,7 +1,8 @@
 //! Read planning over a mounted manifest: chunk views, page flags and read tasks.
 use crate::manifest::{Chunk, FileRecord, Manifest};
-use crate::{folded, pak_path_hash, FILE_PACKED};
+use crate::{folded, pak_path_hash, Error, FILE_PACKED};
 pub use crate::{CoreError, CoreResult};
+use ampr_format::source::{Source, PATH_BUF};
 
 /// `AmprPackChunkView`: a chunk plus raw size derived from block geometry.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -41,7 +42,7 @@ pub fn task_count(f: &FileRecord, offset: u64, length: u64) -> usize {
     usize::try_from(last - first + 1).unwrap_or(0)
 }
 
-impl Manifest<'_> {
+impl<S: Source + ?Sized> Manifest<'_, S> {
     /// `ampr_pack_core_make_task`: task `index` of a read of `length` bytes at
     /// `offset` of `f`; see `task_count`.
     pub fn read_task(
@@ -91,17 +92,27 @@ impl Manifest<'_> {
         path: &[u8],
         logical_size: u64,
     ) -> CoreResult<()> {
-        let f = file_id
+        let id = file_id
             .checked_sub(1)
             .filter(|&id| id < self.file_count())
-            .and_then(|id| self.file_record(id).ok())
             .ok_or(CoreError::InvalidArgument)?;
+        // A read error is not a mismatch: the caller reports EIO.
+        let f = self.file_record(id).map_err(|e| match e {
+            Error::Io => CoreError::Io,
+            _ => CoreError::InvalidArgument,
+        })?;
+        // Size and hash first: the stored path is read only on a match.
+        if f.logical_size != logical_size || f.path_hash != pak_path_hash(path) {
+            return Err(CoreError::ChecksumMismatch);
+        }
+        let mut buf = [0u8; PATH_BUF];
         let stored = self
-            .string(f.path_offset, f.path_length)
-            .map_err(|_| CoreError::ChecksumMismatch)?;
-        if f.logical_size != logical_size
-            || f.path_hash != pak_path_hash(path)
-            || stored.len() != path.len()
+            .string(f.path_offset, f.path_length, &mut buf)
+            .map_err(|e| match e {
+                Error::Io => CoreError::Io,
+                _ => CoreError::ChecksumMismatch,
+            })?;
+        if stored.len() != path.len()
             || !stored
                 .iter()
                 .zip(path)

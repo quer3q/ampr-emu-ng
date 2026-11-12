@@ -16,7 +16,9 @@
 
 #![allow(non_snake_case)]
 
-use super::fd_cache::FileEntryView;
+use super::fd_cache::{EntryPath, FileEntryView};
+use super::index_memory::{self as im, lookup_alloc, lookup_free};
+use super::index_pages::{self, IndexSource};
 use super::runtime_memory::{
     ampr_internal_amm_pool_alloc, ampr_internal_amm_pool_ensure, ampr_internal_amm_pool_free,
     ampr_internal_amm_pool_ready_has_capacity, ampr_sdk_cpu_memory_class_name,
@@ -25,7 +27,8 @@ use super::runtime_memory::{
 use super::stats;
 use super::sync::{Condvar, Mutex, SyncCell};
 use super::sys::*;
-use ampr_format::index::Index;
+use ampr_format::index::{FastEntry, Index, Layout};
+use ampr_format::source::PATH_BUF;
 use core::ffi::{c_char, c_int, c_void, CStr};
 use core::ptr::{null, null_mut};
 use core::sync::atomic::{AtomicU32, AtomicU8, Ordering::*};
@@ -122,17 +125,24 @@ fn next_unreadable_loads(count: u32, result: LoadResult) -> u32 {
 
 // ---- global state ----------------------------------------------------------
 
-/// The resident image (C++ FileIndexState compact* fields): records, path
-/// blob and hash slots inside one SDK CPU allocation at `map_base`.
+/// The file index (C++ FileIndexState compact* fields): the AMPRIDX3 image
+/// read at the offsets of its checked header, whole in index memory when it
+/// fits with its tables (as in v0.3.5), else through the index page cache
+/// (rt/index_pages.rs) with a resident fast table, so a large index keeps
+/// only part of itself in memory. A paged file stays open at `fd`; an image
+/// that could not be installed is served from its build buffer at `mem`.
 pub(crate) struct Compact {
-    pub entries: *mut CompactEntry,
+    pub src: Option<IndexSource>,
+    pub layout: Layout,
     pub count: usize,
-    pub path_blob: *const u8,
-    pub hash_slots: *mut HashSlot,
-    pub hash_mask: usize,
-    pub map_base: *mut c_void,
-    pub map_size: usize,
-    pub path_blob_size: usize,
+    /// The paged index file, -1 for none or an image in memory.
+    pub fd: c_int,
+    /// The image in memory (a file read whole, or the build buffer; Index
+    /// ledger), null for a paged file.
+    pub mem: *mut u8,
+    /// The fast table of a paged file (`count` entries, `lookup_alloc`),
+    /// null for an image in memory.
+    pub fast: *mut FastEntry,
     pub sorted: bool,
     pub available: bool,
     /// The build walk saw a symlink and did not index it, so misses are not
@@ -141,16 +151,25 @@ pub(crate) struct Compact {
     pub links: bool,
 }
 
+const LAYOUT0: Layout = Layout {
+    count: 0,
+    records_len: 0,
+    paths_at: 0,
+    path_bytes: 0,
+    slots_at: 0,
+    slot_count: 0,
+    slots_len: 0,
+    file_len: 0,
+};
+
 impl Compact {
     pub const EMPTY: Self = Self {
-        entries: null_mut(),
+        src: None,
+        layout: LAYOUT0,
         count: 0,
-        path_blob: null(),
-        hash_slots: null_mut(),
-        hash_mask: 0,
-        map_base: null_mut(),
-        map_size: 0,
-        path_blob_size: 0,
+        fd: -1,
+        mem: null_mut(),
+        fast: null_mut(),
         sorted: false,
         available: false,
         links: false,
@@ -510,55 +529,72 @@ impl Drop for PathStack {
 // ---- resident image helpers ----------------------------------------------------
 
 impl Compact {
-    /// `clear_compact_file_index_locked`: frees the image (`read_compact`).
+    /// `clear_compact_file_index_locked`: gives back the page cache source,
+    /// the file and the in-memory image. Never on a published index.
     pub unsafe fn clear(&mut self) {
-        if !self.map_base.is_null() {
-            unsafe {
-                super::index_memory::index_free(self.map_base, c"apr.index.full.release".as_ptr())
-            };
+        if let Some(IndexSource::Paged(src)) = self.src {
+            index_pages::unregister(src);
         }
+        unsafe { self.free_fast() };
+        // Host tests link no libkernel and register no file.
+        #[cfg(not(test))]
+        if self.fd >= 0 {
+            unsafe { real_physical_close(self.fd) };
+        }
+        unsafe { title_free(self.mem, c"apr.index.build.image") };
         *self = Self::EMPTY;
     }
-    /// `move_compact_file_index_locked(dst=self, src)`: frees `self`'s image,
-    /// takes `src`'s and leaves `src` empty.
+    /// `move_compact_file_index_locked(dst=self, src)`: clears `self`,
+    /// takes `src`'s image and leaves `src` empty.
     pub unsafe fn move_from(&mut self, src: &mut Compact) {
         unsafe { self.clear() };
         *self = core::mem::replace(src, Self::EMPTY);
     }
-    /// `compact_index_sections`: (records, paths, slots), None while a section is unset.
-    pub unsafe fn sections(&self) -> Option<(&[u8], &[u8], &[u8])> {
-        if self.entries.is_null() || self.path_blob.is_null() || self.hash_slots.is_null() {
-            return None;
+    /// O(1) lookup view over the validated image, with the fast table of
+    /// a paged file.
+    pub fn view(&self) -> Option<Index<'_, IndexSource>> {
+        let view = Index::view_validated(self.src.as_ref()?, &self.layout).ok()?;
+        if self.fast.is_null() {
+            return Some(view);
         }
-        unsafe {
-            Some((
-                core::slice::from_raw_parts(
-                    self.entries.cast(),
-                    self.count * size_of::<CompactEntry>(),
-                ),
-                core::slice::from_raw_parts(self.path_blob, self.path_blob_size),
-                core::slice::from_raw_parts(
-                    self.hash_slots.cast(),
-                    (self.hash_mask + 1) * size_of::<HashSlot>(),
-                ),
-            ))
+        let fast = unsafe { core::slice::from_raw_parts(self.fast, self.count) };
+        view.with_fast(fast).ok()
+    }
+    fn fast_bytes(&self) -> usize {
+        (self.count * size_of::<FastEntry>()).max(1)
+    }
+    unsafe fn free_fast(&mut self) {
+        if !self.fast.is_null() {
+            stats::sub(stats::Stat::IndexFastBytes, self.fast_bytes() as u64);
+            let tag = c"apr.index.fast.release".as_ptr();
+            unsafe { lookup_free(self.fast.cast(), self.fast_bytes(), tag) };
+            self.fast = null_mut();
         }
     }
-    /// O(1) lookup view over the validated image.
-    pub unsafe fn view(&self) -> Option<Index<'_>> {
-        let (r, p, s) = unsafe { self.sections() }?;
-        Index::view_validated_sections(r, p, s).ok()
-    }
-    /// `compact_index_entry_view`: one-based record `id` of the image.
-    pub unsafe fn entry_view(&self, id: u32, out: &mut FileEntryView) -> bool {
-        let Some(r) = unsafe { self.view() }.and_then(|v| v.record_trusted(id).ok()) else {
-            return false;
-        };
-        out.path = r.path.as_ptr().cast();
-        out.path_length = r.path.len() as u32;
+    /// `compact_index_entry_view`: one-based record `id` of the image. The
+    /// path is copied into `path` (NUL-terminated) and `out.path` points
+    /// there; without `path`, `out.path` is null (size and mtime only).
+    /// `Io` when a paged read failed, which callers must not report as a
+    /// missing file.
+    pub fn try_entry_view(
+        &self,
+        id: u32,
+        out: &mut FileEntryView,
+        path: Option<&mut EntryPath>,
+    ) -> ampr_format::Result<()> {
+        let v = self.view().ok_or(ampr_format::Error::Invalid)?;
+        let r = v.record(id)?;
+        out.path = null();
+        if let Some(buf) = path {
+            let n = r.path_len as usize;
+            v.path(&r, &mut buf[..n])?;
+            buf[n] = 0;
+            out.path = buf.as_ptr().cast();
+        }
+        out.path_length = r.path_len;
         out.size = r.size as usize;
         out.mtime = r.mtime;
-        true
+        Ok(())
     }
 }
 
@@ -964,10 +1000,13 @@ impl RuntimeBuilder {
             && install
             && unsafe { write_temp_index(file) }
             && unsafe { install_temp_index() };
+        // An installed image is read back from the file by `save_final`'s
+        // caller; one that could not be installed is served from memory.
         if built && !ok {
-            unsafe { adopt_compact_index(idx, file) };
+            unsafe { adopt_compact_index(idx, image, l.file_bytes) };
+        } else {
+            unsafe { title_free(image, c"apr.index.build.image") };
         }
-        unsafe { title_free(image, c"apr.index.build.image") };
         ok
     }
 }
@@ -1044,8 +1083,9 @@ pub(crate) fn fill_image(image: &mut [u8], l: &ImageLayout, records: &[u8], path
     ampr_format::index::fill_slots(records, paths, slots).is_ok()
 }
 
-/// Index memory `read_compact` maps for an image: records, paths and hash
-/// slots, page-rounded.
+/// What a fully resident image costs: records, paths and hash slots past
+/// the header, page-rounded (the ledger tests size the index with it).
+#[cfg(test)]
 pub(crate) fn resident_bytes(l: &ampr_format::index::Layout) -> usize {
     let slots_rel = (l.slots_at - ampr_format::IDX_HEADER as u64) as usize;
     round_up_page(slots_rel + l.slots_len as usize)
@@ -1330,49 +1370,13 @@ unsafe fn add_dirent(
 
 // ---- load / validate -------------------------------------------------------------
 
-/// `pread_exact_logged`: reads `size` bytes at `offset` in 1 MiB chunks.
-unsafe fn pread_exact(fd: c_int, dst: *mut u8, size: usize, offset: off_t) -> bool {
-    unsafe {
-        pread_exact_with(dst, size, offset, |p, want, at| {
-            let n = real_physical_pread(fd, p.cast(), want, at);
-            (n, if n < 0 { errno() } else { 0 })
-        })
-    }
-}
-
 /// Bound on back-to-back EINTR retries of one index write call.
 const EINTR_RETRY_MAX: u32 = 64;
 
-/// `pread_exact` over `read(dst, want, offset) -> (n, errno)`, a thin adapter
-/// over the pack loader's `pread_loop`: short reads continue at the new
-/// offset and EINTR retries, so a USB-backed /app0 that returns partial
-/// reads or a signal-interrupted call still loads the index; 0 (EOF before
-/// `size`) and any other error fail. EINTR uses the shared bound
-/// (`PREAD_EINTR_RETRIES`, 16 in a row), not this file's `EINTR_RETRY_MAX`.
-unsafe fn pread_exact_with(
-    dst: *mut u8,
-    size: usize,
-    offset: off_t,
-    mut read: impl FnMut(*mut u8, usize, off_t) -> (isize, c_int),
-) -> bool {
-    let last_errno = core::cell::Cell::new(0);
-    offset >= 0
-        && super::pack::pread_loop(
-            size,
-            offset as u64,
-            1024 * 1024,
-            |done, want, at| {
-                let (n, err) = read(unsafe { dst.add(done) }, want, at);
-                last_errno.set(err);
-                n as ssize_t
-            },
-            || last_errno.get(),
-        )
-}
-
-/// `load_compact_app0_index_locked`: reads INDEX_PATH into one persistent SDK
-/// CPU allocation (records, paths, slots; the header is not kept), validates
-/// it fully and marks `idx` available.
+/// `load_compact_app0_index_locked`: reads INDEX_PATH whole into index
+/// memory when it fits with its tables, else registers it with the index
+/// page cache (the fd stays open, misses read it again); validates it fully
+/// and marks `idx` available.
 pub(crate) unsafe fn load_compact_index(idx: &mut FileIndexState) -> LoadResult {
     unsafe { idx.compact.clear() };
     let fd = unsafe { real_posix_open(INDEX_PATH.as_ptr(), O_RDONLY, 0) };
@@ -1380,19 +1384,70 @@ pub(crate) unsafe fn load_compact_index(idx: &mut FileIndexState) -> LoadResult 
         return open_failure_result(errno());
     }
     let mut st = Stat::default();
-    let read = if unsafe { real_physical_fstat(fd, (&raw mut st).cast()) } != 0 {
+    let len = if unsafe { real_physical_fstat(fd, (&raw mut st).cast()) } != 0 {
         Err(LoadResult::Unreadable)
-    } else if st.st_size < 0 {
+    } else if st.st_size < ampr_format::IDX_HEADER as i64 {
         Err(LoadResult::Invalid)
     } else {
-        unsafe {
-            read_compact(&mut idx.compact, st.st_size as u64, |dst, size, at| {
-                pread_exact(fd, dst, size, at as off_t)
-            })
-        }
+        Ok(st.st_size as u64)
     };
-    unsafe { real_physical_close(fd) };
-    unsafe { finish_compact(idx, read) }
+    // The header is checked before any memory is committed: a corrupt file
+    // must not take the page arena (rt/index_pages.rs).
+    let src = len
+        .and_then(|len| Ok((len, unsafe { read_count(fd) }?)))
+        .and_then(|(len, count)| match unsafe { read_whole(fd, len, count) } {
+            Some(bytes) => Ok(IndexSource::Resident(bytes)),
+            None => index_pages::register_file(fd, len)
+                .map(IndexSource::Paged)
+                .ok_or(LoadResult::Memory),
+        });
+    match src {
+        Ok(src) => {
+            if let IndexSource::Resident(bytes) = src {
+                unsafe { real_physical_close(fd) };
+                idx.compact.mem = bytes.as_ptr().cast_mut();
+            } else {
+                idx.compact.fd = fd;
+            }
+            idx.compact.src = Some(src);
+            unsafe { finish_compact(idx) }
+        }
+        Err(e) => {
+            unsafe { real_physical_close(fd) };
+            e
+        }
+    }
+}
+
+/// Lookup bytes a paged index adds per record: its fast table entry and
+/// about 20 B of pack tables built from it (16 B of projection per id and
+/// 4 B of order, rt/pack/zstd.rs `lookup_bytes`).
+const LOOKUP_PER_FILE: usize = size_of::<FastEntry>() + 20;
+
+/// The record count of the index file `fd` from its checked header:
+/// Unreadable on a read error, Invalid when it is not an AMPRIDX3 header.
+unsafe fn read_count(fd: c_int) -> Result<usize, LoadResult> {
+    let mut head = [0u8; ampr_format::IDX_HEADER];
+    if !index_pages::read_head(fd, &mut head) {
+        return Err(LoadResult::Unreadable);
+    }
+    Layout::parse(&head)
+        .map(|l| l.count as usize)
+        .map_err(load_error)
+}
+
+/// The index file `fd` of `len` bytes and `count` records read whole, when
+/// it and the tables a paged one would need fit the Index room left; None
+/// otherwise (then it is paged) or on a read error.
+unsafe fn read_whole(fd: c_int, len: u64, count: usize) -> Option<&'static [u8]> {
+    let fits = usize::try_from(len)
+        .ok()
+        .and_then(|n| n.checked_add(count.checked_mul(LOOKUP_PER_FILE)?))
+        .is_some_and(|n| n <= im::index_room());
+    if !fits {
+        return None;
+    }
+    unsafe { index_pages::read_resident(fd, len, c"apr.index.file") }
 }
 
 /// Only ENOENT means there is no index to load; any other open error
@@ -1405,98 +1460,106 @@ fn open_failure_result(err: c_int) -> LoadResult {
     }
 }
 
-/// Adopts a built `image` (header first) into `idx` in memory, validated
-/// like `load_compact_index`, for when it cannot be installed as INDEX_PATH.
-unsafe fn adopt_compact_index(idx: &mut FileIndexState, image: &[u8]) -> LoadResult {
+/// Adopts a built image (header first, `len` bytes at `image`, a
+/// `build_alloc` block that `idx` now owns) for when it cannot be installed
+/// as INDEX_PATH. It is read from memory like a file read whole (no page
+/// cache, no fast table), validated like `load_compact_index` and freed by
+/// `clear`.
+unsafe fn adopt_compact_index(idx: &mut FileIndexState, image: *mut u8, len: usize) -> LoadResult {
     unsafe { idx.compact.clear() };
-    let read = unsafe {
-        read_compact(
-            &mut idx.compact,
-            image.len() as u64,
-            |dst, size, at| match image.get(at as usize..).and_then(|s| s.get(..size)) {
-                Some(src) => {
-                    core::ptr::copy_nonoverlapping(src.as_ptr(), dst, size);
-                    true
-                }
-                None => false,
-            },
-        )
-    };
-    unsafe { finish_compact(idx, read) }
+    idx.compact.mem = image;
+    let bytes = unsafe { core::slice::from_raw_parts(image.cast_const(), len) };
+    idx.compact.src = Some(IndexSource::Resident(bytes));
+    unsafe { finish_compact(idx) }
 }
 
-/// Validates the sections `read_compact` filled against their header and
-/// marks `idx` available; clears the image on any error.
-unsafe fn finish_compact(
-    idx: &mut FileIndexState,
-    read: Result<[u8; ampr_format::IDX_HEADER], LoadResult>,
-) -> LoadResult {
-    let header = match read {
-        Ok(h) => h,
+/// Checks the image (`check_compact`) and marks `idx` available; clears
+/// it on any error. A read error is Unreadable; a fast table that does not
+/// fit, or a paged file that is not sorted, refuses the index (Memory)
+/// with the one index notice.
+unsafe fn finish_compact(idx: &mut FileIndexState) -> LoadResult {
+    let c = &mut idx.compact;
+    match unsafe { check_compact(c) } {
+        Ok(()) => {
+            c.available = true;
+            idx.available = true;
+            // With no pack index to mount after it, this file's fast table
+            // is the last lookup table: the page arena takes the room left
+            // (the pack mounts grow it in a title with packs).
+            if !super::pack::packs_present() {
+                index_pages::grow_arena(0);
+            }
+            LoadResult::Loaded
+        }
         Err(e) => {
             unsafe { idx.compact.clear() };
-            return e;
+            e
         }
-    };
-    let sorted = unsafe { idx.compact.sections() }
-        .and_then(|(r, p, s)| Index::open_parts(&header, r, p, s).ok())
-        .map(|i| i.records_sorted());
-    let Some(sorted) = sorted else {
-        unsafe { idx.compact.clear() };
-        return LoadResult::Invalid;
-    };
-    idx.compact.sorted = sorted;
-    idx.compact.available = true;
-    idx.available = true;
-    LoadResult::Loaded
+    }
 }
 
-/// Header check, allocation and section reads for `load_compact_index` and
-/// `adopt_compact_index`. `read(dst, size, offset)` fills `dst` from a
-/// source of `file_len` bytes. On error the caller clears `c`.
-unsafe fn read_compact(
-    c: &mut Compact,
-    file_len: u64,
-    mut read: impl FnMut(*mut u8, usize, u64) -> bool,
-) -> Result<[u8; ampr_format::IDX_HEADER], LoadResult> {
-    const HDR: usize = ampr_format::IDX_HEADER;
-    let mut header = [0u8; HDR];
-    if file_len < HDR as u64 {
-        return Err(LoadResult::Invalid);
+fn load_error(e: ampr_format::Error) -> LoadResult {
+    match e {
+        ampr_format::Error::Io => LoadResult::Unreadable,
+        _ => LoadResult::Invalid,
     }
-    if !read(header.as_mut_ptr(), HDR, 0) {
-        return Err(LoadResult::Unreadable);
+}
+
+/// Sets `c`'s layout, count and sort flag from its source. A paged file
+/// gets its fast table first and is checked against it in one sequential
+/// pass over records and paths (`Index::check`), with no slot probe
+/// through the page cache. A paged file must be sorted: an unsorted one
+/// would answer `find_directory` with a scan of every record through the
+/// cache, so it is served only read whole (the runtime builder writes
+/// sorted images).
+unsafe fn check_compact(c: &mut Compact) -> Result<(), LoadResult> {
+    let src = c.src.as_ref().ok_or(LoadResult::Invalid)?;
+    let layout = ampr_format::index::read_layout(src).map_err(load_error)?;
+    (c.layout, c.count) = (layout, layout.count as usize);
+    let paged = !src.is_resident();
+    if paged {
+        unsafe { attach_fast(c) }?;
     }
-    let l = ampr_format::index::Layout::parse(&header)
-        .ok()
-        .filter(|l| l.file_len <= file_len)
-        .ok_or(LoadResult::Invalid)?;
-    let slots_rel = (l.slots_at - HDR as u64) as usize;
-    let mapped_bytes = resident_bytes(&l);
-    // Index memory like the pack index (rt/index_memory.rs), never the
-    // pool: a fully packed LZ4 title's index is 25.2 MiB.
-    let mapped: *mut u8 = unsafe {
-        super::index_memory::index_alloc(mapped_bytes, MAX_ALIGN, c"apr.index.full".as_ptr())
-    };
-    if mapped.is_null() {
+    let src = c.src.as_ref().ok_or(LoadResult::Invalid)?;
+    let mut view = Index::view_validated(src, &c.layout).map_err(load_error)?;
+    if !c.fast.is_null() {
+        let fast = unsafe { core::slice::from_raw_parts(c.fast, c.count) };
+        view = view.with_fast(fast).map_err(load_error)?;
+    }
+    c.sorted = view.check().map_err(load_error)?;
+    if paged && !c.sorted {
+        let len = ampr_format::source::Source::len(src);
+        let needed = usize::try_from(len).unwrap_or(usize::MAX);
+        unsafe { index_pages::refuse(needed) };
         return Err(LoadResult::Memory);
     }
-    c.map_base = mapped.cast();
-    c.map_size = mapped_bytes;
-    c.entries = mapped.cast();
-    c.path_blob = unsafe { mapped.add(l.records_len as usize) };
-    c.hash_slots = unsafe { mapped.add(slots_rel) }.cast();
-    c.hash_mask = (l.slot_count as usize).wrapping_sub(1);
-    c.count = l.count as usize;
-    c.path_blob_size = l.path_bytes as usize;
-    let ok = read(c.entries.cast(), l.records_len as usize, HDR as u64)
-        && read(c.path_blob.cast_mut(), l.path_bytes as usize, l.paths_at)
-        && read(c.hash_slots.cast(), l.slots_len as usize, l.slots_at);
-    if ok {
-        Ok(header)
-    } else {
-        Err(LoadResult::Unreadable)
+    Ok(())
+}
+
+/// The fast table of a paged index (`count` and `layout` set), one
+/// lookup allocation filled by one pass over its hash slots. Without it
+/// the index is refused: a paged lookup would probe slots through the
+/// page cache. Memory, with the index notice, when it and the pack tables
+/// built from it do not fit the lookup cap or the Index room.
+unsafe fn attach_fast(c: &mut Compact) -> Result<(), LoadResult> {
+    let needed = c.count.saturating_mul(LOOKUP_PER_FILE);
+    if im::lookup_used().saturating_add(needed) > im::INDEX_LOOKUP_MAX || needed > im::index_room()
+    {
+        unsafe { index_pages::refuse(needed) };
+        return Err(LoadResult::Memory);
     }
+    let src = c.src.as_ref().ok_or(LoadResult::Invalid)?;
+    let view = Index::view_validated(src, &c.layout).map_err(load_error)?;
+    let p = unsafe { lookup_alloc(c.fast_bytes(), 4, c"apr.index.fast".as_ptr()) };
+    if p.is_null() {
+        return Err(LoadResult::Memory);
+    }
+    let out = unsafe { core::slice::from_raw_parts_mut(p.cast::<FastEntry>(), c.count) };
+    let filled = view.fill_fast(out);
+    c.fast = p.cast();
+    stats::add(stats::Stat::IndexFastBytes, c.fast_bytes() as u64);
+    // On an error `clear` frees the table with the rest.
+    filled.map_err(load_error)
 }
 
 // ---- pack manifest probe -----------------------------------------------------------
@@ -1634,44 +1697,73 @@ const fn empty_view() -> FileEntryView {
     }
 }
 
-/// `lookup_app0_index_key_view`: (view, one-based id) of a file key.
-unsafe fn lookup_key_view(key: &[u8], allow_build: bool) -> Option<(FileEntryView, u32)> {
+/// A lookup that could not read the index file (a page cache read error).
+/// It is not a miss: the file may exist, so no caller answers ENOENT or
+/// "not packed" for it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct IndexIo;
+
+/// `Io` as `IndexIo`; any other error reads as no answer, as before.
+fn io_or_none<T>(r: ampr_format::Result<Option<T>>) -> Result<Option<T>, IndexIo> {
+    match r {
+        Err(ampr_format::Error::Io) => Err(IndexIo),
+        r => Ok(r.ok().flatten()),
+    }
+}
+
+/// `lookup_app0_index_key_view`: (view, one-based id) of a file key; the
+/// view's path is copied into `path` when given (see `entry_view`).
+unsafe fn lookup_key_view(
+    key: &[u8],
+    allow_build: bool,
+    path: Option<&mut EntryPath>,
+) -> Result<Option<(FileEntryView, u32)>, IndexIo> {
     if !unsafe { ensure_ready(allow_build) } {
-        return None;
+        return Ok(None);
     }
     // A true ensure_ready means the image was published as available.
-    let c = published()?;
-    if !c.available || c.hash_mask == 0 {
-        return None;
-    }
-    let id = unsafe { c.view() }?.find(key).ok().flatten()?;
+    let Some(c) = published().filter(|c| c.available) else {
+        return Ok(None);
+    };
+    let Some(view) = c.view() else {
+        return Ok(None);
+    };
+    let Some(id) = io_or_none(view.find(key))? else {
+        return Ok(None);
+    };
     if id == 0 || id == FILEID_INVALID || id as usize > c.count {
-        return None;
+        return Ok(None);
     }
     let mut v = empty_view();
-    unsafe { c.entry_view(id, &mut v) }.then_some((v, id))
+    io_or_none(c.try_entry_view(id, &mut v, path).map(|()| Some((v, id))))
 }
 
 /// `lookup_resident_app0_directory_key`: a representative view for a
-/// directory key that has at least one resident descendant file.
-unsafe fn lookup_directory_key(key: &[u8]) -> Option<FileEntryView> {
-    let c = published()?;
-    if !c.available || c.entries.is_null() || c.count == 0 {
-        return None;
-    }
-    let id = unsafe { c.view() }?
-        .find_directory(key, c.sorted)
-        .unwrap_or(0);
+/// directory key that has at least one resident descendant file. Its path
+/// is that file's, copied into `path`, cut to the key's length.
+unsafe fn lookup_directory_key(
+    key: &[u8],
+    path: Option<&mut EntryPath>,
+) -> Result<Option<FileEntryView>, IndexIo> {
+    let Some(c) = published().filter(|c| c.available && c.count != 0) else {
+        return Ok(None);
+    };
+    let Some(view) = c.view() else {
+        return Ok(None);
+    };
+    let Some(id) = io_or_none(view.find_directory(key, c.sorted))? else {
+        return Ok(None);
+    };
     let mut e = empty_view();
-    if id == 0 || !unsafe { c.entry_view(id, &mut e) } {
-        return None;
-    }
-    Some(FileEntryView {
+    let Some(()) = io_or_none(c.try_entry_view(id, &mut e, path).map(Some))? else {
+        return Ok(None);
+    };
+    Ok(Some(FileEntryView {
         path: e.path,
         path_length: key.len() as u32,
         size: 0,
         mtime: e.mtime,
-    })
+    }))
 }
 
 fn is_app0_key(key: &[u8]) -> bool {
@@ -1707,6 +1799,10 @@ struct Lookup {
     /// A `Miss` the index can answer (see `miss_is_authoritative`); a
     /// non-authoritative miss goes to the real call.
     authoritative: bool,
+    /// A `Miss` because the index could not be read (`IndexIo`): never
+    /// authoritative, and an ENOENT from the real call becomes EIO while
+    /// packs are mounted (`io_miss`).
+    io: bool,
 }
 
 /// The walk indexes every regular file of /app0 under a key that folds ASCII
@@ -1731,16 +1827,57 @@ fn miss_is_authoritative(raw: &[u8], key: &[u8], links: bool) -> bool {
         && !skipped.iter().any(|p| p.to_bytes() == key)
 }
 
+/// A `Miss` lookup that could not read the index: not authoritative, so
+/// the hook asks the real call (`io_miss`).
+fn io_lookup(mut r: Lookup) -> Lookup {
+    stats::add(stats::Stat::IndexLookupIo, 1);
+    (r.state, r.io, r.authoritative) = (Resident::Miss, true, false);
+    r
+}
+
+/// The errno a hook returns when the real call answered `err` for a path
+/// whose lookup could not read the index: with packs mounted an ENOENT
+/// becomes EIO, as the file may be packed and have no copy on disk.
+fn io_miss_errno(err: c_int, packs: bool) -> c_int {
+    if packs && err == ENOENT {
+        EIO
+    } else {
+        err
+    }
+}
+
+/// The real call's `rc` (-1 and errno on failure) for a non-authoritative
+/// miss, with `io_miss_errno` applied when the lookup failed to read.
+unsafe fn io_miss(l: &Lookup, rc: c_int) -> c_int {
+    unsafe { io_miss_if(l.io, rc) }
+}
+
+/// `io_miss` for a read failure known by the caller: the lookup's, or the
+/// pack index's (`ampr_pack_try_stat_path` unhandled EIO).
+unsafe fn io_miss_if(io: bool, rc: c_int) -> c_int {
+    if rc == -1 && io {
+        let packs = unsafe { ampr_pack_manifest_is_resident_ready() };
+        set_errno(io_miss_errno(errno(), packs));
+    }
+    rc
+}
+
 /// `lookup_resident_app0_path`: consumes only the immutable published image;
-/// never starts index I/O or waits (hooks may run under nonsleeping locks).
+/// never builds or loads the index. A page of a large index that is not
+/// resident is read from the index file by the page cache. A hook never
+/// waits on another thread here: a page another thread is loading is read
+/// from the index file by this thread, like the open() the hook replaces.
+/// The entry's path is copied into `pbuf` (a hit's path, or a directory's
+/// canonical prefix).
 #[inline(never)]
-unsafe fn lookup_resident_path(path: *const c_char) -> Lookup {
+unsafe fn lookup_resident_path(path: *const c_char, pbuf: &mut EntryPath) -> Lookup {
     let mut r = Lookup {
         state: Resident::NotApp0,
         entry: empty_view(),
         file_id: 0,
         expected_miss: false,
         authoritative: false,
+        io: false,
     };
     if !unsafe { has_app0_root(path) } {
         return r;
@@ -1760,15 +1897,26 @@ unsafe fn lookup_resident_path(path: *const c_char) -> Lookup {
         return r;
     }
     r.state = Resident::Miss;
-    if !trailing && len > 5 {
-        if let Some((e, id)) = unsafe { lookup_key_view(key, false) } {
+    let file = if !trailing && len > 5 {
+        unsafe { lookup_key_view(key, false, Some(&mut *pbuf)) }
+    } else {
+        Ok(None)
+    };
+    match file {
+        Ok(Some((e, id))) => {
             (r.state, r.entry, r.file_id) = (Resident::Hit, e, id);
             return r;
         }
+        Err(IndexIo) => return io_lookup(r),
+        Ok(None) => {}
     }
-    if let Some(e) = unsafe { lookup_directory_key(key) } {
-        (r.state, r.entry) = (Resident::Directory, e);
-        return r;
+    match unsafe { lookup_directory_key(key, Some(pbuf)) } {
+        Ok(Some(e)) => {
+            (r.state, r.entry) = (Resident::Directory, e);
+            return r;
+        }
+        Err(IndexIo) => return io_lookup(r),
+        Ok(None) => {}
     }
     r.expected_miss = true;
     let links = published().is_some_and(|c| c.links);
@@ -1798,13 +1946,16 @@ pub(crate) unsafe fn probe_packed_path(path: *const c_char) -> Option<u8> {
     }
     // is_resident_ready() holds, so ensure_ready inside returns at once.
     if !trailing && len > 5 {
-        if let Some((_, id)) = unsafe { lookup_key_view(key, false) } {
+        if let Ok(Some((_, id))) = unsafe { lookup_key_view(key, false, None) } {
             // A refused guard reads as "manifest not ready": no answer.
             let reader = super::pack::ManifestReader::enter()?;
             return super::pack::file_id_is_packed(&reader, id).then_some(b'p');
         }
     }
-    unsafe { lookup_directory_key(key) }.map(|_| b'd')
+    unsafe { lookup_directory_key(key, None) }
+        .ok()
+        .flatten()
+        .map(|_| b'd')
 }
 
 /// Copies the indexed path of one-based file `id` into `out` (truncated,
@@ -1817,21 +1968,24 @@ pub(crate) fn probe_file_path(id: u32, out: &mut [u8]) -> Option<usize> {
         return None;
     }
     let mut v = empty_view();
-    if !unsafe { c.entry_view(id, &mut v) } || v.path.is_null() {
+    let mut buf: EntryPath = [0; PATH_BUF];
+    if c.try_entry_view(id, &mut v, Some(&mut buf)).is_err() {
         return None;
     }
     let n = (v.path_length as usize).min(out.len() - 1);
-    for (i, b) in out[..n].iter_mut().enumerate() {
-        *b = unsafe { *v.path.cast::<u8>().add(i) };
-    }
+    out[..n].copy_from_slice(&buf[..n]);
     out[n] = 0;
     Some(n)
 }
 
-/// `maybe_resolve_app0_path_arg`: the indexed path for a resident hit.
+/// `maybe_resolve_app0_path_arg`: the indexed path for a resident hit,
+/// copied into `pbuf` (the result points there), else `path`.
 #[inline(never)]
-pub(crate) unsafe fn maybe_resolve_path(path: *const c_char) -> *const c_char {
-    let l = unsafe { lookup_resident_path(path) };
+pub(crate) unsafe fn maybe_resolve_path(
+    path: *const c_char,
+    pbuf: &mut EntryPath,
+) -> *const c_char {
+    let l = unsafe { lookup_resident_path(path, pbuf) };
     if l.state == Resident::Hit {
         l.entry.path
     } else {
@@ -1974,7 +2128,8 @@ unsafe fn open_with(
     real: RealOpen,
     op: u8,
 ) -> c_int {
-    let l = unsafe { lookup_resident_path(path) };
+    let mut pbuf: EntryPath = [0; PATH_BUF];
+    let l = unsafe { lookup_resident_path(path, &mut pbuf) };
     let fd = unsafe { open_resolved(&l, path, flags, mode, real) };
     // A file hit opened with O_DIRECTORY fails ENOTDIR, as on retail. Not
     // logged: a UE3 title tests every cooked file this way at start (~5000
@@ -2070,7 +2225,7 @@ unsafe fn open_resolved(
                 }
             }
             if !l.authoritative {
-                return unsafe { real(path, flags, mode) };
+                return unsafe { io_miss(l, real(path, flags, mode)) };
             }
             index_miss()
         }
@@ -2113,7 +2268,8 @@ unsafe fn stat_impl(path: *const c_char, sb: *mut Stat) -> c_int {
 }
 
 unsafe fn stat_with(path: *const c_char, sb: *mut Stat, real: RealStat, op: u8) -> c_int {
-    let l = unsafe { lookup_resident_path(path) };
+    let mut pbuf: EntryPath = [0; PATH_BUF];
+    let l = unsafe { lookup_resident_path(path, &mut pbuf) };
     let rc = unsafe { stat_resolved(&l, path, sb, real) };
     stats::fs_event(op, how(&l), rc as i64, path);
     rc
@@ -2124,15 +2280,18 @@ unsafe fn stat_resolved(l: &Lookup, path: *const c_char, sb: *mut Stat, real: Re
         Resident::Directory => unsafe { sb.write_unaligned(dir_stat(&l)) },
         Resident::Hit => unsafe { sb.write_unaligned(file_stat(&l)) },
         Resident::Miss => {
+            let mut pack_io = false;
             if unsafe { ampr_pack_manifest_is_resident_ready() } {
                 let mut handled = false;
                 let rc = unsafe { ampr_pack_try_stat_path(path, sb, &mut handled) };
                 if handled {
                     return posix_return_from_sce(rc);
                 }
+                // The pack index could not be read: the file may be loose.
+                pack_io = rc == SCE_KERNEL_ERROR_EIO;
             }
-            if !l.authoritative {
-                return unsafe { real(path, sb.cast()) };
+            if !l.authoritative || pack_io {
+                return unsafe { io_miss_if(l.io || pack_io, real(path, sb.cast())) };
             }
             return index_miss();
         }
@@ -2143,7 +2302,8 @@ unsafe fn stat_resolved(l: &Lookup, path: *const c_char, sb: *mut Stat, real: Re
 
 /// `sceKernelCheckReachability_impl`.
 unsafe fn reachability_impl(path: *const c_char) -> c_int {
-    let l = unsafe { lookup_resident_path(path) };
+    let mut pbuf: EntryPath = [0; PATH_BUF];
+    let l = unsafe { lookup_resident_path(path, &mut pbuf) };
     let rc = unsafe { reachability_resolved(&l, path) };
     stats::fs_event(b'r', how(&l), rc as i64, path);
     rc
@@ -2153,15 +2313,22 @@ unsafe fn reachability_resolved(l: &Lookup, path: *const c_char) -> c_int {
     match l.state {
         Resident::Directory | Resident::Hit => 0,
         Resident::Miss => {
+            let mut pack_io = false;
             if unsafe { ampr_pack_manifest_is_resident_ready() } {
                 let mut handled = false;
                 let rc = unsafe { ampr_pack_try_reachability(path, &mut handled) };
                 if handled {
                     return rc;
                 }
+                pack_io = rc == SCE_KERNEL_ERROR_EIO;
             }
-            if !l.authoritative {
-                return unsafe { real_check_reachability(path) };
+            if !l.authoritative || pack_io {
+                let rc = unsafe { real_check_reachability(path) };
+                if (l.io || pack_io) && rc == SCE_KERNEL_ERROR_ENOENT {
+                    let packs = unsafe { ampr_pack_manifest_is_resident_ready() };
+                    return sce_errno(io_miss_errno(ENOENT, packs));
+                }
+                return rc;
             }
             SCE_KERNEL_ERROR_ENOENT
         }
@@ -2176,7 +2343,8 @@ unsafe fn unlink_impl(path: *const c_char) -> c_int {
     if rc == 0 || !should_try_index_fallback(rc, err) || !unsafe { is_app0_path(path) } {
         return return_direct(rc, err);
     }
-    let real = unsafe { maybe_resolve_path(path) };
+    let mut pbuf: EntryPath = [0; PATH_BUF];
+    let real = unsafe { maybe_resolve_path(path, &mut pbuf) };
     if real == path {
         return return_direct(rc, err);
     }
@@ -2195,7 +2363,13 @@ unsafe fn rename_impl(from: *const c_char, to: *const c_char) -> c_int {
     {
         return return_direct(rc, err);
     }
-    let (rf, rt) = unsafe { (maybe_resolve_path(from), maybe_resolve_path(to)) };
+    let (mut from_buf, mut to_buf): (EntryPath, EntryPath) = ([0; PATH_BUF], [0; PATH_BUF]);
+    let (rf, rt) = unsafe {
+        (
+            maybe_resolve_path(from, &mut from_buf),
+            maybe_resolve_path(to, &mut to_buf),
+        )
+    };
     if rf == from && rt == to {
         return return_direct(rc, err);
     }
@@ -2369,7 +2543,8 @@ pub unsafe extern "C" fn posix_access_emul(path: *const c_char, mode: c_int) -> 
         unsafe { observe_note(path, b'a', rc) };
         return rc;
     }
-    let l = unsafe { lookup_resident_path(path) };
+    let mut pbuf: EntryPath = [0; PATH_BUF];
+    let l = unsafe { lookup_resident_path(path, &mut pbuf) };
     let rc = match l.state {
         Resident::Hit | Resident::Directory if mode & W_OK != 0 => {
             set_errno(EROFS);
@@ -2393,7 +2568,8 @@ pub unsafe extern "C" fn posix_access_emul(path: *const c_char, mode: c_int) -> 
             if handled {
                 posix_return_from_sce(rc)
             } else {
-                unsafe { real_access(path, mode) }
+                let pack_io = rc == SCE_KERNEL_ERROR_EIO;
+                unsafe { io_miss_if(l.io || pack_io, real_access(path, mode)) }
             }
         }
         Resident::Miss => {
@@ -2459,7 +2635,11 @@ pub unsafe fn ampr_index_resolve_path_to_id(
     if len == 5 || trailing {
         return -EOPNOTSUPP;
     }
-    let Some((v, id)) = (unsafe { lookup_key_view(&buf[..len], APP0_INDEX_AUTOBUILD) }) else {
+    let Some((v, id)) = (match unsafe { lookup_key_view(&buf[..len], APP0_INDEX_AUTOBUILD, None) } {
+        Ok(found) => found,
+        // Not ENOENT: the file may be packed (rt/pack callers serve EIO).
+        Err(IndexIo) => return -EIO,
+    }) else {
         return -ENOENT;
     };
     unsafe {
@@ -2471,7 +2651,27 @@ pub unsafe fn ampr_index_resolve_path_to_id(
     0
 }
 
+/// Size and mtime of one-based file `id`; `out.path` is null (callers that
+/// need the path use `ampr_index_get_entry_view_path`).
 pub unsafe fn ampr_index_get_entry_view(id: u32, out: *mut FileEntryView) -> c_int {
+    unsafe { entry_view_by_id(id, out, None) }
+}
+
+/// `ampr_index_get_entry_view` plus the path, copied NUL-terminated into
+/// `path`; `out.path` points there and lives as long as `path`.
+pub unsafe fn ampr_index_get_entry_view_path(
+    id: u32,
+    out: *mut FileEntryView,
+    path: &mut EntryPath,
+) -> c_int {
+    unsafe { entry_view_by_id(id, out, Some(path)) }
+}
+
+unsafe fn entry_view_by_id(
+    id: u32,
+    out: *mut FileEntryView,
+    path: Option<&mut EntryPath>,
+) -> c_int {
     if id == 0 || id == FILEID_INVALID || !unsafe { ensure_ready(APP0_INDEX_AUTOBUILD) } {
         return -ENOENT;
     }
@@ -2479,8 +2679,10 @@ pub unsafe fn ampr_index_get_entry_view(id: u32, out: *mut FileEntryView) -> c_i
         return -ENOENT;
     };
     let mut v = empty_view();
-    if !unsafe { c.entry_view(id, &mut v) } {
-        return -ENOENT;
+    match c.try_entry_view(id, &mut v, path) {
+        Ok(()) => {}
+        Err(ampr_format::Error::Io) => return -EIO,
+        Err(_) => return -ENOENT,
     }
     if !out.is_null() {
         unsafe { *out = v };
@@ -2501,22 +2703,17 @@ use ampr_lz4::{FILE_RECORD, PAK_HEADER};
 const PACK_OK: c_int = 0;
 const PACK_INVALID_ARGUMENT: c_int = -1;
 
-/// `AmprPackCoreView`: pointers into a mounted manifest.
-#[repr(C)]
-pub struct AmprPackCoreView {
-    pub base: *const u8,
-    pub size: usize,
-    pub header: *const u8,
-    pub files: *const u8,
-    pub chunks: *const u8,
-    pub packs: *const u8,
-    pub strings: *const c_char,
-    pub strings_size: usize,
+/// The mounted AMPRPAK4 manifest: a file read whole, or paged with its
+/// records in a resident fast table (rt/pack/manifest.rs).
+pub(crate) type Lz4Manifest = Manifest<'static, IndexSource>;
+
+/// `AmprPackCoreView`: the mounted manifest and a copy of its header. The
+/// manifest may be paged, so the view holds no pointers into it.
+#[derive(Clone, Copy)]
+pub(crate) struct AmprPackCoreView {
+    pub manifest: Option<Lz4Manifest>,
+    pub header: super::pack::AmprPackIndexHeader,
 }
-const _: () = assert!(
-    size_of::<AmprPackCoreView>() == 64
-        && core::mem::offset_of!(AmprPackCoreView, strings_size) == 56
-);
 
 /// `AmprPackChunkView`.
 #[repr(C)]
@@ -2588,18 +2785,15 @@ unsafe fn region<'a>(p: *const u8, len: usize) -> Option<&'a [u8]> {
         .then(|| unsafe { core::slice::from_raw_parts(p, len) })
 }
 
+/// `file` is a caller-owned copy of a 48-byte record (rt/pack
+/// virtual_read.rs `TaskFile`), never a pointer into the manifest.
 unsafe fn file_record(file: *const u8) -> Option<FileRecord> {
     FileRecord::parse(unsafe { region(file, FILE_RECORD) }?).ok()
 }
 
-/// The manifest bytes of a mounted view (trusted: validated once at mount).
-unsafe fn view_manifest<'a>(v: *const AmprPackCoreView) -> Option<Manifest<'a>> {
-    let v = unsafe { v.as_ref() }?;
-    Manifest::view_trusted(unsafe { region(v.base, v.size) }?).ok()
-}
-
-fn le64(b: &[u8], at: usize) -> usize {
-    u64::from_le_bytes(b[at..at + 8].try_into().unwrap()) as usize
+/// The manifest of a mounted view (trusted: validated once at mount).
+unsafe fn view_manifest(v: *const AmprPackCoreView) -> Option<Lz4Manifest> {
+    unsafe { v.as_ref() }?.manifest
 }
 
 pub unsafe fn ampr_pack_crc32(data: *const c_void, size: usize, seed: u32) -> u32 {
@@ -2609,42 +2803,38 @@ pub unsafe fn ampr_pack_crc32(data: *const c_void, size: usize, seed: u32) -> u3
     unsafe { region(data.cast(), size) }.map_or(0, |b| ampr_format::crc32_seeded(b, seed))
 }
 
-/// Full `Manifest::open` validation, then fills `out` (zeroed on error); LZ4 only
-/// (zstd mounts through `zstd::zstd_mount_validate`).
-pub unsafe fn ampr_pack_core_mount(
-    data: *const c_void,
-    size: usize,
+/// Full `Manifest::open` validation through the mounted source, then
+/// fills `out` (empty on error); LZ4 only (zstd mounts through
+/// `zstd::zstd_mount_validate`).
+pub(crate) unsafe fn ampr_pack_core_mount(
+    src: &'static IndexSource,
     out: *mut AmprPackCoreView,
 ) -> c_int {
-    {
-        if out.is_null() {
-            return PACK_INVALID_ARGUMENT;
-        }
-        unsafe { out.write(core::mem::zeroed()) };
-        let Some(b) = (unsafe { region(data.cast(), size) }).filter(|b| b.len() >= PAK_HEADER)
-        else {
-            return PACK_INVALID_ARGUMENT;
-        };
-        if let Err(e) = Manifest::open(b) {
-            return CoreError::from(e).code();
-        }
-        // Manifest::open proved the sections are in bounds.
-        let base = b.as_ptr();
-        let at = |off| unsafe { base.add(le64(b, off)) };
-        unsafe {
-            out.write(AmprPackCoreView {
-                base,
-                size,
-                header: base,
-                files: at(72),
-                chunks: at(80),
-                packs: at(88),
-                strings: at(96).cast(),
-                strings_size: le64(b, 104),
-            })
-        };
-        PACK_OK
+    use ampr_format::source::Source;
+    if out.is_null() {
+        return PACK_INVALID_ARGUMENT;
     }
+    unsafe { out.write(AmprPackCoreView::EMPTY) };
+    if src.len() < PAK_HEADER as u64 {
+        return PACK_INVALID_ARGUMENT;
+    }
+    let m = match Manifest::open(src) {
+        Ok(m) => m,
+        Err(e) => return CoreError::from(e).code(),
+    };
+    let mut h = [0u8; PAK_HEADER];
+    if let Err(e) = src.read_at(0, &mut h) {
+        return CoreError::from(e).code();
+    }
+    // Manifest::open checked the header; the copy keeps its on-disk layout.
+    let header = unsafe { core::ptr::read_unaligned(h.as_ptr().cast()) };
+    unsafe {
+        out.write(AmprPackCoreView {
+            manifest: Some(m),
+            header,
+        })
+    };
+    PACK_OK
 }
 
 /// One-based `file_id` against `path`/`logical_size` of a mounted view.
@@ -2669,6 +2859,8 @@ pub unsafe fn ampr_pack_core_validate_logical_file(
         };
         match m.validate_logical_file(file_id, path, logical_size) {
             Ok(()) => PACK_OK,
+            // As zstd: a packed file whose index could not be read is EIO.
+            Err(CoreError::Io) => zstd::VALIDATE_IO,
             Err(e) => e.code(),
         }
     }
@@ -2793,31 +2985,11 @@ mod tests {
         assert!(!miss_with(c"/app0/linked/x.bin", true));
     }
 
-    /// USB index I/O: pread and write loops continue short transfers and
-    /// retry EINTR, and fail on EOF, errors and endless EINTR.
+    /// USB index I/O: the write loop continues short transfers and retries
+    /// EINTR, and fails on errors and endless EINTR. (Index file reads go
+    /// through rt/index_pages.rs and the pack `pread_loop`.)
     #[test]
     fn io_loops_continue_short_transfers_and_retry_eintr() {
-        let src: std::vec::Vec<u8> = (0..=255u8).cycle().take(3000).collect();
-        let mut dst = std::vec![0u8; 2000];
-        let mut calls = 0;
-        let ok = unsafe {
-            pread_exact_with(dst.as_mut_ptr(), dst.len(), 100, |p, want, at| {
-                calls += 1;
-                if calls % 2 == 1 {
-                    return (-1, EINTR);
-                }
-                let n = want.min(300);
-                core::ptr::copy_nonoverlapping(src.as_ptr().add(at as usize), p, n);
-                (n as isize, 0)
-            })
-        };
-        assert!(ok);
-        assert_eq!(&dst[..], &src[100..2100]);
-        let p = dst.as_mut_ptr();
-        assert!(!unsafe { pread_exact_with(p, 16, 0, |_, _, _| (0, 0)) });
-        assert!(!unsafe { pread_exact_with(p, 16, 0, |_, _, _| (-1, EIO)) });
-        assert!(!unsafe { pread_exact_with(p, 16, 0, |_, _, _| (-1, EINTR)) });
-
         let data: std::vec::Vec<u8> = (0..1000u32).map(|i| i as u8).collect();
         let mut out = std::vec::Vec::new();
         let mut calls = 0;
@@ -2848,10 +3020,65 @@ mod tests {
             file_id: 2,
             expected_miss: false,
             authoritative: false,
+            io: false,
         };
         let st = file_stat(&l);
         assert_eq!(st.st_size, 8_130_000_000);
         assert_eq!(st.st_blocks, 8_130_000_000 / 512 + 1);
+    }
+
+    /// A lookup that cannot read the index is not a miss: `find` and
+    /// `find_directory` errors come back as `IndexIo` (other errors still
+    /// read as no answer), the lookup is a non-authoritative miss that the
+    /// hook sends to the real call, and an ENOENT from that call becomes EIO
+    /// while packs are mounted.
+    #[test]
+    fn an_index_read_error_is_not_an_authoritative_miss() {
+        use core::cell::Cell;
+        struct Failing<'a>(&'a [u8], Cell<bool>);
+        impl ampr_format::source::Source for Failing<'_> {
+            fn len(&self) -> u64 {
+                self.0.len() as u64
+            }
+            fn read_at(&self, at: u64, out: &mut [u8]) -> ampr_format::Result<()> {
+                if self.1.get() {
+                    return Err(ampr_format::Error::Io);
+                }
+                self.0.read_at(at, out)
+            }
+        }
+        let image = sized_image(64, 8 << 10);
+        let src = Failing(&image, Cell::new(false));
+        let view = Index::open(&src).unwrap();
+        let mut buf: EntryPath = [0; PATH_BUF];
+        let path = view
+            .path(&view.record(3).unwrap(), &mut buf)
+            .unwrap()
+            .to_vec();
+        assert_eq!(io_or_none(view.find(&path)), Ok(Some(3)));
+        assert_eq!(io_or_none(view.find(b"no/app0")), Ok(None));
+        src.1.set(true);
+        assert_eq!(io_or_none(view.find(&path)), Err(IndexIo));
+        assert_eq!(
+            io_or_none(view.find_directory(b"/app0/d001", true)),
+            Err(IndexIo)
+        );
+        assert_eq!(io_or_none(view.find(b"no/app0")), Ok(None));
+
+        let mut l = Lookup {
+            state: Resident::NotApp0,
+            entry: empty_view(),
+            file_id: 0,
+            expected_miss: false,
+            authoritative: true,
+            io: false,
+        };
+        l = io_lookup(l);
+        assert!(l.state == Resident::Miss && l.io && !l.authoritative);
+        assert_eq!(how(&l), b'M');
+        assert_eq!(io_miss_errno(ENOENT, true), EIO);
+        assert_eq!(io_miss_errno(ENOENT, false), ENOENT);
+        assert_eq!(io_miss_errno(EACCES, true), EACCES);
     }
 
     /// Only ENOENT means the index is missing; unreadable loads count only
@@ -2876,18 +3103,25 @@ mod tests {
         );
     }
 
-    // ---- index room (rt/index_memory.rs `INDEX_FILE_MAX`) ----
+    // ---- uninstalled image (rt/index_pages.rs memory source) ----
 
-    /// An AMPRIDX3 image of `n` files and exactly `file_bytes` bytes: the
-    /// paths take what records and hash slots leave.
+    /// A sorted AMPRIDX3 image of `n` files and exactly `file_bytes` bytes:
+    /// the paths take what records and hash slots leave.
     fn sized_image(n: usize, file_bytes: usize) -> Vec<u8> {
+        sized_image_in(n, file_bytes, |i| i * 997 / n)
+    }
+
+    /// `sized_image` with file `i` in directory `dir(i)`.
+    fn sized_image_in(n: usize, file_bytes: usize, dir: impl Fn(usize) -> usize) -> Vec<u8> {
         let fixed = image_layout(n, 0).unwrap();
         let slots = fixed.slot_count * size_of::<HashSlot>();
         let path_bytes = file_bytes - fixed.path_at - slots;
         let (base, extra) = (path_bytes / n, path_bytes % n);
         let (mut records, mut paths) = (Vec::with_capacity(n * 24), Vec::new());
         for i in 0..n {
-            let mut p = format!("/app0/d{:03}/f{i:07}", i % 997).into_bytes();
+            // 18 bytes: the 3000-file image leaves 18 or 19 per path, so
+            // no path is cut to another's.
+            let mut p = format!("/app0/d{:03}/f{i:06}", dir(i)).into_bytes();
             p.resize(base - 1 + usize::from(i < extra), b'a');
             records.extend_from_slice(&(paths.len() as u32).to_le_bytes());
             records.extend_from_slice(&(p.len() as u32).to_le_bytes());
@@ -2914,35 +3148,126 @@ mod tests {
         }
     }
 
-    /// A 52 MiB AMPRIDX3 file loads through `adopt_compact_index` (the
-    /// `read_compact` path) under the index cap; one whose image is a page
-    /// over the cap is refused with the index notice.
+    /// A paged AMPRIDX3 file mounts only with its fast table: with less
+    /// Index room than the table and the pack tables built from it need, it
+    /// is refused with the index notice and takes nothing; with the room,
+    /// `find` answers as the plain image does and `clear` gives every byte
+    /// back. In a title with no packs the mount then grows the page arena.
     #[test]
-    fn a_52_mib_file_index_loads_and_one_over_the_cap_is_refused() {
+    fn a_paged_file_index_needs_its_fast_table() {
         use super::super::index_memory as im;
         let _pool = im::POOL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let n = 200_000;
-        let image = sized_image(n, im::INDEX_FILE_MAX);
-        let mut idx = empty_state();
+        let n = 3000;
+        let image: &'static [u8] = sized_image(n, 256 << 10).leak();
+        let plain = Index::open(image).unwrap();
+        let paged = |idx: &mut FileIndexState| {
+            let src = unsafe { index_pages::register_memory(image.as_ptr(), image.len()) };
+            idx.compact.src = Some(IndexSource::Paged(src.unwrap()));
+            unsafe { finish_compact(idx) }
+        };
+        let page = SCE_KERNEL_PAGE_SIZE;
         let used = im::test_index_used();
-        assert!(unsafe { adopt_compact_index(&mut idx, &image) } == LoadResult::Loaded);
-        assert_eq!(idx.compact.count, n);
-        let resident = im::test_index_used() - used;
-        assert_eq!(
-            resident,
-            round_up_page(im::INDEX_FILE_MAX - ampr_format::IDX_HEADER)
-        );
-        assert!(used + resident <= im::INDEX_MEMORY_MAX);
+        let grows = index_pages::test_grow_calls();
+        im::test_take_index_notice();
+        unsafe {
+            // Leave a page less than the tables need.
+            let need = (n * LOOKUP_PER_FILE).next_multiple_of(page);
+            let fill = im::index_room() - need + page;
+            let other = im::index_alloc(fill, page, c"test.other.tables".as_ptr());
+            assert!(!other.is_null());
+            let mut idx = empty_state();
+            assert!(paged(&mut idx) == LoadResult::Memory);
+            assert!(im::test_take_index_notice());
+            assert!(!idx.available && idx.compact.src.is_none() && idx.compact.fast.is_null());
+            assert_eq!(im::test_index_used(), used + fill);
+            assert_eq!(index_pages::test_grow_calls(), grows);
+            im::index_free(other.cast(), c"test.other.tables.free".as_ptr());
+
+            assert!(paged(&mut idx) == LoadResult::Loaded);
+            assert!(!im::test_take_index_notice());
+            assert!(idx.compact.sorted);
+            assert_eq!(index_pages::test_grow_calls(), grows + 1);
+            assert!(!idx.compact.fast.is_null());
+            assert_eq!(im::lookup_used(), (n * 12).next_multiple_of(page));
+            let view = idx.compact.view().unwrap();
+            assert!(view.has_fast());
+            let mut buf: EntryPath = [0; PATH_BUF];
+            for id in [1, n as u32 / 2, n as u32] {
+                let path = plain.path(&plain.record(id).unwrap(), &mut buf).unwrap();
+                assert_eq!(view.find(path), Ok(Some(id)));
+            }
+            assert_eq!(view.find(b"/app0/none"), plain.find(b"/app0/none"));
+            idx.compact.clear();
+
+            // An unsorted file is not paged: `find_directory` would scan
+            // every record through the cache. Refused with the notice.
+            let unsorted: &'static [u8] = sized_image_in(n, 256 << 10, |i| i % 997).leak();
+            let src = index_pages::register_memory(unsorted.as_ptr(), unsorted.len());
+            let mut idx = empty_state();
+            idx.compact.src = Some(IndexSource::Paged(src.unwrap()));
+            assert!(finish_compact(&mut idx) == LoadResult::Memory);
+            assert!(im::test_take_index_notice());
+            assert!(!idx.available && idx.compact.src.is_none() && idx.compact.fast.is_null());
+        }
+        assert_eq!(im::test_index_used(), used);
+        assert_eq!(im::lookup_used(), 0);
+    }
+
+    /// A built image that cannot be installed is served from its own
+    /// build buffer like a file read whole (no page cache, no fast table):
+    /// `adopt_compact_index` validates it, lookups and entry views copy
+    /// paths out of it, and `clear` gives the buffer back. A corrupt image
+    /// is refused and freed the same way.
+    #[test]
+    fn an_uninstalled_image_is_served_from_memory_and_given_back() {
+        use super::super::index_memory as im;
+        let _pool = im::POOL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let n = 20_000;
+        let image = sized_image(n, 4 << 20);
+        let used = im::test_index_used();
+        let adopt = |image: &[u8]| {
+            let mem = unsafe { build_alloc(image.len(), c"test.index.image") };
+            assert!(!mem.is_null());
+            unsafe { core::ptr::copy_nonoverlapping(image.as_ptr(), mem, image.len()) };
+            let mut idx = empty_state();
+            let rc = unsafe { adopt_compact_index(&mut idx, mem, image.len()) };
+            (idx, rc)
+        };
+        let (mut idx, rc) = adopt(&image);
+        assert!(rc == LoadResult::Loaded);
+        assert!(idx.available && idx.compact.count == n);
+        assert!(idx.compact.fast.is_null());
+        assert!(idx.compact.src.is_some_and(|s| s.is_resident()));
+        let view = idx.compact.view().unwrap();
+        let mut a: EntryPath = [0xA5; PATH_BUF];
+        let rec = view.record(7).unwrap();
+        let path = view.path(&rec, &mut a).unwrap().to_vec();
+        assert_eq!(view.find(&path), Ok(Some(7)));
+        let mut v = empty_view();
+        let mut b: EntryPath = [0xA5; PATH_BUF];
+        assert_eq!(idx.compact.try_entry_view(7, &mut v, Some(&mut b)), Ok(()));
+        assert_eq!(v.path, b.as_ptr().cast());
+        assert_eq!(&b[..v.path_length as usize], &path[..]);
+        assert_eq!(b[v.path_length as usize], 0);
+        assert!(idx.compact.try_entry_view(7, &mut v, None).is_ok() && v.path.is_null());
+        assert!(idx
+            .compact
+            .try_entry_view(n as u32 + 1, &mut v, None)
+            .is_err());
         unsafe { idx.compact.clear() };
+        assert!(idx.compact.src.is_none());
         assert_eq!(im::test_index_used(), used);
 
-        im::test_take_index_notice();
-        let over = im::INDEX_MEMORY_MAX + SCE_KERNEL_PAGE_SIZE + ampr_format::IDX_HEADER;
-        let image = sized_image(n, over);
-        let mut idx = empty_state();
-        assert!(unsafe { adopt_compact_index(&mut idx, &image) } == LoadResult::Memory);
-        assert!(!idx.available && idx.compact.map_base.is_null());
-        assert!(im::test_take_index_notice(), "no index notice");
+        let mut bad = image.clone();
+        let slots_at = u64::from_le_bytes(bad[32..40].try_into().unwrap()) as usize;
+        let hit = (slots_at..bad.len())
+            .step_by(16)
+            .find(|&at| bad[at + 8..at + 12] != [0; 4])
+            .unwrap();
+        bad[hit] ^= 1;
+        let (idx, rc) = adopt(&bad);
+        assert!(rc == LoadResult::Invalid);
+        assert!(!idx.available && idx.compact.src.is_none() && idx.compact.mem.is_null());
         assert_eq!(im::test_index_used(), used);
     }
 }

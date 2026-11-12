@@ -2,6 +2,7 @@
 //! ASCII-folded path ordering, overlay path normalization, packed directory
 //! ranges, service-name hiding and synthetic `struct dirent` records.
 //! Uses caller-owned buffers; no alloc.
+use crate::source::PATH_BUF;
 use core::cmp::Ordering;
 
 /// `SCE_KERNEL_PATH_MAX`.
@@ -102,32 +103,45 @@ pub struct Child {
 }
 
 // The directory-order helpers below are shared by AMPRPAK4 and zstd: `order`
-// holds record ids sorted by folded path, and `path` maps an id to its path
-// (None for a malformed record).
+// holds record ids sorted by folded path, and `path` writes an id's path
+// into the buffer and returns its length (None for a malformed record).
+// Paths are copied, not borrowed, so an index can be paged.
+
+/// The path writer the helpers below take.
+pub type PathBuf = [u8; PATH_BUF];
 
 /// First position in `order` whose path does not sort before `key`;
 /// an id without a path never sorts before it.
-pub fn lower_bound<'a>(order: &[u32], key: &[u8], path: impl Fn(u32) -> Option<&'a [u8]>) -> usize {
-    order.partition_point(|&id| path(id).is_some_and(|p| folded_compare(p, key).is_lt()))
+pub fn lower_bound(
+    order: &[u32],
+    key: &[u8],
+    mut path: impl FnMut(u32, &mut PathBuf) -> Option<usize>,
+) -> usize {
+    let mut buf = [0u8; PATH_BUF];
+    order.partition_point(|&id| {
+        path(id, &mut buf).is_some_and(|n| folded_compare(&buf[..n], key).is_lt())
+    })
 }
 
 /// The `[begin, end)` span of `order` whose paths lie strictly below
 /// `prefix`, a directory path ending in `/`; None when none does.
 /// `prefix` is scratch: its last byte is overwritten.
-pub fn prefix_range<'a>(
+pub fn prefix_range(
     order: &[u32],
     prefix: &mut [u8],
-    path: impl Fn(u32) -> Option<&'a [u8]>,
+    mut path: impl FnMut(u32, &mut PathBuf) -> Option<usize>,
 ) -> Option<(u32, u32)> {
     let n = prefix.len();
-    let begin = lower_bound(order, prefix, &path);
-    let first = path(*order.get(begin)?)?;
+    let begin = lower_bound(order, prefix, &mut path);
+    let mut buf = [0u8; PATH_BUF];
+    let len = path(*order.get(begin)?, &mut buf)?;
+    let first = buf.get(..len)?;
     if first.len() <= n || !folded_equal(&first[..n], prefix) {
         return None;
     }
     // '0' follows '/': [dir/, dir0) is exactly the paths below dir.
     *prefix.last_mut()? = b'0';
-    let end = lower_bound(order, prefix, &path);
+    let end = lower_bound(order, prefix, &mut path);
     Some((begin as u32, end as u32))
 }
 
@@ -148,18 +162,20 @@ fn child_span(path: &[u8], dir_len: usize) -> Option<(usize, usize)> {
 /// path, as `path` spells it, is `dir_len` bytes, merged with the following
 /// entries of the same folded name (a directory if any of them has
 /// descendants). `name` gets the NUL-terminated child name.
-pub fn next_child<'a>(
+pub fn next_child(
     order: &[u32],
     range_end: u32,
     dir_len: usize,
     cursor: u32,
     name: &mut [u8],
-    path: impl Fn(u32) -> Option<&'a [u8]>,
+    mut path: impl FnMut(u32, &mut PathBuf) -> Option<usize>,
 ) -> Option<Child> {
     if cursor >= range_end {
         return None;
     }
-    let first = path(*order.get(cursor as usize)?)?;
+    let mut first_buf = [0u8; PATH_BUF];
+    let len = path(*order.get(cursor as usize)?, &mut first_buf)?;
+    let first = first_buf.get(..len)?;
     let (rel, end) = child_span(first, dir_len)?;
     if rel >= first.len() {
         return None;
@@ -172,8 +188,15 @@ pub fn next_child<'a>(
     name[child.len()] = 0;
     let mut kind = if end < first.len() { DT_DIR } else { DT_REG };
     let mut next = cursor + 1;
+    let mut other_buf = [0u8; PATH_BUF];
     while next < range_end {
-        let Some(other) = order.get(next as usize).and_then(|&i| path(i)) else {
+        let Some(len) = order
+            .get(next as usize)
+            .and_then(|&i| path(i, &mut other_buf))
+        else {
+            break;
+        };
+        let Some(other) = other_buf.get(..len) else {
             break;
         };
         let Some((orel, oend)) = child_span(other, dir_len) else {

@@ -1881,9 +1881,10 @@ unsafe fn load_observe(
     // retries the name the game asked for. Only ENOENT, the error of a
     // missing file; other failures may come after the loader mapped or
     // started the module. An ENOENT for another reason (a missing import)
-    // costs one more failed load with the same result. An index hit points
-    // into the index even when the bytes match; those do not retry.
-    let path = unsafe { super::index::maybe_resolve_path(name) };
+    // costs one more failed load with the same result. An index hit is a
+    // copy in `pbuf` even when the bytes match; those do not retry.
+    let mut pbuf: super::fd_cache::EntryPath = [0; ampr_format::source::PATH_BUF];
+    let path = unsafe { super::index::maybe_resolve_path(name, &mut pbuf) };
     let mut module = unsafe { orig(path, args, argp, flags, opt, result) };
     if module == sys::SCE_KERNEL_ERROR_ENOENT
         && path != name

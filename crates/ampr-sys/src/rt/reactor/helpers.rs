@@ -98,6 +98,18 @@ pub(crate) fn apr_file_id_lookup_error(fileId: u32) -> c_int {
     }
 }
 
+/// The rc for a failed `ampr_index_get_entry_view*` of `fileId`: SCE EIO
+/// for an index read error (an I/O failure, not a bad file id; the command
+/// result still maps it, `apr_backend_read_error_to_apr`), else the file
+/// id lookup error.
+pub(crate) fn apr_entry_view_error(fileId: u32, rc: c_int) -> c_int {
+    if rc == -EIO {
+        SCE_KERNEL_ERROR_EIO
+    } else {
+        apr_file_id_lookup_error(fileId)
+    }
+}
+
 pub(crate) fn apr_result_is_ampr_error(rc: c_int) -> bool {
     (rc as u32 & 0xffffff00) == 0x81912000
 }
@@ -136,8 +148,9 @@ pub(crate) fn apr_prepare_aio_read_desc(
         return false;
     }
     let mut entry: FileEntryView = unsafe { core::mem::zeroed() };
-    if unsafe { ampr_index_get_entry_view(fileId, &mut entry) } != 0 {
-        *outRc = apr_file_id_lookup_error(fileId);
+    let rc = unsafe { ampr_index_get_entry_view(fileId, &mut entry) };
+    if rc != 0 {
+        *outRc = apr_entry_view_error(fileId, rc);
         return false;
     }
     let fileSize = entry.size as u64;
@@ -152,8 +165,6 @@ pub(crate) fn apr_prepare_aio_read_desc(
         offset,
         errorOff,
         fileSize: entry.size,
-        filePath: entry.path,
-        filePathLength: entry.path_length,
         fileMetadataValid: true,
         ..AprAioReadDesc::default()
     };

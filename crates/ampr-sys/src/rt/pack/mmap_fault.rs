@@ -61,12 +61,12 @@
 //!   takes those faults itself.
 //!
 //! Memory, only after the game maps a packed file with the knob at 1:
-//! `SLOTS` x 512 KiB scratch (2 MiB, Index ledger) plus one libzstd DCtx
-//! each from the libc heap, persistent; one byte per mapped chunk from the
+//! `SLOTS` x 512 KiB scratch (2 MiB, Index ledger) plus a 112 KiB zstd
+//! decoder workspace each (448 KiB, Buffer ledger), persistent; one byte per mapped chunk from the
 //! small slab, transient, released on munmap. Unmeasured on a console (Makefile).
 
 use super::super::index::{sdk_alloc, sdk_release, title_alloc, title_free, MEM_TRANSIENT};
-use super::zstd::{zstd_entry, zstd_index};
+use super::zstd::{zstd_chunk_resident, zstd_chunks_resident, zstd_entry, zstd_index};
 use super::*;
 use core::sync::atomic::{AtomicI32, AtomicU8, AtomicUsize};
 
@@ -220,7 +220,7 @@ unsafe fn open_volumes(first: u16, last: u16) -> bool {
 pub(crate) const STATES_MAX: usize = 2048;
 
 /// Concurrent fills; a fault with every slot busy spins for one.
-const SLOTS: usize = 4;
+pub(crate) const SLOTS: usize = 4;
 /// Stored bytes (at most one chunk) then the decoded chunk.
 const SLOT_BYTES: usize = 2 * CHUNK as usize;
 const _: () = assert!(CHUNK as usize == ampr_codec::ZSTD_MAX_CHUNK_SIZE);
@@ -243,8 +243,10 @@ static SLOTS_STATE: AtomicU8 = AtomicU8::new(0);
 
 /// Under FAULT_M, on the first fault-path map: the scratch buffers (one
 /// 2 MiB block from the Index ledger, rt/index_memory.rs, not a fixed
-/// pool site) and a warmed-up decoder per slot, so a fill allocates nothing.
-/// False when any allocation fails; what was made is released.
+/// pool site) and a warmed-up decoder per slot (one 448 KiB block of
+/// decoder workspaces from the Buffer ledger, not the libc heap), so a
+/// fill allocates nothing. False when any allocation fails; what was made
+/// is released.
 unsafe fn make_slots() -> bool {
     match SLOTS_STATE.load(Ordering::Acquire) {
         1 => return true,
@@ -252,35 +254,40 @@ unsafe fn make_slots() -> bool {
         _ => {}
     }
     let block = unsafe { title_alloc(SLOTS * SLOT_BYTES, c"apr.mmap.fault-slots") };
-    let mut ok = !block.is_null();
+    const WS: usize = ampr_codec::ZSTD_DECODER_WORKSPACE;
+    let ws_tag = c"apr.mmap.fault-decoders".as_ptr();
+    let (ws, ws_len) = unsafe { crate::rt::index_memory::buffer_alloc(SLOTS * WS, ws_tag) };
+    let mut ok = !block.is_null() && ws_len >= SLOTS * WS;
     for (i, slot) in SLOT_TABLE.iter().enumerate() {
         if !ok {
             break;
         }
         let buf = unsafe { block.add(i * SLOT_BYTES) };
-        let mut decoder = alloc::boxed::Box::new(ampr_codec::ZstdDecoder::new());
+        let decoder = unsafe { ampr_codec::ZstdDecoder::init_in(ws.add(i * WS), WS) };
+        let Some(decoder) = (unsafe { decoder.as_mut() }) else {
+            ok = false;
+            break;
+        };
         if crate::rt::tune::zstd_verify() {
             let _ = decoder.set_verify_checksum(true);
         }
         let out = unsafe { core::slice::from_raw_parts_mut(buf.add(CHUNK as usize), CHUNK as usize) };
-        // A decoder that cannot warm up (libzstd allocation or init failed)
-        // would fail its first fill; fail the setup instead, so every map
-        // takes the disk cache.
+        // A decoder that cannot warm up would fail its first fill; fail the
+        // setup instead, so every map takes the disk cache.
         if decoder.warm_up(out).is_err() {
             ok = false;
             break;
         }
         slot.buf.store(buf, Ordering::Relaxed);
-        slot.decoder.store(alloc::boxed::Box::into_raw(decoder), Ordering::Relaxed);
+        slot.decoder.store(decoder, Ordering::Relaxed);
     }
     if !ok {
         unsafe { title_free(block, c"apr.mmap.fault-slots") };
+        // The decoders sit in this block; a static DCtx has nothing to free.
+        unsafe { crate::rt::index_memory::buffer_free(ws.cast(), ws_tag) };
         for slot in &SLOT_TABLE {
             slot.buf.store(null_mut(), Ordering::Relaxed);
-            let decoder = slot.decoder.swap(null_mut(), Ordering::Relaxed);
-            if !decoder.is_null() {
-                drop(unsafe { alloc::boxed::Box::from_raw(decoder) });
-            }
+            slot.decoder.store(null_mut(), Ordering::Relaxed);
         }
     }
     SLOTS_STATE.store(if ok { 1 } else { 2 }, Ordering::Release);
@@ -544,6 +551,10 @@ pub(crate) unsafe fn try_map(
     let (Some(entry), Some(index)) = (zstd_entry(ampr_id), zstd_index()) else {
         return MapResult::Fallback;
     };
+    // The fault handler reads chunk records from memory only.
+    if !zstd_chunks_resident() {
+        return MapResult::Fallback;
+    }
     let Ok(file) = index.file(u64::from(entry.zstd_id)) else {
         return MapResult::Fallback;
     };
@@ -924,17 +935,18 @@ unsafe fn decode_and_copy(info: &MapInfo, chunk: u64, state: &AtomicU8) -> bool 
     // The record lookup reads the zstd mount, which module_stop frees once
     // the reader count is zero, so it runs under a ManifestReader (two
     // atomics, safe in the signal handler). A refused enter fails the fill
-    // as a missing mount does. The record is a copy, so the guard ends with
-    // the lookup; the slot and fill spin locks below are never held by
-    // shutdown, so no reader waits on them while shutdown waits for readers.
+    // as a missing mount does. The record comes from memory only (the fast
+    // table or a resident index): the page cache lock, a wait or an index
+    // pread could deadlock or stall a faulting thread, so a record that
+    // would need one fails the fill. The record is a copy, so the guard
+    // ends with the lookup; the slot and fill spin locks below are never
+    // held by shutdown, so no reader waits on them while shutdown waits
+    // for readers.
     let record = {
         let Some(_reader) = ManifestReader::enter() else {
             return false;
         };
-        let Some(index) = zstd_index() else {
-            return false;
-        };
-        let Ok(record) = index.chunk(info.first_record + chunk as u32) else {
+        let Some(record) = zstd_chunk_resident(info.first_record + chunk as u32) else {
             return false;
         };
         record

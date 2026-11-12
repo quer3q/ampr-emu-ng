@@ -81,12 +81,45 @@ fn note_unpark(job: &mut VirtualAioSlot) {
     (job.parked_ns, job.requeued_ns) = (0, 0);
 }
 
-/// zstd: frees `worker`'s decoder (thread create failure, pack shutdown).
+/// zstd: gives `worker`'s decoder workspace back to the Buffer ledger
+/// (thread create failure, worker retired, pack shutdown). The decoder sits
+/// at the workspace start and its static DCtx needs no free of its own.
 pub(crate) unsafe fn release_worker_decoder(worker: &mut WorkerContext) {
     if !worker.decoder.is_null() {
-        drop(unsafe { alloc::boxed::Box::from_raw(worker.decoder) });
+        unsafe {
+            crate::rt::index_memory::buffer_free(
+                worker.decoder.cast(),
+                c"apr.pack.worker.decoder".as_ptr(),
+            )
+        };
         worker.decoder = null_mut();
     }
+}
+
+/// zstd: `worker`'s decoder in a workspace from the Buffer ledger, warmed
+/// up on its decode scratch. False, with nothing kept, when the ledger
+/// refuses the workspace or the decoder cannot be set up or warm up.
+unsafe fn make_worker_decoder(worker: &mut WorkerContext) -> bool {
+    let tag = c"apr.pack.worker.decoder".as_ptr();
+    let (ws, len) =
+        unsafe { crate::rt::index_memory::buffer_alloc(ampr_codec::ZSTD_DECODER_WORKSPACE, tag) };
+    let decoder = unsafe { ampr_codec::ZstdDecoder::init_in(ws, len) };
+    let Some(d) = (unsafe { decoder.as_mut() }) else {
+        unsafe { crate::rt::index_memory::buffer_free(ws.cast(), tag) };
+        return false;
+    };
+    let scratch = unsafe {
+        core::slice::from_raw_parts_mut(worker.decoded_scratch, worker.decoded_scratch_size)
+    };
+    if super::super::tune::zstd_verify() {
+        let _ = d.set_verify_checksum(true);
+    }
+    if d.warm_up(scratch).is_err() {
+        unsafe { crate::rt::index_memory::buffer_free(ws.cast(), tag) };
+        return false;
+    }
+    worker.decoder = decoder;
+    true
 }
 
 pub(crate) unsafe fn queue_cache_waiter_locked(
@@ -364,23 +397,18 @@ unsafe fn spawn_worker_locked(state: *mut PackState, i: usize) -> bool {
         return false;
     }
     // The runtime-wide thread budget (rt/thread_hooks.rs), before the
-    // decoder: a worker the budget refuses keeps no heap.
+    // decoder: a worker the budget refuses keeps no workspace.
     if !super::super::thread_hooks::reserve(WORKERS_LIVE.load(Ordering::Relaxed) == 0) {
         return false;
     }
-    // zstd only: one decoder per live worker, not per possible one, since it
-    // comes out of the game's libc heap. Its buffers are allocated now, not on
-    // a game read; the scratch holds a whole zstd chunk (256 KiB, zstd.rs).
-    if zstd_mode() && worker.decoder.is_null() {
-        let mut decoder = alloc::boxed::Box::new(ampr_codec::ZstdDecoder::new());
-        if super::super::tune::zstd_verify() {
-            let _ = decoder.set_verify_checksum(true);
-        }
-        let scratch = unsafe {
-            core::slice::from_raw_parts_mut(worker.decoded_scratch, worker.decoded_scratch_size)
-        };
-        let _ = decoder.warm_up(scratch);
-        worker.decoder = alloc::boxed::Box::into_raw(decoder);
+    // zstd only: one decoder per live worker, not per possible one, in a
+    // 112 KiB workspace from the Buffer ledger (rt/index_memory.rs), not
+    // the game's libc heap. A refused workspace or failed warm-up stops this
+    // worker like a refused decode buffer; the scratch holds a whole zstd
+    // chunk (256 KiB, ampr-codec zstd.rs).
+    if zstd_mode() && worker.decoder.is_null() && !unsafe { make_worker_decoder(worker) } {
+        super::super::thread_hooks::unreserve();
+        return false;
     }
     let arg = worker as *mut WorkerContext as *mut c_void;
     let rc = unsafe {
@@ -888,8 +916,8 @@ pub(crate) unsafe fn ensure_workers_locked(state: *mut PackState) -> bool {
         }
         worker.decoded_scratch = scratch;
         worker.decoded_scratch_size = PACK_MAX_BLOCK_BYTES;
-        // The zstd decoder (libc heap) is made when the thread starts and
-        // freed when it leaves (spawn_worker_locked, reap_workers_locked).
+        // The zstd decoder (Buffer ledger) is made when the thread starts
+        // and freed when it leaves (spawn_worker_locked, reap_workers_locked).
         prepared += 1;
     }
     WORKERS_CEILING.store(prepared, Ordering::Relaxed);

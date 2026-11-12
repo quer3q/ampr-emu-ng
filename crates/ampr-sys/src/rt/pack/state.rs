@@ -3,6 +3,7 @@
 
 use super::*;
 
+use crate::rt::index::IndexIo;
 use core::mem::align_of;
 use core::ptr::addr_of_mut;
 
@@ -273,32 +274,43 @@ pub(crate) fn pread_loop(
     true
 }
 
-pub(crate) unsafe fn manifest_string(
+// ---- AMPRPAK4 records, copied out of the mounted manifest ----
+
+/// File record `index` (zero-based) of the mounted manifest; None when no
+/// manifest is mounted or the index is out of range.
+pub(crate) unsafe fn lz4_file(state: *const PackState, index: u32) -> Option<AmprPackFileRecord> {
+    let raw = (*state).core_view.manifest?.file_record_raw(index).ok()?;
+    Some(unsafe { core::ptr::read_unaligned(raw.as_ptr().cast()) })
+}
+
+/// Pack record `id` of the mounted manifest, as `lz4_file`.
+pub(crate) unsafe fn lz4_pack(state: *const PackState, id: u32) -> Option<AmprPackDataRecord> {
+    let raw = (*state).core_view.manifest?.pack_record_raw(id).ok()?;
+    Some(unsafe { core::ptr::read_unaligned(raw.as_ptr().cast()) })
+}
+
+/// The NUL-terminated string-table entry at `offset` copied into `buf`
+/// (without its NUL); None when absent or longer than `buf`.
+pub(crate) unsafe fn manifest_string<'b>(
     state: *const PackState,
     offset: u32,
     length: u32,
-) -> *const c_char {
-    let (offset, length) = (offset as usize, length as usize);
-    if (*state).strings.is_null()
-        || offset >= (*state).strings_bytes
-        || length >= (*state).strings_bytes - offset
-    {
-        return null();
-    }
-    let value = unsafe { (*state).strings.add(offset) };
-    if unsafe { *value.add(length) } == 0 {
-        value
-    } else {
-        null()
-    }
+    buf: &'b mut [u8],
+) -> Option<&'b [u8]> {
+    (*state)
+        .core_view
+        .manifest?
+        .string(offset, length, buf)
+        .ok()
 }
 
 pub(crate) fn overlay_bytes(value: *const c_char) -> *const u8 {
     value as *const u8
 }
 
-pub(crate) unsafe fn overlay_manifest(state: *const PackState) -> *const u8 {
-    (*state).core_view.base
+/// The view the overlay shims (overlay_ffi.rs) read the manifest from.
+pub(crate) unsafe fn overlay_manifest(state: *const PackState) -> *const AmprPackCoreView {
+    &raw const (*state).core_view
 }
 
 fn fold(c: c_char) -> u8 {
@@ -314,12 +326,20 @@ pub(crate) unsafe fn folded_equal(
     a_length == b_length && (0..a_length).all(|i| unsafe { fold(*a.add(i)) == fold(*b.add(i)) })
 }
 
-pub(crate) unsafe fn file_record_path(state: *const PackState, file_index: u32) -> *const c_char {
-    if (*state).header.is_null() || file_index as u64 >= unsafe { (*(*state).header).file_count } {
-        return null();
-    }
-    let file = unsafe { *(*state).files.add(file_index as usize) };
-    unsafe { manifest_string(state, file.path_offset, file.path_length) }
+/// File record `file_index`'s path copied into `buf`; `Err(Io)` for a
+/// read error of a paged index, apart from an absent record.
+pub(crate) unsafe fn file_record_path<'b>(
+    state: *const PackState,
+    file_index: u32,
+    buf: &'b mut [u8],
+) -> ampr_format::Result<&'b [u8]> {
+    let manifest = (*state)
+        .core_view
+        .manifest
+        .ok_or(ampr_format::Error::Invalid)?;
+    let raw = manifest.file_record_raw(file_index)?;
+    let file: AmprPackFileRecord = unsafe { core::ptr::read_unaligned(raw.as_ptr().cast()) };
+    manifest.string(file.path_offset, file.path_length, buf)
 }
 
 pub(crate) unsafe fn folded_hash(value: *const c_char, length: usize) -> u64 {
@@ -343,18 +363,17 @@ pub(crate) unsafe fn normalize_overlay_path(
 }
 
 pub(crate) unsafe fn build_packed_file_order(state: *mut PackState) -> bool {
-    if (*state).header.is_null() || (*state).files.is_null() {
+    if (*state).header.is_null() || (*state).core_view.manifest.is_none() {
         return false;
     }
-    let count =
-        unsafe { ampr_rust_overlay_packed_count(overlay_manifest(state), (*state).core_view.size) };
+    let count = unsafe { ampr_rust_overlay_packed_count(overlay_manifest(state)) };
     (*state).packed_file_count = count;
     if count == 0 {
         return true;
     }
     let bytes = count as usize * size_of::<u32>();
     let memory = unsafe {
-        crate::rt::index_memory::index_alloc(
+        crate::rt::index_memory::lookup_alloc(
             bytes,
             align_of::<u32>(),
             c"apr.pack.directory-index".as_ptr(),
@@ -365,12 +384,7 @@ pub(crate) unsafe fn build_packed_file_order(state: *mut PackState) -> bool {
     }
     (*state).packed_file_order = memory as *mut u32;
     unsafe {
-        ampr_rust_overlay_build_order(
-            overlay_manifest(state),
-            (*state).core_view.size,
-            (*state).packed_file_order,
-            count,
-        )
+        ampr_rust_overlay_build_order(overlay_manifest(state), (*state).packed_file_order, count)
     }
 }
 
@@ -386,18 +400,19 @@ pub(crate) unsafe fn packed_order(state: *const PackState) -> (*const u32, u32) 
     }
 }
 
+/// The packed span below `directory`; `Err(IndexIo)` when an index read
+/// failed on the way (the directory may be packed: EIO, not ENOENT).
 pub(crate) unsafe fn find_virtual_directory_range(
     state: *const PackState,
     directory: *const c_char,
     directory_length: u16,
     out_begin: *mut u32,
     out_end: *mut u32,
-) -> bool {
+) -> Result<bool, IndexIo> {
     let (order, count) = packed_order(state);
-    unsafe {
+    let found = unsafe {
         ampr_rust_overlay_directory_range(
             overlay_manifest(state),
-            (*state).core_view.size,
             order,
             count,
             overlay_bytes(directory),
@@ -405,41 +420,53 @@ pub(crate) unsafe fn find_virtual_directory_range(
             out_begin,
             out_end,
         )
+    };
+    match found {
+        Ok(found) => Ok(found),
+        Err(ampr_format::Error::Io) => Err(IndexIo),
+        Err(_) => Ok(false),
     }
 }
 
 /// A packed file found by `resolve_packed_file`, per pack format.
 pub(crate) enum PackedFile {
-    /// AMPRPAK4: the manifest file record.
-    Lz4(*const AmprPackFileRecord),
+    /// AMPRPAK4: the manifest file record, copied out.
+    Lz4(AmprPackFileRecord),
     /// zstd: the resident AMPRIDX3 entry view.
     Zstd(FileEntryView),
 }
 
 /// The one-based AMPRIDX3 id of `path` and its packed file, when the id
 /// names a packed file of the indexed size (for zstd: an R4 projection onto
-/// a zstd file). An id without a packed record is loose (None), never an
-/// error.
+/// a zstd file). An id without a packed record is loose (`Ok(None)`).
+/// `Err(IndexIo)` when an index read failed on the way: the file may be
+/// packed and has no disk copy then, so the caller answers EIO, never
+/// "not packed".
 pub(crate) unsafe fn resolve_packed_file(
     state: *const PackState,
     path: *const c_char,
-) -> Option<(u32, PackedFile)> {
+) -> Result<Option<(u32, PackedFile)>, IndexIo> {
     let zstd = zstd_mode();
     let mut file_id = 0u32;
     let mut indexed_size = 0usize;
-    if path.is_null()
-        || unsafe { ampr_index_resolve_path_to_id(path, &mut file_id, &mut indexed_size) } != 0
-        || (!zstd && (*state).header.is_null())
-        || !unsafe {
-            ampr_rust_overlay_packed_file_matches(
-                overlay_manifest(state),
-                (*state).core_view.size,
-                file_id,
-                indexed_size as u64,
-            )
-        }
-    {
-        return None;
+    if path.is_null() {
+        return Ok(None);
+    }
+    match unsafe { ampr_index_resolve_path_to_id(path, &mut file_id, &mut indexed_size) } {
+        0 => {}
+        rc if rc == -EIO => return Err(IndexIo),
+        _ => return Ok(None),
+    }
+    if !zstd && (*state).header.is_null() {
+        return Ok(None);
+    }
+    let packed = unsafe {
+        ampr_rust_overlay_packed_file_matches(overlay_manifest(state), file_id, indexed_size as u64)
+    };
+    match packed {
+        Ok(true) => {}
+        Err(ampr_format::Error::Io) => return Err(IndexIo),
+        _ => return Ok(None),
     }
     let file = if zstd {
         let mut entry = FileEntryView {
@@ -448,14 +475,22 @@ pub(crate) unsafe fn resolve_packed_file(
             size: 0,
             mtime: 0,
         };
-        if unsafe { ampr_index_get_entry_view(file_id, &mut entry) } != 0 {
-            return None;
+        match unsafe { ampr_index_get_entry_view(file_id, &mut entry) } {
+            0 => PackedFile::Zstd(entry),
+            rc if rc == -EIO => return Err(IndexIo),
+            _ => return Ok(None),
         }
-        PackedFile::Zstd(entry)
     } else {
-        PackedFile::Lz4(unsafe { (*state).files.add(file_id as usize - 1) })
+        let Some(m) = (*state).core_view.manifest else {
+            return Ok(None);
+        };
+        match m.file_record_raw(file_id - 1) {
+            Ok(raw) => PackedFile::Lz4(unsafe { core::ptr::read_unaligned(raw.as_ptr().cast()) }),
+            Err(ampr_format::Error::Io) => return Err(IndexIo),
+            Err(_) => return Ok(None),
+        }
     };
-    Some((file_id, file))
+    Ok(Some((file_id, file)))
 }
 
 pub(crate) unsafe fn fill_synthetic_stat(
@@ -535,7 +570,6 @@ pub(crate) unsafe fn service_name_hidden(
         && unsafe {
             ampr_rust_overlay_service_name_hidden(
                 null(),
-                0,
                 directory as *const u8,
                 directory_length,
                 name as *const u8,
@@ -562,16 +596,24 @@ pub(crate) unsafe fn service_name_hidden(
     // Hide the exact physical volumes named by the loaded manifest; pack
     // names are deployment-relative to the logical /app0 namespace.
     let root = AMPR_EMU_PACK_LOGICAL_ROOT_PATH.to_bytes();
-    if !(*state).header.is_null() && !(*state).packs.is_null() {
+    if !(*state).header.is_null() {
         let root_slash = root.last() != Some(&b'/');
         for pack_id in 0..unsafe { (*(*state).header).pack_count } {
-            let record = unsafe { *(*state).packs.add(pack_id as usize) };
-            let pack_name =
-                unsafe { manifest_string(state, record.name_offset, record.name_length) };
-            if pack_name.is_null() {
+            let Some(record) = (unsafe { lz4_pack(state, pack_id) }) else {
                 continue;
-            }
-            let name_len = record.name_length as usize;
+            };
+            let mut pack_name = [0u8; SCE_KERNEL_PATH_MAX];
+            let Some(pack_name) = (unsafe {
+                manifest_string(
+                    state,
+                    record.name_offset,
+                    record.name_length,
+                    &mut pack_name,
+                )
+            }) else {
+                continue;
+            };
+            let name_len = pack_name.len();
             let target_length = root.len() + root_slash as usize + name_len;
             if target_length >= SCE_KERNEL_PATH_MAX {
                 continue;
@@ -585,7 +627,11 @@ pub(crate) unsafe fn service_name_hidden(
                     *t.add(cursor) = b'/' as c_char;
                     cursor += 1;
                 }
-                core::ptr::copy_nonoverlapping(pack_name, t.add(cursor), name_len);
+                core::ptr::copy_nonoverlapping(
+                    pack_name.as_ptr() as *const c_char,
+                    t.add(cursor),
+                    name_len,
+                );
                 if joined_entry_matches_path(directory, directory_length, name, name_length, t) {
                     return true;
                 }
@@ -726,7 +772,7 @@ mod tests {
         assert!(!VirtualFdSlot::EMPTY.holds(-1));
     }
 
-    // ---- index room (rt/index_memory.rs `INDEX_FILE_MAX`) ----
+    // ---- paged AMPRPAK4 index ----
 
     /// An AMPRPAK4 image of `n` empty packed files and exactly `bytes`
     /// bytes: the paths take what the records leave. No chunks, no packs.
@@ -774,41 +820,101 @@ mod tests {
         b
     }
 
-    /// A 52 MiB AMPRPAK4 index of 786,432 packed files loads with its
-    /// directory order at exactly the index cap; one more file at the same
-    /// size needs a page past it and is refused with the index notice.
+    /// An LZ4 index read error is not a miss: the open validation answers
+    /// EIO (as zstd `VALIDATE_IO`) and the packed check `Err(Io)`, so
+    /// neither the open nor the stat (rt/pack/directories.rs) falls to a
+    /// disk copy the packed file does not have.
     #[test]
-    fn a_52_mib_lz4_index_and_its_order_fit_and_more_files_are_refused() {
+    fn an_lz4_index_read_error_is_eio_not_a_miss() {
+        use crate::rt::index::AmprPackCoreView;
+        use crate::rt::index_pages::{self, IndexSource};
+        use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+        // 2000 records span six 16 KiB pages; the cache holds one page.
+        let n = 2000u32;
+        let image: &'static [u8] = lz4_index(n as usize, 128 + 2000 * 88).leak();
+        let fail: &'static AtomicBool = Box::leak(Box::new(AtomicBool::new(false)));
+        let src = IndexSource::Paged(index_pages::test_file(image, fail));
+        let src: &'static IndexSource = Box::leak(Box::new(src));
+        let mut view = AmprPackCoreView::EMPTY;
+        view.manifest = Some(ampr_lz4::manifest::Manifest::open(src).unwrap());
+        let m = view.manifest.unwrap();
+        let path = |id: u32| {
+            let mut buf = [0u8; SCE_KERNEL_PATH_MAX];
+            m.path(&m.file(id - 1).unwrap(), &mut buf).unwrap().to_vec()
+        };
+        let (first, last) = (path(1), path(n));
+        let validate = |id: u32, p: &[u8]| unsafe {
+            ampr_pack_core_validate_logical_file(&view, id, p.as_ptr().cast(), p.len(), 0)
+        };
+        let matches = |id: u32| unsafe { ampr_rust_overlay_packed_file_matches(&view, id, 0) };
+        assert_eq!((validate(1, &first), matches(1)), (0, Ok(true)));
+        // The one cached page now holds paths; the last records are paged out.
+        fail.store(true, SeqCst);
+        assert_eq!(validate(n, &last), SCE_KERNEL_ERROR_EIO);
+        assert_eq!(matches(n - 1), Err(ampr_format::Error::Io));
+        // An id outside the index stays an answer, not an error.
+        assert_eq!(matches(n + 1), Ok(false));
+        assert_ne!(validate(n + 1, &last), SCE_KERNEL_ERROR_EIO);
+        fail.store(false, SeqCst);
+        assert_eq!((validate(n, &last), matches(n - 1)), (0, Ok(true)));
+    }
+
+    /// A 52 MiB AMPRPAK4 index of 786,432 packed files mounts paged: its
+    /// fast table (the 48 B records) and its directory order (4 B per
+    /// packed file) are index memory, its paths are not. With a page less
+    /// room than those need it is refused with the index notice and takes
+    /// nothing; the release gives every byte back.
+    #[test]
+    fn a_52_mib_lz4_index_mounts_paged_with_its_fast_table() {
         use crate::rt::index_memory as im;
+        use crate::rt::index_pages::{self, IndexSource};
         let _pool = im::POOL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        for (n, fits) in [(786_432usize, true), (786_433, false)] {
-            let image = lz4_index(n, im::INDEX_FILE_MAX);
-            let layout = std::alloc::Layout::new::<PackState>();
-            let state = unsafe { std::alloc::alloc_zeroed(layout) }.cast::<PackState>();
-            assert!(!state.is_null());
+        let n = 786_432usize;
+        let image = lz4_index(n, 52 << 20);
+        let layout = std::alloc::Layout::new::<PackState>();
+        let state = unsafe { std::alloc::alloc_zeroed(layout) }.cast::<PackState>();
+        assert!(!state.is_null());
+        let manifest = super::super::manifest::validate_manifest_layout;
+        unsafe {
+            let src = index_pages::register_memory(image.as_ptr(), image.len()).unwrap();
+            let src: &'static IndexSource = Box::leak(Box::new(IndexSource::Paged(src)));
             let used = im::test_index_used();
+            let (page, needed) = (SCE_KERNEL_PAGE_SIZE, n * 48 + n * 4);
             im::test_take_index_notice();
-            unsafe {
-                let mem = im::index_alloc(image.len(), 8, c"test.pack.index".as_ptr());
-                assert!(!mem.is_null());
-                core::ptr::copy_nonoverlapping(image.as_ptr(), mem, image.len());
-                assert!(super::super::manifest::validate_manifest_layout(
-                    state,
-                    mem.cast(),
-                    image.len()
-                ));
-                (*state).manifest_base = mem.cast();
-                (*state).manifest_bytes = image.len();
-                assert_eq!(build_packed_file_order(state), fits, "{n} files");
-                assert_eq!(im::test_take_index_notice(), !fits);
-                if fits {
-                    assert_eq!((*state).packed_file_count as usize, n);
-                    assert_eq!(im::test_index_used() - used, im::INDEX_MEMORY_MAX);
-                }
-                super::super::manifest::release_manifest_storage(state);
-                std::alloc::dealloc(state.cast(), layout);
-            }
+            let fill = (im::index_room() - needed) / page * page + page;
+            let other = im::index_alloc(fill, page, c"test.other.tables".as_ptr());
+            assert!(!other.is_null());
+            assert!(!manifest(state, src));
+            assert!(im::test_take_index_notice());
+            assert_eq!(im::test_index_used(), used + fill);
+            assert!((*state).header.is_null());
+            im::index_free(other.cast(), c"test.other.tables.free".as_ptr());
+
+            assert!(manifest(state, src));
+            assert!(!im::test_take_index_notice());
+            assert_eq!({ (*(*state).header).file_count }, n as u64);
+            assert!((*state).core_view.manifest.is_some_and(|m| m.has_fast()));
+            assert!(build_packed_file_order(state));
+            assert_eq!((*state).packed_file_count as usize, n);
+            let grown = im::test_index_used() - used;
+            assert!(grown >= needed && grown < image.len(), "{grown}");
+            assert_eq!(
+                lz4_file(state, 0).map(|f| f.flags),
+                Some(AMPR_PACK_FILE_PACKED)
+            );
+            assert!(lz4_file(state, n as u32).is_none());
+            let mut buf = [0u8; SCE_KERNEL_PATH_MAX];
+            let path = file_record_path(state, 0, &mut buf).unwrap();
+            assert!(path.starts_with(b"/app0/"));
+            super::super::manifest::release_manifest_storage(state);
+            assert!((*state).header.is_null() && lz4_file(state, 0).is_none());
             assert_eq!(im::test_index_used(), used);
+            assert_eq!(im::lookup_used(), 0);
+            index_pages::unregister(match *src {
+                IndexSource::Paged(p) => p,
+                IndexSource::Resident(_) => unreachable!(),
+            });
+            std::alloc::dealloc(state.cast(), layout);
         }
     }
 }

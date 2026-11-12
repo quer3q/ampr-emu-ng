@@ -1,12 +1,15 @@
-//! AMPRPAK4 byte-backed manifest reader and AMPRDAT3 header check.
+//! AMPRPAK4 manifest reader and AMPRDAT3 header check. The manifest reads
+//! through a `Source`, so the runtime can page a large index instead of
+//! holding it whole.
 use crate::{
-    crc32, header_crc, i64_at, logical_path, pak_path_hash, range, safe_components, section,
-    terminated_string, u16_at, u32_at, u64_at, Error, Result, CHUNK_LZ4, CHUNK_PAGE_ALIGNED,
-    CHUNK_PAGE_CONTAINED, CHUNK_RAW, CHUNK_RECORD, CHUNK_STREAMING, DAT_HEADER, DAT_HEADER_CRC_AT,
-    DAT_MAGIC, ENDIAN_MARKER, FILE_PACKED, FILE_RANDOM_ACCESS, FILE_RECORD, FILE_STORE_ONLY,
-    FILE_STREAMING, PACK_IO_PAGE_LAYOUT, PACK_RECORD, PACK_STRIPED, PAK_HEADER, PAK_HEADER_CRC_AT,
-    PAK_MAGIC, PAK_PAYLOAD_CRC_AT,
+    header_crc, logical_path, pak_path_hash, range, safe_components, u16_at, u32_at, u64_at, Error,
+    Result, CHUNK_LZ4, CHUNK_PAGE_ALIGNED, CHUNK_PAGE_CONTAINED, CHUNK_RAW, CHUNK_RECORD,
+    CHUNK_STREAMING, DAT_HEADER, DAT_HEADER_CRC_AT, DAT_MAGIC, ENDIAN_MARKER, FILE_PACKED,
+    FILE_RANDOM_ACCESS, FILE_RECORD, FILE_STORE_ONLY, FILE_STREAMING, PACK_IO_PAGE_LAYOUT,
+    PACK_RECORD, PACK_STRIPED, PAK_HEADER, PAK_HEADER_CRC_AT, PAK_MAGIC, PAK_PAYLOAD_CRC_AT,
 };
+use ampr_format::overlay::folded_compare;
+use ampr_format::source::{src_crc32, src_u32, src_u64, Source, PATH_BUF};
 
 /// Raw 48-byte AMPRPAK4 file record (`AmprPackFileRecord`), not validated.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -34,7 +37,7 @@ impl FileRecord {
         Ok(Self {
             path_hash: u64_at(r, 0)?,
             logical_size: u64_at(r, 8)?,
-            mtime: i64_at(r, 16)?,
+            mtime: crate::i64_at(r, 16)?,
             first_chunk: u32_at(r, 24)?,
             chunk_count: u32_at(r, 28)?,
             path_offset: u32_at(r, 32)?,
@@ -47,9 +50,12 @@ impl FileRecord {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
-pub struct File<'a> {
-    pub path: &'a [u8],
+/// A checked file record by value: the path stays in the source at
+/// `path_at` (absolute offset) and is copied out with `Manifest::path`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct File {
+    pub path_at: u64,
+    pub path_len: u32,
     pub logical_size: u64,
     pub mtime: i64,
     pub first_chunk: u32,
@@ -68,146 +74,300 @@ pub struct Chunk {
     pub flags: u8,
 }
 
-#[derive(Clone, Copy, Debug)]
-pub struct Pack<'a> {
-    pub name: &'a [u8],
+/// A pack record by value; its name is copied out with `Manifest::pack_name`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Pack {
     pub payload_bytes: u64,
     pub file_size: u64,
     pub flags: u32,
     pub io_page_size: u32,
 }
 
-impl Pack<'_> {
+impl Pack {
     pub fn payload_offset(&self) -> u64 {
         self.file_size - self.payload_bytes
     }
 }
 
-pub struct Manifest<'a> {
-    pub build_id: &'a [u8],
-    files: &'a [u8],
-    chunks: &'a [u8],
-    packs: &'a [u8],
-    strings: &'a [u8],
+/// Reads records through `src` at absolute section offsets, so the same
+/// reader serves a resident image and the runtime's index page cache; with
+/// a fast table (`with_fast`) the records come from memory and only paths
+/// are read through `src`.
+pub struct Manifest<'s, S: Source + ?Sized = [u8]> {
+    src: &'s S,
+    /// The fast table (`fill_fast`): the file, chunk and pack record
+    /// sections, `[files_at, strings_at)`, held in memory by the caller.
+    fast: Option<&'s [u8]>,
+    /// Records are in folded path order, ties allowed (checked by `open`;
+    /// false for `view_trusted`).
+    sorted: bool,
+    pub build_id: [u8; 16],
+    files_at: u64,
+    file_count: u32,
+    chunks_at: u64,
+    chunk_count: u32,
+    packs_at: u64,
+    pack_count: u32,
+    strings_at: u64,
+    strings_len: u64,
 }
 
-impl<'a> Manifest<'a> {
-    pub fn open(bytes: &'a [u8]) -> Result<Self> {
-        let m = Self::layout(bytes)?;
+// A copy reads the same source; `derive` would ask `S: Copy` of `[u8]`.
+impl<S: Source + ?Sized> Clone for Manifest<'_, S> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl<S: Source + ?Sized> Copy for Manifest<'_, S> {}
+
+/// `at` when `[at, at + len)` lies in the source: `Invalid` on overflow,
+/// `Truncated` past the end, as a slice section was.
+fn section(src: &(impl Source + ?Sized), at: u64, len: u64) -> Result<u64> {
+    let end = at.checked_add(len).ok_or(Error::Invalid)?;
+    if end > src.len() {
+        return Err(Error::Truncated);
+    }
+    Ok(at)
+}
+
+/// Absolute offset of record `id` of `count` records of `size` bytes at
+/// `base`: `OutOfRange` when the byte offset overflows u32, `Truncated`
+/// past the section, as the slice reader returned.
+fn record_at(base: u64, count: u32, id: u32, size: usize) -> Result<u64> {
+    let off = id.checked_mul(size as u32).ok_or(Error::OutOfRange)?;
+    if id >= count {
+        return Err(Error::Truncated);
+    }
+    Ok(base + u64::from(off))
+}
+
+/// File, chunk and pack counts at header offsets 40, 48 and 56, checked
+/// against the record index widths.
+fn counts(src: &(impl Source + ?Sized)) -> Result<(u32, u32, u32)> {
+    let file_count = src_u64(src, 40)?;
+    let chunk_count = src_u64(src, 48)?;
+    let pack_count = src_u32(src, 56)?;
+    if file_count > u32::MAX as u64 || chunk_count > u32::MAX as u64 || pack_count > u16::MAX as u32
+    {
+        return Err(Error::Invalid);
+    }
+    Ok((file_count as u32, chunk_count as u32, pack_count))
+}
+
+/// (files, chunks, packs) declared by an AMPRPAK4 header, before `open`
+/// checks the rest: lets the caller size its tables before the full pass.
+pub fn header_counts(h: &[u8]) -> Result<(u32, u32, u32)> {
+    if h.get(..8) != Some(&PAK_MAGIC[..]) {
+        return Err(Error::Invalid);
+    }
+    counts(h)
+}
+
+impl<'s, S: Source + ?Sized> Manifest<'s, S> {
+    /// Full validation: every pack and file record, each path read once.
+    /// The same pass notes whether the records are in folded path order
+    /// (`records_sorted`), comparing each path with the one before it.
+    pub fn open(src: &'s S) -> Result<Self> {
+        let mut m = Self::layout(src)?;
         for id in 0..m.pack_count() {
             m.pack(id)?;
         }
+        let mut bufs = [[0u8; PATH_BUF]; 2];
+        let (mut previous, mut sorted) = (None, true);
         for id in 0..m.file_count() {
-            m.validate_file(id)?;
+            let [a, b] = &mut bufs;
+            let (cur, prev) = if id & 1 == 0 { (a, &*b) } else { (b, &*a) };
+            let len = m.validate_file(id, cur)?;
+            if previous.is_some_and(|n: usize| folded_compare(&prev[..n], &cur[..len]).is_gt()) {
+                sorted = false;
+            }
+            previous = Some(len);
         }
+        m.sorted = sorted;
         Ok(m)
     }
 
-    /// Per-call view of bytes that already passed `open` and stay immutable:
-    /// slices the sections at the header offsets with bounds checks only; no
-    /// header field checks, no CRC and no per-record validation. Never panics.
-    pub fn view_trusted(bytes: &'a [u8]) -> Result<Self> {
-        let file_count = u64_at(bytes, 40)?;
-        let chunk_count = u64_at(bytes, 48)?;
-        let pack_count = u32_at(bytes, 56)?;
-        if file_count > u32::MAX as u64
-            || chunk_count > u32::MAX as u64
-            || pack_count > u16::MAX as u32
-        {
-            return Err(Error::Invalid);
-        }
-        let len = |count: u64, size: usize| count.checked_mul(size as u64).ok_or(Error::Invalid);
+    /// Whether `open` found the records in folded path order, ties allowed:
+    /// then (folded path, id) order is plain id order.
+    pub fn records_sorted(&self) -> bool {
+        self.sorted
+    }
+
+    /// Per-call view of a source that already passed `open` and stays
+    /// immutable: section offsets from the header with bounds checks only;
+    /// no header field checks, no CRC and no per-record validation. Never
+    /// panics.
+    pub fn view_trusted(src: &'s S) -> Result<Self> {
+        let (file_count, chunk_count, pack_count) = counts(src)?;
+        let len = |count: u32, size: usize| u64::from(count) * size as u64;
+        let mut build_id = [0u8; 16];
+        src.read_at(24, &mut build_id)?;
         Ok(Self {
-            build_id: range(bytes, 24, 16)?,
-            files: section(bytes, u64_at(bytes, 72)?, len(file_count, FILE_RECORD)?)?,
-            chunks: section(bytes, u64_at(bytes, 80)?, len(chunk_count, CHUNK_RECORD)?)?,
-            packs: section(
-                bytes,
-                u64_at(bytes, 88)?,
-                len(u64::from(pack_count), PACK_RECORD)?,
-            )?,
-            strings: section(bytes, u64_at(bytes, 96)?, u64_at(bytes, 104)?)?,
+            src,
+            fast: None,
+            sorted: false,
+            build_id,
+            files_at: section(src, src_u64(src, 72)?, len(file_count, FILE_RECORD))?,
+            file_count,
+            chunks_at: section(src, src_u64(src, 80)?, len(chunk_count, CHUNK_RECORD))?,
+            chunk_count,
+            packs_at: section(src, src_u64(src, 88)?, len(pack_count, PACK_RECORD))?,
+            pack_count,
+            strings_at: section(src, src_u64(src, 96)?, src_u64(src, 104)?)?,
+            strings_len: src_u64(src, 104)?,
         })
     }
 
-    fn layout(bytes: &'a [u8]) -> Result<Self> {
-        if bytes.get(..8) != Some(PAK_MAGIC) {
+    fn layout(src: &'s S) -> Result<Self> {
+        let mut magic = [0u8; 8];
+        if src.len() < 8 {
             return Err(Error::Invalid);
         }
-        range(bytes, 0, PAK_HEADER)?;
-        if u32_at(bytes, 8)? != 4
-            || u32_at(bytes, 12)? != PAK_HEADER as u32
-            || u32_at(bytes, 16)? != 0
-            || u32_at(bytes, 20)? != ENDIAN_MARKER
-            || u32_at(bytes, 60)? != FILE_RECORD as u32
-            || u32_at(bytes, 64)? != CHUNK_RECORD as u32
-            || u32_at(bytes, 68)? != PACK_RECORD as u32
-            || u64_at(bytes, 120)? != 0
+        src.read_at(0, &mut magic)?;
+        if &magic != PAK_MAGIC {
+            return Err(Error::Invalid);
+        }
+        let mut h = [0u8; PAK_HEADER];
+        src.read_at(0, &mut h)?;
+        if u32_at(&h, 8)? != 4
+            || u32_at(&h, 12)? != PAK_HEADER as u32
+            || u32_at(&h, 16)? != 0
+            || u32_at(&h, 20)? != ENDIAN_MARKER
+            || u32_at(&h, 60)? != FILE_RECORD as u32
+            || u32_at(&h, 64)? != CHUNK_RECORD as u32
+            || u32_at(&h, 68)? != PACK_RECORD as u32
+            || u64_at(&h, 120)? != 0
         {
             return Err(Error::Invalid);
         }
-        if header_crc(bytes, PAK_HEADER, PAK_HEADER_CRC_AT)? != u32_at(bytes, PAK_HEADER_CRC_AT)?
-            || crc32(&bytes[PAK_HEADER..]) != u32_at(bytes, PAK_PAYLOAD_CRC_AT)?
+        if header_crc(&h, PAK_HEADER, PAK_HEADER_CRC_AT)? != u32_at(&h, PAK_HEADER_CRC_AT)?
+            || src_crc32(src, PAK_HEADER as u64, src.len(), 0)? != u32_at(&h, PAK_PAYLOAD_CRC_AT)?
         {
             return Err(Error::Checksum);
         }
-        let file_count = u64_at(bytes, 40)?;
-        let chunk_count = u64_at(bytes, 48)?;
-        let pack_count = u32_at(bytes, 56)?;
-        if file_count > u32::MAX as u64
-            || chunk_count > u32::MAX as u64
-            || pack_count > u16::MAX as u32
-        {
-            return Err(Error::Invalid);
-        }
-        let file_len = file_count
-            .checked_mul(FILE_RECORD as u64)
-            .ok_or(Error::Invalid)?;
-        let chunk_len = chunk_count
-            .checked_mul(CHUNK_RECORD as u64)
-            .ok_or(Error::Invalid)?;
+        let (file_count, chunk_count, pack_count) = counts(src)?;
+        let file_len = u64::from(file_count) * FILE_RECORD as u64;
+        let chunk_len = u64::from(chunk_count) * CHUNK_RECORD as u64;
         let pack_len = u64::from(pack_count) * PACK_RECORD as u64;
         let files_at = PAK_HEADER as u64;
-        let chunks_at = files_at.checked_add(file_len).ok_or(Error::Invalid)?;
-        let packs_at = chunks_at.checked_add(chunk_len).ok_or(Error::Invalid)?;
-        let strings_at = packs_at.checked_add(pack_len).ok_or(Error::Invalid)?;
-        let strings_len = u64_at(bytes, 104)?;
-        if u64_at(bytes, 72)? != files_at
-            || u64_at(bytes, 80)? != chunks_at
-            || u64_at(bytes, 88)? != packs_at
-            || u64_at(bytes, 96)? != strings_at
-            || strings_at.checked_add(strings_len) != Some(bytes.len() as u64)
+        let chunks_at = files_at + file_len;
+        let packs_at = chunks_at + chunk_len;
+        let strings_at = packs_at + pack_len;
+        let strings_len = u64_at(&h, 104)?;
+        if u64_at(&h, 72)? != files_at
+            || u64_at(&h, 80)? != chunks_at
+            || u64_at(&h, 88)? != packs_at
+            || u64_at(&h, 96)? != strings_at
+            || strings_at.checked_add(strings_len) != Some(src.len())
         {
             return Err(Error::Invalid);
         }
+        let mut build_id = [0u8; 16];
+        build_id.copy_from_slice(range(&h, 24, 16)?);
         Ok(Self {
-            build_id: range(bytes, 24, 16)?,
-            files: section(bytes, files_at, file_len)?,
-            chunks: section(bytes, chunks_at, chunk_len)?,
-            packs: section(bytes, packs_at, pack_len)?,
-            strings: section(bytes, strings_at, strings_len)?,
+            src,
+            fast: None,
+            sorted: false,
+            build_id,
+            files_at,
+            file_count,
+            chunks_at,
+            chunk_count,
+            packs_at,
+            pack_count,
+            strings_at,
+            strings_len,
         })
     }
 
+    pub fn source(&self) -> &'s S {
+        self.src
+    }
     pub fn file_count(&self) -> u32 {
-        (self.files.len() / FILE_RECORD) as u32
+        self.file_count
     }
     pub fn chunk_count(&self) -> u32 {
-        (self.chunks.len() / CHUNK_RECORD) as u32
+        self.chunk_count
     }
     pub fn pack_count(&self) -> u32 {
-        (self.packs.len() / PACK_RECORD) as u32
+        self.pack_count
     }
 
-    /// Returns the zero-based file record at `index`.
-    pub fn file(&self, id: u32) -> Result<File<'a>> {
+    // ---- fast table ----
+
+    /// Bytes of the fast table: the file, chunk and pack record sections,
+    /// which `layout` placed back to back from the header (48 B per file,
+    /// 12 B per chunk, 32 B per pack). Paths stay in the source.
+    pub fn fast_len(&self) -> usize {
+        usize::try_from(self.strings_at.saturating_sub(self.files_at)).unwrap_or(usize::MAX)
+    }
+
+    /// Fills the fast table with one sequential pass over the record
+    /// sections, 4 KiB per source read (no_std threads have small stacks).
+    /// `Invalid` when `out` is not `fast_len` long or the sections are not
+    /// back to back (a `view_trusted` header that `open` would refuse).
+    pub fn fill_fast(&self, out: &mut [u8]) -> Result<()> {
+        if out.len() != self.fast_len() || !self.sections_contiguous() {
+            return Err(Error::Invalid);
+        }
+        for (n, block) in out.chunks_mut(4096).enumerate() {
+            self.src.read_at(self.files_at + (n * 4096) as u64, block)?;
+        }
+        Ok(())
+    }
+
+    /// Makes record reads (files, chunks, packs) use `fast`, filled by
+    /// `fill_fast` from this manifest. `Invalid` when its length differs.
+    pub fn with_fast(mut self, fast: &'s [u8]) -> Result<Self> {
+        if fast.len() != self.fast_len() || !self.sections_contiguous() {
+            return Err(Error::Invalid);
+        }
+        self.fast = Some(fast);
+        Ok(self)
+    }
+
+    /// Whether file, chunk and pack records are read from memory only.
+    pub fn has_fast(&self) -> bool {
+        self.fast.is_some()
+    }
+
+    fn sections_contiguous(&self) -> bool {
+        let len = |count: u32, size: usize| u64::from(count) * size as u64;
+        self.chunks_at == self.files_at + len(self.file_count, FILE_RECORD)
+            && self.packs_at == self.chunks_at + len(self.chunk_count, CHUNK_RECORD)
+            && self.strings_at == self.packs_at + len(self.pack_count, PACK_RECORD)
+    }
+
+    /// Record bytes at absolute offset `at` (inside a record section, which
+    /// `record_at` checked): from the fast table when there is one.
+    fn read_record(&self, at: u64, out: &mut [u8]) -> Result<()> {
+        match self.fast {
+            Some(f) => {
+                let from = (at - self.files_at) as usize;
+                let bytes = f.get(from..from + out.len()).ok_or(Error::Truncated)?;
+                out.copy_from_slice(bytes);
+                Ok(())
+            }
+            None => self.src.read_at(at, out),
+        }
+    }
+
+    /// The checked zero-based file record at `id`; reads its path once to
+    /// check it against the record's hash.
+    pub fn file(&self, id: u32) -> Result<File> {
+        self.file_into(id, &mut [0u8; PATH_BUF])
+    }
+
+    /// `file` with the checked path left in `buf`.
+    fn file_into(&self, id: u32, buf: &mut [u8; PATH_BUF]) -> Result<File> {
         let r = self.file_record(id)?;
-        let path = self.string(r.path_offset, r.path_length)?;
+        let path = self.string(r.path_offset, r.path_length, buf)?;
         if !logical_path(path) || pak_path_hash(path) != r.path_hash || r.reserved != 0 {
             return Err(Error::Invalid);
         }
         Ok(File {
-            path,
+            path_at: self.strings_at + u64::from(r.path_offset),
+            path_len: r.path_length,
             logical_size: r.logical_size,
             mtime: r.mtime,
             first_chunk: r.first_chunk,
@@ -218,17 +378,44 @@ impl<'a> Manifest<'a> {
         })
     }
 
-    /// Returns the raw, unvalidated zero-based file record at `id`.
-    pub fn file_record(&self, id: u32) -> Result<FileRecord> {
-        let at = id
-            .checked_mul(FILE_RECORD as u32)
-            .ok_or(Error::OutOfRange)? as usize;
-        FileRecord::parse(range(self.files, at, FILE_RECORD)?)
+    /// Copies `f`'s path into `buf`; `Invalid` when it does not fit.
+    pub fn path<'b>(&self, f: &File, buf: &'b mut [u8]) -> Result<&'b [u8]> {
+        ampr_format::source::src_bytes(self.src, f.path_at, f.path_len as usize, buf)
     }
 
-    /// NUL-terminated string-table entry without interior NULs.
-    pub fn string(&self, off: u32, len: u32) -> Result<&'a [u8]> {
-        terminated_string(self.strings, off, len)
+    /// Returns the raw, unvalidated zero-based file record at `id`.
+    pub fn file_record(&self, id: u32) -> Result<FileRecord> {
+        FileRecord::parse(&self.file_record_raw(id)?)
+    }
+
+    /// The 48 bytes of file record `id`, for callers that keep the on-disk
+    /// layout (the runtime's `AmprPackFileRecord`).
+    pub fn file_record_raw(&self, id: u32) -> Result<[u8; FILE_RECORD]> {
+        let at = record_at(self.files_at, self.file_count, id, FILE_RECORD)?;
+        let mut r = [0u8; FILE_RECORD];
+        self.read_record(at, &mut r)?;
+        Ok(r)
+    }
+
+    /// NUL-terminated string-table entry without interior NULs, copied into
+    /// `buf`. `Invalid` when `len` is `PATH_BUF` or more (the PS5 path
+    /// limit; the packer never writes longer) or longer than `buf`.
+    pub fn string<'b>(&self, off: u32, len: u32, buf: &'b mut [u8]) -> Result<&'b [u8]> {
+        let end = u64::from(off) + u64::from(len);
+        if len as usize >= PATH_BUF || end >= self.strings_len {
+            return Err(Error::Invalid);
+        }
+        let out = buf.get_mut(..len as usize).ok_or(Error::Invalid)?;
+        let mut nul = [0xffu8];
+        self.src.read_at(self.strings_at + end, &mut nul)?;
+        if nul[0] != 0 {
+            return Err(Error::Invalid);
+        }
+        self.src.read_at(self.strings_at + u64::from(off), out)?;
+        if out.contains(&0) {
+            return Err(Error::Invalid);
+        }
+        Ok(out)
     }
 
     pub fn chunk(&self, id: u32) -> Result<Chunk> {
@@ -241,12 +428,11 @@ impl<'a> Manifest<'a> {
 
     /// Decodes a chunk record; only reserved descriptor bits 30..31 are checked.
     pub fn chunk_record(&self, id: u32) -> Result<Chunk> {
-        let at = id
-            .checked_mul(CHUNK_RECORD as u32)
-            .ok_or(Error::OutOfRange)? as usize;
-        let r = range(self.chunks, at, CHUNK_RECORD)?;
-        let loc = u64_at(r, 0)?;
-        let desc = u32_at(r, 8)?;
+        let at = record_at(self.chunks_at, self.chunk_count, id, CHUNK_RECORD)?;
+        let mut r = [0u8; CHUNK_RECORD];
+        self.read_record(at, &mut r)?;
+        let loc = u64_at(&r, 0)?;
+        let desc = u32_at(&r, 8)?;
         if desc & 0xc000_0000 != 0 {
             return Err(Error::Invalid);
         }
@@ -259,46 +445,48 @@ impl<'a> Manifest<'a> {
         })
     }
 
-    pub fn pack(&self, id: u32) -> Result<Pack<'a>> {
-        let at = id
-            .checked_mul(PACK_RECORD as u32)
-            .ok_or(Error::OutOfRange)? as usize;
-        let r = range(self.packs, at, PACK_RECORD)?;
-        let name = self.string(u32_at(r, 16)?, u32_at(r, 20)?)?;
+    /// Raw pack record `id`: payload bytes, file size, flags, I/O page
+    /// size, name offset and length. No checks.
+    fn pack_raw(&self, id: u32) -> Result<(Pack, u32, u32)> {
+        let r = self.pack_record_raw(id)?;
         let p = Pack {
-            name,
-            payload_bytes: u64_at(r, 0)?,
-            file_size: u64_at(r, 8)?,
-            flags: u32_at(r, 24)?,
-            io_page_size: u32_at(r, 28)?,
+            payload_bytes: u64_at(&r, 0)?,
+            file_size: u64_at(&r, 8)?,
+            flags: u32_at(&r, 24)?,
+            io_page_size: u32_at(&r, 28)?,
         };
-        if !safe_components(name)
-            || !p.io_page_size.is_power_of_two()
-            || !(1 << 12..=1 << 20).contains(&p.io_page_size)
-            || p.flags & !(PACK_STRIPED | PACK_IO_PAGE_LAYOUT) != 0
-            || p.flags & PACK_IO_PAGE_LAYOUT == 0
-            || p.file_size < DAT_HEADER as u64
-            || p.payload_bytes > p.file_size
-            || p.payload_offset() < DAT_HEADER as u64
-            || p.payload_offset() % u64::from(p.io_page_size) != 0
-            || p.file_size % u64::from(p.io_page_size) != 0
-        {
+        Ok((p, u32_at(&r, 16)?, u32_at(&r, 20)?))
+    }
+
+    /// The 32 bytes of pack record `id` (the runtime's `AmprPackDataRecord`).
+    pub fn pack_record_raw(&self, id: u32) -> Result<[u8; PACK_RECORD]> {
+        let at = record_at(self.packs_at, self.pack_count, id, PACK_RECORD)?;
+        let mut r = [0u8; PACK_RECORD];
+        self.read_record(at, &mut r)?;
+        Ok(r)
+    }
+
+    /// The checked pack record `id`, its name included.
+    pub fn pack(&self, id: u32) -> Result<Pack> {
+        let (p, off, len) = self.pack_raw(id)?;
+        let mut buf = [0u8; PATH_BUF];
+        let name = self.string(off, len, &mut buf)?;
+        if !safe_components(name) || !pack_fields_valid(&p) {
             return Err(Error::Invalid);
         }
         Ok(p)
     }
 
-    /// Raw name of pack record `id`: string-table bounds only, no pack checks.
-    pub fn pack_name(&self, id: u32) -> Result<&'a [u8]> {
-        let at = id
-            .checked_mul(PACK_RECORD as u32)
-            .ok_or(Error::OutOfRange)? as usize;
-        let r = range(self.packs, at, PACK_RECORD)?;
-        self.string(u32_at(r, 16)?, u32_at(r, 20)?)
+    /// Raw name of pack record `id` copied into `buf`: string-table bounds
+    /// only, no pack checks.
+    pub fn pack_name<'b>(&self, id: u32, buf: &'b mut [u8]) -> Result<&'b [u8]> {
+        let (_, off, len) = self.pack_raw(id)?;
+        self.string(off, len, buf)
     }
 
-    fn validate_file(&self, id: u32) -> Result<()> {
-        let f = self.file(id)?;
+    /// Checks file record `id`; its path is left in `buf`, its length returned.
+    fn validate_file(&self, id: u32, buf: &mut [u8; PATH_BUF]) -> Result<usize> {
+        let f = self.file_into(id, buf)?;
         if f.flags & !0x1f != 0 {
             return Err(Error::Invalid);
         }
@@ -311,7 +499,7 @@ impl<'a> Manifest<'a> {
             {
                 return Err(Error::Invalid);
             }
-            return Ok(());
+            return Ok(f.path_len as usize);
         }
         if !(14..=20).contains(&f.block_shift)
             || f.flags & FILE_STREAMING != 0 && f.flags & FILE_RANDOM_ACCESS != 0
@@ -324,9 +512,19 @@ impl<'a> Manifest<'a> {
         if u64::from(f.chunk_count) != expected {
             return Err(Error::Invalid);
         }
+        // The last pack is kept: a file's chunks mostly share one, and each
+        // `pack` call reads its record and name through the source.
+        let mut last: Option<(u16, Pack)> = None;
         for local in 0..f.chunk_count {
             let c = self.chunk(f.first_chunk + local)?;
-            let p = self.pack(u32::from(c.pack_id))?;
+            let p = match last {
+                Some((id, p)) if id == c.pack_id => p,
+                _ => {
+                    let p = self.pack(u32::from(c.pack_id))?;
+                    last = Some((c.pack_id, p));
+                    p
+                }
+            };
             let raw = core::cmp::min(block, f.logical_size - u64::from(local) * block);
             let stored = u64::from(c.stored_size);
             let page = u64::from(p.io_page_size);
@@ -353,7 +551,7 @@ impl<'a> Manifest<'a> {
                 return Err(Error::Invalid);
             }
         }
-        Ok(())
+        Ok(f.path_len as usize)
     }
 
     /// Checks a volume header against a manifest pack record and actual volume size.
@@ -362,7 +560,7 @@ impl<'a> Manifest<'a> {
         check_volume_header(
             h,
             pack_id,
-            self.build_id,
+            &self.build_id,
             p.flags,
             p.file_size,
             p.payload_bytes,
@@ -371,6 +569,19 @@ impl<'a> Manifest<'a> {
         )?;
         Ok(())
     }
+}
+
+/// The numeric pack record checks of `Manifest::pack`.
+fn pack_fields_valid(p: &Pack) -> bool {
+    p.io_page_size.is_power_of_two()
+        && (1 << 12..=1 << 20).contains(&p.io_page_size)
+        && p.flags & !(PACK_STRIPED | PACK_IO_PAGE_LAYOUT) == 0
+        && p.flags & PACK_IO_PAGE_LAYOUT != 0
+        && p.file_size >= DAT_HEADER as u64
+        && p.payload_bytes <= p.file_size
+        && p.payload_offset() >= DAT_HEADER as u64
+        && p.payload_offset() % u64::from(p.io_page_size) == 0
+        && p.file_size % u64::from(p.io_page_size) == 0
 }
 
 /// Check a separately read AMPRDAT3 header against an already validated pack.

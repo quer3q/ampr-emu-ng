@@ -8,10 +8,10 @@ with it, then ship the release build.
 
 `./ps5/build-docker.sh` (`make dist`) builds both files. The debug one is
 `make AMPR_MEM_REPORT=1` (Cargo feature `mem_report`) with the pool set to
-`AMPR_DEBUG_POOL_SIZE` (`0x7508000`, 117.03 MiB); the release pool is
-`0x7664000` (118.39 MiB). The smaller pool offsets the larger debug code, so
-both PRX files load to 127 MiB with the same ledger caps, caches and thread
-limits.
+`AMPR_DEBUG_POOL_SIZE` (`0x7e78000`, 126.47 MiB); the release pool is
+`0x7fd4000` (127.83 MiB). The smaller pool offsets the larger debug code, so
+both PRX files load to 136.5 MiB with the same ledger caps, caches and
+thread limits.
 
 Only the debug build:
 
@@ -63,6 +63,27 @@ Then one `name value` pair per line: uptime, pool used, peak and size, the
 counts, the last 32 file events as `fs` lines, the knobs as `tune_` lines and
 pool use per site as `pool_now:` and `pool_peak:` lines. Counters are totals
 since load; `*_max` values reset on each scrape.
+
+The index page cache (`rt/index_pages.rs`) reads the index files that do not
+fit the Index ledger whole in 16 KiB pages through an arena of
+`index_arena_bytes` (a 16 MiB floor plus the room the lookup tables left;
+0 while every index file is read whole; `index_fast_bytes` is the resident
+fast tables of the paged files): `index_page_hits` (pages
+served from the arena), `index_page_misses` and `index_page_miss_ns` (pages
+read from the file and the time spent), `index_page_evictions` (pages dropped
+to make room), `index_page_resident` (pages in the arena now),
+`index_page_direct_reads` (reads served from the file past the arena,
+because another thread was loading that page or no slot could be evicted;
+no reader waits on another thread) and `index_files_bytes` (the registered
+index files together). When
+`index_files_bytes` fits the arena, misses stop at one per page and
+evictions stay 0; growing evictions mean the index files outgrew it.
+`index_fast_bytes` covers the fast tables of all three index files (zstd
+16 B per file for hash and size, 8 B per chunk and volume; AMPRIDX3 12 B per file; LZ4 48 B per
+file, 12 B per chunk, 32 B per pack); a paged index whose fast table does
+not fit is not served (the one index notice). `index_lookup_io` counts
+file index lookups that could not read the index file: they go to the
+real call instead of answering ENOENT.
 
 Most runs compare three numbers:
 

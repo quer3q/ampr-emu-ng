@@ -76,10 +76,10 @@ pub(crate) unsafe fn readahead_last_chunk(
     file_id: u32,
     request: &SceKernelAioRWRequest,
 ) -> Option<u32> {
-    if k() == 0 || (*state).files.is_null() || request.offset < 0 || request.nbyte == 0 {
+    if k() == 0 || request.offset < 0 || request.nbyte == 0 {
         return None;
     }
-    let file = unsafe { &*(*state).files.add(file_id as usize - 1) };
+    let file = unsafe { lz4_file(state, file_id.checked_sub(1)?) }?;
     let (flags, logical_size, shift) =
         ({ file.flags }, { file.logical_size }, { file.block_shift }
             as u32);
@@ -99,8 +99,14 @@ pub(crate) unsafe fn readahead_window_locked(
     fd_index: u32,
     last: u32,
 ) -> (u32, u32) {
+    let file_id = (*state).virtual_fds[fd_index as usize].file_id;
+    let Some(file) = file_id
+        .checked_sub(1)
+        .and_then(|i| unsafe { lz4_file(state, i) })
+    else {
+        return (0, 0);
+    };
     let slot = &mut (*state).virtual_fds[fd_index as usize];
-    let file = unsafe { &*(*state).files.add(slot.file_id as usize - 1) };
     let flags = { file.flags };
     let last = last as u64;
     let k = k() as u64;
@@ -135,12 +141,17 @@ pub(crate) unsafe fn queue_readahead(file_id: u32, start: u32, end: u32) -> bool
         return false;
     }
     let state = unsafe { pack_state() };
-    let file = unsafe { &*(*state).files.add(file_id as usize - 1) };
+    let Some(file) = file_id
+        .checked_sub(1)
+        .and_then(|i| unsafe { lz4_file(state, i) })
+    else {
+        return false;
+    };
     let (logical_size, shift) = ({ file.logical_size }, { file.block_shift } as u32);
     let count = end - start;
     let offset = (start as u64) << shift;
     let length = ((end as u64) << shift).min(logical_size) - offset;
-    let file_ptr = file as *const AmprPackFileRecord as *const u8;
+    let file_ptr = &file as *const AmprPackFileRecord as *const u8;
 
     let mut chunks = [AmprPackChunkView::default(); K_CAP];
     let mut planned = 0;
@@ -325,7 +336,7 @@ pub(crate) unsafe fn bench_volume_path(out: &mut [u8; 1024]) -> Option<(usize, u
     let file_size = if zstd_mode() {
         zstd::zstd_volume_size(0)?
     } else {
-        unsafe { (*(*state).packs).file_size }
+        unsafe { lz4_pack(state, 0) }?.file_size
     };
     Some((length, file_size))
 }

@@ -1,7 +1,9 @@
 //! Direct-read fd policy, read descriptor acquire/release, `submit` and synthetic submit-id waits.
 
 use super::*;
+use crate::rt::fd_cache::EntryPath;
 use crate::rt::stats::{self, Stat};
+use ampr_format::source::PATH_BUF;
 
 pub(crate) const fn apr_direct_read_aio_limit(effectiveLimit: u32, baseLimit: u32) -> u32 {
     if effectiveLimit == 0 || baseLimit == 0 {
@@ -53,19 +55,29 @@ pub(crate) fn apr_update_read_desc_fd_policy(rd: &mut AprAioReadDesc, promoteFul
             && !promoteFullFile;
 }
 
-pub(crate) fn apr_read_desc_entry(rd: &AprAioReadDesc, out: *mut FileEntryView) -> bool {
+/// The file index entry of `rd`, its path copied into `path` (`out.path`
+/// points there), for an open: a desc keeps no path of its own (the index
+/// may be paged). Its size is the one `apr_prepare_aio_read_desc` checked.
+/// 0, `-EIO` when the index could not be read, else `-ENOENT`.
+pub(crate) fn apr_read_desc_entry(
+    rd: &AprAioReadDesc,
+    out: *mut FileEntryView,
+    path: &mut EntryPath,
+) -> c_int {
     if out.is_null() {
-        return false;
+        return -ENOENT;
     }
-    if rd.fileMetadataValid {
-        let o = unsafe { &mut *out };
-        o.path = rd.filePath;
-        o.path_length = rd.filePathLength;
-        o.size = rd.fileSize;
-        o.mtime = 0;
-        return !rd.filePath.is_null();
+    match unsafe { ampr_index_get_entry_view_path(rd.fileId, out, path) } {
+        0 => 0,
+        rc if rc == -EIO => -EIO,
+        _ => -ENOENT,
     }
-    unsafe { ampr_index_get_entry_view(rd.fileId, out) == 0 }
+}
+
+/// The acquire rc for a failed `apr_read_desc_entry`
+/// (`apr_entry_view_error`).
+fn apr_read_desc_entry_error(rd: &AprAioReadDesc, rc: c_int) -> c_int {
+    apr_entry_view_error(rd.fileId, rc)
 }
 
 pub(crate) fn apr_acquire_aio_read_desc(
@@ -91,9 +103,10 @@ pub(crate) fn apr_acquire_aio_read_desc(
 
     if rd.bypassFdCache {
         let mut directEntry: FileEntryView = unsafe { core::mem::zeroed() };
-        let haveDirectEntry = apr_read_desc_entry(rd, &mut directEntry);
-        if !haveDirectEntry {
-            set_rc(apr_file_id_lookup_error(rd.fileId));
+        let mut directPath: EntryPath = [0; PATH_BUF];
+        let entryRc = apr_read_desc_entry(rd, &mut directEntry, &mut directPath);
+        if entryRc != 0 {
+            set_rc(apr_read_desc_entry_error(rd, entryRc));
             return false;
         }
         // A packed direct read uses a synthetic descriptor; resolve it before
@@ -176,15 +189,22 @@ pub(crate) fn apr_acquire_aio_read_desc(
         return true;
     }
 
-    let mut cachedEntry: FileEntryView = unsafe { core::mem::zeroed() };
-    if !apr_read_desc_entry(rd, &mut cachedEntry) {
+    // Cache acquisition tries packed files before enforcing the physical FD
+    // budget. The entry and its path are read only when the cache has no
+    // fd for the file: the desc's size already passed the range checks.
+    let mut lookupFailed = false;
+    let entry = |out: &mut FileEntryView, path: &mut EntryPath| {
+        let rc = apr_read_desc_entry(rd, out, path);
+        // An index read error goes back as the fd (-EIO): SCE EIO below.
+        lookupFailed = rc != 0 && rc != -EIO;
+        rc
+    };
+    let fd =
+        unsafe { ampr_index_acquire_cached_fd(jobId, rd.fileId, entry, kAprAioOpenFlags, 0, true) };
+    if lookupFailed {
         set_rc(apr_file_id_lookup_error(rd.fileId));
         return false;
     }
-    // Cache acquisition tries packed files before enforcing the physical FD budget.
-    let fd = unsafe {
-        ampr_index_acquire_cached_fd(jobId, rd.fileId, &cachedEntry, kAprAioOpenFlags, 0, true)
-    };
     if fd < 0 {
         set_rc(ampr_sce_errno_from_posix(-fd));
         return false;

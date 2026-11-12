@@ -5,7 +5,9 @@
 
 #[allow(unsafe_code)]
 mod zstd;
-pub use zstd::{ZstdDecoder, ZSTD_CODEC_RAW, ZSTD_CODEC_ZSTD, ZSTD_MAX_CHUNK_SIZE};
+pub use zstd::{
+    ZstdDecoder, ZSTD_CODEC_RAW, ZSTD_CODEC_ZSTD, ZSTD_DECODER_WORKSPACE, ZSTD_MAX_CHUNK_SIZE,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {

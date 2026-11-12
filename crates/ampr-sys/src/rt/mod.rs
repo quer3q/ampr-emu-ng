@@ -10,6 +10,7 @@ mod fd_cache;
 mod hook;
 mod index;
 pub(crate) mod index_memory;
+mod index_pages;
 mod libc_exports;
 #[cfg(feature = "mem_report")]
 mod probe;

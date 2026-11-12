@@ -490,8 +490,8 @@ unsafe fn copy_virtual_file(vfd: c_int, fd: c_int) -> Result<u64, c_int> {
 }
 
 /// Largest packed file `read_packed` reads whole. The buffer comes from the
-/// Index ledger's free room, which can be less (3 MiB of tables room when
-/// the index file is near its 52 MiB, rt/index_memory.rs): a larger icon is
+/// Index ledger's free room, which can be less (the 2 MiB the page arena
+/// leaves for transient buffers, rt/index_pages.rs `TRANSIENT_ROOM`): a larger icon is
 /// then skipped like one over this size, counted in `save_icon_skipped`
 /// without the index notice (rt/save.rs `save_icon_by_path_emul`).
 pub(crate) const READ_PACKED_MAX: usize = 8 * 1024 * 1024;

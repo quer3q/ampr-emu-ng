@@ -325,6 +325,33 @@ stats! {
     MmapFaults = "mmap_faults",
     MmapFaultBytes = "mmap_fault_bytes",
     MmapFaultErrors = "mmap_fault_errors",
+    /// Index page cache (rt/index_pages.rs): 16 KiB page lookups served
+    /// from the arena, pages read from the index file and the time those
+    /// reads took, resident pages dropped to make room, pages resident
+    /// now (gauge) and the bytes of all registered index files. Misses
+    /// past the first load of each page mean the paged index files
+    /// outgrew the arena (`index_arena_bytes`).
+    IndexPageHits = "index_page_hits",
+    IndexPageMisses = "index_page_misses",
+    IndexPageMissNs = "index_page_miss_ns",
+    IndexPageEvictions = "index_page_evictions",
+    IndexPageResident = "index_page_resident",
+    /// Reads served straight from the index file, bypassing the arena:
+    /// the page was being loaded by another thread or no slot could be
+    /// evicted. A reader never waits on another thread.
+    IndexPageDirectReads = "index_page_direct_reads",
+    IndexFilesBytes = "index_files_bytes",
+    /// Page arena size: the 16 MiB floor taken by the first paged index
+    /// file plus the room the lookup tables left (rt/index_pages.rs
+    /// `grow_arena`); 0 while every index file is read whole.
+    IndexArenaBytes = "index_arena_bytes",
+    /// Resident fast tables of the paged index files (zstd: 16 B per file
+    /// for hash and size, 8 B per chunk and volume; AMPRIDX3: 12 B per file; LZ4: 48 B per
+    /// file, 12 B per chunk, 32 B per pack).
+    IndexFastBytes = "index_fast_bytes",
+    /// File index lookups that could not read the index file: sent to the
+    /// real call, never answered ENOENT (rt/index.rs `IndexIo`).
+    IndexLookupIo = "index_lookup_io",
 }
 
 const N: usize = Stat::Count as usize;
@@ -670,6 +697,14 @@ pub(crate) fn gs_retry_mismatch(rc: i64, prep: (u32, u64), got: (u32, u64)) {
 pub(crate) fn add(s: Stat, v: u64) {
     if ON {
         VALUES[s as usize].fetch_add(v, Relaxed);
+    }
+}
+
+/// Takes `v` back from a running total (a source given back).
+#[inline(always)]
+pub(crate) fn sub(s: Stat, v: u64) {
+    if ON {
+        VALUES[s as usize].fetch_sub(v, Relaxed);
     }
 }
 

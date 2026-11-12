@@ -2,8 +2,8 @@
 
 use crate::Error;
 use zstd_sys::{
-    ZSTD_DCtx, ZSTD_DCtx_setParameter, ZSTD_createDCtx, ZSTD_dParameter, ZSTD_decompressDCtx,
-    ZSTD_findFrameCompressedSize, ZSTD_freeDCtx, ZSTD_getFrameContentSize, ZSTD_isError,
+    ZSTD_DCtx, ZSTD_DCtx_setParameter, ZSTD_dParameter, ZSTD_decompressDCtx,
+    ZSTD_findFrameCompressedSize, ZSTD_getFrameContentSize, ZSTD_initStaticDCtx, ZSTD_isError,
 };
 
 pub const ZSTD_MAX_CHUNK_SIZE: usize = 1 << 18;
@@ -17,85 +17,98 @@ const MAX_STORED_SIZE: usize = 1 << 18;
 const WARM_UP_RAW_SIZE: usize = ZSTD_MAX_CHUNK_SIZE;
 
 /// 256 KiB of `i % 7`, `zstd -19 -C` (content size and checksum): two
-/// 128 KiB blocks, a 256 KiB window. The decode-on-access fault handler
-/// (ampr-sys rt/pack/mmap_fault.rs) decodes inside a signal handler and must
-/// not allocate there; a smaller warm-up frame would leave larger chunks to
-/// grow the decoder's buffers on first use.
+/// 128 KiB blocks, a 256 KiB window: warm-up decodes the largest frame a
+/// real chunk can be, so a workspace too small for it fails at setup, not on
+/// a game read (the decode-on-access fault handler, ampr-sys
+/// rt/pack/mmap_fault.rs, decodes inside a signal handler).
 const WARM_UP_FRAME: [u8; 42] = [
     40, 181, 47, 253, 164, 0, 0, 4, 0, 124, 0, 0, 56, 0, 1, 2, 3, 4, 5, 6, 1, 0, 246, 255, 202,
     139, 17, 69, 0, 0, 0, 1, 0, 253, 255, 202, 11, 16, 147, 29, 0, 1,
 ];
 
-/// A reusable zstd chunk decoder over one libzstd `ZSTD_DCtx` (native C
-/// zstd: ~10x ruzstd's speed on the console). Its buffers are allocated by
-/// the first zstd chunk and reused by every later one, so a long-lived
-/// decoder does not allocate per chunk. Not shareable: one per decoding
-/// thread.
+/// Bytes of the workspace `ZstdDecoder::init_in` takes: the decoder, then a
+/// static libzstd DCtx in the rest. `ZSTD_estimateDCtxSize()` is 95968 B for
+/// zstd 1.5.7 (host test below); 112 KiB is seven 16 KiB pages, the unit the
+/// runtime pool hands out, and leaves 18 KiB of slack for a later 1.5.x.
+pub const ZSTD_DECODER_WORKSPACE: usize = 112 << 10;
+/// The decoder's own bytes at the workspace start; the DCtx follows, 64 B
+/// aligned.
+const DECODER_HEADER: usize = 64;
+const _: () = assert!(core::mem::size_of::<ZstdDecoder>() <= DECODER_HEADER);
+const _: () = assert!(core::mem::align_of::<ZstdDecoder>() <= DECODER_HEADER);
+
+/// A reusable zstd chunk decoder over one static libzstd `ZSTD_DCtx` (native
+/// C zstd: ~10x ruzstd's speed on the console). The decoder and its DCtx live
+/// in a caller-provided workspace (`init_in`), so libzstd never allocates:
+/// single-shot `ZSTD_decompressDCtx` needs no buffers past the DCtx. Not
+/// shareable: one per decoding thread. Nothing to free: the workspace owner
+/// frees the workspace (a static DCtx refuses `ZSTD_freeDCtx`).
 pub struct ZstdDecoder {
-    /// Null when libzstd could not allocate it; every zstd decode then fails.
     dctx: *mut ZSTD_DCtx,
 }
 
 // The context is owned and only used through `&mut self`.
 unsafe impl Send for ZstdDecoder {}
 
-impl Drop for ZstdDecoder {
-    fn drop(&mut self) {
-        if !self.dctx.is_null() {
-            unsafe { ZSTD_freeDCtx(self.dctx) };
-        }
-    }
-}
-
-impl Default for ZstdDecoder {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl ZstdDecoder {
-    pub fn new() -> Self {
-        let dctx = unsafe { ZSTD_createDCtx() };
+    /// Places a decoder at `workspace`, `len` bytes, at least
+    /// `ZSTD_DECODER_WORKSPACE` and 64 B aligned; null when it is too small
+    /// or misaligned, or libzstd refused the DCtx or a parameter.
+    ///
+    /// # Safety
+    /// `workspace` is writable for `len` bytes and outlives the decoder; the
+    /// caller uses it for nothing else until it frees it.
+    pub unsafe fn init_in(workspace: *mut u8, len: usize) -> *mut ZstdDecoder {
+        if workspace.is_null()
+            || len < ZSTD_DECODER_WORKSPACE
+            || workspace as usize % DECODER_HEADER != 0
+        {
+            return core::ptr::null_mut();
+        }
+        let dctx = unsafe {
+            ZSTD_initStaticDCtx(workspace.add(DECODER_HEADER).cast(), len - DECODER_HEADER)
+        };
+        if dctx.is_null() {
+            return core::ptr::null_mut();
+        }
         // A frame may not need a window past one chunk (2^18). The frame
         // checksum is not verified (ZSTD_d_forceIgnoreChecksum): a few percent
         // of decode time; corrupt data still fails libzstd's own decoding
         // checks, but a corruption that decodes cleanly is no longer caught.
         let set =
             |param, value| unsafe { ZSTD_isError(ZSTD_DCtx_setParameter(dctx, param, value)) };
-        if !dctx.is_null()
-            && (set(
-                ZSTD_dParameter::ZSTD_d_windowLogMax,
-                ZSTD_MAX_CHUNK_SIZE.trailing_zeros() as i32,
-            ) != 0
-                // ZSTD_d_forceIgnoreChecksum: skip the per-chunk XXH64 check.
-                || set(ZSTD_dParameter::ZSTD_d_experimentalParam3, 1) != 0)
+        if set(
+            ZSTD_dParameter::ZSTD_d_windowLogMax,
+            ZSTD_MAX_CHUNK_SIZE.trailing_zeros() as i32,
+        ) != 0
+            // ZSTD_d_forceIgnoreChecksum: skip the per-chunk XXH64 check.
+            || set(ZSTD_dParameter::ZSTD_d_experimentalParam3, 1) != 0
         {
-            unsafe { ZSTD_freeDCtx(dctx) };
-            return Self {
-                dctx: core::ptr::null_mut(),
-            };
+            return core::ptr::null_mut();
         }
-        Self { dctx }
+        let decoder = workspace.cast::<ZstdDecoder>();
+        unsafe { decoder.write(Self { dctx }) };
+        decoder
     }
 
     /// Turns the frame checksum check (XXH64, written by the packer) on or
-    /// off; off after `new`. On costs a few percent of decode time and
+    /// off; off after `init_in`. On costs a few percent of decode time and
     /// fails a chunk whose decoded bytes do not match. False when libzstd
     /// refused the setting. Call between frames.
     pub fn set_verify_checksum(&mut self, on: bool) -> bool {
-        !self.dctx.is_null()
-            && unsafe {
-                ZSTD_isError(ZSTD_DCtx_setParameter(
-                    self.dctx,
-                    ZSTD_dParameter::ZSTD_d_experimentalParam3,
-                    i32::from(!on),
-                ))
-            } == 0
+        let rc = unsafe {
+            ZSTD_DCtx_setParameter(
+                self.dctx,
+                ZSTD_dParameter::ZSTD_d_experimentalParam3,
+                i32::from(!on),
+            )
+        };
+        unsafe { ZSTD_isError(rc) == 0 }
     }
 
     /// Decodes a built-in full-size (256 KiB, 256 KiB window) frame into
-    /// `scratch`, so the decoder's buffers reach the size of the largest
-    /// real chunk before the first one. Callers pass the scratch they
+    /// `scratch`, so a decoder that cannot decode the largest real chunk
+    /// fails here, before the first one. Callers pass the scratch they
     /// decode real chunks into, which must hold `ZSTD_MAX_CHUNK_SIZE`
     /// (256 KiB) bytes.
     pub fn warm_up(&mut self, scratch: &mut [u8]) -> Result<(), Error> {
@@ -140,9 +153,6 @@ impl ZstdDecoder {
 }
 
 fn decode_zstd(dctx: *mut ZSTD_DCtx, stored: &[u8], raw: &mut [u8]) -> Result<(), Error> {
-    if dctx.is_null() {
-        return Err(Error::Unsupported);
-    }
     // The frame descriptor is byte 4, after the four-byte zstd magic. The
     // archive requires a checksum, explicit content size, and no dictionary.
     if stored.len() < 6 || stored[..4] != [0x28, 0xb5, 0x2f, 0xfd] {
@@ -163,7 +173,7 @@ fn decode_zstd(dctx: *mut ZSTD_DCtx, stored: &[u8], raw: &mut [u8]) -> Result<()
     {
         return Err(Error::InvalidFormat);
     }
-    // The checksum is ignored (see `ZstdDecoder::new`); libzstd still fails
+    // The checksum is ignored (see `ZstdDecoder::init_in`); libzstd still fails
     // on truncated input and on data its decoder rejects.
     let n =
         unsafe { ZSTD_decompressDCtx(dctx, raw.as_mut_ptr().cast(), raw.len(), src, stored.len()) };
@@ -179,9 +189,38 @@ mod tests {
 
     const FRAME: [u8; 42] = WARM_UP_FRAME;
 
+    #[repr(C, align(64))]
+    struct Workspace([u8; ZSTD_DECODER_WORKSPACE + DECODER_HEADER]);
+
+    #[test]
+    fn workspace_holds_the_dctx() {
+        // 95968 B for zstd 1.5.7 on the host.
+        let need = unsafe { zstd_sys::ZSTD_estimateDCtxSize() };
+        assert!(need + DECODER_HEADER <= ZSTD_DECODER_WORKSPACE, "{need}");
+        assert_eq!(ZSTD_DECODER_WORKSPACE % (16 << 10), 0);
+        let mut ws = Workspace([0; ZSTD_DECODER_WORKSPACE + DECODER_HEADER]);
+        let base = ws.0.as_mut_ptr();
+        // Too small or misaligned: refused.
+        let small = ZSTD_DECODER_WORKSPACE - 1;
+        assert!(unsafe { ZstdDecoder::init_in(base, small) }.is_null());
+        let off = unsafe { base.add(8) };
+        assert!(unsafe { ZstdDecoder::init_in(off, ZSTD_DECODER_WORKSPACE) }.is_null());
+        // A DCtx of just the estimate decodes a full chunk: decode needs
+        // no memory past it.
+        let dctx = unsafe { ZSTD_initStaticDCtx(base.add(DECODER_HEADER).cast(), need) };
+        let mut tight = ZstdDecoder { dctx };
+        assert!(!dctx.is_null());
+        let mut out = [0u8; ZSTD_MAX_CHUNK_SIZE];
+        tight.warm_up(&mut out).unwrap();
+        assert!(tight.set_verify_checksum(true));
+        tight.warm_up(&mut out).unwrap();
+    }
+
     #[test]
     fn reused_decoder_ignores_checksums_but_rejects_bad_frames() {
-        let mut decoder = ZstdDecoder::new();
+        let mut ws = Workspace([0; ZSTD_DECODER_WORKSPACE + DECODER_HEADER]);
+        let decoder = unsafe { ZstdDecoder::init_in(ws.0.as_mut_ptr(), ZSTD_DECODER_WORKSPACE) };
+        let decoder = unsafe { decoder.as_mut() }.unwrap();
         let mut out = [0u8; ZSTD_MAX_CHUNK_SIZE];
         decoder.warm_up(&mut out).unwrap();
         let raw = WARM_UP_RAW_SIZE;

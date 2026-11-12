@@ -94,28 +94,61 @@ CI (`.github/workflows/build.yml`) runs the same commands; a pushed `v*` tag cre
   lower the game's free direct memory, direct allocations did; flexible
   memory had 0-28 MiB free during play). The one exception is the Rust
   global allocator (`LibcAlloc` in `lib.rs`), which uses the game's libc
-  heap: iced-x86 and, in zstd titles, one zstd decoder per live pack
-  worker (`rt/pack/worker.rs`) and per decode-on-access slot
-  (`rt/pack/mmap_fault.rs`, `AMPR_ZSTD_MMAP=1` only). Keep it to those. Ledgers (`rt/index_memory.rs`):
-  Index 55 MiB (a 52 MiB index file plus 3 MiB for the tables built from
-  it, walk build buffers, the save icon buffer), Cache 32 MiB (16 MiB
-  physical + 16 MiB decoded, carved at startup), Buffer 28 MiB (4 x 1 MiB
-  decode + 12 x 2 MiB I/O windows), plus a 2 MiB budget for the fixed sites
+  heap: iced-x86 only. Keep it to that; zstd decoders use a static DCtx
+  in a pool workspace (`ZstdDecoder::init_in` in `crates/ampr-codec`).
+  Ledgers (`rt/index_memory.rs`):
+  Index 64 MiB (index files, lookup tables, walk build buffers, the save
+  icon buffer), Cache 32 MiB (16 MiB physical +
+  16 MiB decoded, carved at startup), Buffer 28.44 MiB (4 x 1 MiB decode +
+  12 x 2 MiB I/O windows + 4 x 112 KiB zstd decoder workspaces, one per
+  live zstd worker, taken at its start and freed when it retires; with
+  `AMPR_ZSTD_MMAP=1` 4 more for the decode-on-access slots), plus a 2 MiB budget for the fixed sites
   listed at `STATIC_POOL_SIZE` in `rt/runtime_memory.rs` (1.56 MiB used; a
   host test fails on a new pool call). A build-time assert checks that the
   caps plus the budget fit the pool. Both PRX builds load to the same
-  127 MiB (PT_LOAD memsz, below 128 MiB): the release pool is 118.39 MiB
-  (`AMPR_INTERNAL_POOL_SIZE` `0x7664000`), the debug one 117.03 MiB
-  (`AMPR_DEBUG_POOL_SIZE` `0x7508000`), the gap being the debug build's
-  larger non-pool part (9.96 vs 8.61 MiB). `dist` fails when the two totals
-  differ by more than 64 KiB or reach 128 MiB
-  (`tools/verify_payload_prx.py --prx-totals`); then update the gap in the
+  136.5 MiB (PT_LOAD memsz, below 192 MiB; v0.3.4 loaded at 200.7 MiB):
+  the release pool is 127.83 MiB
+  (`AMPR_INTERNAL_POOL_SIZE` `0x7fd4000`), the debug one 126.47 MiB
+  (`AMPR_DEBUG_POOL_SIZE` `0x7e78000`), the gap being the debug build's
+  larger non-pool part (10.04 vs 8.69 MiB). `AMPR_ZSTD_MMAP=1` grows both
+  pools by 448 KiB (136.95 MiB). `dist` fails when the two totals
+  differ by more than 64 KiB or reach 192 MiB (`PRX_TOTAL_LIMIT` in
+  `tools/verify_payload_prx.py --prx-totals`); then update the gap in the
   Makefile. A refused allocation degrades (index: one notice, packs
-  unserved; cache off; window slow path; icon skipped). The compact index
-  costs 104-124 bytes per file at 48-byte paths, so the Index cap holds
-  524,288 files. Pool peak outside the ledgers 0.56 MiB on a zstd title;
-  the largest index measured is 25.2 MiB. Any change that grows runtime
-  memory needs a measurement and an updated Makefile comment.
+  unserved; cache off; window slow path; icon skipped). Each index file
+  (AMPRZPK1, AMPRPAK4, AMPRIDX3), in mount order, is read whole into
+  index memory when it fits the room left with its tables
+  (`IndexSource::Resident`, `rt/index_pages.rs`); else it is read in
+  16 KiB pages through a page arena of at least 16 MiB
+  (`INDEX_ARENA_MIN`), taken by the first paged file and grown by
+  `grow_arena` to the room the tables leave. A paged file gets a fast
+  table, built by one sequential pass at mount and resident until
+  shutdown, so lookups and read jobs run from memory and a path is read
+  only to confirm a hash match: zstd 16 B per file (hash, logical size),
+  8 B per chunk and volume;
+  AMPRIDX3 12 B per file (hash, id); LZ4 its record sections, 48 B per
+  file, 12 B per chunk, 32 B per pack (`fill_fast` in each reader). It is
+  mandatory: there is no paged-lookup fallback. Lookup tables (fast
+  tables first, at mount, then 16 B of projection per AMPRIDX3 id and 4 B
+  of order per packed file) are capped at 48 MiB (`INDEX_LOOKUP_MAX`); an
+  index whose tables do not fit, or that would leave the arena below
+  16 MiB, is refused with the notice. A paged AMPRIDX3 must be sorted
+  (the runtime builder writes it sorted): an unsorted one is served only
+  read whole, else refused with the notice. Its header is checked
+  before it takes the arena, and the arena goes back to the ledger when
+  no paged file is left (a failed or replaced load). Hooks never wait on another thread
+  for a page: a page another thread is loading, or a miss with no
+  evictable slot, is read from the index file by the hook's thread, like
+  the open() it replaces; a read error there is never an authoritative
+  ENOENT (`index_lookup_io`). The pack
+  index is capped only by the loader's 512 MiB fstat check
+  (`AMPR_EMU_PACK_INDEX_MAX_BYTES`; paths must be shorter than 1024
+  bytes). 48 MiB holds the lookup tables of about 1.6 million zstd files
+  with 100 GB of chunks (computed). A title without
+  `ampr_emu.index` builds its AMPRIDX3 whole in the Index ledger (walk
+  build, 104-124 B per file at 48-byte paths) before writing and paging
+  it. Pool peak outside the ledgers 0.56 MiB on a zstd title; the largest
+  index measured is 25.2 MiB. Any change that grows runtime memory needs a measurement and an updated Makefile comment.
 - Comments: plain prose `//!` and `///`, saying why, with the measured numbers
   and the source they come from (e.g. `rt/stats.rs`). Large files group items under
   `// ---- topic ----` section lines; keep that style.

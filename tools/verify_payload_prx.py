@@ -52,8 +52,9 @@ def fself_versions(data: bytes) -> tuple[int, int]:
 
 MIB = 1 << 20
 # The release and debug PRX must have the same size (Makefile
-# AMPR_INTERNAL_POOL_SIZE / AMPR_DEBUG_POOL_SIZE), below 128 MiB.
-PRX_TOTAL_LIMIT = 128 * MIB
+# AMPR_INTERNAL_POOL_SIZE / AMPR_DEBUG_POOL_SIZE), below PRX_TOTAL_LIMIT.
+# v0.3.4 loaded at 200.7 MiB, so 192 MiB is known to load.
+PRX_TOTAL_LIMIT = 192 * MIB
 PRX_TOTAL_SLACK = 64 << 10
 
 
@@ -70,7 +71,7 @@ def pt_load_total(data: bytes) -> int:
 
 
 def check_prx_totals(release: Path, debug: Path) -> int:
-    """Fails unless both PRX totals match within 64 KiB and stay below 128 MiB."""
+    """Fails unless both PRX totals match within 64 KiB and stay below the limit."""
     rel, dbg = pt_load_total(release.read_bytes()), pt_load_total(debug.read_bytes())
     gap = abs(rel - dbg)
     print(
@@ -80,7 +81,8 @@ def check_prx_totals(release: Path, debug: Path) -> int:
     if gap > PRX_TOTAL_SLACK or max(rel, dbg) >= PRX_TOTAL_LIMIT:
         raise ValueError(
             "release and debug PRX totals must match within 64 KiB and stay "
-            "below 128 MiB: update the pool gap in the Makefile (debug - release "
+            f"below {PRX_TOTAL_LIMIT // MIB} MiB: update the pool gap in the "
+            "Makefile (debug - release "
             f"= {dbg - rel:+d} B; move that, in 16 KiB pages, from "
             "AMPR_DEBUG_POOL_SIZE to AMPR_INTERNAL_POOL_SIZE)"
         )

@@ -326,7 +326,7 @@ pub(crate) unsafe fn pack_mount_ready(state: *const PackState) -> bool {
     if zstd_mode() {
         zstd::zstd_index().is_some()
     } else {
-        !(*state).header.is_null() && !(*state).packs.is_null()
+        !(*state).header.is_null() && (*state).core_view.manifest.is_some()
     }
 }
 
@@ -360,10 +360,8 @@ pub(crate) unsafe fn pack_io_page_size(state: *const PackState, pack_id: u16) ->
     }
     if zstd_mode() {
         Some(ZSTD_IO_PAGE_SIZE)
-    } else if (*state).packs.is_null() {
-        None
     } else {
-        Some(unsafe { (*(*state).packs.add(pack_id as usize)).io_page_size })
+        unsafe { lz4_pack(state, u32::from(pack_id)) }.map(|p| p.io_page_size)
     }
 }
 
@@ -450,13 +448,19 @@ unsafe fn build_pack_path_lz4(
     {
         return false;
     }
-    let record = *(*state).packs.add(pack_id as usize);
-    let name = manifest_string(state, record.name_offset, record.name_length);
+    let Some(record) = lz4_pack(state, u32::from(pack_id)) else {
+        return false;
+    };
+    let mut name = [0u8; SCE_KERNEL_PATH_MAX];
+    let Some(name) = manifest_string(state, record.name_offset, record.name_length, &mut name)
+    else {
+        return false;
+    };
     let root = AMPR_EMU_PACK_ROOT_PATH.to_bytes();
     let needs_slash = !root.is_empty() && root[root.len() - 1] != b'/';
     let prefix_length = root.len() + needs_slash as usize;
-    let name_length = record.name_length as usize;
-    if name.is_null() || prefix_length + name_length + 1 > output_size {
+    let name_length = name.len();
+    if prefix_length + name_length + 1 > output_size {
         return false;
     }
     let out = output as *mut u8;
@@ -464,7 +468,7 @@ unsafe fn build_pack_path_lz4(
     if needs_slash {
         *out.add(root.len()) = b'/';
     }
-    core::ptr::copy_nonoverlapping(name as *const u8, out.add(prefix_length), name_length);
+    core::ptr::copy_nonoverlapping(name.as_ptr(), out.add(prefix_length), name_length);
     *out.add(prefix_length + name_length) = 0;
     true
 }
@@ -555,7 +559,9 @@ unsafe fn validate_data_header_lz4(
     ) {
         return false;
     }
-    let record = *(*state).packs.add(pack_id as usize);
+    let Some(record) = lz4_pack(state, u32::from(pack_id)) else {
+        return false;
+    };
     ampr_rust_volume_header_validate(
         header.as_ptr() as *const u8,
         core::ptr::addr_of!((*(*state).header).build_id) as *const u8,

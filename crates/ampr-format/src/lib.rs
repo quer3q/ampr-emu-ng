@@ -7,6 +7,7 @@ pub mod handles;
 pub mod index;
 pub mod index_key;
 pub mod overlay;
+pub mod source;
 pub mod zstd;
 
 pub const IDX_MAGIC: &[u8; 8] = b"AMPRIDX3";
@@ -21,6 +22,8 @@ pub enum Error {
     Invalid,
     Checksum,
     OutOfRange,
+    /// The backing file of a paged index could not be read.
+    Io,
 }
 
 pub type Result<T> = core::result::Result<T, Error>;
@@ -34,6 +37,8 @@ pub enum CoreError {
     ChecksumMismatch = -3,
     OutOfRange = -4,
     Unsupported = -5,
+    /// The backing file of a paged index could not be read: not a miss.
+    Io = -6,
 }
 
 impl CoreError {
@@ -48,6 +53,7 @@ impl From<Error> for CoreError {
             Error::Truncated | Error::Invalid => Self::InvalidFormat,
             Error::Checksum => Self::ChecksumMismatch,
             Error::OutOfRange => Self::OutOfRange,
+            Error::Io => Self::Io,
         }
     }
 }
@@ -252,10 +258,10 @@ mod tests {
         let slot = slots_at + (idx_path_hash(path) as usize & 1) * IDX_SLOT;
         put64(&mut b, slot, idx_path_hash(path));
         put32(&mut b, slot + 8, 1);
-        let index = index::Index::open(&b).unwrap();
+        let index = index::Index::open(&b[..]).unwrap();
         assert_eq!(index.record(1).unwrap().size, 42);
         assert_eq!(index.find(b"/APP0/one.BIN").unwrap(), Some(1));
         b[slot] ^= 1;
-        assert!(index::Index::open(&b).is_err());
+        assert!(index::Index::open(&b[..]).is_err());
     }
 }

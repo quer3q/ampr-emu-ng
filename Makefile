@@ -10,19 +10,25 @@ BUILD_MAKEFILE := $(lastword $(MAKEFILE_LIST))
 # 1 = debug build: TCP metrics endpoint on port 9090 (rt/exports.rs, rt/stats.rs).
 AMPR_MEM_REPORT ?= 0
 # Internal pool size in bytes, read by rt/runtime_memory.rs: all runtime
-# memory. It holds the Index 55 (a 52 MiB index file plus 3 MiB of tables) +
-# Cache 32 + Buffer 28 MiB ledger caps (rt/index_memory.rs; buffers are
-# 4 x 1 MiB decode + 12 x 2 MiB I/O) and a 2 MiB budget for the fixed sites
-# (1.56 MiB used); a pool below that fails the build. Both builds have the
-# same PRX size T (PT_LOAD memsz total) = 127 MiB, the smallest 1 MiB
-# multiple holding the 117 MiB of debug ledgers and budget plus the debug
-# build's non-pool part, below 128 MiB. Each pool is T minus its build's
-# non-pool part (code, data, reactor storage), rounded down to a 16 KiB
-# page. Non-pool parts: release 9027322 B (8.61 MiB), debug 10443938 B
-# (9.96 MiB; more code, /fsfail and retry records, rt/stats.rs), so the
-# release pool is 1.36 MiB (87 pages) larger: 118.39 vs 117.03 MiB. `dist` checks both totals
+# memory. It holds the Index 64 (index files read whole or through a page
+# cache of at least 16 MiB, plus up to 48 MiB of lookup tables) +
+# Cache 32 + Buffer 28.44 MiB ledger caps (rt/index_memory.rs; buffers are
+# 4 x 1 MiB decode + 4 x 112 KiB zstd decoder workspaces + 12 x 2 MiB I/O)
+# and a 2 MiB budget for the fixed sites (1.56 MiB used); a pool below that
+# fails the build. Both builds have the same PRX size T (PT_LOAD memsz
+# total), below 192 MiB: 136.5 MiB, the 127 MiB that held the 117 MiB of
+# debug ledgers and budget plus the debug build's non-pool part, grown by
+# the 448 KiB of decoder workspaces (once in libzstd DCtx on the game's
+# libc heap) and the 9 MiB the Index ledger grew by (v0.3.4 loaded at
+# 200.7 MiB, so the larger PRX loads). Each pool is T minus its build's non-pool part (code, data,
+# reactor storage), rounded down to a 16 KiB page. Non-pool parts: release
+# 9109746 B (8.69 MiB), debug 10531514 B (10.04 MiB; more code, /fsfail and
+# retry records, rt/stats.rs), so the release pool is 1.36 MiB (87 pages)
+# larger: 127.83 vs 126.47 MiB. `AMPR_ZSTD_MMAP=1` adds 448 KiB to both
+# pools (4 decode-on-access decoder workspaces, Buffer ledger): T 136.95
+# MiB. `dist` checks both totals
 # (tools/verify_payload_prx.py --prx-totals): they must match within 64 KiB
-# and stay below 128 MiB, else update the gap here.
+# and stay below 192 MiB, else update the gap here.
 # The first pool allocation publishes the pool (mprotect), so the startup
 # cache carve can use it; a carve before the pool was published failed
 # (pool_alloc_failed 1, caches off).
@@ -31,11 +37,11 @@ AMPR_MEM_REPORT ?= 0
 # did (a title had 42 MiB of direct memory free during play), and flexible
 # memory had 0-28 MiB free in another title (debug /metrics flex_* and the
 # former direct memory lines).
-AMPR_INTERNAL_POOL_SIZE ?= 0x7664000
+AMPR_INTERNAL_POOL_SIZE ?= $(if $(filter 1,$(AMPR_ZSTD_MMAP)),0x8044000,0x7fd4000)
 # Debug build pool (passed to it as AMPR_INTERNAL_POOL_SIZE by `dist`):
-# T minus the debug non-pool part, 117.03 MiB, the same ledger caps as
+# T minus the debug non-pool part, 126.47 MiB, the same ledger caps as
 # release; host tests build with it (rt/runtime_memory.rs).
-AMPR_DEBUG_POOL_SIZE ?= 0x7508000
+AMPR_DEBUG_POOL_SIZE ?= $(if $(filter 1,$(AMPR_ZSTD_MMAP)),0x7ee8000,0x7e78000)
 # Pread pool threads: at most 6 (tune::RELEASE_PREAD_THREADS), grown by
 # backlog and retired by load within the runtime-wide budget of 16 worker
 # threads (rt/thread_hooks.rs); a zstd title peaked at 5-6, two titles at
@@ -105,8 +111,9 @@ AMPR_ZSTD_LIBC_HOOKS ?= 0xfff
 # packed file takes the disk cache), opt-in and not run on a console: none
 # of the three measured fully packed games mmapped a packed file
 # (mmap_virtual 0), so it has never served a game.
-# It adds 2 MiB of index memory scratch (4 slots of 512 KiB) plus 4 libzstd
-# DCtx on the libc heap and one pool byte per mapped 256 KiB chunk (a
+# It adds 2 MiB of index memory scratch (4 slots of 512 KiB) plus 4 x 112
+# KiB zstd decoder workspaces (Buffer ledger; both pools grow by 448 KiB
+# for them, above) and one pool byte per mapped 256 KiB chunk (a
 # mapping over 512 MiB takes the disk cache), and its known
 # limits (mprotect not tracked, handler on the faulting thread's stack,
 # handler kept after module_stop; module doc of mmap_fault.rs) are unsolved.

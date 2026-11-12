@@ -1,14 +1,14 @@
 //! Pointer-level shims for the directory overlay, called from
 //! `rt/pack/state.rs` and `rt/pack/directories.rs`. Those keep PackState,
-//! slots and locking; they pass the manifest bytes from a successful
-//! `ampr_pack_core_mount` plus the fields each helper needs.
+//! slots and locking; they pass the view a successful
+//! `ampr_pack_core_mount` filled plus the fields each helper needs.
 //!
 //! zstd mode has no AMPRPAK4 manifest: the manifest arguments are
 //! ignored and the helpers read the mounted zstd index and its directory
 //! order (rt/pack/zstd.rs). An `order` array then holds zstd file ids, and
 //! nothing is packed until the zstd projection is ready.
 
-use crate::rt::pack::{zstd, zstd_mode};
+use crate::rt::pack::{zstd, zstd_mode, AmprPackCoreView};
 use ampr_lz4::manifest::Manifest;
 use ampr_lz4::overlay;
 
@@ -37,10 +37,10 @@ unsafe fn bytes_mut<'a>(ptr: *mut u8, len: usize) -> Option<&'a mut [u8]> {
 }
 
 /// # Safety
-/// `ptr` must name `len` manifest bytes that passed `ampr_pack_core_mount`,
-/// readable and immutable for the borrow (no re-validation here).
-unsafe fn manifest<'a>(ptr: *const u8, len: usize) -> Option<Manifest<'a>> {
-    Manifest::view_trusted(unsafe { bytes(ptr, len) }?).ok()
+/// A non-null `view` must name a view filled by `ampr_pack_core_mount`
+/// (no re-validation here).
+unsafe fn manifest(view: *const AmprPackCoreView) -> Option<crate::rt::pack::Lz4Manifest> {
+    unsafe { view.as_ref() }?.manifest
 }
 
 /// # Safety
@@ -101,24 +101,22 @@ pub unsafe fn ampr_rust_overlay_normalize_path(
 /// zstd builds its order with the projection instead.
 ///
 /// # Safety
-/// `manifest` must name `manifest_len` readable bytes.
-pub unsafe fn ampr_rust_overlay_packed_count(manifest_ptr: *const u8, manifest_len: usize) -> u32 {
-    unsafe { manifest(manifest_ptr, manifest_len) }.map_or(0, |m| overlay::packed_count(&m))
+/// `view` as `manifest`.
+pub unsafe fn ampr_rust_overlay_packed_count(view: *const AmprPackCoreView) -> u32 {
+    unsafe { manifest(view) }.map_or(0, |m| overlay::packed_count(&m))
 }
 
 /// `build_packed_file_order` into a caller-allocated array of `count`
 /// (`ampr_rust_overlay_packed_count`) entries.
 ///
 /// # Safety
-/// `manifest` must name `manifest_len` readable bytes and `out` `count`
-/// writable `u32`s.
+/// `view` as `manifest`; `out` must name `count` writable `u32`s.
 pub unsafe fn ampr_rust_overlay_build_order(
-    manifest_ptr: *const u8,
-    manifest_len: usize,
+    view: *const AmprPackCoreView,
     out: *mut u32,
     count: u32,
 ) -> bool {
-    let Some(m) = (unsafe { manifest(manifest_ptr, manifest_len) }) else {
+    let Some(m) = (unsafe { manifest(view) }) else {
         return false;
     };
     if out.is_null() {
@@ -128,32 +126,39 @@ pub unsafe fn ampr_rust_overlay_build_order(
     overlay::build_packed_order(&m, out)
 }
 
-/// `find_virtual_directory_range` over the sorted packed order.
+/// `find_virtual_directory_range` over the sorted packed order: `Ok(true)`
+/// with the span written, `Ok(false)` when no packed path lies below
+/// `directory`, `Err(Io)` when a path of the paged index could not be read
+/// (the directory may be packed, so the caller answers EIO, not ENOENT).
 ///
 /// # Safety
-/// `manifest` must name `manifest_len` readable bytes, `order` `count`
-/// `u32`s, `directory` `directory_len` bytes; non-null outputs one `u32`.
+/// `view` as `manifest`; `order` must name `count` `u32`s, `directory`
+/// `directory_len` bytes; non-null outputs one `u32`.
 pub unsafe fn ampr_rust_overlay_directory_range(
-    manifest_ptr: *const u8,
-    manifest_len: usize,
+    view: *const AmprPackCoreView,
     order_ptr: *const u32,
     count: u32,
     directory: *const u8,
     directory_len: u16,
     out_begin: *mut u32,
     out_end: *mut u32,
-) -> bool {
+) -> ampr_format::Result<bool> {
     let dir = unsafe { bytes(directory, usize::from(directory_len)) };
     let order = unsafe { order(order_ptr, count) };
     let range = if zstd_mode() {
         zstd::zstd_index()
             .zip(dir)
-            .and_then(|(index, dir)| zstd::zstd_directory_range(index, order, dir))
+            .map_or(Ok(None), |(index, dir)| {
+                zstd::zstd_directory_range(index, order, dir)
+            })
     } else {
-        unsafe { manifest(manifest_ptr, manifest_len) }
+        unsafe { manifest(view) }
             .zip(dir)
-            .and_then(|(m, dir)| overlay::directory_range(&m, order, dir))
+            .map_or(Ok(None), |(m, dir)| {
+                overlay::directory_range(&m, order, dir)
+            })
     };
+    let range = range?;
     let (begin, end) = range.unwrap_or((0, 0));
     if !out_begin.is_null() {
         unsafe { *out_begin = begin };
@@ -161,36 +166,34 @@ pub unsafe fn ampr_rust_overlay_directory_range(
     if !out_end.is_null() {
         unsafe { *out_end = end };
     }
-    range.is_some()
+    Ok(range.is_some())
 }
 
 /// Pure core of `resolve_packed_file` after the AMPRIDX3 lookup.
 ///
 /// # Safety
-/// `manifest` must name `manifest_len` readable bytes.
+/// `view` as `manifest`.
 pub unsafe fn ampr_rust_overlay_packed_file_matches(
-    manifest_ptr: *const u8,
-    manifest_len: usize,
+    view: *const AmprPackCoreView,
     file_id: u32,
     indexed_size: u64,
-) -> bool {
+) -> ampr_format::Result<bool> {
     // zstd: a one-based AMPRIDX3 id without a zstd record is loose.
     if zstd_mode() {
         zstd::zstd_packed_file_matches(file_id, indexed_size)
     } else {
-        unsafe { manifest(manifest_ptr, manifest_len) }.map_or(false, |m| {
+        unsafe { manifest(view) }.map_or(Ok(false), |m| {
             overlay::packed_file_matches(&m, file_id, indexed_size)
         })
     }
 }
 
-/// `service_name_hidden`; a null or rejected manifest skips pack names.
+/// `service_name_hidden`; a null or empty view skips pack names.
 ///
 /// # Safety
 /// Each non-null pointer must name its length in readable bytes.
 pub unsafe fn ampr_rust_overlay_service_name_hidden(
-    manifest_ptr: *const u8,
-    manifest_len: usize,
+    view: *const AmprPackCoreView,
     directory: *const u8,
     directory_len: u16,
     name: *const u8,
@@ -204,54 +207,10 @@ pub unsafe fn ampr_rust_overlay_service_name_hidden(
     };
     // zstd: the fixed service names plus ampr_zstd.index and mounted volumes.
     if zstd_mode() {
-        overlay::service_name_hidden(None, dir, name) || zstd::zstd_name_hidden(dir, name)
+        overlay::service_name_hidden(None::<&Manifest>, dir, name)
+            || zstd::zstd_name_hidden(dir, name)
     } else {
-        let m = unsafe { manifest(manifest_ptr, manifest_len) };
+        let m = unsafe { manifest(view) };
         overlay::service_name_hidden(m.as_ref(), dir, name)
     }
-}
-
-/// zstd `next_virtual_child` (LZ4 walks the manifest in directories.rs).
-/// `*out_next` is `cursor` unless a child is returned.
-///
-/// # Safety
-/// `order` must name `count` `u32`s, `name` `name_capacity` writable bytes; the other outputs one
-/// writable value each when non-null.
-pub unsafe fn ampr_rust_overlay_next_child(
-    order_ptr: *const u32,
-    count: u32,
-    range_end: u32,
-    directory_len: u16,
-    cursor: u32,
-    name: *mut u8,
-    name_capacity: usize,
-    out_name_len: *mut u8,
-    out_type: *mut u8,
-    out_next: *mut u32,
-) -> bool {
-    if !out_next.is_null() {
-        unsafe { *out_next = cursor };
-    }
-    if out_name_len.is_null() || out_type.is_null() {
-        return false;
-    }
-    let Some(name) = (unsafe { bytes_mut(name, name_capacity) }) else {
-        return false;
-    };
-    let order = unsafe { order(order_ptr, count) };
-    let directory_len = usize::from(directory_len);
-    let child = zstd::zstd_index().and_then(|index| {
-        zstd::zstd_next_child(index, order, range_end, directory_len, cursor, name)
-    });
-    let Some(child) = child else {
-        return false;
-    };
-    unsafe {
-        *out_name_len = child.len;
-        *out_type = child.kind;
-    }
-    if !out_next.is_null() {
-        unsafe { *out_next = child.next };
-    }
-    true
 }

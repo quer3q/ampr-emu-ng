@@ -352,7 +352,7 @@ pub(crate) use super::fd_cache::{
     ampr_index_fd_uncached_open_count, ampr_index_release_cached_fd_pin, FileEntryView,
     PressureCaps as AmprIndexFdPressureCaps,
 };
-pub(crate) use super::index::ampr_index_get_entry_view;
+pub(crate) use super::index::{ampr_index_get_entry_view, ampr_index_get_entry_view_path};
 pub(crate) use super::services::{apr_libkernel_rc_to_sce, time_counter_now};
 pub(crate) use ampr_command::{op_type::*, OpRecord as Op, SceAmprCommandBuffer};
 // Errno, kernel file/memory and sync helpers under their `ampr_*` names.
@@ -781,8 +781,6 @@ pub(crate) struct AprAioReadDesc {
     pub(crate) length: u64,
     pub(crate) offset: u64,
     pub(crate) fileSize: usize,
-    pub(crate) filePath: *const c_char,
-    pub(crate) filePathLength: u32,
     pub(crate) errorOff: u32,
     pub(crate) readClass: AmprLooseReadClass,
     pub(crate) coalescedCommandCount: u8,

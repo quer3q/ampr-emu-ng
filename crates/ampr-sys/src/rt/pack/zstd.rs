@@ -5,8 +5,10 @@
 //!
 //! Public accessors. Each returns `None`/`0`/`false`
 //! until the projection is ready (`zstd_projection_ready`):
-//! - `zstd_index() -> Option<&'static Index<'static>>`: the mounted, fully
-//!   validated zstd index (bytes live in `PackState::manifest_base`).
+//! - `zstd_index() -> Option<&'static ZstdIndex>`: the mounted, fully
+//!   validated zstd index: read whole when it fits the Index ledger with
+//!   its tables, else through the index page cache (rt/index_pages.rs)
+//!   with a resident fast table.
 //! - `zstd_entry(ampr_id) -> Option<ZstdEntry>`: projection record of a
 //!   one-based AMPRIDX3 id that is packed; `None` = loose or unknown id.
 //! - `zstd_file_for_ampr_id(ampr_id) -> Option<u64>`: zero-based zstd file
@@ -30,12 +32,12 @@
 //! Directory overlay: `zstd_packed_order() -> &[u32]` holds the distinct
 //! zstd ids of the packed AMPRIDX3 ids sorted by the folded directory
 //! comparator (built with the projection; zstd index order is hash order).
-//! `zstd_directory_range`, `zstd_next_child`, `zstd_service_name_hidden`
+//! `zstd_directory_range`, `zstd_next_child_read`, `zstd_service_name_hidden`
 //! (ampr_zstd.index and mounted ampr_zstd-NNN.pak) and `zstd_packed_file_matches`
 //! back the `ampr_rust_overlay_*` exports in overlay_ffi.rs.
 //!
-//! Mount lifecycle, called only from manifest.rs: `zstd_mount_validate`,
-//! `zstd_mount_clear`, `zstd_mount_release`.
+//! Mount lifecycle, called only from manifest.rs: `zstd_index_source`,
+//! `zstd_mount_validate`, `zstd_mount_clear`, `zstd_mount_release`.
 //!
 //! Core tasks: `zstd_core_{validate_logical_file,task_count,make_task}` are
 //! the bodies of the `ampr_pack_core_*` exports in rt/index.rs;
@@ -49,9 +51,15 @@
 //! A packed path whose logical size differs from AMPRIDX3 invalidates the
 //! mount (`LOAD_STATE = PACK_LOAD_INVALID`).
 
+use super::manifest::{mount_index_source, MountedSource};
 use super::*;
+use crate::rt::index_memory::{self as im, lookup_alloc, lookup_free};
+use crate::rt::index_pages::{self, IndexSource};
+use ampr_format::source::{Source, PATH_BUF};
 use ampr_format::zstd::Index;
-use crate::rt::index_memory::{index_alloc, index_free};
+
+/// The mounted index, whole or paged (`IndexSource`).
+pub(crate) type ZstdIndex = Index<'static, IndexSource>;
 
 pub(crate) const AMPR_EMU_ZSTD_INDEX_PATH: &CStr = c"/app0/ampr_zstd.index";
 // The index paths here spell the format crate's `INDEX_NAME`.
@@ -120,8 +128,13 @@ const PROJECTION_READY: u32 = 2;
 const PROJECTION_INVALID: u32 = 3;
 
 struct ZstdMount {
-    /// Borrows the index memory at `PackState::manifest_base` (rt/index_memory.rs).
-    index: Option<Index<'static>>,
+    /// Reads the index file through `ZSTD_SOURCE` (rt/index_pages.rs);
+    /// a paged one with the fast table at `fast`.
+    index: Option<ZstdIndex>,
+    /// The fast table of a paged index (hashes, chunks, volumes, 8 B
+    /// each), `fast_bytes` of lookup memory; null for a resident index.
+    fast: *mut u64,
+    fast_bytes: usize,
     entries: *mut ZstdEntry,
     ampr_count: u32,
     packed_count: u32,
@@ -134,6 +147,8 @@ struct ZstdMount {
 impl ZstdMount {
     const EMPTY: Self = Self {
         index: None,
+        fast: null_mut(),
+        fast_bytes: 0,
         entries: null_mut(),
         ampr_count: 0,
         packed_count: 0,
@@ -162,30 +177,46 @@ pub(crate) fn ampr_relative_path(path: &[u8]) -> Option<&[u8]> {
 
 /// Projection record of one AMPRIDX3 entry (`path`, logical `size`):
 /// `ZstdEntry::LOOSE` when zstd has no such path (including paths zstd
-/// cannot hold, e.g. non-UTF-8), `None` when the matched zstd file has a
-/// different logical size or an unusable record (the mount is invalid).
-pub(crate) fn project_entry(index: &Index<'_>, path: &[u8], size: u64) -> Option<ZstdEntry> {
+/// cannot hold, e.g. non-UTF-8). `Err(Io)` is a read error of a paged
+/// index (the build is retried); any other error is a different logical
+/// size or an unusable record (the mount is invalid).
+pub(crate) fn project_entry<S: Source + ?Sized>(
+    index: &Index<'_, S>,
+    path: &[u8],
+    size: u64,
+) -> ampr_format::Result<ZstdEntry> {
+    use ampr_format::Error;
     let Some(relative) = ampr_relative_path(path) else {
-        return Some(ZstdEntry::LOOSE);
+        return Ok(ZstdEntry::LOOSE);
     };
-    let Ok(Some(id)) = index.find(relative) else {
-        return Some(ZstdEntry::LOOSE);
+    // A read error is not a miss: the build fails rather than mark a
+    // packed file loose for the life of the mount.
+    let id = match index.find(relative) {
+        Ok(Some(id)) => id,
+        Err(Error::Io) => return Err(Error::Io),
+        _ => return Ok(ZstdEntry::LOOSE),
     };
-    let file = index.file(id).ok()?;
+    let file = index.file(id)?;
     if file.logical_size != size {
-        return None;
+        return Err(Error::Invalid);
     }
-    let zstd_id = u32::try_from(id).ok().filter(|&n| n != ZSTD_FILE_NONE)?;
+    let zstd_id = u32::try_from(id)
+        .ok()
+        .filter(|&n| n != ZSTD_FILE_NONE)
+        .ok_or(Error::Invalid)?;
     let (first_volume, last_volume) = if file.chunk_count == 0 {
         (ZSTD_VOLUME_NONE, ZSTD_VOLUME_NONE)
     } else {
-        let last = file.first_chunk.checked_add(file.chunk_count - 1)?;
+        let last = file
+            .first_chunk
+            .checked_add(file.chunk_count - 1)
+            .ok_or(Error::Invalid)?;
         (
-            index.chunk(file.first_chunk).ok()?.volume_id,
-            index.chunk(last).ok()?.volume_id,
+            index.chunk(file.first_chunk)?.volume_id,
+            index.chunk(last)?.volume_id,
         )
     };
-    Some(ZstdEntry {
+    Ok(ZstdEntry {
         zstd_id,
         first_chunk: file.first_chunk,
         chunk_count: file.chunk_count,
@@ -194,19 +225,41 @@ pub(crate) fn project_entry(index: &Index<'_>, path: &[u8], size: u64) -> Option
     })
 }
 
+/// Why `project_ids` stopped: `Invalid(id)` names the first id that
+/// invalidates the mount (no entry view, or a size mismatch); `Io` is a
+/// read error of a paged index, which leaves the projection to retry.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ProjectError {
+    Invalid(u32),
+    Io,
+}
+
+impl ProjectError {
+    fn at(id: u32, error: ampr_format::Error) -> Self {
+        match error {
+            ampr_format::Error::Io => Self::Io,
+            _ => Self::Invalid(id),
+        }
+    }
+}
+
 /// Fills `out[n]` for AMPRIDX3 id `n + 1`; `entry(id)` yields that id's path
-/// and logical size. Returns the packed-id count, or the first id that
-/// invalidates the mount (no entry view, or a size mismatch).
-pub(crate) fn project_ids<'p>(
-    index: &Index<'_>,
+/// and logical size (`Err(Io)` for a read error). Returns the packed-id
+/// count.
+pub(crate) fn project_ids<S: Source + ?Sized>(
+    index: &Index<'_, S>,
     out: &mut [ZstdEntry],
-    mut entry: impl FnMut(u32) -> Option<(&'p [u8], u64)>,
-) -> Result<u32, u32> {
+    mut entry: impl FnMut(u32, &mut [u8; PATH_BUF]) -> ampr_format::Result<(usize, u64)>,
+) -> Result<u32, ProjectError> {
     let mut packed = 0u32;
+    let mut buf = [0u8; PATH_BUF];
     for (n, slot) in out.iter_mut().enumerate() {
-        let id = u32::try_from(n + 1).map_err(|_| u32::MAX)?;
-        let projected = entry(id).and_then(|(path, size)| project_entry(index, path, size));
-        *slot = projected.ok_or(id)?;
+        let id = u32::try_from(n + 1).map_err(|_| ProjectError::Invalid(u32::MAX))?;
+        let projected = entry(id, &mut buf).and_then(|(len, size)| {
+            let path = buf.get(..len).ok_or(ampr_format::Error::Invalid)?;
+            project_entry(index, path, size)
+        });
+        *slot = projected.map_err(|e| ProjectError::at(id, e))?;
         packed += u32::from(slot.is_packed());
     }
     Ok(packed)
@@ -214,17 +267,59 @@ pub(crate) fn project_ids<'p>(
 
 // ---- mount lifecycle (manifest.rs) -------------------------------------------------
 
-/// manifest.rs `validate_manifest_layout`: runs the full `Index::open` validation on
-/// the loaded image and applies the runtime caps. On success the index
-/// borrows `base` until `zstd_mount_clear`; the projection starts pending.
-pub(crate) unsafe fn zstd_mount_validate(base: *mut c_void, bytes: usize) -> bool {
-    if base.is_null() || bytes < ZSTD_INDEX_MIN_BYTES || bytes > isize::MAX as usize {
-        return false;
-    }
-    // The pool allocation outlives the mount (freed by manifest.rs release only after
-    // zstd_mount_clear drops this borrow).
-    let image: &'static [u8] = unsafe { core::slice::from_raw_parts(base as *const u8, bytes) };
-    let Ok(index) = Index::open(image) else {
+/// The mounted index file (manifest.rs `mount_index_source`).
+static ZSTD_SOURCE: MountedSource = MountedSource::new();
+
+/// Lookup bytes the mount needs beside the file: the fast table (16 B per
+/// file, 8 B per chunk and volume) and the derived tables: 16 B of
+/// projection per AMPRIDX3 id and 4 B of order per packed file (at most
+/// one per zstd file and per id). `ampr_ids` is the published AMPRIDX3
+/// count; before it is published the estimate is one id per zstd file.
+fn lookup_bytes(files: u64, chunks: u64, volumes: u64, ampr_ids: Option<u64>) -> (usize, usize) {
+    let size = |v: u64| usize::try_from(v).unwrap_or(usize::MAX);
+    let fast = files
+        .saturating_mul(2)
+        .saturating_add(chunks)
+        .saturating_add(volumes);
+    let ids = ampr_ids.unwrap_or(files);
+    let projection = ids.saturating_mul(size_of::<ZstdEntry>() as u64);
+    let order = files.min(ids).saturating_mul(size_of::<u32>() as u64);
+    (
+        size(fast.saturating_mul(8)),
+        size(projection.saturating_add(order)),
+    )
+}
+
+/// The AMPRIDX3 id count once the index is published (`lookup_bytes`).
+fn published_ampr_ids() -> Option<u64> {
+    super::super::index::published().map(|c| c.count as u64)
+}
+
+/// manifest.rs `load_manifest`: the open index file `fd` of `len` bytes
+/// as the mount's source, read whole when it fits the Index room with the
+/// derived tables it still needs (a whole file has no fast table), else
+/// paged. Takes `fd` (kept for a paged source, else closed).
+pub(crate) unsafe fn zstd_index_source(fd: c_int, len: u64) -> Option<&'static IndexSource> {
+    let mut head = [0u8; ampr_format::zstd::INDEX_HEADER_SIZE];
+    let derived = match index_pages::read_head(fd, &mut head)
+        .then(|| ampr_format::zstd::header_counts(&head).ok())
+        .flatten()
+    {
+        Some((files, chunks, volumes)) => {
+            lookup_bytes(files, chunks, u64::from(volumes), published_ampr_ids()).1
+        }
+        None => usize::MAX,
+    };
+    unsafe { mount_index_source(&ZSTD_SOURCE, fd, len, derived) }
+}
+
+/// manifest.rs `load_manifest`: runs the full `Index::open` validation
+/// and applies the runtime caps; a paged index also gets its fast table,
+/// without which it is refused with the index notice. On success the
+/// mount reads `source` until `zstd_mount_clear`; the projection starts
+/// pending.
+pub(crate) unsafe fn zstd_mount_validate(source: &'static IndexSource) -> bool {
+    let Ok(index) = Index::open(source) else {
         return false;
     };
     if index.file_count() > AMPR_EMU_PACK_MAX_FILES
@@ -235,9 +330,60 @@ pub(crate) unsafe fn zstd_mount_validate(base: *mut c_void, bytes: usize) -> boo
     }
     let mount = unsafe { &mut *ZSTD_MOUNT.get() };
     *mount = ZstdMount::EMPTY;
+    let index = if source.is_resident() {
+        index
+    } else {
+        let Some(index) = (unsafe { attach_fast(index, mount) }) else {
+            return false;
+        };
+        index
+    };
     mount.index = Some(index);
     ZSTD_PROJECTION.store(PROJECTION_PENDING, Ordering::Release);
     true
+}
+
+/// The fast table of a paged index, in one lookup allocation filled by
+/// one pass over the index. None, with the index notice, when it and the
+/// derived tables still to come do not fit the lookup cap or the Index
+/// room; None on a read error.
+unsafe fn attach_fast(index: ZstdIndex, mount: &mut ZstdMount) -> Option<ZstdIndex> {
+    let (f, c, v) = index.fast_lens();
+    let (bytes, derived) = lookup_bytes(f as u64, c as u64, v as u64, published_ampr_ids());
+    let needed = bytes.saturating_add(derived);
+    if im::lookup_used().saturating_add(needed) > im::INDEX_LOOKUP_MAX || needed > im::index_room()
+    {
+        unsafe { index_pages::refuse(needed) };
+        return None;
+    }
+    let p = unsafe { lookup_alloc(bytes.max(8), 8, c"apr.zstd.fast".as_ptr()) }.cast::<u64>();
+    if p.is_null() {
+        return None;
+    }
+    let all = unsafe { core::slice::from_raw_parts_mut(p, 2 * f + c + v) };
+    let (hashes, rest) = all.split_at_mut(f);
+    let (sizes, rest) = rest.split_at_mut(f);
+    let (chunks, volumes) = rest.split_at_mut(c);
+    if index.fill_fast(hashes, sizes, chunks, volumes).is_err() {
+        unsafe { lookup_free(p.cast(), bytes.max(8), c"apr.zstd.fast.invalid".as_ptr()) };
+        return None;
+    }
+    let fast = ampr_format::zstd::Fast {
+        hashes,
+        sizes,
+        chunks,
+        volumes,
+    };
+    mount.fast = p;
+    mount.fast_bytes = bytes.max(8);
+    stats::add(stats::Stat::IndexFastBytes, mount.fast_bytes as u64);
+    index.with_fast(fast).ok()
+}
+
+/// manifest.rs: a failed mount gives its source back (it was never
+/// published to lookups).
+pub(crate) unsafe fn zstd_source_drop() {
+    unsafe { ZSTD_SOURCE.drop_source() };
 }
 
 /// manifest.rs `clear_manifest_view`: drops the index borrow and projection view.
@@ -247,29 +393,32 @@ pub(crate) fn zstd_mount_clear() {
     unsafe { *ZSTD_MOUNT.get() = ZstdMount::EMPTY };
 }
 
-/// manifest.rs `release_manifest_storage`: frees the projection array and clears the
-/// mount; manifest.rs then frees the index image itself.
+/// manifest.rs `release_manifest_storage`: frees the projection, the
+/// order and the fast table and clears the mount; the index file stays
+/// mounted (`ZSTD_SOURCE`) until a reload replaces it.
 pub(crate) unsafe fn zstd_mount_release() {
     let mount = unsafe { &mut *ZSTD_MOUNT.get() };
-    if !mount.order.is_null() {
-        unsafe {
-            index_free(
-                mount.order as *mut c_void,
-                c"apr.zstd.directory-index.release".as_ptr(),
-            )
-        };
-        mount.order = null_mut();
+    let order_bytes = mount.packed_count as usize * size_of::<u32>();
+    let entries_bytes = mount.ampr_count as usize * size_of::<ZstdEntry>();
+    unsafe {
+        lookup_free(
+            mount.order.cast(),
+            order_bytes,
+            c"apr.zstd.directory-index.release".as_ptr(),
+        );
+        lookup_free(
+            mount.entries.cast(),
+            entries_bytes,
+            c"apr.zstd.projection.release".as_ptr(),
+        );
     }
-    if !mount.entries.is_null() {
-        unsafe {
-            index_free(
-                mount.entries as *mut c_void,
-                c"apr.zstd.projection.release".as_ptr(),
-            )
-        };
-        mount.entries = null_mut();
-    }
+    // The fast table goes with the index that reads it.
+    let (fast, fast_bytes) = (mount.fast, mount.fast_bytes);
     zstd_mount_clear();
+    if !fast.is_null() {
+        stats::sub(stats::Stat::IndexFastBytes, fast_bytes as u64);
+        unsafe { lookup_free(fast.cast(), fast_bytes, c"apr.zstd.fast.release".as_ptr()) };
+    }
 }
 
 // ---- projection build ---------------------------------------------------------
@@ -325,48 +474,63 @@ unsafe fn zstd_projection_step(wait: bool) -> bool {
                 {
                     let _lock = MANIFEST_MUTEX.lock();
                     ZSTD_PROJECTION.store(
-                        if built {
-                            PROJECTION_READY
-                        } else {
-                            PROJECTION_INVALID
+                        match built {
+                            Built::Ready => PROJECTION_READY,
+                            // A read error of the paged index is not a
+                            // bad pack: a later call builds again.
+                            Built::Retry => PROJECTION_PENDING,
+                            Built::Invalid => PROJECTION_INVALID,
                         },
                         Ordering::Release,
                     );
-                    if !built {
+                    if built == Built::Invalid {
                         LOAD_STATE.store(PACK_LOAD_INVALID, Ordering::Release);
                     }
                 }
                 MANIFEST_CV.notify_all();
-                return built;
+                return built == Built::Ready;
             }
         }
     }
 }
 
+/// What `build_projection` left: `Retry` after a read error of a paged
+/// index, with nothing kept.
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum Built {
+    Ready,
+    Retry,
+    Invalid,
+}
+
 /// The sole builder (`ZSTD_PROJECTION == BUILDING`): one record per
 /// published AMPRIDX3 id, in a pool allocation kept until shutdown.
-unsafe fn build_projection() -> bool {
+unsafe fn build_projection() -> Built {
     let mount = unsafe { &mut *ZSTD_MOUNT.get() };
-    let (Some(index), Some(count)) = (
+    let (Some(index), Some((count, sorted))) = (
         mount.index.as_ref(),
-        super::super::index::published().map(|c| c.count),
+        super::super::index::published().map(|c| (c.count, c.sorted)),
     ) else {
-        return false;
+        return Built::Invalid;
     };
     let Ok(ampr_count) = u32::try_from(count) else {
-        return false;
+        return Built::Invalid;
     };
     if u64::from(ampr_count) > AMPR_EMU_PACK_MAX_FILES {
-        return false;
+        return Built::Invalid;
     }
     let mut entries: *mut ZstdEntry = null_mut();
     if ampr_count != 0 {
         let bytes = count * size_of::<ZstdEntry>();
         let memory = unsafe {
-            index_alloc(bytes, align_of::<ZstdEntry>(), c"apr.zstd.projection".as_ptr())
+            lookup_alloc(
+                bytes,
+                align_of::<ZstdEntry>(),
+                c"apr.zstd.projection".as_ptr(),
+            )
         };
         if memory.is_null() {
-            return false;
+            return Built::Invalid;
         }
         entries = memory as *mut ZstdEntry;
     }
@@ -375,68 +539,109 @@ unsafe fn build_projection() -> bool {
     } else {
         unsafe { core::slice::from_raw_parts_mut(entries, count) }
     };
-    let result = project_ids(index, out, |id| {
+    let result = project_ids(index, out, |id, buf| {
         let mut view = FileEntryView {
             path: null(),
             path_length: 0,
             size: 0,
             mtime: 0,
         };
-        if unsafe { ampr_index_get_entry_view(id, &mut view) } != 0 || view.path.is_null() {
-            return None;
+        match unsafe { ampr_index_get_entry_view_path(id, &mut view, buf) } {
+            0 => Ok((view.path_length as usize, view.size as u64)),
+            rc if rc == -EIO => Err(ampr_format::Error::Io),
+            _ => Err(ampr_format::Error::Invalid),
         }
-        // The published AMPRIDX3 image is immutable for the module lifetime.
-        let path: &'static [u8] =
-            unsafe { core::slice::from_raw_parts(view.path.cast(), view.path_length as usize) };
-        Some((path, view.size as u64))
     });
-    let order = result
-        .ok()
-        .and_then(|packed| unsafe { build_order(index, out, packed) }.map(|o| (packed, o)));
-    let Some((packed, (order, order_count))) = order else {
-        if !entries.is_null() {
+    let order = match result {
+        Ok(packed) => unsafe { build_order(index, out, packed, sorted) }.map(|o| (packed, o)),
+        Err(ProjectError::Io) => Err(Built::Retry),
+        Err(ProjectError::Invalid(_)) => Err(Built::Invalid),
+    };
+    let (packed, (order, order_count)) = match order {
+        Ok(order) => order,
+        Err(built) => {
             unsafe {
-                index_free(
-                    entries as *mut c_void,
+                lookup_free(
+                    entries.cast(),
+                    count * size_of::<ZstdEntry>(),
                     c"apr.zstd.projection.invalid".as_ptr(),
                 )
             };
+            return built;
         }
-        return false;
     };
     mount.entries = entries;
     mount.ampr_count = ampr_count;
     mount.packed_count = packed;
     mount.order = order;
     mount.order_count = order_count;
-    true
+    // The lookup tables are all built: the page arena takes the room left.
+    index_pages::grow_arena(0);
+    Built::Ready
 }
 
 /// The directory order of the `packed` projected ids in `entries`: an
-/// index memory array of distinct zstd ids sorted by `zstd_sort_order` (null when no
-/// id is packed). None on allocation failure.
-unsafe fn build_order(
-    index: &Index<'_>,
+/// index memory array of distinct zstd ids in `zstd_sort_order` order (null
+/// when no id is packed), taken from AMPRIDX3 id order without a path read
+/// when that image is `sorted` (`sorted_order`). `Invalid` on allocation
+/// failure, `Retry` when the sort could not read a path.
+unsafe fn build_order<S: Source + ?Sized>(
+    index: &Index<'_, S>,
     entries: &[ZstdEntry],
     packed: u32,
-) -> Option<(*mut u32, u32)> {
+    sorted: bool,
+) -> Result<(*mut u32, u32), Built> {
     if packed == 0 {
-        return Some((null_mut(), 0));
+        return Ok((null_mut(), 0));
     }
     let bytes = packed as usize * size_of::<u32>();
     let memory = unsafe {
-        index_alloc(bytes, align_of::<u32>(), c"apr.zstd.directory-index".as_ptr())
+        lookup_alloc(
+            bytes,
+            align_of::<u32>(),
+            c"apr.zstd.directory-index".as_ptr(),
+        )
     };
     if memory.is_null() {
-        return None;
+        return Err(Built::Invalid);
     }
     let order = unsafe { core::slice::from_raw_parts_mut(memory as *mut u32, packed as usize) };
+    let count = sorted_order(entries, order);
+    let count = if sorted {
+        Ok(count)
+    } else {
+        zstd_sort_order(index, &mut order[..count])
+    };
+    match count {
+        Ok(count) => Ok((memory as *mut u32, count as u32)),
+        Err(_) => {
+            unsafe {
+                lookup_free(
+                    memory.cast(),
+                    bytes,
+                    c"apr.zstd.directory-index.io".as_ptr(),
+                )
+            };
+            Err(Built::Retry)
+        }
+    }
+}
+
+/// Fills `order` with the packed zstd ids of `entries` in AMPRIDX3 id
+/// order; returns how many. For a sorted AMPRIDX3 image that is already
+/// `zstd_sort_order` order: its records are in folded path order and
+/// `Index::open` refused two records of one folded path, so the ids are
+/// in strict folded order; a packed entry's zstd path is its AMPRIDX3
+/// path less the `/app0/` root, folded alike in every record; and distinct
+/// paths name distinct zstd files, so there is no tie and no repeat.
+pub(crate) fn sorted_order(entries: &[ZstdEntry], order: &mut [u32]) -> usize {
     let ids = entries.iter().filter(|e| e.is_packed()).map(|e| e.zstd_id);
+    let mut count = 0;
     for (slot, id) in order.iter_mut().zip(ids) {
         *slot = id;
+        count += 1;
     }
-    let count = zstd_sort_order(index, order);
-    Some((memory as *mut u32, count as u32))
+    count
 }
 
 // ---- accessors ----------------------------------------------------------------
@@ -450,7 +655,7 @@ fn ready_mount() -> Option<&'static ZstdMount> {
     zstd_projection_ready().then(|| unsafe { &*ZSTD_MOUNT.get() })
 }
 
-pub(crate) fn zstd_index() -> Option<&'static Index<'static>> {
+pub(crate) fn zstd_index() -> Option<&'static ZstdIndex> {
     ready_mount().and_then(|m| m.index.as_ref())
 }
 
@@ -477,6 +682,23 @@ pub(crate) fn zstd_volume_size(volume: u32) -> Option<u64> {
 
 pub(crate) fn zstd_chunk_count() -> u32 {
     zstd_index().map_or(0, |i| i.chunk_count())
+}
+
+/// Chunk record `id` read from memory only: the fast table of a paged
+/// index or a resident index; never a page cache lock, wait or pread, so
+/// the decode-on-access signal handler may call it (rt/pack/mmap_fault.rs).
+/// None for an unknown id or an index that would need a source read.
+pub(crate) fn zstd_chunk_resident(id: u32) -> Option<ampr_format::zstd::ChunkRecord> {
+    let index = zstd_index()?;
+    zstd_chunks_resident()
+        .then(|| index.chunk(id).ok())
+        .flatten()
+}
+
+/// Whether `zstd_chunk_resident` can answer: false before the projection
+/// is ready (a paged index mounts only with its fast table).
+pub(crate) fn zstd_chunks_resident() -> bool {
+    zstd_index().is_some_and(|i| i.has_fast() || unsafe { ZSTD_SOURCE.is_resident() })
 }
 
 pub(crate) fn zstd_ampr_count() -> u32 {
@@ -535,14 +757,31 @@ const _: () = assert!(DT_DIR == overlay::DT_DIR && DT_REG == overlay::DT_REG);
 /// Hidden from `/app0` listings, like the AMPRPAK4 index.
 pub(crate) const ZSTD_INDEX_LOGICAL_PATH: &[u8] = b"/app0/ampr_zstd.index";
 
-fn zstd_path<'a>(index: &Index<'a>, id: u32) -> Option<&'a [u8]> {
-    index.file(u64::from(id)).ok().map(|f| f.path)
+/// Copies zstd file `id`'s path into `buf` (the overlay helpers' path
+/// writer). The error is kept, so a caller can tell a read error of a
+/// paged index (`Io`) from an unusable record.
+pub(crate) fn zstd_path_read<S: Source + ?Sized>(
+    index: &Index<'_, S>,
+    id: u32,
+    buf: &mut [u8; PATH_BUF],
+) -> ampr_format::Result<usize> {
+    let file = index.file(u64::from(id))?;
+    index.path(&file, buf).map(<[u8]>::len)
 }
 
 /// Sorts `order` (zstd ids) into directory order and drops repeated ids;
-/// returns the length of the kept prefix. A record without a path sorts last.
-pub(crate) fn zstd_sort_order(index: &Index<'_>, order: &mut [u32]) -> usize {
-    order.sort_unstable_by(|&a, &b| zstd_order_compare(index, a, b));
+/// returns the length of the kept prefix. A record without a path sorts
+/// last. `Err(Io)` when a path read failed: the order is then wrong and
+/// the caller drops it.
+pub(crate) fn zstd_sort_order<S: Source + ?Sized>(
+    index: &Index<'_, S>,
+    order: &mut [u32],
+) -> ampr_format::Result<usize> {
+    let io = core::cell::Cell::new(false);
+    order.sort_unstable_by(|&a, &b| zstd_order_compare(index, a, b, &io));
+    if io.get() {
+        return Err(ampr_format::Error::Io);
+    }
     let mut kept = 0usize;
     for i in 0..order.len() {
         if kept == 0 || order[kept - 1] != order[i] {
@@ -550,16 +789,40 @@ pub(crate) fn zstd_sort_order(index: &Index<'_>, order: &mut [u32]) -> usize {
             kept += 1;
         }
     }
-    kept
+    Ok(kept)
 }
 
 /// Kept out of line: inlined, the sort's small-sort network grew to ~40 KB
 /// of code for a sort that runs once, when the directory index is built.
+/// The paths are copied out of the (paged) index into two stack buffers.
+/// After a read error (`io` set) it compares ids only: the order is
+/// dropped anyway, and the sort needs no further path reads.
 #[inline(never)]
-fn zstd_order_compare(index: &Index<'_>, a: u32, b: u32) -> core::cmp::Ordering {
+fn zstd_order_compare<S: Source + ?Sized>(
+    index: &Index<'_, S>,
+    a: u32,
+    b: u32,
+    io: &core::cell::Cell<bool>,
+) -> core::cmp::Ordering {
     use core::cmp::Ordering as Cmp;
-    match (zstd_path(index, a), zstd_path(index, b)) {
-        (Some(x), Some(y)) => overlay::folded_compare(x, y).then(a.cmp(&b)),
+    if io.get() {
+        return a.cmp(&b);
+    }
+    let (mut x_buf, mut y_buf) = ([0u8; PATH_BUF], [0u8; PATH_BUF]);
+    let read = |id, buf: &mut [u8; PATH_BUF]| match zstd_path_read(index, id, buf) {
+        Ok(n) => Some(n),
+        Err(ampr_format::Error::Io) => {
+            io.set(true);
+            None
+        }
+        Err(_) => None,
+    };
+    let (x, y) = (read(a, &mut x_buf), read(b, &mut y_buf));
+    if io.get() {
+        return a.cmp(&b);
+    }
+    match (x, y) {
+        (Some(x), Some(y)) => overlay::folded_compare(&x_buf[..x], &y_buf[..y]).then(a.cmp(&b)),
         (Some(_), None) => Cmp::Less,
         (None, Some(_)) => Cmp::Greater,
         (None, None) => a.cmp(&b),
@@ -582,46 +845,68 @@ pub(crate) fn zstd_relative_dir(directory: &[u8]) -> Option<&[u8]> {
 
 /// The `[begin, end)` span of `order` whose paths lie strictly below the
 /// normalized logical `directory`; None when it has no packed descendant.
-pub(crate) fn zstd_directory_range(
-    index: &Index<'_>,
+/// A read error of a paged index is `Err(Io)`, not no descendant, so an
+/// open or stat of a packed directory fails rather than miss.
+pub(crate) fn zstd_directory_range<S: Source + ?Sized>(
+    index: &Index<'_, S>,
     order: &[u32],
     directory: &[u8],
-) -> Option<(u32, u32)> {
-    let relative = zstd_relative_dir(directory)?;
-    let count = u32::try_from(order.len()).ok()?;
+) -> ampr_format::Result<Option<(u32, u32)>> {
+    let (Some(relative), Ok(count)) = (zstd_relative_dir(directory), u32::try_from(order.len()))
+    else {
+        return Ok(None);
+    };
     if count == 0 || directory.len() >= PATH_MAX - 1 {
-        return None;
+        return Ok(None);
     }
     if relative.is_empty() {
-        return Some((0, count));
+        return Ok(Some((0, count)));
     }
     let mut buffer = [0u8; PATH_MAX];
     let n = relative.len() + 1;
     buffer[..relative.len()].copy_from_slice(relative);
     buffer[relative.len()] = b'/';
-    overlay::prefix_range(order, &mut buffer[..n], |id| zstd_path(index, id))
+    let mut io = false;
+    let range = overlay::prefix_range(order, &mut buffer[..n], |id, b| {
+        let path = zstd_path_read(index, id, b);
+        io |= path == Err(ampr_format::Error::Io);
+        path.ok()
+    });
+    if io {
+        return Err(ampr_format::Error::Io);
+    }
+    Ok(range)
 }
 
 /// `next_virtual_child` over zstd paths: the child at `order[cursor]` of
 /// the normalized logical directory of `directory_len` bytes, merged with
 /// the following entries of the same folded name (a directory if any of
-/// them has descendants). `name` gets the NUL-terminated child name.
-pub(crate) fn zstd_next_child(
-    index: &Index<'_>,
+/// them has descendants). `name` gets the NUL-terminated child name. A read
+/// error of a paged index is `Err(Io)`, not no child, so a listing fails
+/// rather than skip or split the entry.
+pub(crate) fn zstd_next_child_read<S: Source + ?Sized>(
+    index: &Index<'_, S>,
     order: &[u32],
     range_end: u32,
     directory_len: usize,
     cursor: u32,
     name: &mut [u8],
-) -> Option<Child> {
+) -> ampr_format::Result<Option<Child>> {
     let root = LOGICAL_ROOT.len();
     if directory_len < root {
-        return None;
+        return Ok(None);
     }
     let dir_len = directory_len.saturating_sub(root + 1);
-    overlay::next_child(order, range_end, dir_len, cursor, name, |id| {
-        zstd_path(index, id)
-    })
+    let io = core::cell::Cell::new(false);
+    let child = overlay::next_child(order, range_end, dir_len, cursor, name, |id, b| {
+        let path = zstd_path_read(index, id, b);
+        io.set(io.get() || path == Err(ampr_format::Error::Io));
+        path.ok()
+    });
+    if io.get() {
+        return Err(ampr_format::Error::Io);
+    }
+    Ok(child)
 }
 
 /// zstd pack service files hidden from listings: `/app0/ampr_zstd.index` and
@@ -671,12 +956,15 @@ pub(crate) fn zstd_name_hidden(directory: &[u8], name: &[u8]) -> bool {
 }
 
 /// Whether one-based AMPRIDX3 `ampr_id` is packed with logical size `size`.
-pub(crate) fn zstd_packed_file_matches(ampr_id: u32, size: u64) -> bool {
-    match (zstd_index(), zstd_entry(ampr_id)) {
-        (Some(index), Some(entry)) => index
-            .file(u64::from(entry.zstd_id))
-            .is_ok_and(|f| f.logical_size == size),
-        _ => false,
+/// `Err(Io)` when its zstd record could not be read: not a miss.
+pub(crate) fn zstd_packed_file_matches(ampr_id: u32, size: u64) -> ampr_format::Result<bool> {
+    let (Some(index), Some(entry)) = (zstd_index(), zstd_entry(ampr_id)) else {
+        return Ok(false);
+    };
+    match index.logical_size(u64::from(entry.zstd_id)) {
+        Ok(logical) => Ok(logical == size),
+        Err(ampr_format::Error::Io) => Err(ampr_format::Error::Io),
+        Err(_) => Ok(false),
     }
 }
 
@@ -689,6 +977,26 @@ pub(crate) fn zstd_packed_file_matches(ampr_id: u32, size: u64) -> bool {
 
 use ampr_format::zstd::{FileRecord as ZstdFileRecord, CHUNK_SIZE as ZSTD_CHUNK_BYTES};
 use ampr_format::CoreError;
+
+/// What a read job needs of a packed file: its chunk span (from the
+/// projection) and logical size (from the fast table of a paged index),
+/// so a task reads no index page.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ZstdExtent {
+    pub logical_size: u64,
+    pub first_chunk: u32,
+    pub chunk_count: u32,
+}
+
+impl From<&ZstdFileRecord> for ZstdExtent {
+    fn from(f: &ZstdFileRecord) -> Self {
+        Self {
+            logical_size: f.logical_size,
+            first_chunk: f.first_chunk,
+            chunk_count: f.chunk_count,
+        }
+    }
+}
 
 /// 18: 256 KiB chunks (`Index::open` rejects any other header chunk_shift).
 const ZSTD_CHUNK_SHIFT: u32 = ampr_format::zstd::CHUNK_SHIFT as u32;
@@ -713,13 +1021,13 @@ const _: () = {
     assert!(chunk_pages <= PACK_MANDATORY_GROUP_MAX_REQUESTS);
 };
 
-fn request_valid(file: &ZstdFileRecord<'_>, offset: u64, length: u64) -> bool {
+fn request_valid(file: &ZstdExtent, offset: u64, length: u64) -> bool {
     length != 0 && offset <= file.logical_size && length <= file.logical_size - offset
 }
 
 /// Read tasks (256 KiB chunks touched) of `[offset, offset + length)` in
 /// `file`; zero for a rejected request (empty, or past the end).
-pub(crate) fn zstd_task_count(file: &ZstdFileRecord<'_>, offset: u64, length: u64) -> usize {
+pub(crate) fn zstd_task_count(file: &ZstdExtent, offset: u64, length: u64) -> usize {
     if !request_valid(file, offset, length) {
         return 0;
     }
@@ -731,9 +1039,9 @@ pub(crate) fn zstd_task_count(file: &ZstdFileRecord<'_>, offset: u64, length: u6
 /// Task `task_index` of a read of `file`: chunk `first_chunk + local` with
 /// its absolute volume offset, `raw_size = min(256 KiB, remaining bytes)`,
 /// volume id in `pack_id`, codec 0 raw / 1 zstd, flags zero.
-pub(crate) fn zstd_read_task(
-    index: &Index<'_>,
-    file: &ZstdFileRecord<'_>,
+pub(crate) fn zstd_read_task<S: Source + ?Sized>(
+    index: &Index<'_, S>,
+    file: &ZstdExtent,
     offset: u64,
     length: u64,
     task_index: usize,
@@ -787,20 +1095,28 @@ pub(crate) fn zstd_read_task(
 
 /// `ampr_pack_core_validate_logical_file` for a packed id: the zstd record
 /// must hold the AMPRIDX3 path (relative, case kept) and logical size.
-pub(crate) fn zstd_validate_logical(
-    index: &Index<'_>,
+/// A read error of the paged index is `Io` (not a mismatch), a
+/// mismatch `Checksum`.
+fn zstd_check_logical<S: Source + ?Sized>(
+    index: &Index<'_, S>,
     entry: &ZstdEntry,
     path: &[u8],
     logical_size: u64,
-) -> Result<(), CoreError> {
-    let file = index
-        .file(u64::from(entry.zstd_id))
-        .map_err(|_| CoreError::InvalidFormat)?;
-    if file.logical_size != logical_size || ampr_relative_path(path) != Some(file.path) {
-        return Err(CoreError::ChecksumMismatch);
+) -> ampr_format::Result<()> {
+    let file = index.file(u64::from(entry.zstd_id))?;
+    let mut buf = [0u8; PATH_BUF];
+    let packed = index.path(&file, &mut buf)?;
+    if file.logical_size != logical_size || ampr_relative_path(path) != Some(packed) {
+        return Err(ampr_format::Error::Checksum);
     }
     Ok(())
 }
+
+/// `zstd_core_validate_logical_file` when the paged index could not be
+/// read: SCE EIO, apart from the `CoreError` codes, so the open
+/// (rt/pack/slots.rs) fails with EIO instead of trying a disk copy the
+/// packed file does not have.
+pub(crate) const VALIDATE_IO: c_int = SCE_KERNEL_ERROR_EIO;
 
 /// A borrowed region; None for null or overflowing ranges.
 unsafe fn region<'a>(p: *const u8, len: usize) -> Option<&'a [u8]> {
@@ -808,13 +1124,22 @@ unsafe fn region<'a>(p: *const u8, len: usize) -> Option<&'a [u8]> {
         .then(|| unsafe { core::slice::from_raw_parts(p, len) })
 }
 
-/// The index and zstd file record behind a `zstd_task_file` pointer.
-fn task_file(file: *const u8) -> Option<(&'static Index<'static>, ZstdFileRecord<'static>)> {
+/// The index and file extent behind a `zstd_task_file` pointer: the
+/// projection's chunk span and the logical size, which reads memory only
+/// on a paged index (its fast table). The size must give the span's chunk
+/// count, as the record it was projected from did.
+fn task_file(file: *const u8) -> Option<(&'static ZstdIndex, ZstdExtent)> {
     let entry = zstd_entry_at(file)?;
     let index = zstd_index()?;
-    let record = index.file(u64::from(entry.zstd_id)).ok()?;
-    (record.first_chunk == entry.first_chunk && record.chunk_count == entry.chunk_count)
-        .then_some((index, record))
+    let logical_size = index.logical_size(u64::from(entry.zstd_id)).ok()?;
+    (logical_size.div_ceil(ZSTD_CHUNK_BYTES) == u64::from(entry.chunk_count)).then_some((
+        index,
+        ZstdExtent {
+            logical_size,
+            first_chunk: entry.first_chunk,
+            chunk_count: entry.chunk_count,
+        },
+    ))
 }
 
 /// zstd `ampr_pack_core_validate_logical_file`: `file_id` is a one-based
@@ -831,9 +1156,11 @@ pub(crate) unsafe fn zstd_core_validate_logical_file(
     if file_id == 0 || file_id > zstd_ampr_count() {
         return CoreError::InvalidArgument.code();
     }
-    match zstd_entry(file_id).map(|e| zstd_validate_logical(index, &e, path, logical_size)) {
+    match zstd_entry(file_id).map(|e| zstd_check_logical(index, &e, path, logical_size)) {
         None | Some(Ok(())) => AMPR_PACK_CORE_OK,
-        Some(Err(e)) => e.code(),
+        Some(Err(ampr_format::Error::Io)) => VALIDATE_IO,
+        Some(Err(ampr_format::Error::Checksum)) => CoreError::ChecksumMismatch.code(),
+        Some(Err(_)) => CoreError::InvalidFormat.code(),
     }
 }
 
@@ -972,10 +1299,27 @@ mod tests {
     fn project(
         index: &Index<'_>,
         entries: &[(&'static [u8], u64)],
-    ) -> (Result<u32, u32>, Vec<ZstdEntry>) {
+    ) -> (Result<u32, ProjectError>, Vec<ZstdEntry>) {
         let mut out = vec![ZstdEntry::LOOSE; entries.len()];
-        let rc = project_ids(index, &mut out, |id| entries.get(id as usize - 1).copied());
+        let rc = project_ids(
+            index,
+            &mut out,
+            by_path(|id| entries.get(id as usize - 1).copied()),
+        );
         (rc, out)
+    }
+
+    /// A `project_ids` callback over borrowed paths: copies each into the buffer.
+    fn by_path<'a>(
+        mut f: impl FnMut(u32) -> Option<(&'a [u8], u64)>,
+    ) -> impl FnMut(u32, &mut [u8; PATH_BUF]) -> ampr_format::Result<(usize, u64)> {
+        move |id, buf| {
+            let (path, size) = f(id).ok_or(ampr_format::Error::Invalid)?;
+            buf.get_mut(..path.len())
+                .ok_or(ampr_format::Error::Invalid)?
+                .copy_from_slice(path);
+            Ok((path.len(), size))
+        }
     }
 
     #[test]
@@ -1038,7 +1382,7 @@ mod tests {
     fn projection_maps_ids_and_rejects_mismatches() {
         // projects every ampr id onto zstd records.
         let image = build_index(ZSTD_FILES, ("Data/B.bin", 1));
-        let index = Index::open(&image).expect("test image validates");
+        let index = Index::open(&image[..]).expect("test image validates");
         assert_eq!(index.volume_count(), 2);
         let entries = ampr_entries();
         let (rc, out) = project(&index, &entries);
@@ -1064,10 +1408,7 @@ mod tests {
         let mut sorted = ids.clone();
         sorted.sort_unstable();
         assert_eq!(sorted, vec![0, 1, 2, 3]);
-        assert_eq!(
-            index.file(u64::from(out[2].zstd_id)).unwrap().path,
-            b"Data/B.bin"
-        );
+        assert_eq!(path_of(&index, out[2].zstd_id), b"Data/B.bin");
         assert_eq!(
             (out[2].chunk_count, out[2].first_volume, out[2].last_volume),
             (2, 0, 1)
@@ -1080,29 +1421,32 @@ mod tests {
 
         // size mismatch or missing view invalidates.
         let image = build_index(ZSTD_FILES, ("Data/B.bin", 1));
-        let index = Index::open(&image).unwrap();
+        let index = Index::open(&image[..]).unwrap();
         let mut entries = ampr_entries();
         entries[2].1 = 299_999;
-        assert_eq!(project(&index, &entries).0, Err(3));
+        assert_eq!(project(&index, &entries).0, Err(ProjectError::Invalid(3)));
         // A loose path may have any size.
         let mut entries = ampr_entries();
         entries[0].1 = 1;
         assert_eq!(project(&index, &entries).0, Ok(4));
         let mut out = vec![ZstdEntry::LOOSE; 3];
         assert_eq!(
-            project_ids(&index, &mut out, |id| (id != 2)
-                .then_some((&b"/app0/x"[..], 0))),
-            Err(2)
+            project_ids(
+                &index,
+                &mut out,
+                by_path(|id| (id != 2).then_some((&b"/app0/x"[..], 0)))
+            ),
+            Err(ProjectError::Invalid(2))
         );
-        assert_eq!(project_ids(&index, &mut [], |_| None), Ok(0));
+        assert_eq!(project_ids(&index, &mut [], by_path(|_| None)), Ok(0));
 
         // logical file matches ampr path and size.
         let image = task_image();
-        let index = Index::open(&image).unwrap();
+        let index = Index::open(&image[..]).unwrap();
         let entry = project_entry(&index, b"/APP0/Data/B.bin", 300_000).unwrap();
         assert!(entry.is_packed());
         assert_eq!(
-            zstd_validate_logical(&index, &entry, b"/app0/Data/B.bin", 300_000),
+            zstd_check_logical(&index, &entry, b"/app0/Data/B.bin", 300_000),
             Ok(())
         );
         for (path, size) in [
@@ -1111,8 +1455,8 @@ mod tests {
             (b"/app0/data/a.bin", 300_000),
         ] {
             assert_eq!(
-                zstd_validate_logical(&index, &entry, path, size),
-                Err(CoreError::ChecksumMismatch)
+                zstd_check_logical(&index, &entry, path, size),
+                Err(ampr_format::Error::Checksum)
             );
         }
     }
@@ -1125,16 +1469,23 @@ mod tests {
         })
     }
 
-    fn file<'a>(index: &Index<'a>, path: &str) -> ZstdFileRecord<'a> {
+    /// File `id`'s path, copied out of the index.
+    fn path_of(index: &Index<'_>, id: u32) -> Vec<u8> {
+        let mut buf = [0u8; PATH_BUF];
+        let f = index.file(u64::from(id)).unwrap();
+        index.path(&f, &mut buf).unwrap().to_vec()
+    }
+
+    fn file(index: &Index<'_>, path: &str) -> ZstdExtent {
         let id = index.find(path.as_bytes()).unwrap().expect("path packed");
-        index.file(id).unwrap()
+        ZstdExtent::from(&index.file(id).unwrap())
     }
 
     #[test]
     fn tasks_split_reads_into_fixed_256k_chunks() {
         // tasks use fixed 256k chunks and carry volume and codec.
         let image = task_image();
-        let index = Index::open(&image).expect("test image validates");
+        let index = Index::open(&image[..]).expect("test image validates");
         let f = file(&index, "Data/B.bin");
         assert_eq!((f.chunk_count, zstd_task_count(&f, 0, 300_000)), (2, 2));
         let t0 = zstd_read_task(&index, &f, 0, 300_000, 0).unwrap();
@@ -1191,7 +1542,7 @@ mod tests {
 
         // partial reads split at chunk boundaries.
         let image = task_image();
-        let index = Index::open(&image).unwrap();
+        let index = Index::open(&image[..]).unwrap();
         let f = file(&index, "Data/B.bin");
         assert_eq!(zstd_task_count(&f, 262_000, 1_000), 2);
         let t0 = zstd_read_task(&index, &f, 262_000, 1_000, 0).unwrap();
@@ -1232,7 +1583,7 @@ mod tests {
 
         // empty file has no tasks.
         let image = task_image();
-        let index = Index::open(&image).unwrap();
+        let index = Index::open(&image[..]).unwrap();
         let f = file(&index, "data/empty");
         assert_eq!(f.chunk_count, 0);
         assert_eq!(zstd_task_count(&f, 0, 0), 0);
@@ -1266,15 +1617,19 @@ mod tests {
         // Every id once in hash order, plus a repeat, as projection yields.
         let mut order: Vec<u32> = (0..index.file_count() as u32).collect();
         order.push(1);
-        let kept = zstd_sort_order(index, &mut order);
+        let kept = zstd_sort_order(index, &mut order).unwrap();
         order.truncate(kept);
         order
     }
 
     fn children(index: &Index<'_>, order: &[u32], dir: &[u8]) -> Vec<(String, u8)> {
-        let (begin, end) = zstd_directory_range(index, order, dir).expect("has packed files");
+        let (begin, end) = zstd_directory_range(index, order, dir)
+            .unwrap()
+            .expect("has packed files");
         let (mut out, mut cursor, mut name) = (Vec::new(), begin, [0u8; 256]);
-        while let Some(c) = zstd_next_child(index, order, end, dir.len(), cursor, &mut name) {
+        while let Ok(Some(c)) =
+            zstd_next_child_read(index, order, end, dir.len(), cursor, &mut name)
+        {
             let text = String::from_utf8(name[..usize::from(c.len)].to_vec()).unwrap();
             assert_eq!(name[usize::from(c.len)], 0);
             out.push((text, c.kind));
@@ -1287,12 +1642,9 @@ mod tests {
     #[test]
     fn directory_order_is_folded_path_order_not_hash_order() {
         let image = build_index(TREE, ("Data/B.bin", 1));
-        let index = Index::open(&image).expect("test image validates");
+        let index = Index::open(&image[..]).expect("test image validates");
         let order = tree_order(&index);
-        let paths: Vec<&[u8]> = order
-            .iter()
-            .map(|&id| index.file(u64::from(id)).unwrap().path)
-            .collect();
+        let paths: Vec<Vec<u8>> = order.iter().map(|&id| path_of(&index, id)).collect();
         let want: [&[u8]; 7] = [
             b"a b/x",
             b"data/a.bin",
@@ -1309,14 +1661,17 @@ mod tests {
             "zstd ids are hash order"
         );
 
-        assert_eq!(zstd_directory_range(&index, &order, b"/app0"), Some((0, 7)));
+        assert_eq!(
+            zstd_directory_range(&index, &order, b"/app0"),
+            Ok(Some((0, 7)))
+        );
         assert_eq!(
             zstd_directory_range(&index, &order, b"/APP0/data"),
-            Some((1, 5))
+            Ok(Some((1, 5)))
         );
         assert_eq!(
             zstd_directory_range(&index, &order, b"/app0/DATA/sub"),
-            Some((4, 5))
+            Ok(Some((4, 5)))
         );
         for missing in [
             &b"/app0/top.bin"[..],
@@ -1325,9 +1680,9 @@ mod tests {
             b"/app1",
             b"/app0x",
         ] {
-            assert_eq!(zstd_directory_range(&index, &order, missing), None);
+            assert_eq!(zstd_directory_range(&index, &order, missing), Ok(None));
         }
-        assert_eq!(zstd_directory_range(&index, &[], b"/app0"), None);
+        assert_eq!(zstd_directory_range(&index, &[], b"/app0"), Ok(None));
 
         let (d, r) = (DT_DIR, DT_REG);
         let s = |n: &str, k| (n.to_string(), k);
@@ -1342,65 +1697,234 @@ mod tests {
         assert_eq!(children(&index, &order, b"/app0/data/sub"), [s("d.bin", r)]);
     }
 
-    // ---- index room (rt/index_memory.rs `INDEX_FILE_MAX`) ----
-
-    /// A 52 MiB AMPRZPK1 index of 156,672 one-chunk files loads with its
-    /// AMPRIDX3 projection and directory order at exactly the index cap;
-    /// one more file at the same size needs a page past it and is refused
-    /// with the index notice.
+    /// A sorted AMPRIDX3 image gives the directory order from id order
+    /// with no path read, equal to the path sort. The zstd index holds
+    /// case variants of one folded path, which tie in its path sort; the
+    /// AMPRIDX3 image can name one of each (`Index::open` refuses two), and
+    /// it may name either one.
     #[test]
-    fn a_52_mib_zstd_index_and_its_tables_fit_and_more_files_are_refused() {
-        use crate::rt::index_memory as im;
+    fn sorted_order_equals_the_path_sort_with_case_variant_ties() {
+        let files = [
+            ("Data/A.bin", 1),
+            ("data/a.bin", 2),
+            ("data/B.bin", 3),
+            ("DATA/b.bin", 4),
+            ("data/sub/x", 5),
+            ("z/Q", 6),
+            ("z/q", 7),
+            ("top.bin", 8),
+        ];
+        let image = build_index(&files, ("", u32::MAX));
+        let index = Index::open(&image[..]).unwrap();
+        let mut all: Vec<u32> = (0..files.len() as u32).collect();
+        zstd_sort_order(&index, &mut all).unwrap();
+        let folded = |id: u32| path_of(&index, id).to_ascii_lowercase();
+        assert!(
+            all.windows(2).any(|w| folded(w[0]) == folded(w[1])),
+            "the zstd index has ties"
+        );
+        let mut ampr: Vec<(&'static [u8], u64)> = vec![
+            (b"/app0/data/a.bin", 2),
+            (b"/APP0/DATA/b.bin", 4),
+            (b"/app0/data/sub/x", 5),
+            (b"/app0/eboot.bin", 9), // loose
+            (b"/app0/top.bin", 8),
+            (b"/app0/z/Q", 6),
+        ];
+        ampr.sort_by(|a, b| ampr_format::index_key::compare(a.0, b.0));
+        assert!(ampr
+            .windows(2)
+            .all(|w| ampr_format::index_key::compare(w[0].0, w[1].0).is_lt()));
+        let (rc, entries) = project(&index, &ampr);
+        assert_eq!(rc, Ok(5));
+        let mut fast = vec![u32::MAX; 5];
+        assert_eq!(sorted_order(&entries, &mut fast), 5);
+        let mut slow = fast.clone();
+        slow.reverse();
+        let kept = zstd_sort_order(&index, &mut slow).unwrap();
+        assert_eq!(fast, slow[..kept]);
+        let paths: Vec<Vec<u8>> = fast.iter().map(|&id| path_of(&index, id)).collect();
+        let want: [&[u8]; 5] = [
+            b"data/a.bin",
+            b"DATA/b.bin",
+            b"data/sub/x",
+            b"top.bin",
+            b"z/Q",
+        ];
+        assert_eq!(paths, want);
+    }
+
+    // ---- index room (rt/index_memory.rs `INDEX_LOOKUP_MAX`) ----
+
+    /// A paged zstd index mounts only with its fast table: with less Index
+    /// room than the fast table and the derived tables need, the mount is
+    /// refused with the index notice and takes nothing; with the room it
+    /// mounts, chunks and volume sizes come from memory, and the release
+    /// gives every byte back.
+    #[test]
+    fn a_paged_zstd_index_needs_its_fast_table() {
         let _pool = im::POOL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        for (n, fits) in [(156_672usize, true), (156_673, false)] {
-            // Header, a 32 B record and one 8 B chunk per file, one volume
-            // record; the paths take the rest.
-            let paths = im::INDEX_FILE_MAX - 128 - 40 * n - 8;
-            let (base, extra) = (paths / n, paths % n);
-            let names: Vec<String> = (0..n)
-                .map(|i| {
-                    let mut p = format!("d{:03}/f{i:07}", i % 997);
-                    p.extend(core::iter::repeat_n(
-                        'a',
-                        base + usize::from(i < extra) - p.len(),
-                    ));
-                    p
-                })
-                .collect();
-            let files: Vec<(&str, u64)> = names.iter().map(|p| (p.as_str(), 1)).collect();
-            let image = build_index(&files, ("", u32::MAX));
-            assert_eq!(image.len(), im::INDEX_FILE_MAX);
-            let ampr: Vec<(Vec<u8>, u64)> = names
-                .iter()
-                .map(|p| (format!("/app0/{p}").into_bytes(), 1))
-                .collect();
-            let used = im::test_index_used();
-            im::test_take_index_notice();
-            unsafe {
-                let mem = index_alloc(image.len(), 8, c"test.zstd.index".as_ptr());
-                assert!(!mem.is_null());
-                core::ptr::copy_nonoverlapping(image.as_ptr(), mem, image.len());
-                let index = Index::open(core::slice::from_raw_parts(mem, image.len())).unwrap();
-                let bytes = n * size_of::<ZstdEntry>();
-                let entries = index_alloc(bytes, 4, c"test.zstd.projection".as_ptr());
-                assert!(!entries.is_null());
-                let out = core::slice::from_raw_parts_mut(entries.cast::<ZstdEntry>(), n);
-                let packed = project_ids(&index, out, |id| {
-                    ampr.get(id as usize - 1).map(|(p, s)| (p.as_slice(), *s))
-                });
-                assert_eq!(packed, Ok(n as u32));
-                let order = build_order(&index, out, n as u32);
-                assert_eq!(order.is_some(), fits, "{n} files");
-                assert_eq!(im::test_take_index_notice(), !fits);
-                if let Some((order, count)) = order {
-                    assert_eq!(count as usize, n);
-                    assert_eq!(im::test_index_used() - used, im::INDEX_MEMORY_MAX);
-                    index_free(order.cast(), c"test.zstd.order.free".as_ptr());
-                }
-                index_free(entries.cast(), c"test.zstd.projection.free".as_ptr());
-                index_free(mem.cast(), c"test.zstd.index.free".as_ptr());
+        let n = 3000usize;
+        let names: Vec<String> = (0..n).map(|i| format!("d{}/f{i}.bin", i % 7)).collect();
+        let files: Vec<(&str, u64)> = names.iter().map(|p| (p.as_str(), 1)).collect();
+        let image: &'static [u8] = build_index(&files, ("", u32::MAX)).leak();
+        let src = unsafe { index_pages::register_memory(image.as_ptr(), image.len()) }.unwrap();
+        let src: &'static IndexSource = Box::leak(Box::new(IndexSource::Paged(src)));
+        let (fast, derived) = lookup_bytes(n as u64, n as u64, 1, published_ampr_ids());
+        let page = SCE_KERNEL_PAGE_SIZE;
+        let used = im::test_index_used();
+        im::test_take_index_notice();
+        unsafe {
+            // Leave a page less than the tables need.
+            let fill = im::index_room() - (fast + derived).next_multiple_of(page) + page;
+            let other = im::index_alloc(fill, page, c"test.other.tables".as_ptr());
+            assert!(!other.is_null());
+            assert!(!zstd_mount_validate(src));
+            assert!(im::test_take_index_notice());
+            assert_eq!(im::test_index_used(), used + fill);
+            assert!((*ZSTD_MOUNT.get()).index.is_none());
+            im::index_free(other.cast(), c"test.other.tables.free".as_ptr());
+            assert!(zstd_mount_validate(src));
+            assert!(!im::test_take_index_notice());
+            let mount = &*ZSTD_MOUNT.get();
+            let index = mount.index.as_ref().unwrap();
+            assert!(index.has_fast() && !mount.fast.is_null());
+            assert_eq!(mount.fast_bytes, fast);
+            let plain = Index::open(image).unwrap();
+            for id in [0, n as u32 / 2, n as u32 - 1] {
+                assert_eq!(index.chunk(id), plain.chunk(id));
             }
-            assert_eq!(im::test_index_used(), used);
+            assert_eq!(index.volume_size(0), plain.volume_size(0));
+            assert_eq!(
+                index.find(names[7].as_bytes()),
+                plain.find(names[7].as_bytes())
+            );
+            zstd_mount_release();
+            assert!((*ZSTD_MOUNT.get()).index.is_none());
+            index_pages::unregister(match *src {
+                IndexSource::Paged(p) => p,
+                IndexSource::Resident(_) => unreachable!(),
+            });
         }
+        assert_eq!(im::test_index_used(), used);
+        assert_eq!(im::lookup_used(), 0);
+    }
+
+    /// A read error of a paged zstd index is not a bad pack: the
+    /// projection and the directory order report `Io` (the build is
+    /// retried) instead of invalidating the mount, and recover once reads
+    /// work again.
+    #[test]
+    fn a_zstd_index_read_error_is_io_not_invalid() {
+        use crate::rt::index_pages::{self, IndexSource};
+        use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+        // 2000 files span several 16 KiB pages; the cache holds one page.
+        let names: Vec<String> = (0..2000).map(|n| format!("dir/file-{n:05}.bin")).collect();
+        let files: Vec<(&str, u64)> = names.iter().map(|n| (n.as_str(), 1)).collect();
+        let image: &'static [u8] = build_index(&files, (files[0].0, 0)).leak();
+        let fail: &'static AtomicBool = Box::leak(Box::new(AtomicBool::new(false)));
+        let src = IndexSource::Paged(index_pages::test_file(image, fail));
+        let src: &'static IndexSource = Box::leak(Box::new(src));
+        let index = Index::open(src).unwrap();
+        let mut order: Vec<u32> = (0..2000).rev().collect();
+        fail.store(true, SeqCst);
+        let first = format!("/app0/{}", names[0]);
+        assert_eq!(
+            project_entry(&index, first.as_bytes(), 1),
+            Err(ampr_format::Error::Io)
+        );
+        let mut out = vec![ZstdEntry::LOOSE; 2];
+        assert_eq!(
+            project_ids(&index, &mut out, |_, _| Err(ampr_format::Error::Io)),
+            Err(ProjectError::Io)
+        );
+        assert_eq!(
+            zstd_sort_order(&index, &mut order),
+            Err(ampr_format::Error::Io)
+        );
+        fail.store(false, SeqCst);
+        assert!(project_entry(&index, first.as_bytes(), 1)
+            .unwrap()
+            .is_packed());
+        assert_eq!(zstd_sort_order(&index, &mut order), Ok(2000));
+
+        // A listing of /app0 fails on a read error instead of skipping.
+        let mut name = [0u8; 256];
+        let list = |n: &mut [u8]| zstd_next_child_read(&index, &order, 2000, 5, 0, n);
+        assert_eq!(list(&mut name).unwrap().map(|c| c.next), Some(2000));
+        fail.store(true, SeqCst);
+        assert_eq!(list(&mut name), Err(ampr_format::Error::Io));
+        // So does the range lookup that opens and stats a directory.
+        assert_eq!(
+            zstd_directory_range(&index, &order, b"/app0/dir"),
+            Err(ampr_format::Error::Io)
+        );
+        fail.store(false, SeqCst);
+        assert_eq!(
+            zstd_directory_range(&index, &order, b"/app0/dir"),
+            Ok(Some((0, 2000)))
+        );
+    }
+
+    /// A read job on a paged index reads no index page: with the fast
+    /// table the logical size, the task count and every task come from
+    /// memory, so they still work while every index read fails.
+    #[test]
+    fn zstd_read_tasks_read_no_index_page() {
+        use crate::rt::index_pages::{self, IndexSource};
+        use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+        // 2000 more files: records span several 16 KiB pages and the test
+        // cache holds one.
+        let names: Vec<String> = (0..2000).map(|n| format!("dir/file-{n:05}.bin")).collect();
+        let mut files: Vec<(&str, u64)> = names.iter().map(|n| (n.as_str(), 1)).collect();
+        files.push(("Data/B.bin", 300_000));
+        let image = build_index_with(&files, ("Data/B.bin", 1), |path, n| {
+            (path == "Data/B.bin" && n == 1).then_some(1000)
+        });
+        let image: &'static [u8] = image.leak();
+        let fail: &'static AtomicBool = Box::leak(Box::new(AtomicBool::new(false)));
+        let src = IndexSource::Paged(index_pages::test_file(image, fail));
+        let src: &'static IndexSource = Box::leak(Box::new(src));
+        let index = Index::open(src).unwrap();
+        let (f, c, v) = index.fast_lens();
+        let (mut hashes, mut sizes) = (vec![0; f], vec![0; f]);
+        let (mut chunks, mut volumes) = (vec![0; c], vec![0; v]);
+        index
+            .fill_fast(&mut hashes, &mut sizes, &mut chunks, &mut volumes)
+            .unwrap();
+        let fast = ampr_format::zstd::Fast {
+            hashes: hashes.leak(),
+            sizes: sizes.leak(),
+            chunks: chunks.leak(),
+            volumes: volumes.leak(),
+        };
+        let index = index.with_fast(fast).unwrap();
+        let plain = Index::open(image).unwrap();
+        let id = plain.find(b"Data/B.bin").unwrap().unwrap();
+        let want = file(&plain, "Data/B.bin");
+        // Leave a page far from the record resident (1024 records away).
+        index.file((id + 1024) % plain.file_count()).unwrap();
+        fail.store(true, SeqCst);
+        assert_eq!(index.file(id).err(), Some(ampr_format::Error::Io));
+        let extent = ZstdExtent {
+            logical_size: index.logical_size(id).unwrap(),
+            ..want
+        };
+        assert_eq!(extent, want);
+        assert_eq!(zstd_task_count(&extent, 0, 300_000), 2);
+        for task in 0..2 {
+            let got = zstd_read_task(&index, &extent, 0, 300_000, task).unwrap();
+            let want = zstd_read_task(&plain, &want, 0, 300_000, task).unwrap();
+            assert_eq!(
+                (got.chunk_index, got.copy_length, got.destination_offset),
+                (want.chunk_index, want.copy_length, want.destination_offset)
+            );
+            let (g, w) = (got.chunk, want.chunk);
+            assert_eq!(
+                (g.offset, g.stored_size, g.pack_id),
+                (w.offset, w.stored_size, w.pack_id)
+            );
+        }
+        fail.store(false, SeqCst);
     }
 }

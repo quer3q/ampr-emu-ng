@@ -7,7 +7,23 @@ this repo only decodes them (`crates/ampr-zstd`: constants, layout, volume
 header; `crates/ampr-format/src/zstd.rs`: index reader). When
 `/app0/ampr_zstd.index` exists, `libSceAmpr.sprx` mounts it instead of the
 LZ4 `ampr_assets.index`, decodes with libzstd (`ampr-codec`) and serves
-AMPR/APR reads and the file calls under What is packed.
+AMPR/APR reads and the file calls under What is packed. An index file
+that fits the Index ledger (64 MiB, `rt/index_memory.rs`) with its tables
+is read whole and used as is. A larger one is read on demand through a
+page cache of 16 KiB pages (an arena of at least 16 MiB, shared with the
+LZ4 manifest and `ampr_emu.index`; `crates/ampr-sys/src/rt/index_pages.rs`)
+and gets a fast table, one sequential pass at mount: the file hashes and
+logical sizes, every chunk record and the volume sizes, 8 B each (16 B
+per file), held in memory, so lookups read only the path of a record
+whose hash matches and read jobs read no index pages (a job takes the
+chunk span from the projection and the size from the fast table). The fast table and the tables built from the index
+(projection 16 B per AMPRIDX3 id, order 4 B per packed file) count
+against 48 MiB of lookup tables (`INDEX_LOOKUP_MAX`); a paged index whose
+tables do not fit is not served. The loader refuses an index file over
+512 MiB (`AMPR_EMU_PACK_INDEX_MAX_BYTES`, `rt/pack/mod.rs`): that bounds
+its page table (2 B per 16 KiB page) and the full CRC read at mount for a
+corrupt file.
+Every path must be shorter than 1024 bytes, the PS5 path limit.
 
 Integers are little-endian. CRC is CRC-32 (IEEE, as in `crc32fast`). The
 path hash is FNV-1a 64 (basis 14695981039346656037, prime 1099511628211)
@@ -64,7 +80,7 @@ File record, 32 bytes, sorted by (path_hash, path bytes) for binary search:
 | 8 | u64 | logical_size |
 | 16 | u32 | first_chunk: the chunks of all earlier records (chunk_count = ceil(size / 256 KiB), 0 for an empty file) |
 | 20 | u32 | path_off (into strings) |
-| 24 | u16 | path_len (bytes, no NUL) |
+| 24 | u16 | path_len (bytes, no NUL; below 1024, the PS5 path limit, or the index is refused) |
 | 26 | u16 | flags: bit0 = store-only (all chunks raw); other bits 0 |
 | 28 | u32 | reserved 0 |
 
@@ -215,7 +231,7 @@ handler. The disk cache takes maps this path cannot serve: GPU prot, an
 offset not 4 KiB aligned, more volumes than its volume fds, a full table,
 over 512 MiB, or no sigaction. No measured game mmapped a packed file
 (`mmap_virtual` 0), so it has never served one. Cost: 2 MiB of Index
-ledger scratch (4 x 512 KiB), 4 libzstd DCtx on the libc heap, one pool
+ledger scratch (4 x 512 KiB), 4 x 112 KiB decoder workspaces in the Buffer ledger, one pool
 byte per mapped chunk. Unsolved: a syscall given an untouched page gets
 EFAULT, mprotect on the range is not tracked, the handler runs on the
 faulting thread's stack, ranges replaced by unhooked VM calls stay

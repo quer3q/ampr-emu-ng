@@ -369,7 +369,7 @@ pub unsafe fn sceKernelAioSubmitReadCommandsMultiple(
                     prepare_rc = SCE_KERNEL_ERROR_EAGAIN;
                     break;
                 }
-                let Some((_file_ptr, _file_size, file_flags)) =
+                let Some((task_file, _file_size, file_flags)) =
                     packed_read_file(state, fd_slot.file_id)
                 else {
                     free_virtual_aio_locked(state, aio_index);
@@ -410,7 +410,7 @@ pub unsafe fn sceKernelAioSubmitReadCommandsMultiple(
                     if let Some((group_index, n)) = split_virtual_read_locked(
                         state,
                         aio_index,
-                        _file_ptr,
+                        task_file.ptr(),
                         _file_size,
                         rest + SPLIT_MIN_FREE_SLOTS,
                         &mut children,
