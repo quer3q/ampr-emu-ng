@@ -806,7 +806,108 @@ unsafe fn emit_dot(
     0
 }
 
+/// `getdents` / `getdirentries` on a virtual directory fd. The debug build
+/// logs each distinct failed (directory, result) once (`note_directory_read`);
+/// successful reads are not logged, as each batch size would take one of the
+/// 96 `/fsfail` entries.
 pub(crate) unsafe fn ampr_pack_try_directory_read_fd(
+    fd: c_int,
+    buffer: *mut c_char,
+    size: c_int,
+    basep: *mut c_long,
+    use_getdirentries: bool,
+    handled: *mut bool,
+) -> c_int {
+    let rc = unsafe { directory_read_fd(fd, buffer, size, basep, use_getdirentries, handled) };
+    #[cfg(feature = "mem_report")]
+    if rc < 0 && !handled.is_null() && unsafe { *handled } {
+        unsafe { note_directory_read(fd, rc) };
+    }
+    rc
+}
+
+/// The /fsfail line "read <directory> rc=0x<8 hex>" (op `U`, lookup `d`) of a
+/// failed read. Logged through `fs_note`, so every distinct result of a
+/// directory is kept once and `/fsfail` counts the repeats.
+#[cfg(feature = "mem_report")]
+unsafe fn note_directory_read(fd: c_int, rc: c_int) {
+    let mut path = [0u8; 96];
+    let Some(path_len) = (unsafe { virtual_directory_fd_path(fd, &mut path) }) else {
+        return;
+    };
+    note_directory_line(&path[..path_len], b"read ", b" rc=", rc, b'd');
+}
+
+/// The /fsfail line "realfail <directory> errno=<n>" (op `U`, lookup `x`):
+/// the physical `getdents` behind a virtual directory failed with `errno`, so
+/// the listing continues from the index alone (`directory_read_fd`). Called
+/// with the slot's path under its mutex, which `note_directory_read` cannot take.
+#[cfg(feature = "mem_report")]
+fn note_directory_real_failure(path: &[c_char], errno: c_int) {
+    let mut bytes = [0u8; 96];
+    let n = path.len().min(bytes.len() - 1);
+    for (i, b) in bytes[..n].iter_mut().enumerate() {
+        *b = path[i] as u8;
+    }
+    note_directory_line(&bytes[..n], b"realfail ", b" errno=", errno, b'x');
+}
+
+/// `<label><path><mid><value>` as an `fs_note` line of op `U`: `value` in
+/// decimal when it is not negative, else as `0x<8 hex>`.
+#[cfg(feature = "mem_report")]
+fn note_directory_line(path: &[u8], label: &[u8], mid: &[u8], value: c_int, how: u8) {
+    let mut buf = [0u8; 128];
+    let mut n = 0usize;
+    let mut push = |bytes: &[u8]| {
+        for &b in bytes {
+            if n + 1 >= buf.len() {
+                return;
+            }
+            buf[n] = b;
+            n += 1;
+        }
+    };
+    push(label);
+    push(path);
+    push(mid);
+    if value >= 0 {
+        let mut digits = [0u8; 10];
+        let mut count = 0usize;
+        let mut v = value as u32;
+        loop {
+            digits[count] = b'0' + (v % 10) as u8;
+            count += 1;
+            v /= 10;
+            if v == 0 {
+                break;
+            }
+        }
+        while count > 0 {
+            count -= 1;
+            push(&[digits[count]]);
+        }
+    } else {
+        push(b"0x");
+        let v = value as u32;
+        for i in (0..8).rev() {
+            push(&[b"0123456789abcdef"[((v >> (i * 4)) & 0xf) as usize]]);
+        }
+    }
+    buf[n] = 0;
+    crate::rt::stats::fs_note(b'U', how, i64::from(value), buf.as_ptr().cast());
+}
+
+/// Whether a failed physical `getdents` ends the physical part of the
+/// listing. EINTR and EAGAIN are the caller's to retry and go back to it;
+/// anything else would give the game the same error again (a folder install
+/// on the internal SSD: EINVAL on every call, 67 million calls in 92 s, while
+/// the same listing on USB exFAT worked), so the physical entries are dropped
+/// and the packed ones are listed instead.
+fn physical_getdents_failure_is_final(errno: c_int) -> bool {
+    errno != EINTR && errno != EAGAIN
+}
+
+unsafe fn directory_read_fd(
     fd: c_int,
     buffer: *mut c_char,
     size: c_int,
@@ -861,7 +962,15 @@ pub(crate) unsafe fn ampr_pack_try_directory_read_fd(
                 f(slot.real_fd, buffer, size)
             };
             if rc < 0 {
-                return rc;
+                let errno = open_failure_errno(rc);
+                if !physical_getdents_failure_is_final(errno) {
+                    return rc;
+                }
+                #[cfg(feature = "mem_report")]
+                note_directory_real_failure(&slot.path[..slot.path_length as usize], errno);
+                slot.real_failed = true;
+                slot.real_exhausted = true;
+                break;
             }
             if use_getdirentries {
                 slot.directory_offset = overlay::advance_offset(physical_base, rc);
@@ -879,6 +988,10 @@ pub(crate) unsafe fn ampr_pack_try_directory_read_fd(
                 slot.real_exhausted = true;
                 break;
             }
+            // The physical listing gives `.` and `..`; a later failure must
+            // not list them again.
+            slot.dot_emitted = true;
+            slot.dot_dot_emitted = true;
             let total = rc as usize;
             let mut input = 0usize;
             let mut output = 0usize;
@@ -915,7 +1028,9 @@ pub(crate) unsafe fn ampr_pack_try_directory_read_fd(
 
         let mut output = 0usize;
         let synthetic_base = slot.directory_offset;
-        if slot.real_fd < 0 {
+        // A physical directory lists `.` and `..` itself; with none, or one
+        // that failed to list, they come from here.
+        if slot.real_fd < 0 || slot.real_failed {
             for (name, which) in [(c".", 0), (c"..", 1)] {
                 let emitted = if which == 0 {
                     &mut slot.dot_emitted
@@ -1036,5 +1151,20 @@ mod tests {
         assert_eq!(physical_dirent_bounds(&record(16, 8, 16)), None);
         assert_eq!(physical_dirent_bounds(&record(24, 3, 16)), None);
         assert_eq!(physical_dirent_bounds(&record(8, 0, 16)), None);
+    }
+
+    /// A physical `getdents` that fails for good ends the physical
+    /// listing; an interrupted or would-block one goes back to the caller.
+    #[test]
+    fn physical_getdents_failure_ends_the_listing_except_for_retries() {
+        assert!(!physical_getdents_failure_is_final(EINTR));
+        assert!(!physical_getdents_failure_is_final(EAGAIN));
+        for errno in [EINVAL, EIO, ENOENT, EBADF, EFAULT] {
+            assert!(physical_getdents_failure_is_final(errno), "{errno}");
+        }
+        // `open_failure_errno` maps the raw -1 to errno() and an SCE code to
+        // its POSIX value, so a failed listing is told apart from a retry.
+        assert_eq!(open_failure_errno(SCE_KERNEL_ERROR_EINVAL), EINVAL);
+        assert_eq!(open_failure_errno(SCE_KERNEL_ERROR_EIO), EIO);
     }
 }
