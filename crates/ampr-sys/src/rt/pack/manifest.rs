@@ -222,38 +222,6 @@ unsafe fn cache_region(target: usize, min_bytes: usize, tag: &CStr) -> Option<(*
     (!memory.is_null()).then_some((memory, bytes))
 }
 
-/// Allocates the physical cache, or leaves it off: a 0 target, or refused
-/// under the cache cap.
-unsafe fn initialize_physical_cache(state: *mut PackState) {
-    if (*state).physical_cache_target_bytes == 0 || PACK_PHYSICAL_CACHE_MAX_PAGES == 0 {
-        return;
-    }
-    let Some((memory, candidate)) = (unsafe {
-        cache_region(
-            (*state).physical_cache_target_bytes,
-            AMPR_EMU_PACK_PHYSICAL_CACHE_MIN_BYTES as usize,
-            c"apr.pack.physical-page-cache",
-        )
-    }) else {
-        return;
-    };
-    (*state).physical_cache_base = memory;
-    (*state).physical_cache_bytes = candidate;
-    (*state).physical_cache_page_count = (candidate / PACK_CACHE_PAGE_BYTES) as u32;
-    (*state).physical_cache_page_bitmap.fill(0);
-    (*state).physical_cache_hash_heads.fill(0);
-    (*state).physical_cache_page_cursor = 0;
-    (*state).physical_cache_free_head = 0;
-    for (i, entry) in (*state).physical_cache_entries.iter_mut().enumerate() {
-        *entry = PhysicalCacheEntry::EMPTY;
-        entry.free_next = if i + 1 < AMPR_EMU_PACK_PHYSICAL_CACHE_ENTRY_CAP {
-            i as u32 + 1
-        } else {
-            INVALID_INDEX
-        };
-    }
-}
-
 /// AMPRPAK4 only: its `build_id` and path do not apply to a zstd mount.
 pub(crate) unsafe fn load_runtime_profile(state: *mut PackState) -> bool {
     let (Some(open_fn), Some(fstat_fn), Some(close_fn)) =
@@ -305,10 +273,11 @@ pub(crate) unsafe fn load_runtime_profile(state: *mut PackState) -> bool {
     if !valid {
         return false;
     }
+    // The format still carries a physical page cache size; there is no
+    // such cache now, so its share goes to the decoded cache.
+    let decoded = decoded.saturating_add(physical);
     (*state).decoded_cache_target_bytes =
         decoded.min(AMPR_EMU_PACK_DECODED_CACHE_MAX_BYTES) as usize;
-    (*state).physical_cache_target_bytes =
-        physical.min(AMPR_EMU_PACK_PHYSICAL_CACHE_MAX_BYTES) as usize;
     (*state).requested_workers = workers.min(AMPR_EMU_PACK_WORKER_CAPACITY as u32);
     (*state).latency_reserve_workers = reserve.min((*state).requested_workers - 1);
     true
@@ -346,14 +315,13 @@ unsafe fn initialize_decoded_cache(state: *mut PackState) {
     }
 }
 
-/// Carves the 16 + 16 MiB caches from the pool at startup. No reserve is
+/// Carves the 64 MiB decoded cache from the pool at startup. No reserve is
 /// held for the pipelines and workers: their windows and decode buffers
 /// have their own Buffer ledger, and the Index, Cache and Buffer caps plus
 /// the fixed sites fit the pool (rt/index_memory.rs), so a cache cannot
 /// take their room. A refused cache stays off.
 pub(crate) unsafe fn initialize_caches(state: *mut PackState) {
     unsafe {
-        initialize_physical_cache(state);
         initialize_decoded_cache(state);
     }
 }

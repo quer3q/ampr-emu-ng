@@ -8,9 +8,9 @@ with it, then ship the release build.
 
 `./ps5/build-docker.sh` (`make dist`) builds both files. The debug one is
 `make AMPR_MEM_REPORT=1` (Cargo feature `mem_report`) with the pool set to
-`AMPR_DEBUG_POOL_SIZE` (`0x7e78000`, 126.47 MiB); the release pool is
-`0x7fd4000` (127.83 MiB). The smaller pool offsets the larger debug code, so
-both PRX files load to 136.5 MiB with the same ledger caps, caches and
+`AMPR_DEBUG_POOL_SIZE` (`0x9e78000`, 158.47 MiB); the release pool is
+`0x9fd4000` (159.83 MiB). The smaller pool offsets the larger debug code, so
+both PRX files load to 167.94 MiB with the same ledger caps, cache and
 thread limits.
 
 Only the debug build:
@@ -85,6 +85,11 @@ not fit is not served (the one index notice). `index_lookup_io` counts
 file index lookups that could not read the index file: they go to the
 real call instead of answering ENOENT.
 
+Pack chunks are read with exact-size reads, the only read path: one disk
+read covers a chunk's stored bytes, adjacent chunks coalesced.
+`pack_disk_reads` counts those reads and `pack_disk_bytes` their bytes.
+Read bytes are not cached; decoded chunks go to the 64 MiB decoded cache.
+
 Most runs compare three numbers:
 
 - game wait per read: `apr_read_ns / apr_reads`;
@@ -127,11 +132,15 @@ curl 'http://<ps5-ip>:9090/set?profile=low'         # low, medium or high
 rewrites the file and lists every knob. Live knobs (read-ahead and its gate,
 pread pool switches, reactor issue limits, lane EOP overlap, thread budget,
 `spin_us`, `regrow_s`, `pread_wake_all`) apply from the next read or reactor
-pass. Startup knobs (cache sizes, workers, pipelines, `pread_threads`,
+pass. Startup knobs (`decoded_mib`, workers, pipelines, `pread_threads`,
 `zstd_verify`, `equeue_local`, `worker_stack_kib`) apply at the next launch.
-A profile sets `decoded_mib`, `physical_mib`, `workers` and `pipelines`;
-caches past the 32 MiB Cache ledger are cut to fit, and workers or windows
-past the Buffer ledger are refused.
+A profile sets `decoded_mib`, `workers` and `pipelines` (low 24 MiB, 4, 8;
+medium 80 MiB, 8, 16; high 160 MiB, 8, 32, `PROFILES` in `rt/tune.rs`); a
+decoded cache past the 64 MiB Cache ledger is cut to fit. The I/O windows
+are taken at the worker start and the pipelines are the windows the Buffer
+ledger grants after the worker buffers; workers are cut until each has a
+pipeline (medium and high run 8 workers with 9 pipelines,
+`buffer_split` in `rt/pack/worker.rs`).
 
 The file stores every knob, defaults included, so a file from an older build
 keeps that build's values (for example `decoded_mib=0`, decoded cache off).

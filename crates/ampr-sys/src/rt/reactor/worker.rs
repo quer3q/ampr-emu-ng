@@ -519,24 +519,6 @@ pub unsafe fn apr_reactor_submit_external_aio_read(
     )
 }
 
-pub unsafe fn apr_reactor_submit_external_aio_read_group(
-    requests: *const SceKernelAioRWRequest,
-    requestCount: usize,
-    priority: c_int,
-    ioClass: AprExternalAioClass,
-    context: *mut c_void,
-    callback: AprExternalAioCallback,
-) -> c_int {
-    apr_aio_reactor().submit_external_aio_read_group(
-        requests,
-        requestCount,
-        priority,
-        ioClass,
-        context,
-        callback,
-    )
-}
-
 /// A game thread creation failed (rt/thread_hooks.rs): asks the read pool
 /// to give up to `want` threads back. Returns how many exited. Only the
 /// debug /threads page calls it; make_room uses the ask/reap split.

@@ -46,7 +46,7 @@ mod software;
 mod worker;
 pub(crate) use worker::{
     apr_reactor_notify_external_progress, apr_reactor_shutdown, apr_reactor_submit,
-    apr_reactor_submit_external_aio_read, apr_reactor_submit_external_aio_read_group,
+    apr_reactor_submit_external_aio_read,
     apr_reactor_wait_synthetic_submit_id, pread_pool_pending_exits,
 };
 #[cfg(feature = "mem_report")]

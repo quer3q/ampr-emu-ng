@@ -37,21 +37,16 @@ pub(crate) unsafe fn pack_state_create() -> *mut PackState {
             for i in 0..AMPR_EMU_PACK_CACHE_ENTRY_CAP {
                 addr_of_mut!((*s).cache_entries[i]).write(CacheEntry::EMPTY);
             }
-            for i in 0..AMPR_EMU_PACK_PHYSICAL_CACHE_ENTRY_CAP {
-                addr_of_mut!((*s).physical_cache_entries[i]).write(PhysicalCacheEntry::EMPTY);
-            }
             let st = &mut *s;
             st.queue_head = [[INVALID_INDEX; PACK_WORK_CLASS_COUNT]; 3];
             st.queue_tail = [[INVALID_INDEX; PACK_WORK_CLASS_COUNT]; 3];
             st.prefetch_head = INVALID_INDEX;
             st.prefetch_tail = INVALID_INDEX;
             st.decoded_cache_target_bytes = super::super::tune::decoded_bytes();
-            st.physical_cache_target_bytes = super::super::tune::physical_bytes();
             st.requested_workers = super::super::tune::workers();
             st.latency_reserve_workers = AMPR_EMU_PACK_LATENCY_RESERVE_WORKERS;
             st.pipeline_free_head = INVALID_INDEX;
             st.cache_free_head = INVALID_INDEX;
-            st.physical_cache_free_head = INVALID_INDEX;
             st.tick = 1;
         }
         g_pack_state.store(s, Ordering::Release);

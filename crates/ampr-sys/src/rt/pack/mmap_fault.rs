@@ -247,6 +247,12 @@ static SLOTS_STATE: AtomicU8 = AtomicU8::new(0);
 /// decoder workspaces from the Buffer ledger, not the libc heap), so a
 /// fill allocates nothing. False when any allocation fails; what was made
 /// is released.
+/// The slot decoders are made, so their workspaces are already in the
+/// Buffer ledger's use and need no room kept for them.
+pub(crate) fn slots_made() -> bool {
+    SLOTS_STATE.load(Ordering::Acquire) == 1
+}
+
 unsafe fn make_slots() -> bool {
     match SLOTS_STATE.load(Ordering::Acquire) {
         1 => return true,

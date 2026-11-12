@@ -13,8 +13,7 @@
 //! `ON` is false and the atomics are never read.
 
 use super::pack::{
-    AMPR_EMU_PACK_DECODED_CACHE_BYTES, AMPR_EMU_PACK_PHYSICAL_CACHE_BYTES,
-    AMPR_EMU_PACK_PIPELINE_SLOTS,
+    AMPR_EMU_PACK_DECODED_CACHE_BYTES, AMPR_EMU_PACK_PIPELINE_SLOTS,
     AMPR_EMU_PACK_READAHEAD_CHUNKS, AMPR_EMU_PACK_READAHEAD_MAX_DISK_INFLIGHT,
     AMPR_EMU_PACK_WORKERS, AMPR_EMU_PACK_WORKER_CAPACITY,
 };
@@ -76,27 +75,26 @@ const fn knob(name: &'static str, live: bool, min: u32, max: u32, default: u32) 
 
 const MIB: u64 = 1024 * 1024;
 const DECODED_MIB: usize = 0;
-const PHYSICAL_MIB: usize = 1;
-const WORKERS: usize = 2;
-const PIPELINES: usize = 3;
-const RA: usize = 4;
-const RA_GATE: usize = 5;
-const PREAD: usize = 6;
-const PREAD_THREADS: usize = 7;
-const LOOSE_PREAD: usize = 8;
-const LOOSE_PREAD_PART_KIB: usize = 9;
-const READ_PASS_KIB: usize = 10;
-const READ_CHUNK_QUANTUM: usize = 11;
-const PER_READ_ACTIVE_KIB: usize = 12;
-const PER_READ_ACTIVE_CHUNKS: usize = 13;
-const LANE_EOP_OVERLAP: usize = 14;
-const PREAD_WAKE_ALL: usize = 15;
-const ZSTD_VERIFY: usize = 16;
-const EQUEUE_LOCAL: usize = 17;
-const THREAD_BUDGET_KNOB: usize = 18;
-const SPIN_US: usize = 19;
-const REGROW_S: usize = 20;
-const WORKER_STACK_KIB: usize = 21;
+const WORKERS: usize = 1;
+const PIPELINES: usize = 2;
+const RA: usize = 3;
+const RA_GATE: usize = 4;
+const PREAD: usize = 5;
+const PREAD_THREADS: usize = 6;
+const LOOSE_PREAD: usize = 7;
+const LOOSE_PREAD_PART_KIB: usize = 8;
+const READ_PASS_KIB: usize = 9;
+const READ_CHUNK_QUANTUM: usize = 10;
+const PER_READ_ACTIVE_KIB: usize = 11;
+const PER_READ_ACTIVE_CHUNKS: usize = 12;
+const LANE_EOP_OVERLAP: usize = 13;
+const PREAD_WAKE_ALL: usize = 14;
+const ZSTD_VERIFY: usize = 15;
+const EQUEUE_LOCAL: usize = 16;
+const THREAD_BUDGET_KNOB: usize = 17;
+const SPIN_US: usize = 18;
+const REGROW_S: usize = 19;
+const WORKER_STACK_KIB: usize = 20;
 
 // ---- runtime thread lifetime (rt/thread_hooks.rs) ----
 // Release values; the debug knobs of the same names default to them.
@@ -119,22 +117,15 @@ const READ_SLICE_KIB: u32 = (kSoftwareReadChunkMax / 1024) as u32;
 /// Largest pass budget and per-read active window, in KiB (16 MiB).
 const READ_LIMIT_MAX_KIB: u32 = 16 * 1024;
 
-/// Cache sizes: 0 turns a cache off (reads bypass it); otherwise the cache
-/// allocators' minimums apply (decoded 16, physical 8 MiB, pack/manifest.rs).
-pub(crate) static KNOBS: [Knob; 22] = [
+/// Cache size: 0 turns the decoded cache off (reads bypass it); otherwise
+/// its 16 MiB minimum applies (pack/manifest.rs).
+pub(crate) static KNOBS: [Knob; 21] = [
     knob(
         "decoded_mib",
         false,
         0,
         512,
         (AMPR_EMU_PACK_DECODED_CACHE_BYTES / MIB) as u32,
-    ),
-    knob(
-        "physical_mib",
-        false,
-        0,
-        128,
-        (AMPR_EMU_PACK_PHYSICAL_CACHE_BYTES / MIB) as u32,
     ),
     knob(
         "workers",
@@ -218,14 +209,15 @@ pub(crate) static KNOBS: [Knob; 22] = [
     knob("worker_stack_kib", false, 0, 1024, WORKER_STACK_KIB_DEFAULT),
 ];
 
-/// (name, [decoded_mib, physical_mib, workers, pipelines]). `pipelines` is
-/// clamped to the build's slots (`apply`); caches past the Cache cap are
-/// cut to what is left under it, and workers and windows past the Buffer
-/// cap are refused (rt/index_memory.rs).
-const PROFILES: [(&str, [u32; 4]); 3] = [
-    ("low", [16, 8, 4, 8]),
-    ("medium", [64, 16, 8, 16]),
-    ("high", [128, 32, 8, 32]),
+/// (name, [decoded_mib, workers, pipelines]). The decoded sizes are the
+/// earlier two-cache totals. `pipelines` is clamped to the build's slots
+/// (`apply`); a cache past the Cache cap is cut to what is left under
+/// it, and workers and windows past the Buffer cap are refused
+/// (rt/index_memory.rs).
+const PROFILES: [(&str, [u32; 3]); 3] = [
+    ("low", [24, 4, 8]),
+    ("medium", [80, 8, 16]),
+    ("high", [160, 8, 32]),
 ];
 
 fn get(i: usize) -> u32 {
@@ -237,13 +229,6 @@ pub(crate) fn decoded_bytes() -> usize {
         get(DECODED_MIB) as usize * MIB as usize
     } else {
         AMPR_EMU_PACK_DECODED_CACHE_BYTES as usize
-    }
-}
-pub(crate) fn physical_bytes() -> usize {
-    if ON {
-        get(PHYSICAL_MIB) as usize * MIB as usize
-    } else {
-        AMPR_EMU_PACK_PHYSICAL_CACHE_BYTES as usize
     }
 }
 pub(crate) fn workers() -> u32 {
@@ -699,7 +684,7 @@ pub(crate) mod tests {
         if ON {
             assert_eq!(pipelines(), RELEASE_PIPELINES as usize);
         }
-        let saved: Vec<u32> = (0..4).map(knob_value).collect();
+        let saved: Vec<u32> = (0..3).map(knob_value).collect();
         assert_eq!(apply(b"profile=high"), Ok(()));
         assert_eq!(knob_value(PIPELINES), slots.min(32));
         assert!(pipelines() <= AMPR_EMU_PACK_PIPELINE_SLOTS);
@@ -711,15 +696,14 @@ pub(crate) mod tests {
     }
 
     /// The sizing knobs are plain numbers with the build defaults (workers
-    /// 4, pipelines 12, both caches 16 MiB); `auto`, junk and the removed
-    /// `workers_min`/`pipelines_min` are rejected without storing; 0 turns a
-    /// cache off.
+    /// 4, pipelines 12, decoded cache 64 MiB); `auto`, junk and the removed
+    /// `workers_min`/`pipelines_min` are rejected without storing; 0 turns
+    /// the cache off.
     #[test]
     fn sizing_knobs_take_numbers_only() {
         let _lock = knob_lock();
         let defaults = [
-            (DECODED_MIB, 16),
-            (PHYSICAL_MIB, 16),
+            (DECODED_MIB, 64),
             (WORKERS, AMPR_EMU_PACK_WORKERS),
             (PIPELINES, RELEASE_PIPELINES),
         ];
@@ -729,15 +713,10 @@ pub(crate) mod tests {
         assert_eq!(AMPR_EMU_PACK_WORKERS, 4);
         assert_eq!(workers(), AMPR_EMU_PACK_WORKERS);
         assert_eq!(decoded_bytes(), AMPR_EMU_PACK_DECODED_CACHE_BYTES as usize);
-        assert_eq!(
-            physical_bytes(),
-            AMPR_EMU_PACK_PHYSICAL_CACHE_BYTES as usize
-        );
         for bad in [
             &b"workers=auto"[..],
             b"pipelines=auto",
             b"decoded_mib=auto",
-            b"physical_mib=auto",
             b"workers=",
             b"workers=-1",
             b"workers=0",
@@ -750,17 +729,14 @@ pub(crate) mod tests {
             assert_eq!(apply(bad), Err(bad), "{}", core::str::from_utf8(bad).unwrap());
         }
         assert_eq!(knob_value(WORKERS), AMPR_EMU_PACK_WORKERS);
-        assert_eq!(
-            apply(b"workers=3&pipelines=5&decoded_mib=0&physical_mib=24"),
-            Ok(())
-        );
+        assert_eq!(apply(b"workers=3&pipelines=5&decoded_mib=0"), Ok(()));
         assert_eq!(
             (knob_value(WORKERS), knob_value(PIPELINES), knob_value(DECODED_MIB)),
             (3, 5, 0)
         );
         if ON {
             assert_eq!((workers(), pipelines()), (3, 5));
-            assert_eq!((decoded_bytes(), physical_bytes()), (0, 24 << 20));
+            assert_eq!(decoded_bytes(), 0);
         }
         for (i, v) in defaults {
             KNOBS[i].v.store(v, Relaxed);
@@ -778,8 +754,8 @@ pub(crate) mod tests {
         let file = buf[..len].to_vec();
         let text = String::from_utf8(file.clone()).unwrap();
         assert!(text.contains("workers=3\n") && text.contains("pipelines=7\n"), "{text}");
-        assert!(text.contains("decoded_mib=16\n"), "{text}");
-        assert_eq!(apply(b"workers=2&pipelines=4&decoded_mib=32"), Ok(()));
+        assert!(text.contains("decoded_mib=64\n"), "{text}");
+        assert_eq!(apply(b"workers=2&pipelines=4&decoded_mib=48"), Ok(()));
         assert_eq!(apply(&file), Ok(()));
         let loaded: Vec<u32> = KNOBS.iter().map(|k| k.v.load(Relaxed)).collect();
         assert_eq!(loaded, saved);

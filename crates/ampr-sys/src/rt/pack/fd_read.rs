@@ -1608,18 +1608,6 @@ unsafe fn free_worker_and_cache_memory(state: *mut PackState) {
         (*state).cache_page_count = 0;
         (*state).cache_page_cursor = 0;
     }
-    if !(*state).physical_cache_base.is_null() {
-        unsafe {
-            crate::rt::index_memory::cache_free(
-                (*state).physical_cache_base as *mut c_void,
-                c"apr.pack.physical-cache.shutdown".as_ptr(),
-            )
-        };
-        (*state).physical_cache_base = null_mut();
-        (*state).physical_cache_bytes = 0;
-        (*state).physical_cache_page_count = 0;
-        (*state).physical_cache_page_cursor = 0;
-    }
 }
 
 // ---- tests --------------------------------------------------------------------

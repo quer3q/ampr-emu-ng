@@ -14,7 +14,7 @@
 //!   `off_t`/`ssize_t`. Struct fields are snake_case (`io_window_pack_id`).
 //! - Build-time knobs keep their macro-style names (`AMPR_EMU_PACK_WORKERS`).
 //!   Other constants are SCREAMING_SNAKE_CASE (`PACK_MAX_BLOCK_BYTES`,
-//!   `AMPR_PACK_FILE_PACKED`, `APR_EXTERNAL_AIO_GROUP_MAX_REQUESTS`).
+//!   `AMPR_PACK_FILE_PACKED`, `INVALID_INDEX`).
 //! - The PackState mutexes, condvars and atomics live in separate statics
 //!   (see "sync state"), so lock guards never borrow PackState:
 //!   `PACK_M`, `CACHE_CVS[i]`, etc.
@@ -55,7 +55,7 @@ pub(crate) use super::index::{
 };
 pub(crate) use crate::cache_ffi::{
     ampr_rust_cache_chunk_key_hash, ampr_rust_cache_find_page_run, ampr_rust_cache_mark_pages,
-    ampr_rust_cache_wait_bucket, ampr_rust_physical_cache_key_hash,
+    ampr_rust_cache_wait_bucket,
 };
 pub(crate) use crate::handle_ffi::{
     ampr_rust_virtual_decode, ampr_rust_virtual_encode, ampr_rust_virtual_next_generation,
@@ -110,8 +110,6 @@ mod caches;
 pub(crate) use caches::*;
 mod leases;
 pub(crate) use leases::*;
-mod page_plan;
-pub(crate) use page_plan::*;
 mod window_aio;
 pub(crate) use window_aio::*;
 mod virtual_read;
@@ -393,8 +391,6 @@ pub(crate) const DT_REG: u8 = 8;
 
 // ---- external AIO broker ------------------------------------------------------
 
-pub(crate) const APR_EXTERNAL_AIO_GROUP_MAX_REQUESTS: usize = 32;
-
 #[repr(u8)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AprExternalAioClass {
@@ -440,8 +436,6 @@ const _: () = assert!(
 // ---- on-disk format -----------------------------------------------------------
 
 pub(crate) const AMPR_PACK_BLOCK_SHIFT_MAX: u8 = 20;
-pub(crate) const AMPR_PACK_IO_PAGE_SHIFT_MIN: u8 = 12;
-pub(crate) const AMPR_PACK_IO_PAGE_SHIFT_MAX: u8 = 20;
 
 pub(crate) const AMPR_PACK_FILE_PACKED: u32 = 1 << 0;
 pub(crate) const AMPR_PACK_FILE_STREAMING: u32 = 1 << 2;
@@ -490,6 +484,8 @@ pub(crate) struct AmprPackRuntimeProfile {
     pub size: u32,
     pub build_id: [u8; 16],
     pub decoded_cache_bytes: u64,
+    /// A page cache size the runtime no longer has; still in the format and
+    /// added to the decoded cache (manifest.rs `load_runtime_profile`).
     pub physical_cache_bytes: u64,
     pub workers: u32,
     pub latency_reserve_workers: u32,
@@ -613,14 +609,13 @@ pub(crate) const AMPR_EMU_PACK_READAHEAD_MAX_DISK_INFLIGHT: u32 =
         None => 2,
     };
 pub(crate) const AMPR_EMU_PACK_DECODED_CACHE_MAX_BYTES: u64 = 512 * 1024 * 1024;
-pub(crate) const AMPR_EMU_PACK_PHYSICAL_CACHE_MAX_BYTES: u64 = 128 * 1024 * 1024;
 /// Pipeline slots, from the Makefile's `AMPR_PACK_PIPELINES` (default 12,
 /// at most AMPR_EMU_PACK_PIPELINE_MAX) in both builds: each pipeline keeps a
-/// 2 MiB I/O window from its first use to shutdown, from the pool under the
-/// Buffer ledger, which holds 12 of them (rt/index_memory.rs; a refused one
-/// degrades, page_plan.rs); work waits
-/// in the queue while all pipelines are busy (schedule.rs). The debug build
-/// starts `tune::pipelines()` of them (worker.rs); built outside the
+/// 2 MiB I/O window from the worker start to shutdown, from the pool under
+/// the Buffer ledger, which holds 12 of them (rt/index_memory.rs); only
+/// pipelines whose window was granted are used (worker.rs `buffer_split`).
+/// Work waits in the queue while all pipelines are busy (schedule.rs). The
+/// debug build starts up to `tune::pipelines()` of them; built outside the
 /// Makefile it keeps room for 32.
 pub(crate) const AMPR_EMU_PACK_PIPELINE_SLOTS: usize =
     if super::tune::ON && option_env!("AMPR_PACK_PIPELINES").is_none() {
@@ -667,37 +662,18 @@ pub(crate) const AMPR_EMU_PACK_VIRTUAL_FD_BASE: usize = 512;
 pub(crate) const AMPR_EMU_PACK_VIRTUAL_AIO_SLOTS: usize = 256;
 pub(crate) const AMPR_EMU_PACK_MAX_PACKS: usize = 1024;
 /// Pack volume descriptors open at once, at most one per volume; the least
-/// recently used closes to open another. 32, the most a mandatory page group
-/// may span (PACK_MANDATORY_GROUP_MAX_REQUESTS). A zstd title with 28
-/// volumes kept all 18 of the old cap busy (debug /metrics).
+/// recently used closes to open another. A zstd title with 28 volumes kept
+/// all 18 of the old cap busy (debug /metrics).
 pub(crate) const AMPR_EMU_PACK_OPEN_PACK_FD_CAP: u32 = 32;
-/// 16 MiB (both builds; debug `decoded_mib`). Larger caches
-/// did not pay on the console: 16 + 16 MiB caches gave a game wait per read
-/// of 312 us against 314 us with 128 + 224 MiB (debug /metrics,
-/// 2026-11-10). At 16 MiB a zstd title (debug /metrics, 150 s) re-decoded
-/// an evicted chunk in 73% of its misses: 29.9 GB decoded for 6.56 GB read.
-/// Earlier, at 16 MiB: a fully packed LZ4 UE3 title (debug /metrics, 75 s from launch,
-/// 128 MiB pool) re-decodes a third of its chunks: 16 MiB served 14% of
-/// chunk reads, cut repeat decodes 34.7k -> 20.7k and the pack job
-/// 1.44-1.46 -> 1.40 ms (two runs without it differ by ~2%), for 16 MiB of
-/// pool (peak 113.6 MiB of 128).
-/// Other titles, same build: a fully packed LZ4 UE5 title 2.6% hits, a
-/// REDengine title (zstd) 59.6%, an RE Engine title (zstd) 20.9%.
-/// It is carved after the physical cache (manifest.rs `cache_region`) and is
-/// off when less than its 16 MiB minimum is left under the Cache cap.
-pub(crate) const AMPR_EMU_PACK_DECODED_CACHE_BYTES: u64 = 16 * 1024 * 1024;
+/// 64 MiB (both builds; debug `decoded_mib`), the whole 64 MiB Cache
+/// ledger: the only pack cache. Exact reads with 64 MiB decoded gave 11-14%
+/// lower game wait per read than 32 + 32 MiB page reads on two zstd titles
+/// (debug /metrics). At 16 MiB a zstd title (debug /metrics, 150 s)
+/// re-decoded an evicted chunk in 73% of its misses: 29.9 GB decoded for
+/// 6.56 GB read. It is off when less than its 16 MiB minimum is left under
+/// the Cache cap.
+pub(crate) const AMPR_EMU_PACK_DECODED_CACHE_BYTES: u64 = 64 * 1024 * 1024;
 pub(crate) const AMPR_EMU_PACK_DECODED_CACHE_MIN_BYTES: u64 = 16 * 1024 * 1024;
-/// 16 MiB like the decoded cache (same console runs), carved before
-/// the decoded cache (manifest.rs): besides its hits
-/// it is where the read planner (page_plan.rs) joins neighbouring pages
-/// into one large read; with it off reads fell to 66 KB (one chunk) and
-/// load APR rose 1.65 -> 2.50 ms. zstd: 64 MiB against 32 gave APR read
-/// 1.11 -> 1.08/1.09 ms and -10% disk bytes at 8.9 GB read, not seen in
-/// game wait per read.
-pub(crate) const AMPR_EMU_PACK_PHYSICAL_CACHE_BYTES: u64 = 16 * 1024 * 1024;
-pub(crate) const AMPR_EMU_PACK_PHYSICAL_CACHE_MIN_BYTES: u64 = 8 * 1024 * 1024;
-pub(crate) const AMPR_EMU_PACK_PHYSICAL_CACHE_ENTRY_CAP: usize = 4096;
-pub(crate) const AMPR_EMU_PACK_PHYSICAL_CACHE_HASH_BUCKETS: usize = 8192;
 pub(crate) const AMPR_EMU_PACK_CACHE_ENTRY_CAP: usize = 8192;
 pub(crate) const AMPR_EMU_PACK_CACHE_PAGE_SHIFT: u32 = 14;
 pub(crate) const AMPR_EMU_PACK_CACHE_HASH_BUCKETS: usize = 16384;
@@ -717,26 +693,10 @@ pub(crate) const AMPR_EMU_PACK_MAX_CHUNKS: u64 = 16_000_000;
 
 pub(crate) const PACK_MAX_BLOCK_BYTES: usize = 1 << AMPR_PACK_BLOCK_SHIFT_MAX;
 pub(crate) const PACK_PIPELINE_IO_BYTES: usize = AMPR_EMU_PACK_IO_STAGING_BYTES as usize;
-pub(crate) const PACK_PIPELINE_MAX_IO_PAGES: usize =
-    PACK_PIPELINE_IO_BYTES / (1 << AMPR_PACK_IO_PAGE_SHIFT_MIN);
-/// Backing AIO requests one mandatory page group may issue (one reactor group).
-pub(crate) const PACK_MANDATORY_GROUP_MAX_REQUESTS: usize = APR_EXTERNAL_AIO_GROUP_MAX_REQUESTS;
-/// Pages one mandatory page group may plan: one staging window of 16 KiB
-/// pages, so contiguous cold pages coalesce into few large requests (page_plan.rs).
-pub(crate) const PACK_MANDATORY_GROUP_MAX_PAGES: usize =
-    PACK_PIPELINE_IO_BYTES / PACK_CACHE_PAGE_BYTES;
-pub(crate) const PACK_COALESCED_AIO_MIN_BYTES: usize = 128 * 1024;
-/// Console pread: ~700 us per request regardless of size up to 1 MiB, so one
-/// backing request may cover a whole staging window.
-pub(crate) const PACK_COALESCED_AIO_MAX_BYTES: usize = PACK_PIPELINE_IO_BYTES;
 pub(crate) const PACK_CACHE_PAGE_BYTES: usize = 1 << AMPR_EMU_PACK_CACHE_PAGE_SHIFT;
 pub(crate) const PACK_CACHE_MAX_PAGES: usize =
     AMPR_EMU_PACK_DECODED_CACHE_MAX_BYTES as usize / PACK_CACHE_PAGE_BYTES;
 pub(crate) const PACK_CACHE_BITMAP_WORDS: usize = (PACK_CACHE_MAX_PAGES + 63) / 64;
-pub(crate) const PACK_PHYSICAL_CACHE_MAX_PAGES: usize =
-    AMPR_EMU_PACK_PHYSICAL_CACHE_MAX_BYTES as usize / PACK_CACHE_PAGE_BYTES;
-pub(crate) const PACK_PHYSICAL_CACHE_BITMAP_WORDS: usize =
-    (PACK_PHYSICAL_CACHE_MAX_PAGES + 63) / 64;
 pub(crate) const INVALID_INDEX: u32 = u32::MAX;
 // ampr_format::handles::Kind; the tags live in Rust.
 pub(crate) const VIRTUAL_KIND_AIO: u32 = 1;
@@ -752,23 +712,8 @@ pub(crate) const DIRECTORY_PHYSICAL_HASH_CAP: usize = 512;
 pub(crate) const PACK_WORK_CLASS_COUNT: usize = PackWorkClass::Count as usize;
 
 const _: () = {
-    assert!(
-        PACK_PIPELINE_MAX_IO_PAGES == 512
-            && PACK_MANDATORY_GROUP_MAX_PAGES <= PACK_PIPELINE_MAX_IO_PAGES
-    );
-    assert!(
-        PACK_MANDATORY_GROUP_MAX_PAGES == 128
-            && PACK_MANDATORY_GROUP_MAX_REQUESTS <= PACK_MANDATORY_GROUP_MAX_PAGES
-    );
-    // A complete mandatory set owns one descriptor per pack (page_plan.rs FD cap check).
-    assert!(AMPR_EMU_PACK_OPEN_PACK_FD_CAP as usize <= PACK_MANDATORY_GROUP_MAX_REQUESTS);
-    assert!(
-        PACK_COALESCED_AIO_MIN_BYTES <= PACK_COALESCED_AIO_MAX_BYTES
-            && PACK_COALESCED_AIO_MAX_BYTES <= PACK_PIPELINE_IO_BYTES
-    );
-    assert!(PACK_CACHE_BITMAP_WORDS == 512 && PACK_PHYSICAL_CACHE_BITMAP_WORDS == 128);
-    assert!(AMPR_EMU_PACK_PHYSICAL_CACHE_BYTES <= AMPR_EMU_PACK_PHYSICAL_CACHE_MAX_BYTES);
-    assert!(AMPR_EMU_PACK_PHYSICAL_CACHE_HASH_BUCKETS.is_power_of_two());
+    assert!(PACK_CACHE_BITMAP_WORDS == 512);
+    assert!(AMPR_EMU_PACK_DECODED_CACHE_BYTES <= AMPR_EMU_PACK_DECODED_CACHE_MAX_BYTES);
     assert!(AMPR_EMU_PACK_CACHE_HASH_BUCKETS.is_power_of_two());
     assert!(AMPR_EMU_PACK_TOUCH_TABLE_SIZE.is_power_of_two());
     assert!(AMPR_EMU_PACK_PIPELINE_SLOTS <= SCE_KERNEL_AIO_REQUEST_NUM_MAX);
@@ -1082,133 +1027,6 @@ pub(crate) struct TouchEntry {
     pub count: u8,
 }
 
-#[repr(u8)]
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PhysicalCacheEntryState {
-    Free,
-    Loading,
-    Ready,
-    Failed,
-}
-
-#[derive(Clone, Copy)]
-pub(crate) struct PhysicalCacheEntry {
-    pub key_hash: u64,
-    pub physical_offset: u64,
-    pub size: u32,
-    pub page_start: u32,
-    pub page_count: u32,
-    pub pin_count: u32,
-    pub hash_next_plus_one: u32,
-    pub free_next: u32,
-    pub pack_id: u16,
-    pub state: PhysicalCacheEntryState,
-    pub referenced: bool,
-    pub error: c_int,
-}
-impl PhysicalCacheEntry {
-    pub(crate) const EMPTY: Self = Self {
-        key_hash: 0,
-        physical_offset: 0,
-        size: 0,
-        page_start: 0,
-        page_count: 0,
-        pin_count: 0,
-        hash_next_plus_one: 0,
-        free_next: INVALID_INDEX,
-        pack_id: 0,
-        state: PhysicalCacheEntryState::Free,
-        referenced: false,
-        error: 0,
-    };
-}
-
-#[derive(Clone, Copy)]
-pub(crate) struct PhysicalCacheLease {
-    pub entry: u32,
-    pub data: *mut u8,
-    pub loader: bool,
-    pub error: c_int,
-}
-impl PhysicalCacheLease {
-    pub(crate) const EMPTY: Self = Self {
-        entry: INVALID_INDEX,
-        data: null_mut(),
-        loader: false,
-        error: 0,
-    };
-}
-
-#[repr(u8)]
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PhysicalCacheAcquireKind {
-    Bypass,
-    Ready,
-    Load,
-    Pending,
-    Failed,
-}
-
-#[derive(Clone, Copy)]
-pub(crate) struct PhysicalCacheAcquireResult {
-    pub kind: PhysicalCacheAcquireKind,
-    pub lease: PhysicalCacheLease,
-}
-impl PhysicalCacheAcquireResult {
-    pub(crate) const EMPTY: Self = Self {
-        kind: PhysicalCacheAcquireKind::Bypass,
-        lease: PhysicalCacheLease::EMPTY,
-    };
-}
-
-#[derive(Clone, Copy)]
-pub(crate) struct PhysicalCachePublication {
-    pub lease: *mut PhysicalCacheLease,
-    pub error: c_int,
-}
-impl PhysicalCachePublication {
-    pub(crate) const EMPTY: Self = Self {
-        lease: null_mut(),
-        error: 0,
-    };
-}
-
-#[derive(Clone, Copy)]
-pub(crate) struct PhysicalCacheAcquireBatchItem {
-    pub result: *mut PhysicalCacheAcquireResult,
-    pub offset: u64,
-    pub size: u32,
-    pub pack_id: u16,
-}
-impl PhysicalCacheAcquireBatchItem {
-    pub(crate) const EMPTY: Self = Self {
-        result: null_mut(),
-        offset: 0,
-        size: 0,
-        pack_id: 0,
-    };
-}
-
-#[derive(Clone, Copy)]
-pub(crate) struct PipelineMandatoryPage {
-    pub acquired: PhysicalCacheAcquireResult,
-    pub offset: u64,
-    pub size: u32,
-    pub request_index: u32,
-    pub staging_offset: u32,
-    pub pack_id: u16,
-}
-impl PipelineMandatoryPage {
-    pub(crate) const EMPTY: Self = Self {
-        acquired: PhysicalCacheAcquireResult::EMPTY,
-        offset: 0,
-        size: 0,
-        request_index: INVALID_INDEX,
-        staging_offset: INVALID_INDEX,
-        pack_id: u16::MAX,
-    };
-}
-
 #[derive(Clone, Copy)]
 pub(crate) struct CacheLease {
     pub entry: u32,
@@ -1274,29 +1092,19 @@ impl WorkerContext {
 pub(crate) struct PipelineIoRange {
     pub offset: u64,
     pub length: u32,
-    pub io_page_size: u32,
     pub pack_id: u16,
 }
 impl PipelineIoRange {
     pub(crate) const EMPTY: Self = Self {
         offset: 0,
         length: 0,
-        io_page_size: 0,
         pack_id: u16::MAX,
     };
 }
 
 #[repr(u8)]
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CacheWaitDomain {
-    Decoded,
-    Physical,
-}
-
-#[repr(u8)]
-#[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PipelineStep {
-    Ready,
     YieldIo,
     YieldCache,
     YieldFd,
@@ -1321,32 +1129,15 @@ pub(crate) struct ReadPipelineContext {
     pub task_index: usize,
     pub task_count: usize,
     pub decoded_lease: CacheLease,
-    pub io_pages: [PhysicalCacheAcquireResult; PACK_PIPELINE_MAX_IO_PAGES],
-    pub io_page_count: usize,
-    pub mandatory_pages: [PipelineMandatoryPage; PACK_MANDATORY_GROUP_MAX_PAGES],
-    pub mandatory_page_count: usize,
-    pub mandatory_task_end: usize,
-    pub mandatory_skip_task: usize,
-    pub mandatory_requests: [SceKernelAioRWRequest; PACK_MANDATORY_GROUP_MAX_REQUESTS],
-    pub mandatory_results: [SceKernelAioResult; PACK_MANDATORY_GROUP_MAX_REQUESTS],
-    pub mandatory_request_uses_scratch: [bool; PACK_MANDATORY_GROUP_MAX_REQUESTS],
-    pub mandatory_fd_pack_ids: [u16; PACK_MANDATORY_GROUP_MAX_REQUESTS],
-    pub mandatory_fds: [c_int; PACK_MANDATORY_GROUP_MAX_REQUESTS],
-    pub mandatory_request_count: usize,
-    pub mandatory_fd_count: usize,
-    pub mandatory_plan_active: bool,
     pub pack_fd: c_int,
     pub native_request: SceKernelAioRWRequest,
     pub native_result: SceKernelAioResult,
     pub cache_wait_epoch: u64,
     pub cache_wait_bucket: u16,
-    pub cache_wait_domain: CacheWaitDomain,
     /// Key of the decoded chunk this pipeline last parked on (0: none). A
     /// Failed entry serves its error only to the readers that waited on its
     /// load; any other reader drops it and loads again (caches.rs).
     pub decoded_wait_key: u64,
-    /// The same for the physical page this pipeline last parked on.
-    pub physical_wait_key: u64,
     pub fd_wait_epoch: u64,
     pub fd_budget_wait_epoch: u64,
     pub native_io_error: c_int,
@@ -1375,28 +1166,12 @@ impl ReadPipelineContext {
         task_index: 0,
         task_count: 0,
         decoded_lease: CacheLease::EMPTY,
-        io_pages: [PhysicalCacheAcquireResult::EMPTY; PACK_PIPELINE_MAX_IO_PAGES],
-        io_page_count: 0,
-        mandatory_pages: [PipelineMandatoryPage::EMPTY; PACK_MANDATORY_GROUP_MAX_PAGES],
-        mandatory_page_count: 0,
-        mandatory_task_end: 0,
-        mandatory_skip_task: usize::MAX,
-        mandatory_requests: [SceKernelAioRWRequest::EMPTY; PACK_MANDATORY_GROUP_MAX_REQUESTS],
-        mandatory_results: [SceKernelAioResult::EMPTY; PACK_MANDATORY_GROUP_MAX_REQUESTS],
-        mandatory_request_uses_scratch: [false; PACK_MANDATORY_GROUP_MAX_REQUESTS],
-        mandatory_fd_pack_ids: [0; PACK_MANDATORY_GROUP_MAX_REQUESTS],
-        mandatory_fds: [0; PACK_MANDATORY_GROUP_MAX_REQUESTS],
-        mandatory_request_count: 0,
-        mandatory_fd_count: 0,
-        mandatory_plan_active: false,
         pack_fd: -1,
         native_request: SceKernelAioRWRequest::EMPTY,
         native_result: SceKernelAioResult::EMPTY,
         cache_wait_epoch: 0,
         cache_wait_bucket: 0,
-        cache_wait_domain: CacheWaitDomain::Decoded,
         decoded_wait_key: 0,
-        physical_wait_key: 0,
         fd_wait_epoch: 0,
         fd_budget_wait_epoch: 0,
         native_io_error: 0,
@@ -1419,14 +1194,13 @@ pub(crate) struct PackSubmission {
 // ---- PackState, data only -----------------------------------------------------
 // Non-zero defaults `pack_state_create` (state.rs) must apply in place on the
 // zeroed storage: every array element = its type's `EMPTY` (virtual_fds,
-// virtual_directories, virtual_aio, pipelines, pack_handles, cache_entries,
-// physical_cache_entries; the others are all-zero), queue_head/queue_tail =
-// prefetch_head/prefetch_tail = INVALID_INDEX, decoded_cache_target_bytes,
-// physical_cache_target_bytes and requested_workers from `tune` (in release
-// AMPR_EMU_PACK_DECODED_CACHE_BYTES, AMPR_EMU_PACK_PHYSICAL_CACHE_BYTES and
-// AMPR_EMU_PACK_WORKERS), latency_reserve_workers =
-// AMPR_EMU_PACK_LATENCY_RESERVE_WORKERS, pipeline_free_head = cache_free_head =
-// physical_cache_free_head = INVALID_INDEX, tick = 1. Never build a whole
+// virtual_directories, virtual_aio, pipelines, pack_handles, cache_entries;
+// the others are all-zero), queue_head/queue_tail =
+// prefetch_head/prefetch_tail = INVALID_INDEX, decoded_cache_target_bytes
+// and requested_workers from `tune` (in release
+// AMPR_EMU_PACK_DECODED_CACHE_BYTES and AMPR_EMU_PACK_WORKERS),
+// latency_reserve_workers = AMPR_EMU_PACK_LATENCY_RESERVE_WORKERS,
+// pipeline_free_head = cache_free_head = INVALID_INDEX, tick = 1. Never build a whole
 // PackState by value (several MB; worker stacks are small).
 pub(crate) struct PackState {
     pub active_submissions: u32, // PACK_M, including singular groups.
@@ -1459,7 +1233,6 @@ pub(crate) struct PackState {
     pub prefetch_chunks_inflight: u32,
 
     pub decoded_cache_target_bytes: usize,
-    pub physical_cache_target_bytes: usize,
     pub requested_workers: u32,
     pub latency_reserve_workers: u32,
     pub workers: [WorkerContext; AMPR_EMU_PACK_WORKER_CAPACITY],
@@ -1490,17 +1263,6 @@ pub(crate) struct PackState {
     /// hands out low indices first, so the CLOCK hand scans only below it.
     pub cache_entry_high_water: u32,
     pub touches: [TouchEntry; AMPR_EMU_PACK_TOUCH_TABLE_SIZE],
-
-    pub physical_cache_base: *mut u8,
-    pub physical_cache_bytes: usize,
-    pub physical_cache_page_count: u32,
-    pub physical_cache_page_bitmap: [u64; PACK_PHYSICAL_CACHE_BITMAP_WORDS],
-    pub physical_cache_entries: [PhysicalCacheEntry; AMPR_EMU_PACK_PHYSICAL_CACHE_ENTRY_CAP],
-    pub physical_cache_free_head: u32,
-    pub physical_cache_hash_heads: [u32; AMPR_EMU_PACK_PHYSICAL_CACHE_HASH_BUCKETS],
-    pub physical_cache_page_cursor: u32,
-    pub physical_cache_clock: u32,
-    pub physical_cache_entry_high_water: u32,
 }
 
 // ---- sync state ---------------------------------------------------------------
@@ -1517,7 +1279,6 @@ pub(crate) static VIRTUAL_FD_MUTEXES: [Mutex; AMPR_EMU_PACK_VIRTUAL_FD_SLOTS] =
 pub(crate) static VIRTUAL_FD_LIVE: [AtomicBool; AMPR_EMU_PACK_VIRTUAL_FD_SLOTS] =
     [const { AtomicBool::new(false) }; AMPR_EMU_PACK_VIRTUAL_FD_SLOTS];
 pub(crate) static CACHE_MUTEX: Mutex = Mutex::new();
-pub(crate) static PHYSICAL_CACHE_MUTEX: Mutex = Mutex::new();
 /// Cold manifest publication (may include large index I/O).
 pub(crate) static MANIFEST_MUTEX: Mutex = Mutex::new();
 pub(crate) static DIRECTORY_TABLE_MUTEX: Mutex = Mutex::new();
@@ -1535,8 +1296,6 @@ pub(crate) static PACK_FD_PROGRESS_EPOCH: AtomicU64 = AtomicU64::new(1);
 pub(crate) static PACK_FD_WAITER_COUNT: AtomicU32 = AtomicU32::new(0);
 pub(crate) static WORKER_STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
 pub(crate) static DECODED_CACHE_PUBLICATION_EPOCH: [AtomicU64; PACK_CACHE_WAIT_BUCKET_COUNT] =
-    [const { AtomicU64::new(0) }; PACK_CACHE_WAIT_BUCKET_COUNT];
-pub(crate) static PHYSICAL_CACHE_PUBLICATION_EPOCH: [AtomicU64; PACK_CACHE_WAIT_BUCKET_COUNT] =
     [const { AtomicU64::new(0) }; PACK_CACHE_WAIT_BUCKET_COUNT];
 
 // ---- global state -------------------------------------------------------------

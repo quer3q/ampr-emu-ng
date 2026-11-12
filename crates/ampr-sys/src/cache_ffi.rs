@@ -1,5 +1,5 @@
-//! Pointer-level shims over `ampr_format::cache` for the LZ4 pack decoded
-//! and physical caches. `rt/pack/caches.rs` owns the bitmaps and calls the
+//! Pointer-level shims over `ampr_format::cache` for the pack decoded
+//! cache. `rt/pack/caches.rs` owns the bitmaps and calls the
 //! bitmap shims with the cache lock held.
 
 use ampr_format::cache;
@@ -11,10 +11,6 @@ pub fn ampr_rust_cache_chunk_key_hash(
     raw_size: u32,
 ) -> u64 {
     cache::chunk_key_hash(offset, pack_id, stored_size, raw_size)
-}
-
-pub fn ampr_rust_physical_cache_key_hash(pack_id: u16, offset: u64, size: u32) -> u64 {
-    cache::physical_key_hash(pack_id, offset, size)
 }
 
 pub fn ampr_rust_cache_wait_bucket(key_hash: u64) -> u32 {

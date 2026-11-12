@@ -161,7 +161,7 @@ pub(crate) unsafe fn wake_cache_waiters_locked(state: *mut PackState) -> bool {
     let now_usec = pack_telemetry_usecs();
     for index in 0..(*state).pipeline_capacity as usize {
         let p = &(*state).pipelines[index];
-        let epoch = cache_wait_epoch(state, p.cache_wait_domain, p.cache_wait_bucket as u32);
+        let epoch = cache_wait_epoch(p.cache_wait_bucket as u32);
         let (active, owner, wait_epoch) = (p.active, p.owner, p.cache_wait_epoch);
         if !active || owner == INVALID_INDEX || wait_epoch == epoch {
             continue;
@@ -242,12 +242,10 @@ static WORKER_EXIT_STATE: [core::sync::atomic::AtomicU8; AMPR_EMU_PACK_WORKER_CA
     [const { core::sync::atomic::AtomicU8::new(WORKER_RUNNING) }; AMPR_EMU_PACK_WORKER_CAPACITY];
 
 /// Smallest worker stack the `worker_stack_kib` knob may set. The deepest
-/// worker chain in the debug PRX is ~30 KiB: pack_worker_entry 17.5 KiB
-/// frame (advance_virtual_read_aio inlined), cleanup_pipeline_continuation
-/// 8 KiB, abandon_mandatory_page_plan 2 KiB; the zstd path is
-/// prepare_mandatory_page_group_capped 4.4 KiB plus
-/// zstd_append_mandatory_requests 4.4 KiB, and zstd decode frames stay under
-/// 1 KiB each (DCtx is heap). 64 KiB, libkernel's default, keeps 2x margin
+/// worker chain in the debug PRX was ~30 KiB with the page read path, since
+/// removed (not re-measured): pack_worker_entry 17.5 KiB frame
+/// (advance_virtual_read_aio inlined), cleanup_pipeline_continuation 8 KiB,
+/// and zstd decode frames stay under 1 KiB each (DCtx is heap). 64 KiB, libkernel's default, keeps 2x margin
 /// for libkernel and libc calls below those frames.
 const WORKER_STACK_MIN: usize = 64 * 1024;
 
@@ -676,8 +674,7 @@ pub(crate) unsafe extern "C" fn pack_worker_entry(argument: *mut c_void) -> *mut
             )
         };
         stats::add(stats::Stat::WorkerStepNs, stats::since(step_start));
-        // Read-ahead never competes for pack descriptors. (It skips decoded
-        // chunks being loaded, so a cache wait here is on a physical page.)
+        // Read-ahead never competes for pack descriptors.
         if unsafe { (*job).prefetch_chunks } != 0 && step == PipelineStep::YieldFd {
             unsafe { cleanup_pipeline_continuation(&mut *pipeline, SCE_KERNEL_ERROR_EAGAIN) };
             step = PipelineStep::Failed;
@@ -733,7 +730,6 @@ pub(crate) unsafe extern "C" fn pack_worker_entry(argument: *mut c_void) -> *mut
                         complete_virtual_job(state, index, pipeline_error as i64, completion)
                     };
                 }
-                PipelineStep::Ready => abort(),
             }
             // Nothing pops in this block, so the depth grew by the jobs it
             // queued (requeue, woken cache waiters).
@@ -752,8 +748,7 @@ unsafe fn job_canceled_or_stopping(job: *mut VirtualAioSlot) -> bool {
         || WORKER_STOP_REQUESTED.load(Ordering::Acquire)
 }
 
-/// Hands the pipeline's backing read (mandatory group or window) to the
-/// reactor. A refused submit requeues the job to finish with that error;
+/// Hands the pipeline's window read to the reactor. A refused submit requeues the job to finish with that error;
 /// returns true then (workers to wake).
 unsafe fn submit_pipeline_io_locked(
     state: *mut PackState,
@@ -764,45 +759,22 @@ unsafe fn submit_pipeline_io_locked(
     unsafe {
         (*state).virtual_aio[index as usize].phase = VirtualAioPhase::IoQueued;
         p.native_accepted = true;
-        let count = p.mandatory_request_count;
-        let mandatory_group = p.mandatory_plan_active && count != 0;
-        let physical_bytes: usize = if mandatory_group {
-            p.mandatory_requests[..count].iter().map(|r| r.nbyte).sum()
-        } else {
-            p.native_request.nbyte
-        };
+        let physical_bytes = p.native_request.nbyte;
         let (priority, work_class) = ((*job).priority, (*job).work_class);
         let aio_priority = native_pack_priority(priority);
         let io_class = native_pack_io_class(work_class, physical_bytes);
         let ctx = p as *mut ReadPipelineContext as *mut c_void;
-        let submit_rc = if mandatory_group && count > 1 {
-            reactor::apr_reactor_submit_external_aio_read_group(
-                p.mandatory_requests.as_ptr().cast(),
-                count,
-                aio_priority,
-                io_class.into(),
-                ctx,
-                Some(complete_pack_backing_aio_adapter),
-            )
-        } else {
-            let request = if mandatory_group {
-                &p.mandatory_requests[0]
-            } else {
-                &p.native_request
-            };
-            reactor::apr_reactor_submit_external_aio_read(
-                (request as *const SceKernelAioRWRequest).cast(),
-                aio_priority,
-                io_class.into(),
-                ctx,
-                Some(complete_pack_backing_aio_adapter),
-            )
-        };
+        let submit_rc = reactor::apr_reactor_submit_external_aio_read(
+            (&p.native_request as *const SceKernelAioRWRequest).cast(),
+            aio_priority,
+            io_class.into(),
+            ctx,
+            Some(complete_pack_backing_aio_adapter),
+        );
         if submit_rc == 0 {
             note_park(&mut (*state).virtual_aio[index as usize], b'i');
-            let reads = if mandatory_group { count } else { 1 };
-            stats::add(stats::Stat::PackDiskReads, reads as u64);
-            disk_inflight_add(p, reads as u32);
+            stats::add(stats::Stat::PackDiskReads, 1);
+            disk_inflight_add(p, 1);
             stats::add(stats::Stat::PackDiskBytes, physical_bytes as u64);
         }
         if submit_rc != 0 {
@@ -825,7 +797,7 @@ unsafe fn park_on_cache_locked(
     p: &mut ReadPipelineContext,
 ) -> bool {
     unsafe {
-        let epoch = cache_wait_epoch(state, p.cache_wait_domain, p.cache_wait_bucket as u32);
+        let epoch = cache_wait_epoch(p.cache_wait_bucket as u32);
         if job_canceled_or_stopping(job) || epoch != p.cache_wait_epoch {
             p.cache_wait_epoch = epoch;
             queue_push_locked(state, index, pack_telemetry_usecs());
@@ -868,39 +840,43 @@ unsafe fn park_on_fd_locked(
     }
 }
 
-pub(crate) unsafe fn ensure_workers_locked(state: *mut PackState) -> bool {
-    if WORKER_STOP_REQUESTED.load(Ordering::Acquire) {
-        return false;
-    }
-    if (*state).workers_started != 0 {
-        return true;
-    }
-    if (*state).pipeline_capacity == 0 {
-        (*state).pipeline_free_head = INVALID_INDEX;
-        for i in 0..super::super::tune::pipelines().min(AMPR_EMU_PACK_PIPELINE_SLOTS) {
-            let pipeline = &mut (*state).pipelines[i];
-            pipeline.io_window_pack_id = u16::MAX;
-            pipeline.owner = INVALID_INDEX;
-            pipeline.next_free = (*state).pipeline_free_head;
-            (*state).pipeline_free_head = i as u32;
-            (*state).pipeline_capacity += 1;
+/// Workers and pipelines that fit `room` bytes of the Buffer ledger: a
+/// worker takes its 1 MiB decode buffer at the start and later its 112 KiB
+/// zstd decoder workspace (counted for LZ4 too, so the fit is one bound),
+/// a pipeline its 2 MiB I/O window, and `reserve` stays free for the
+/// decode-on-access decoders. Workers are cut until each has a pipeline,
+/// so a large worker ask still keeps pipelines for every worker. At the
+/// defaults (28.44 MiB) that is 4 workers and 12 pipelines, 8 workers get
+/// 9. (0, 0) when not one worker fits.
+pub(crate) fn buffer_split(
+    room: usize,
+    reserve: usize,
+    workers: u32,
+    pipelines: usize,
+) -> (u32, usize) {
+    let per_worker = PACK_MAX_BLOCK_BYTES + ampr_codec::ZSTD_DECODER_WORKSPACE;
+    let room = room.saturating_sub(reserve);
+    let mut workers = workers;
+    while workers != 0 {
+        let left = room.saturating_sub(workers as usize * per_worker);
+        let fit = pipelines.min(left / PACK_PIPELINE_IO_BYTES);
+        if workers as usize <= fit {
+            return (workers, fit);
         }
+        workers -= 1;
     }
-    if (*state).pipeline_capacity == 0 {
-        return false;
-    }
+    (0, 0)
+}
 
-    let requested_workers = (*state).requested_workers.min((*state).pipeline_capacity);
-    // Every worker's scratch now, kept until shutdown; threads start at
-    // PACK_WORKERS_START and grow on demand (maybe_grow_workers_locked).
-    let mut prepared = 0u32;
-    for i in 0..requested_workers as usize {
+/// Every worker's 1 MiB decode scratch, kept until shutdown; threads start
+/// at PACK_WORKERS_START and grow on demand (maybe_grow_workers_locked).
+unsafe fn prepare_worker_scratch(state: *mut PackState, workers: u32) {
+    for i in 0..workers as usize {
         let worker = &mut (*state).workers[i];
         worker.index = i as u32;
         // Prepared by an earlier call whose first spawn failed: reuse it, or
         // each retry would allocate new scratch over it and leak it.
         if !worker.decoded_scratch.is_null() {
-            prepared += 1;
             continue;
         }
         // The pool, under the Buffer ledger (rt/index_memory.rs).
@@ -918,8 +894,73 @@ pub(crate) unsafe fn ensure_workers_locked(state: *mut PackState) -> bool {
         worker.decoded_scratch_size = PACK_MAX_BLOCK_BYTES;
         // The zstd decoder (Buffer ledger) is made when the thread starts
         // and freed when it leaves (spawn_worker_locked, reap_workers_locked).
-        prepared += 1;
     }
+}
+
+pub(crate) unsafe fn ensure_workers_locked(state: *mut PackState) -> bool {
+    if WORKER_STOP_REQUESTED.load(Ordering::Acquire) {
+        return false;
+    }
+    if (*state).workers_started != 0 {
+        return true;
+    }
+    if (*state).pipeline_capacity == 0 {
+        // Scratch an earlier failed call kept is still ours to size with.
+        let held: usize = (*state)
+            .workers
+            .iter()
+            .map(|w| w.decoded_scratch_size)
+            .sum();
+        let reserve = if super::mmap::MMAP_MODE == 1 && !super::mmap_fault::slots_made() {
+            super::mmap_fault::SLOTS * ampr_codec::ZSTD_DECODER_WORKSPACE
+        } else {
+            0
+        };
+        let (workers, pipelines) = buffer_split(
+            crate::rt::index_memory::buffer_room() + held,
+            reserve,
+            (*state)
+                .requested_workers
+                .min(AMPR_EMU_PACK_WORKER_CAPACITY as u32),
+            super::super::tune::pipelines().min(AMPR_EMU_PACK_PIPELINE_SLOTS),
+        );
+        if workers == 0 {
+            return false;
+        }
+        (*state).requested_workers = workers;
+        unsafe { prepare_worker_scratch(state, workers) };
+        (*state).pipeline_free_head = INVALID_INDEX;
+        // Every window now: a refused window has no slow path and would
+        // fail the game read ENOMEM (window_aio.rs `prepare_exact_window_aio`).
+        for i in 0..pipelines {
+            let pipeline = &mut (*state).pipelines[i];
+            if !unsafe { super::window_aio::ensure_pipeline_io_scratch(pipeline) } {
+                break;
+            }
+            pipeline.io_window_pack_id = u16::MAX;
+            pipeline.owner = INVALID_INDEX;
+            pipeline.next_free = (*state).pipeline_free_head;
+            (*state).pipeline_free_head = i as u32;
+            (*state).pipeline_capacity += 1;
+        }
+        if (*state).pipeline_capacity == 0 {
+            return false;
+        }
+        // Each worker needs a pipeline; a window the ledger refused cuts one.
+        (*state).requested_workers = workers.min((*state).pipeline_capacity);
+        // A reserve of every worker would leave none for other reads.
+        (*state).latency_reserve_workers = (*state)
+            .latency_reserve_workers
+            .min((*state).requested_workers - 1);
+    }
+    // A start whose scratch was refused retries it here: the windows are
+    // already published, so the block above does not run again.
+    unsafe { prepare_worker_scratch(state, (*state).requested_workers) };
+    let requested_workers = (*state).requested_workers;
+    let prepared = (&(*state).workers)[..requested_workers as usize]
+        .iter()
+        .filter(|w| !w.decoded_scratch.is_null())
+        .count() as u32;
     WORKERS_CEILING.store(prepared, Ordering::Relaxed);
     let mut started = 0;
     for i in 0..requested_workers as usize {
@@ -953,4 +994,42 @@ pub(crate) fn reset_virtual_aio_slot(
     slot.submit_ns = 0;
     slot.prefetch_chunks = 0;
     slot.split_group = INVALID_INDEX;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The Buffer cap at the default knobs, with the decode-on-access room
+    /// kept as the worker start keeps it.
+    fn split(workers: u32, pipelines: usize) -> (u32, usize) {
+        let reserve = if super::super::mmap::MMAP_MODE == 1 {
+            super::super::mmap_fault::SLOTS * ampr_codec::ZSTD_DECODER_WORKSPACE
+        } else {
+            0
+        };
+        buffer_split(
+            crate::rt::index_memory::BUFFER_MEMORY_MAX,
+            reserve,
+            workers,
+            pipelines,
+        )
+    }
+
+    /// Defaults keep 4 workers and 12 pipelines; the debug medium profile
+    /// keeps its 8 workers with the 9 windows left; high (16) is cut until
+    /// each worker has a pipeline.
+    #[test]
+    fn buffer_split_fits_the_buffer_cap() {
+        assert_eq!(split(4, 12), (4, 12));
+        assert_eq!(split(8, 16), (8, 9));
+        assert_eq!(split(16, 16), (9, 9));
+        assert_eq!(split(1, 0), (0, 0));
+        let one = PACK_MAX_BLOCK_BYTES + ampr_codec::ZSTD_DECODER_WORKSPACE;
+        assert_eq!(buffer_split(one + PACK_PIPELINE_IO_BYTES, 0, 4, 12), (1, 1));
+        assert_eq!(
+            buffer_split(one + PACK_PIPELINE_IO_BYTES - 1, 0, 4, 12),
+            (0, 0)
+        );
+    }
 }

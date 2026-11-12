@@ -17,7 +17,8 @@ index, `AMPRZDT1` volumes), picked at load by whether
   118 sceAmpr* (`rt/exports.rs`, found by `EXPORT_RE`) and 19 libc/libc++
   symbols that retail libSceAmpr re-exports (`rt/libc_exports.rs`, listed in
   `EXTRA_EXPORTS` in `tools/generate_payload_exports.py`).
-- `crates/ampr-format`: shared index readers, byte helpers and overlay utilities.
+- `crates/ampr-format`: shared index readers, byte helpers, overlay utilities
+  and the exact-read run planner (`src/run.rs`).
 - `crates/ampr-codec`: zstd decode.
 - `crates/ampr-lz4`: AMPRPAK4 manifest, AMPRDAT3 header, read planning and LZ4 decode.
 - `crates/ampr-command`, `ampr-hook`: APR command encoding and x86 hook decoding.
@@ -60,7 +61,9 @@ fails with EAGAIN makes the runtime give threads back and is retried; the
 runtime-wide budget of 16 worker threads is cut and regrows by one per
 10 s quiet. The groups are capped at 4 decode workers (`AMPR_PACK_WORKERS`;
 an LZ4 title's `ampr_assets.index.runtime` profile can ask for up to 16,
-`AMPR_EMU_PACK_WORKER_CAPACITY`, within the Buffer ledger),
+`AMPR_EMU_PACK_WORKER_CAPACITY`; the worker start cuts workers until
+each has a pipeline in the Buffer ledger, 9 and 9 at 16, `buffer_split`
+in `rt/pack/worker.rs`),
 6 disk read threads (`tune::RELEASE_PREAD_THREADS`) and 4 fd read threads
 (`READ_THREADS` in `rt/pack/fd_read.rs`). Runtime threads retire by load,
 not by idle time (no idle timer): each group keeps its last 8192
@@ -98,24 +101,27 @@ CI (`.github/workflows/build.yml`) runs the same commands; a pushed `v*` tag cre
   in a pool workspace (`ZstdDecoder::init_in` in `crates/ampr-codec`).
   Ledgers (`rt/index_memory.rs`):
   Index 64 MiB (index files, lookup tables, walk build buffers, the save
-  icon buffer), Cache 32 MiB (16 MiB physical +
-  16 MiB decoded, carved at startup), Buffer 28.44 MiB (4 x 1 MiB decode +
+  icon buffer), Cache 64 MiB (one decoded chunk cache, carved at
+  startup; pack chunks are read with exact-size reads, the only read
+  path, and no read pages are cached), Buffer 28.44 MiB (4 x 1 MiB decode +
   12 x 2 MiB I/O windows + 4 x 112 KiB zstd decoder workspaces, one per
   live zstd worker, taken at its start and freed when it retires; with
   `AMPR_ZSTD_MMAP=1` 4 more for the decode-on-access slots), plus a 2 MiB budget for the fixed sites
   listed at `STATIC_POOL_SIZE` in `rt/runtime_memory.rs` (1.56 MiB used; a
   host test fails on a new pool call). A build-time assert checks that the
   caps plus the budget fit the pool. Both PRX builds load to the same
-  136.5 MiB (PT_LOAD memsz, below 192 MiB; v0.3.4 loaded at 200.7 MiB):
-  the release pool is 127.83 MiB
-  (`AMPR_INTERNAL_POOL_SIZE` `0x7fd4000`), the debug one 126.47 MiB
-  (`AMPR_DEBUG_POOL_SIZE` `0x7e78000`), the gap being the debug build's
-  larger non-pool part (10.04 vs 8.69 MiB). `AMPR_ZSTD_MMAP=1` grows both
-  pools by 448 KiB (136.95 MiB). `dist` fails when the two totals
+  167.94 MiB (PT_LOAD memsz, below 192 MiB; v0.3.4 loaded at 200.7 MiB):
+  the release pool is 159.83 MiB
+  (`AMPR_INTERNAL_POOL_SIZE` `0x9fd4000`), the debug one 158.47 MiB
+  (`AMPR_DEBUG_POOL_SIZE` `0x9e78000`), the gap being the debug build's
+  larger non-pool part (9.47 vs 8.11 MiB). `AMPR_ZSTD_MMAP=1` grows both
+  pools by 448 KiB (168.38 MiB). `dist` fails when the two totals
   differ by more than 64 KiB or reach 192 MiB (`PRX_TOTAL_LIMIT` in
   `tools/verify_payload_prx.py --prx-totals`); then update the gap in the
   Makefile. A refused allocation degrades (index: one notice, packs
-  unserved; cache off; window slow path; icon skipped). Each index file
+  unserved; cache off; icon skipped). Every I/O window is taken at the
+  worker start, after the decode buffers, and the pipeline count is the
+  windows granted: there is no slow path for a read without one. Each index file
   (AMPRZPK1, AMPRPAK4, AMPRIDX3), in mount order, is read whole into
   index memory when it fits the room left with its tables
   (`IndexSource::Resident`, `rt/index_pages.rs`); else it is read in

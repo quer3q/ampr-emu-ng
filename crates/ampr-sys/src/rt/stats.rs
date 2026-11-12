@@ -56,9 +56,6 @@ stats! {
     /// cached, random-access file, no free slot or worker).
     PrefetchChunks = "prefetch_chunks",
     PrefetchSkipped = "prefetch_skipped",
-    /// Physical page cache lookups (hits = no disk read needed).
-    PhysHits = "phys_hits",
-    PhysMisses = "phys_misses",
     /// Reads served by the blocking pread pool (reactor/pread_pool.rs): calls and
     /// bytes, time queued for a pool thread, time in pread, and the peak
     /// number of queued + running reads since the last scrape. Pack reads
@@ -166,9 +163,6 @@ stats! {
     OpenDirectory = "open_directory",
     OpenVirtual = "open_virtual",
     OpenRealFailed = "open_real_failed",
-    /// zstd: bytes a mandatory group read through gaps of cached pages
-    /// between its cold pages (one request instead of two), then discarded.
-    ReadGapBytes = "read_gap_bytes",
     /// Where a pack job's time goes besides disk and decode: submit to the
     /// first worker pick (queue wait), worker time inside its read steps
     /// (planning, decode, copies), and the copies of decoded bytes into the
@@ -191,9 +185,6 @@ stats! {
     ParkFdNs = "park_fd_ns",
     Requeues = "requeues",
     RequeueNs = "requeue_ns",
-    /// zstd: physical pages another job was loading, read privately by this
-    /// job (its own disk read into its I/O window) instead of waiting.
-    PrivatePageReads = "private_page_reads",
     /// Reactor issue limits (reactor/progress.rs, reactor/flush.rs; live knobs
     /// read_pass_kib, read_chunk_quantum, per_read_active_kib,
     /// per_read_active_chunks in rt/tune.rs). read_budget_held: lane passes

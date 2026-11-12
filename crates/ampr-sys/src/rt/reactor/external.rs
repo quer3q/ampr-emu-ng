@@ -20,26 +20,6 @@ impl AprAioReactor {
         self.submit_external_aio_read_impl(request, 1, false, priority, ioClass, context, callback)
     }
 
-    pub(crate) fn submit_external_aio_read_group(
-        &mut self,
-        requests: *const SceKernelAioRWRequest,
-        requestCount: usize,
-        priority: c_int,
-        ioClass: AprExternalAioClass,
-        context: *mut c_void,
-        callback: AprExternalAioCallback,
-    ) -> c_int {
-        self.submit_external_aio_read_impl(
-            requests,
-            requestCount,
-            true,
-            priority,
-            ioClass,
-            context,
-            callback,
-        )
-    }
-
     pub(crate) fn submit_external_aio_read_impl(
         &mut self,
         requests: *const SceKernelAioRWRequest,

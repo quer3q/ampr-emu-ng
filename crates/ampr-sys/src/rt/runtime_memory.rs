@@ -17,7 +17,7 @@ use core::ptr::{null, null_mut};
 /// direct memory lines).
 ///
 /// Layout: the Index, Cache and Buffer ledgers (rt/index_memory.rs,
-/// 64 + 32 + 28 MiB caps) and `POOL_SITES_BUDGET` (2 MiB) for these fixed
+/// 64 + 64 + 28 MiB caps) and `POOL_SITES_BUDGET` (2 MiB) for these fixed
 /// sites with their largest live size:
 /// - small slab (`sdk_alloc` up to a page): at most 64 blocks of 16 KiB,
 ///   1 MiB; its users are the getdents buffer up to 16 KiB and the
@@ -28,7 +28,7 @@ use core::ptr::{null, null_mut};
 ///   `DENTS_POOL_MAX`; a larger st_blksize takes index memory);
 /// - the disk cache copy piece, 256 KiB, one under CACHE_M
 ///   (pack/mmap.rs `PIECE`).
-/// Sites sum: 1.56 MiB (`POOL_SITES_MAX`); the caps plus the budget, 126 MiB,
+/// Sites sum: 1.56 MiB (`POOL_SITES_MAX`); the caps plus the budget, 158 MiB,
 /// are checked against the pool at build time (index_memory.rs).
 pub(crate) const STATIC_POOL_SIZE: usize = {
     let v = match option_env!("AMPR_INTERNAL_POOL_SIZE") {
@@ -40,7 +40,7 @@ pub(crate) const STATIC_POOL_SIZE: usize = {
 
 /// The Makefile's `AMPR_DEBUG_POOL_SIZE`, the smaller of the two pools, so
 /// host tests check the tighter fit.
-pub(crate) const DEFAULT_POOL_SIZE: usize = 0x7e7_8000;
+pub(crate) const DEFAULT_POOL_SIZE: usize = 0x9e7_8000;
 
 /// Compile-time number parser (Makefile knobs); a malformed value fails the build.
 pub(crate) const fn parse_size(s: &[u8]) -> usize {

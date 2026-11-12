@@ -120,9 +120,11 @@ volume to its recorded size. A file may continue in the next volume.
 
 Each chunk has its own frame and absolute offset, found in O(1).
 Contiguous chunks are one byte range in one volume, so a batch is one
-pread whose chunks the decode workers decode in parallel. A game read
-spanning several chunks is split into chunk-aligned child jobs
-(`rt/pack/zstd_split.rs`).
+pread whose chunks the decode workers decode in parallel. The pread is
+exact-size: it covers the chunks' stored bytes, not rounded to pages, and
+never past the volume's end. Read bytes are not cached; decoded chunks go
+to the 64 MiB decoded cache. A game read spanning several chunks is split
+into chunk-aligned child jobs (`rt/pack/zstd_split.rs`).
 
 ## What is packed
 

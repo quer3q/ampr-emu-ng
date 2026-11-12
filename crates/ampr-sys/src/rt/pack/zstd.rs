@@ -676,6 +676,8 @@ pub(crate) fn zstd_volume_count() -> u32 {
     zstd_index().map_or(0, |i| i.volume_count())
 }
 
+/// Debug only: the metrics bench (readahead.rs `bench_volume_path`).
+#[cfg(feature = "mem_report")]
 pub(crate) fn zstd_volume_size(volume: u32) -> Option<u64> {
     zstd_index().and_then(|i| i.volume_size(volume).ok())
 }
@@ -1010,15 +1012,12 @@ const _: () = assert!(
         && ZSTD_MAX_STORED_BYTES as u64 == ZSTD_CHUNK_BYTES
 );
 // The shared read pipeline holds a whole 256 KiB chunk: the worker decoded
-// scratch (worker.rs, also the warm-up scratch) is one max AMPRPAK4 block, a
-// chunk's aligned backing window (virtual_read.rs make_pipeline_window_range) fits one
-// staging window, and its pages fit the smallest mandatory group plan (page_plan.rs).
+// scratch (worker.rs, also the warm-up scratch) is one max AMPRPAK4 block,
+// and a chunk's stored bytes fit one I/O window (virtual_read.rs
+// `prepare_exact_task_window`).
 const _: () = {
-    let page = ZSTD_IO_PAGE_SIZE as usize;
-    let chunk_pages = (ZSTD_MAX_STORED_BYTES as usize).div_ceil(page) + 1;
     assert!(ZSTD_CHUNK_BYTES as usize <= PACK_MAX_BLOCK_BYTES);
-    assert!(chunk_pages * page <= PACK_PIPELINE_IO_BYTES);
-    assert!(chunk_pages <= PACK_MANDATORY_GROUP_MAX_REQUESTS);
+    assert!(ZSTD_MAX_STORED_BYTES as usize <= PACK_PIPELINE_IO_BYTES);
 };
 
 fn request_valid(file: &ZstdExtent, offset: u64, length: u64) -> bool {

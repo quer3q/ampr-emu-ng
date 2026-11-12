@@ -12,36 +12,37 @@ AMPR_MEM_REPORT ?= 0
 # Internal pool size in bytes, read by rt/runtime_memory.rs: all runtime
 # memory. It holds the Index 64 (index files read whole or through a page
 # cache of at least 16 MiB, plus up to 48 MiB of lookup tables) +
-# Cache 32 + Buffer 28.44 MiB ledger caps (rt/index_memory.rs; buffers are
-# 4 x 1 MiB decode + 4 x 112 KiB zstd decoder workspaces + 12 x 2 MiB I/O)
+# Cache 64 + Buffer 28.44 MiB ledger caps (rt/index_memory.rs; Cache is one
+# 64 MiB decoded chunk cache, chunks are read with exact-size reads and
+# no read pages are kept; buffers are 4 x 1 MiB decode + 4 x 112 KiB zstd
+# decoder workspaces + 12 x 2 MiB I/O)
 # and a 2 MiB budget for the fixed sites (1.56 MiB used); a pool below that
 # fails the build. Both builds have the same PRX size T (PT_LOAD memsz
-# total), below 192 MiB: 136.5 MiB, the 127 MiB that held the 117 MiB of
-# debug ledgers and budget plus the debug build's non-pool part, grown by
-# the 448 KiB of decoder workspaces (once in libzstd DCtx on the game's
-# libc heap) and the 9 MiB the Index ledger grew by (v0.3.4 loaded at
-# 200.7 MiB, so the larger PRX loads). Each pool is T minus its build's non-pool part (code, data,
-# reactor storage), rounded down to a 16 KiB page. Non-pool parts: release
-# 9109746 B (8.69 MiB), debug 10531514 B (10.04 MiB; more code, /fsfail and
-# retry records, rt/stats.rs), so the release pool is 1.36 MiB (87 pages)
-# larger: 127.83 vs 126.47 MiB. `AMPR_ZSTD_MMAP=1` adds 448 KiB to both
-# pools (4 decode-on-access decoder workspaces, Buffer ledger): T 136.95
-# MiB. `dist` checks both totals
+# total), below 192 MiB: 167.94 MiB (v0.3.4 loaded at 200.7 MiB, so a PRX
+# of this size loads). Each pool is T minus its build's non-pool part (code,
+# data, reactor storage), rounded down to a 16 KiB page. Non-pool parts:
+# release 8506402 B (8.11 MiB), debug 9929746 B (9.47 MiB; more code,
+# /fsfail and retry records, rt/stats.rs), so the release pool is 1.36 MiB
+# (87 pages) larger: 159.83 vs 158.47 MiB. Deleting the physical page cache
+# took about 589 KiB off both non-pool parts (229 KiB of PackState .bss,
+# the rest code). `AMPR_ZSTD_MMAP=1` adds 448 KiB to both pools (4
+# decode-on-access decoder workspaces, Buffer ledger): T 168.38 MiB.
+# `dist` checks both totals
 # (tools/verify_payload_prx.py --prx-totals): they must match within 64 KiB
 # and stay below 192 MiB, else update the gap here.
 # The first pool allocation publishes the pool (mprotect), so the startup
 # cache carve can use it; a carve before the pool was published failed
-# (pool_alloc_failed 1, caches off).
+# (pool_alloc_failed 1, cache off).
 # Nothing comes from the game's direct or flexible memory: the pool is .bss
 # and did not lower the game's free direct memory, while direct allocations
 # did (a title had 42 MiB of direct memory free during play), and flexible
 # memory had 0-28 MiB free in another title (debug /metrics flex_* and the
 # former direct memory lines).
-AMPR_INTERNAL_POOL_SIZE ?= $(if $(filter 1,$(AMPR_ZSTD_MMAP)),0x8044000,0x7fd4000)
+AMPR_INTERNAL_POOL_SIZE ?= $(if $(filter 1,$(AMPR_ZSTD_MMAP)),0xa044000,0x9fd4000)
 # Debug build pool (passed to it as AMPR_INTERNAL_POOL_SIZE by `dist`):
-# T minus the debug non-pool part, 126.47 MiB, the same ledger caps as
+# T minus the debug non-pool part, 158.47 MiB, the same ledger caps as
 # release; host tests build with it (rt/runtime_memory.rs).
-AMPR_DEBUG_POOL_SIZE ?= $(if $(filter 1,$(AMPR_ZSTD_MMAP)),0x7ee8000,0x7e78000)
+AMPR_DEBUG_POOL_SIZE ?= $(if $(filter 1,$(AMPR_ZSTD_MMAP)),0x9ee8000,0x9e78000)
 # Pread pool threads: at most 6 (tune::RELEASE_PREAD_THREADS), grown by
 # backlog and retired by load within the runtime-wide budget of 16 worker
 # threads (rt/thread_hooks.rs); a zstd title peaked at 5-6, two titles at
@@ -71,7 +72,8 @@ AMPR_PACK_WORKERS ?= 4
 # slot count and the default pipeline count, debug build too, so the debug
 # `pipelines` knob and profiles stop at it (build with 32 to tune above 12).
 # Each pipeline has a 2 MiB I/O window under the Buffer ledger, allocated
-# on first use and kept to shutdown. 12: a
+# at the worker start and kept to shutdown; a refused window lowers the
+# pipeline count (rt/pack/worker.rs `buffer_split`). 12: a
 # zstd title used at most 9-10 of 16, and 12 vs 16 gave 312 vs 315 us game
 # wait per read; at 6 it used all 6, 333 vs 345 us at 16 (debug /metrics).
 AMPR_PACK_PIPELINES ?= 12
@@ -123,7 +125,7 @@ AMPR_ZSTD_MMAP ?= 2
 # (1.62 vs 1.60 ms) and off shortened the worst read (26.7 vs 36.2 ms). On a
 # second, lighter game it doubled disk bytes (1.69 vs 0.78 per game byte) and
 # the worst read (13.4 vs 5.6 ms). Prefetched chunks land in the decoded
-# cache (16 MiB, rt/pack/readahead.rs); read-ahead was not re-measured with it.
+# cache (64 MiB, rt/pack/readahead.rs); read-ahead was not re-measured with it.
 AMPR_PACK_READAHEAD_CHUNKS ?= 0
 AMPR_PACK_READAHEAD_MAX_DISK_INFLIGHT ?= 2
 # Git revision in the debug build's /metrics (rt/exports.rs BUILD_REV):
@@ -137,7 +139,8 @@ AMPR_GIT_REV ?= unknown
 # PRX identical to the default one (out/*/obj/build-config.txt).
 BUILD_KNOBS := AMPR_MEM_REPORT AMPR_INTERNAL_POOL_SIZE AMPR_DEBUG_POOL_SIZE \
   AMPR_PACK_WORKERS AMPR_PACK_PIPELINES AMPR_ZSTD_LIBC_HOOKS AMPR_ZSTD_MMAP \
-  AMPR_PACK_READAHEAD_CHUNKS AMPR_PACK_READAHEAD_MAX_DISK_INFLIGHT AMPR_GIT_REV
+  AMPR_PACK_READAHEAD_CHUNKS AMPR_PACK_READAHEAD_MAX_DISK_INFLIGHT \
+  AMPR_GIT_REV
 $(foreach k,$(BUILD_KNOBS),$(if $(filter 1,$(words $($(k)))),,\
   $(error $(k) must be one word, got '$($(k))'; pass each knob as its own argument)))
 

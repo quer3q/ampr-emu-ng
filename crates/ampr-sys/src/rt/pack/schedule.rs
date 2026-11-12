@@ -253,25 +253,14 @@ fn reset_pipeline_io(pipeline: &mut ReadPipelineContext) {
     pipeline.task_count = 0;
 }
 
-fn reset_pipeline_tail(pipeline: &mut ReadPipelineContext) {
-    pipeline.mandatory_page_count = 0;
-    pipeline.mandatory_task_end = 0;
-    pipeline.mandatory_skip_task = usize::MAX;
-    pipeline.mandatory_request_count = 0;
-    pipeline.mandatory_fd_count = 0;
-    pipeline.mandatory_plan_active = false;
-}
-
 fn reset_pipeline_native(pipeline: &mut ReadPipelineContext) {
     pipeline.native_request = SceKernelAioRWRequest::EMPTY;
     pipeline.native_result = SceKernelAioResult::EMPTY;
     pipeline.cache_wait_epoch = 0;
     pipeline.cache_wait_bucket = 0;
-    pipeline.cache_wait_domain = CacheWaitDomain::Decoded;
-    // The parked-on load keys belong to the job that parked; a job reset
+    // The parked-on load key belongs to the job that parked; a job reset
     // here must not let the next one take a failed load's error as its own.
     pipeline.decoded_wait_key = 0;
-    pipeline.physical_wait_key = 0;
     pipeline.fd_wait_epoch = 0;
     pipeline.fd_budget_wait_epoch = 0;
     pipeline.native_io_error = 0;
@@ -299,10 +288,6 @@ pub(crate) unsafe fn acquire_pipeline_locked(
     pipeline.owner = owner;
     reset_pipeline_io(pipeline);
     pipeline.decoded_lease = CacheLease::EMPTY;
-    // io_pages and the mandatory_* arrays are only read below their counts,
-    // which are reset here; refilling ~19 KiB under PACK_M is unnecessary.
-    pipeline.io_page_count = 0;
-    reset_pipeline_tail(pipeline);
     pipeline.pack_fd = -1;
     reset_pipeline_native(pipeline);
     pipeline.active = true;
@@ -350,29 +335,14 @@ pub(crate) unsafe fn release_pipeline_locked(state: *mut PackState, owner: u32) 
     let free_head = (*state).pipeline_free_head;
     let pipeline = &mut (*state).pipelines[index as usize];
     if pipeline.pack_fd >= 0
-        || pipeline.mandatory_fd_count != 0
         || pipeline.native_accepted
         || native_submitted(pipeline).load(Ordering::Acquire)
         || pipeline.decoded_lease.entry != INVALID_INDEX
     {
         abort();
     }
-    if pipeline.io_pages[..pipeline.io_page_count]
-        .iter()
-        .any(|p| p.lease.entry != INVALID_INDEX)
-    {
-        abort();
-    }
-    if pipeline.mandatory_pages[..pipeline.mandatory_page_count]
-        .iter()
-        .any(|p| p.acquired.lease.entry != INVALID_INDEX)
-    {
-        abort();
-    }
     pipeline.owner = INVALID_INDEX;
     reset_pipeline_io(pipeline);
-    pipeline.io_page_count = 0;
-    reset_pipeline_tail(pipeline);
     reset_pipeline_native(pipeline);
     pipeline.active = false;
     pipeline.next_free = free_head;

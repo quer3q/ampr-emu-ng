@@ -11,8 +11,8 @@
 //! pack has AMPR_EMU_PACK_READAHEAD_MAX_DISK_INFLIGHT physical backing reads in
 //! flight. A started job runs the normal pipeline (Bulk class, LOW AIO priority
 //! so the kernel serves game reads first) but only loads chunks it gets a Load lease for;
-//! it may wait for a physical page another read is loading, but uses only an
-//! already-open pack descriptor and is dropped instead of waiting for one (worker.rs). A game read of a chunk being
+//! it uses only an already-open pack descriptor and is dropped instead of
+//! waiting for one (worker.rs). A game read of a chunk being
 //! prefetched sees the Loading entry and waits like any concurrent load.
 
 use super::*;

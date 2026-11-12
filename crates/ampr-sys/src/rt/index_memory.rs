@@ -1,9 +1,9 @@
-//! Runtime memory that grows with the title, and the pack caches and
+//! Runtime memory that grows with the title, and the pack cache and
 //! buffers, carved from the PRX's static pool (rt/runtime_memory.rs) under
 //! three ledgers with hard caps: Index (index files read whole, the index
 //! page arena, the lookup tables and every build buffer sized by file
 //! count, path bytes or file size), Cache (the
-//! two pack caches) and Buffer (the pipeline I/O windows and worker decode
+//! decoded chunk cache) and Buffer (the pipeline I/O windows and worker decode
 //! buffers). The caps plus the fixed pool sites fit the pool (checked at
 //! build time), so no ledger can take another's room and no reserve is
 //! needed. Never direct or flexible memory: the pool is PRX .bss and did not
@@ -14,9 +14,10 @@
 //!
 //! A refused allocation degrades: an index that does not fit leaves the
 //! packs unserved (packed files read as missing, ENOENT) after one console
-//! notice naming the size and the cap; a refused cache stays off; a refused
-//! I/O window takes the slow path (page_plan.rs); a refused save icon is
-//! skipped (pack/mmap.rs).
+//! notice naming the size and the cap; a refused cache stays off; every
+//! I/O window is taken at the worker start and a refused one lowers the
+//! pipeline count (pack/worker.rs `buffer_split`); a refused save icon is skipped
+//! (pack/mmap.rs).
 
 use super::runtime_memory::{ampr_internal_amm_pool_alloc, ampr_internal_amm_pool_free};
 use super::sync::{SpinLock, SyncCell};
@@ -52,10 +53,10 @@ pub(crate) const INDEX_LOOKUP_MAX: usize = 48 * MIB;
 pub(crate) const INDEX_ARENA_MIN: usize = 16 * MIB;
 const _: () = assert!(INDEX_LOOKUP_MAX + INDEX_ARENA_MIN == INDEX_MEMORY_MAX);
 
-/// Cap on cache memory: the 16 + 16 MiB cache defaults (rt/pack/mod.rs).
-/// A runtime profile or debug knob asking more gets what is left under the
-/// cap (pack/manifest.rs `cache_region`).
-pub(crate) const CACHE_MEMORY_MAX: usize = 32 * MIB;
+/// Cap on cache memory: the 64 MiB decoded cache default, the only pack
+/// cache (rt/pack/mod.rs). A runtime profile or debug knob asking more gets
+/// what is left under the cap (pack/manifest.rs `cache_region`).
+pub(crate) const CACHE_MEMORY_MAX: usize = 64 * MIB;
 
 /// Cap on buffer memory: a 1 MiB decode buffer and a 112 KiB zstd decoder
 /// workspace for each build worker (Makefile `AMPR_PACK_WORKERS`, default
@@ -63,7 +64,7 @@ pub(crate) const CACHE_MEMORY_MAX: usize = 32 * MIB;
 /// default 12) and, with `AMPR_ZSTD_MMAP=1`, a decoder workspace per
 /// decode-on-access slot: 28.44 MiB at the defaults (rt/pack/mod.rs).
 /// Buffers past it are refused: a worker without one does not start, a
-/// pipeline without a window reads the slow way.
+/// pipeline without a window is not used (worker.rs `buffer_split`).
 pub(crate) const BUFFER_MEMORY_MAX: usize = BUFFER_WORKERS * crate::rt::pack::PACK_MAX_BLOCK_BYTES
     + BUFFER_PIPELINES * crate::rt::pack::PACK_PIPELINE_IO_BYTES
     + BUFFER_DECODERS * ampr_codec::ZSTD_DECODER_WORKSPACE;
@@ -80,7 +81,7 @@ const BUFFER_MMAP_SLOTS: usize = if crate::rt::pack::mmap::MMAP_MODE == 1 {
 // A workspace is whole pages, so the ledger counts it at its size.
 const _: () = assert!(ampr_codec::ZSTD_DECODER_WORKSPACE % SCE_KERNEL_PAGE_SIZE == 0);
 
-/// The three caps together, 124.44 MiB at the default knobs; the pool also
+/// The three caps together, 156.44 MiB at the default knobs; the pool also
 /// holds the 2 MiB fixed sites budget (rt/runtime_memory.rs
 /// `POOL_SITES_BUDGET`). A knob that grows a cap past the pool fails the
 /// build here instead of refusing buffers at run time.
@@ -131,8 +132,8 @@ const PENDING: usize = 1;
 /// debug /bench buffer: 16. The page cache (rt/index_pages.rs) adds its
 /// arena and one page table per registered source (4 at most): 21.
 const INDEX_BLOCKS: usize = 21;
-/// The two caches.
-const CACHE_BLOCKS: usize = 2;
+/// The decoded cache.
+const CACHE_BLOCKS: usize = 1;
 /// One per pipeline window, per worker decode buffer and decoder workspace,
 /// and one for the decode-on-access decoder workspaces.
 const BUFFER_BLOCKS: usize = crate::rt::pack::AMPR_EMU_PACK_PIPELINE_SLOTS
@@ -430,7 +431,7 @@ fn index_cap_notice(needed: usize, room: usize, tables: bool, buf: &mut [u8; 128
     }
 }
 
-/// "ampr-emu-ng: cache memory refused, 32 MiB; running without it".
+/// "ampr-emu-ng: cache memory refused, 64 MiB; running without it".
 fn ledger_refused_notice(kind: Kind, bytes: usize, buf: &mut [u8; 128]) -> usize {
     let mut o = Out { buf, n: 0 };
     o.s(b"ampr-emu-ng: ").s(kind.name()).s(b" memory refused, ");
@@ -568,9 +569,8 @@ pub(crate) fn cache_mem_bytes() -> usize {
 
 /// A pipeline I/O window, worker decode buffer or zstd decoder workspace of
 /// `bytes` from the pool under the buffer cap, page-aligned. Returns the
-/// block and its usable size, (null, 0) when refused. Called at pack
-/// prepare (decode buffers, so they come before any window), on a
-/// pipeline's first use (I/O windows; both kept until shutdown), at a zstd
+/// block and its usable size, (null, 0) when refused. Called at the worker
+/// start (decode buffers, then I/O windows; both kept until shutdown), at a zstd
 /// worker's start (its decoder, freed when it leaves) and on the first
 /// decode-on-access map (slot decoders, kept).
 pub(crate) unsafe fn buffer_alloc(bytes: usize, tag: *const c_char) -> (*mut u8, usize) {
@@ -587,6 +587,12 @@ pub(crate) unsafe fn buffer_alloc(bytes: usize, tag: *const c_char) -> (*mut u8,
 /// Frees a `buffer_alloc` result (null is a no-op).
 pub(crate) unsafe fn buffer_free(ptr: *mut c_void, tag: *const c_char) {
     unsafe { free_kind(Kind::Buffer, ptr, tag) }
+}
+
+/// Buffer bytes not yet taken under the cap, so the worker start can size
+/// its pipelines to windows that will be granted.
+pub(crate) fn buffer_room() -> usize {
+    with_kind(Kind::Buffer, |l| l.cap - l.used)
 }
 
 /// Buffer bytes (/metrics `buffer_mem_bytes`).
@@ -642,10 +648,10 @@ mod tests {
     #[test]
     fn caps_and_sites_fit_the_pool() {
         assert_eq!(INDEX_MEMORY_MAX, 64 << 20);
-        assert_eq!(CACHE_MEMORY_MAX, 32 << 20);
+        assert_eq!(CACHE_MEMORY_MAX, 64 << 20);
         assert_eq!(BUFFER_DECODERS, 4);
         assert_eq!(BUFFER_MEMORY_MAX, ((4 + 12 * 2) << 20) + 4 * (112 << 10));
-        assert_eq!(LEDGER_MEMORY_MAX, (124 << 20) + (448 << 10));
+        assert_eq!(LEDGER_MEMORY_MAX, (156 << 20) + (448 << 10));
         // Host tests build with the debug pool, the smaller of the two.
         assert_eq!(
             STATIC_POOL_SIZE,
@@ -667,15 +673,10 @@ mod tests {
     }
 
     #[test]
-    fn cache_cap_holds_the_default_caches() {
-        use crate::rt::pack::{
-            AMPR_EMU_PACK_DECODED_CACHE_BYTES as DECODED,
-            AMPR_EMU_PACK_PHYSICAL_CACHE_BYTES as PHYSICAL,
-        };
-        assert_eq!((DECODED + PHYSICAL) as usize, CACHE_MEMORY_MAX);
+    fn cache_cap_holds_the_default_cache() {
+        use crate::rt::pack::AMPR_EMU_PACK_DECODED_CACHE_BYTES as DECODED;
+        assert_eq!(DECODED as usize, CACHE_MEMORY_MAX);
         let mut l = Ledgers::new();
-        let p = l.cache.reserve(PHYSICAL as usize).unwrap();
-        l.cache.fill(p, 0x1000_0000);
         let d = l.cache.reserve(DECODED as usize).unwrap();
         l.cache.fill(d, 0x4000_0000);
         assert_eq!(l.cache.used, CACHE_MEMORY_MAX);
@@ -684,7 +685,6 @@ mod tests {
             Err(Refusal::LedgerCap)
         );
         l.cache.take(0x4000_0000).unwrap();
-        l.cache.take(0x1000_0000).unwrap();
         assert_eq!(l.cache.used, 0);
     }
 
@@ -699,7 +699,7 @@ mod tests {
         // Host tests build with the default knobs.
         assert_eq!((BUFFER_WORKERS, BUFFER_PIPELINES), (4, 12));
         let mut l = Ledgers::new();
-        // Decode buffers are taken at prepare, before any window; a zstd
+        // Decode buffers are taken at the worker start, before the windows; a zstd
         // worker takes its decoder workspace when it starts.
         for i in 0..BUFFER_WORKERS {
             let b = l.buffer.reserve(PACK_MAX_BLOCK_BYTES).unwrap();
@@ -716,7 +716,7 @@ mod tests {
             l.buffer.fill(b, 0x1000_0000 + i * PACK_PIPELINE_IO_BYTES);
         }
         assert_eq!(l.buffer.used, BUFFER_MEMORY_MAX);
-        // A 13th window (debug `pipelines` knob) is refused: slow path.
+        // A 13th window (debug `pipelines` knob) is refused.
         assert_eq!(
             l.buffer.reserve(PACK_PIPELINE_IO_BYTES),
             Err(Refusal::LedgerCap)
@@ -740,12 +740,10 @@ mod tests {
         let state = unsafe { std::alloc::alloc_zeroed(layout) }.cast::<PackState>();
         assert!(!state.is_null());
         unsafe {
-            (*state).physical_cache_target_bytes = 16 << 20;
-            (*state).decoded_cache_target_bytes = 16 << 20;
+            (*state).decoded_cache_target_bytes = 64 << 20;
             initialize_caches(state);
-            assert_eq!((*state).physical_cache_bytes, 16 << 20);
-            assert_eq!((*state).cache_bytes, 16 << 20);
-            assert!(!(*state).physical_cache_base.is_null() && !(*state).cache_base.is_null());
+            assert_eq!((*state).cache_bytes, 64 << 20);
+            assert!(!(*state).cache_base.is_null());
         }
         assert_eq!(cache_room(), 0);
         let index = unsafe { index_alloc(INDEX_MEMORY_MAX, 16, c"test.index".as_ptr()) };
@@ -784,10 +782,6 @@ mod tests {
             }
             index_free(index.cast(), c"test.index.free".as_ptr());
             cache_free((*state).cache_base.cast(), c"test.cache.free".as_ptr());
-            cache_free(
-                (*state).physical_cache_base.cast(),
-                c"test.cache.free".as_ptr(),
-            );
             std::alloc::dealloc(state.cast(), layout);
         }
         assert_eq!(with_all(|l| l.total()), 0);

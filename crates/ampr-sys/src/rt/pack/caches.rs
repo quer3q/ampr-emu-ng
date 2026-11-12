@@ -1,5 +1,5 @@
-//! Decoded-cache admission, acquire/publish/release and physical-cache
-//! hash table, page runs and eviction.
+//! Decoded-cache admission, acquire/publish/release, page runs and
+//! eviction.
 
 use super::*;
 
@@ -33,7 +33,7 @@ pub(crate) unsafe fn cache_release_entry_locked(state: *mut PackState, index: u3
 }
 
 /// The hand walks only the indices below the high-water mark (at most the
-/// live entry count, about 64 for 256 KiB zstd chunks in the 16 MiB cache)
+/// live entry count, about 256 for 256 KiB zstd chunks in the 64 MiB cache)
 /// instead of all 8192 slots, and wraps at it, so it visits the live entries
 /// in the same order as a full-range hand would.
 pub(crate) unsafe fn cache_evict_one_locked(state: *mut PackState) -> bool {
@@ -230,6 +230,26 @@ pub(crate) unsafe fn cache_acquire(
     }
 }
 
+/// True when the decoded cache holds `chunk` (Ready or Loading), without
+/// taking a lease. An exact read (virtual_read.rs) ends its run of adjacent
+/// chunks there instead of reading bytes the cache already has.
+pub(crate) unsafe fn cache_holds_chunk(chunk: &AmprPackChunkView) -> bool {
+    unsafe {
+        let state = pack_state();
+        if (*state).cache_base.is_null() || (*state).cache_page_count == 0 {
+            return false;
+        }
+        let key_hash = chunk_key_hash(chunk);
+        let _lock = CACHE_MUTEX.lock();
+        let found = cache_find_locked(state, chunk, key_hash);
+        found != INVALID_INDEX
+            && matches!(
+                (*state).cache_entries[found as usize].state,
+                CacheEntryState::Ready | CacheEntryState::Loading
+            )
+    }
+}
+
 pub(crate) fn cache_error_is_transient(error: c_int) -> bool {
     error == SCE_KERNEL_ERROR_EAGAIN
         || error == SCE_KERNEL_ERROR_EMFILE
@@ -296,212 +316,24 @@ pub(crate) unsafe fn cache_release(lease: &mut CacheLease) {
     *lease = CacheLease::EMPTY;
 }
 
-pub(crate) fn physical_cache_key_hash(pack_id: u16, offset: u64, size: u32) -> u64 {
-    ampr_rust_physical_cache_key_hash(pack_id, offset, size)
-}
-
 // ampr_format::cache::WAIT_BUCKETS sizes the epoch and condvar arrays.
 const _: () = assert!(PACK_CACHE_WAIT_BUCKET_COUNT == 64);
 pub(crate) fn cache_wait_bucket(key_hash: u64) -> u32 {
     ampr_rust_cache_wait_bucket(key_hash)
 }
 
-/// The epochs are statics; `state` is unused.
-pub(crate) unsafe fn cache_wait_epoch(
-    _state: *const PackState,
-    domain: CacheWaitDomain,
-    bucket: u32,
-) -> u64 {
-    if bucket as usize >= PACK_CACHE_WAIT_BUCKET_COUNT {
-        return 0;
-    }
-    let epochs = if domain == CacheWaitDomain::Physical {
-        &PHYSICAL_CACHE_PUBLICATION_EPOCH
-    } else {
-        &DECODED_CACHE_PUBLICATION_EPOCH
-    };
-    epochs[bucket as usize].load(Ordering::Acquire)
+/// The publication epoch of a cache wait bucket (a static, so no state).
+pub(crate) fn cache_wait_epoch(bucket: u32) -> u64 {
+    DECODED_CACHE_PUBLICATION_EPOCH
+        .get(bucket as usize)
+        .map_or(0, |e| e.load(Ordering::Acquire))
 }
 
 /// Reads the epoch statics directly: `pipeline` usually lives inside
 /// PackState, so no second access path to it is needed here.
-pub(crate) unsafe fn prepare_cache_wait(
-    pipeline: &mut ReadPipelineContext,
-    domain: CacheWaitDomain,
-    key_hash: u64,
-) {
-    pipeline.cache_wait_domain = domain;
+pub(crate) unsafe fn prepare_cache_wait(pipeline: &mut ReadPipelineContext, key_hash: u64) {
     pipeline.cache_wait_bucket = cache_wait_bucket(key_hash) as u16;
-    let epochs = if domain == CacheWaitDomain::Physical {
-        &PHYSICAL_CACHE_PUBLICATION_EPOCH
-    } else {
-        &DECODED_CACHE_PUBLICATION_EPOCH
-    };
-    pipeline.cache_wait_epoch = epochs
-        .get(pipeline.cache_wait_bucket as usize)
-        .map_or(0, |e| e.load(Ordering::Acquire));
-}
-
-pub(crate) fn physical_cache_key_equal(
-    entry: &PhysicalCacheEntry,
-    pack_id: u16,
-    offset: u64,
-    size: u32,
-    key_hash: u64,
-) -> bool {
-    entry.state != PhysicalCacheEntryState::Free
-        && entry.key_hash == key_hash
-        && entry.pack_id == pack_id
-        && entry.physical_offset == offset
-        && entry.size == size
-}
-
-pub(crate) unsafe fn physical_cache_find_locked(
-    state: *mut PackState,
-    pack_id: u16,
-    offset: u64,
-    size: u32,
-    key_hash: u64,
-) -> u32 {
-    let bucket =
-        ampr_format::cache::bucket_index(key_hash, AMPR_EMU_PACK_PHYSICAL_CACHE_HASH_BUCKETS);
-    let mut link = (*state).physical_cache_hash_heads[bucket];
-    while link != 0 {
-        let index = link - 1;
-        if index as usize >= AMPR_EMU_PACK_PHYSICAL_CACHE_ENTRY_CAP {
-            break;
-        }
-        let entry = &(*state).physical_cache_entries[index as usize];
-        if physical_cache_key_equal(entry, pack_id, offset, size, key_hash) {
-            return index;
-        }
-        link = entry.hash_next_plus_one;
-    }
-    INVALID_INDEX
-}
-
-pub(crate) unsafe fn physical_cache_hash_link_locked(state: *mut PackState, index: u32) {
-    let entry = &mut (*state).physical_cache_entries[index as usize];
-    let bucket =
-        ampr_format::cache::bucket_index(entry.key_hash, AMPR_EMU_PACK_PHYSICAL_CACHE_HASH_BUCKETS);
-    entry.hash_next_plus_one = (*state).physical_cache_hash_heads[bucket];
-    (*state).physical_cache_hash_heads[bucket] = index + 1;
-}
-
-pub(crate) unsafe fn physical_cache_hash_unlink_locked(state: *mut PackState, index: u32) {
-    let i = index as usize;
-    let bucket = ampr_format::cache::bucket_index(
-        (*state).physical_cache_entries[i].key_hash,
-        AMPR_EMU_PACK_PHYSICAL_CACHE_HASH_BUCKETS,
-    );
-    let next = (*state).physical_cache_entries[i].hash_next_plus_one;
-    // `prev` is None while the link is the bucket head.
-    let mut prev: Option<usize> = None;
-    let mut link = (*state).physical_cache_hash_heads[bucket];
-    while link != 0 {
-        let current = link - 1;
-        if current == index {
-            match prev {
-                None => (*state).physical_cache_hash_heads[bucket] = next,
-                Some(p) => (*state).physical_cache_entries[p].hash_next_plus_one = next,
-            }
-            break;
-        }
-        if current as usize >= AMPR_EMU_PACK_PHYSICAL_CACHE_ENTRY_CAP {
-            break;
-        }
-        prev = Some(current as usize);
-        link = (*state).physical_cache_entries[current as usize].hash_next_plus_one;
-    }
-    (*state).physical_cache_entries[i].hash_next_plus_one = 0;
-}
-
-pub(crate) unsafe fn physical_cache_mark_pages(
-    state: *mut PackState,
-    start: u32,
-    count: u32,
-    used: bool,
-) {
-    let words = bitmap_words(&(*state).physical_cache_page_bitmap);
-    unsafe {
-        ampr_rust_cache_mark_pages(
-            (*state).physical_cache_page_bitmap.as_mut_ptr(),
-            words,
-            start,
-            count,
-            used,
-        )
-    };
-}
-
-pub(crate) unsafe fn physical_cache_find_page_run_locked(state: *mut PackState, count: u32) -> u32 {
-    let words = bitmap_words(&(*state).physical_cache_page_bitmap);
-    unsafe {
-        ampr_rust_cache_find_page_run(
-            (*state).physical_cache_page_bitmap.as_ptr(),
-            words,
-            (*state).physical_cache_page_count,
-            (*state).physical_cache_page_cursor,
-            count,
-        )
-    }
-}
-
-pub(crate) unsafe fn physical_cache_release_entry_locked(state: *mut PackState, index: u32) {
-    physical_cache_hash_unlink_locked(state, index);
-    let (start, count) = {
-        let e = &(*state).physical_cache_entries[index as usize];
-        (e.page_start, e.page_count)
-    };
-    if count != 0 {
-        physical_cache_mark_pages(state, start, count, false);
-    }
-    let entry = &mut (*state).physical_cache_entries[index as usize];
-    *entry = PhysicalCacheEntry::EMPTY;
-    entry.state = PhysicalCacheEntryState::Free;
-    entry.free_next = (*state).physical_cache_free_head;
-    (*state).physical_cache_free_head = index;
-}
-
-/// Bounded and wrapped at the high-water mark like cache_evict_one_locked.
-pub(crate) unsafe fn physical_cache_evict_one_locked(state: *mut PackState) -> bool {
-    let limit = (*state)
-        .physical_cache_entry_high_water
-        .min(AMPR_EMU_PACK_PHYSICAL_CACHE_ENTRY_CAP as u32);
-    for _ in 0..limit * 2 {
-        let index = if (*state).physical_cache_clock < limit {
-            (*state).physical_cache_clock
-        } else {
-            0
-        };
-        (*state).physical_cache_clock = index + 1;
-        let entry = &mut (*state).physical_cache_entries[index as usize];
-        if entry.state == PhysicalCacheEntryState::Free
-            || entry.pin_count != 0
-            || entry.state == PhysicalCacheEntryState::Loading
-        {
-            continue;
-        }
-        if entry.referenced {
-            entry.referenced = false;
-            continue;
-        }
-        physical_cache_release_entry_locked(state, index);
-        return true;
-    }
-    false
-}
-
-pub(crate) unsafe fn physical_cache_request_valid(
-    state: *const PackState,
-    offset: u64,
-    size: u32,
-) -> bool {
-    !(*state).physical_cache_base.is_null()
-        && (*state).physical_cache_page_count != 0
-        && size != 0
-        && size <= 1u32 << AMPR_PACK_IO_PAGE_SHIFT_MAX
-        && offset & (size as u64 - 1) == 0
+    pipeline.cache_wait_epoch = cache_wait_epoch(pipeline.cache_wait_bucket as u32);
 }
 
 #[cfg(test)]

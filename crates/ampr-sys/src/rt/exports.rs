@@ -1121,7 +1121,7 @@ mod mem_report {
             out.kv("hooks_installed_lo", super::super::hook::installed_bits(0))
                 .kv("hooks_installed_hi", super::super::hook::installed_bits(64));
         }
-        // What the pack runtime actually got at startup (caches are cut to
+        // What the pack runtime actually got at startup (the cache is cut to
         // what is left under the Cache cap), then the knobs as set now.
         let state = super::super::pack::g_pack_state.load(core::sync::atomic::Ordering::Acquire);
         if !state.is_null() {
@@ -1130,10 +1130,6 @@ mod mem_report {
             let s = state;
             unsafe {
                 out.kv("pack_decoded_cache_bytes", (*s).cache_bytes as u64)
-                    .kv(
-                        "pack_physical_cache_bytes",
-                        (*s).physical_cache_bytes as u64,
-                    )
                     .kv("pack_workers", (*s).workers_started as u64)
                     .kv("pack_pipelines", (*s).pipeline_capacity as u64);
             }
@@ -1308,7 +1304,7 @@ mod mem_report {
                 b"next launch\n"
             });
         }
-        out.s(b"profile=low|medium|high sets decoded_mib, physical_mib, workers, pipelines\n");
+        out.s(b"profile=low|medium|high sets decoded_mib, workers, pipelines\n");
     }
 
     unsafe fn serve(listener: c_int, start_ns: u64) -> ! {

@@ -1,4 +1,4 @@
-//! Pure decoded/physical pack cache bookkeeping:
+//! Pure decoded pack cache bookkeeping:
 //! key hashes, wait buckets and the page-bitmap allocator. Bit `p` of the
 //! bitmap is `bitmap[p / 64] >> (p % 64) & 1`; a set bit is a used page.
 //! Pages beyond the bitmap count as used and are never marked.
@@ -24,11 +24,6 @@ pub fn chunk_key_hash(offset: u64, pack_id: u16, stored_size: u32, raw_size: u32
         ^ (u64::from(stored_size) << 16)
         ^ (u64::from(raw_size) << 32);
     mix64(value) | 1
-}
-
-/// Physical-cache key hash of a pack byte range; low bit forced on.
-pub fn physical_key_hash(pack_id: u16, offset: u64, size: u32) -> u64 {
-    mix64(offset ^ (u64::from(pack_id) << 48) ^ (u64::from(size) << 17)) | 1
 }
 
 /// Bucket or slot index of a key hash in a table of `buckets` entries
@@ -141,7 +136,7 @@ mod tests {
             for i in 0..256u64 {
                 for hash in [
                     chunk_key_hash(i * 0x1_0000, 1, 0x8000, 0x1_0000),
-                    physical_key_hash(1, i * 0x1_0000, 0x1_0000),
+                    chunk_key_hash(i * 0x1_0000, 2, 0x1_0000, 0x1_0000),
                 ] {
                     let index = bucket_index(hash, buckets);
                     assert!(index < buckets);
@@ -202,7 +197,7 @@ mod tests {
         assert_eq!(find_run_next_fit(&bitmap, 100, 63, 3), 63);
         assert_eq!(find_run_next_fit(&bitmap, 100, 500, 2), 62);
         assert_eq!(find_run_next_fit(&bitmap, 64, 0, 2), 62);
-        assert_eq!(physical_key_hash(1, 2, 3) & 1, 1);
+        assert_eq!(chunk_key_hash(1, 2, 3, 4) & 1, 1);
         assert_eq!(mix64(1), 0x5692_161d_100b_05e5);
         let mut seed = 0x9e37_79b9_7f4a_7c15u64;
         let mut patterns = [[0u64; 4]; 16];

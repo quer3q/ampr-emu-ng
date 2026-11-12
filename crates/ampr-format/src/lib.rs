@@ -7,6 +7,7 @@ pub mod handles;
 pub mod index;
 pub mod index_key;
 pub mod overlay;
+pub mod run;
 pub mod source;
 pub mod zstd;
 

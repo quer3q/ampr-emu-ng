@@ -25,9 +25,9 @@ ampr_emu.
 
 | Memory and size | Original C++ | ampr-emu-ng LZ4 | ampr-emu-ng zstd |
 | --- | --- | --- | --- |
-| Pool size (release) | 384 MiB | 127.83 MiB (-67%) | 127.83 MiB (-67%) |
+| Pool size (release) | 384 MiB | 159.83 MiB (-58%) | 159.83 MiB (-58%) |
 | Pool peak (ampr-emu-ng: highest, measured with an earlier build: 128 MiB pool, 32 + 16 MiB caches) | 267.9 MiB | 113.6 MiB (-58%) | 95.6 MiB (-64%) |
-| Runtime memory (PRX segments, release and debug) | 397.2 MiB | 136.5 MiB (-66%) | 136.5 MiB (-66%) |
+| Runtime memory (PRX segments, release and debug) | 397.2 MiB | 167.94 MiB (-58%) | 167.94 MiB (-58%) |
 | Pack on disk | 32.43 GiB (LZ4) | 32.43 GiB (LZ4) | 23.61 GiB (zstd level 5, -27%) |
 
 ## How to
