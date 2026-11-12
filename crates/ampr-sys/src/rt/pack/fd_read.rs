@@ -1167,6 +1167,7 @@ pub unsafe fn ampr_pack_try_lseek_fd(
         }
     }
     slot.real_exhausted = false;
+    slot.real_failed = false;
     slot.directory_offset = 0;
     slot.dot_emitted = false;
     slot.dot_dot_emitted = false;

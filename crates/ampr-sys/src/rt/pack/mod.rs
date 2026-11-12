@@ -879,6 +879,9 @@ pub(crate) struct VirtualDirectorySlot {
     pub path_length: u16,
     pub active: bool,
     pub real_exhausted: bool,
+    /// The physical `getdents` failed for good; the rest of the listing is
+    /// the packed entries (directories.rs `directory_read_fd`).
+    pub real_failed: bool,
     pub dot_emitted: bool,
     pub dot_dot_emitted: bool,
     pub physical_hash_overflow: bool,
@@ -897,6 +900,7 @@ impl VirtualDirectorySlot {
         path_length: 0,
         active: false,
         real_exhausted: false,
+        real_failed: false,
         dot_emitted: false,
         dot_dot_emitted: false,
         physical_hash_overflow: false,

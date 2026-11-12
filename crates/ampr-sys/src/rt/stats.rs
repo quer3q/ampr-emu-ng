@@ -439,6 +439,11 @@ pub(crate) fn now() -> u64 {
 /// the debug `zstd_verify` knob also a zstd frame checksum mismatch),
 /// lookup b'-', path "decode fid=<hex> chunk=<hex> pack=<hex> off=<hex>
 /// size=<hex>".
+/// b'U' a failed getdents/getdirentries on a virtual directory fd
+/// (rt/pack/directories.rs `note_directory_read`), lookup b'd', path
+/// "read <directory> rc=0x<8 hex>"; lookup b'x', path "realfail <directory>
+/// errno=<n>", the physical listing failed and the packed entries are listed
+/// alone. Logged through `fs_note`, so each distinct line is kept once.
 /// b'V' a save data icon the runtime handed over from a pack (rt/save.rs),
 /// lookup b'-', path "save icon <packed path> rc=0x<result>". Logged through
 /// `fs_note`, so `/fsfail` lists each distinct icon path whatever the result.
