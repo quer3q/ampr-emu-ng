@@ -4,32 +4,32 @@ version = 4
 
 [[package]]
 name = "ampr-codec"
-version = "0.3.5"
+version = "0.4.0"
 dependencies = [
  "zstd-sys",
 ]
 
 [[package]]
 name = "ampr-command"
-version = "0.3.5"
+version = "0.4.0"
 
 [[package]]
 name = "ampr-format"
-version = "0.3.5"
+version = "0.4.0"
 dependencies = [
  "ampr-zstd",
 ]
 
 [[package]]
 name = "ampr-hook"
-version = "0.3.5"
+version = "0.4.0"
 dependencies = [
  "iced-x86",
 ]
 
 [[package]]
 name = "ampr-lz4"
-version = "0.3.5"
+version = "0.4.0"
 dependencies = [
  "ampr-codec",
  "ampr-format",
@@ -38,7 +38,7 @@ dependencies = [
 
 [[package]]
 name = "ampr-pkg"
-version = "0.3.5"
+version = "0.4.0"
 dependencies = [
  "ampr-format",
  "ampr-lz4",
@@ -46,7 +46,7 @@ dependencies = [
 
 [[package]]
 name = "ampr-sys"
-version = "0.3.5"
+version = "0.4.0"
 dependencies = [
  "ampr-codec",
  "ampr-command",
@@ -58,7 +58,7 @@ dependencies = [
 
 [[package]]
 name = "ampr-zstd"
-version = "0.3.5"
+version = "0.4.0"
 dependencies = [
  "crc32fast",
 ]
