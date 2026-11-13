@@ -131,6 +131,10 @@ stats! {
     /// apr_reads still count each read once.
     LoosePreadSplitReads = "loose_pread_split_reads",
     LoosePreadParts = "loose_pread_parts",
+    /// Packed reads split into chunk-aligned child jobs that workers decode
+    /// in parallel (rt/pack/zstd_split.rs), and the children they made.
+    PackSplitReads = "pack_split_reads",
+    PackSplitChildren = "pack_split_children",
     /// Highest number of reactor AIO reads in flight since the last scrape.
     AprInflightMax = "apr_inflight_max",
     /// Failures: pack virtual reads completed with an error, chunk decodes that failed.

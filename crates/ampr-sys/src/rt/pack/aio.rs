@@ -331,7 +331,7 @@ pub unsafe fn sceKernelAioSubmitReadCommandsMultiple(
         const J: usize = AMPR_EMU_PACK_VIRTUAL_AIO_SLOTS;
         let mut virtual_indexes = [0u32; J];
         let mut virtual_positions = [0usize; J];
-        // zstd: split group of each request position, or INVALID_INDEX.
+        // Split group of each request position, or INVALID_INDEX.
         let mut split_groups = [INVALID_INDEX; N];
         // Per virtual request: (fd index, file_id, last local chunk read or u32::MAX);
         // then per file: (file_id, first local chunk, end local chunk) to read ahead.
@@ -397,34 +397,31 @@ pub unsafe fn sceKernelAioSubmitReadCommandsMultiple(
                 virtual_positions[virtual_count] = i;
                 virtual_count += 1;
                 virtual_requests += 1;
-                // zstd: a read over >= 2 chunks becomes parallel child jobs,
-                // while the rest of the batch and SPLIT_MIN_FREE_SLOTS keep
-                // free slots (else it stays one job). The split is written
-                // for zstd's fixed 256 KiB chunks and AMPRZPK1 geometry
-                // (zstd_split.rs). LZ4 files have a fixed block size too
-                // (`1 << block_shift`, ampr-lz4 plan.rs), but would need
-                // their own split, so an LZ4 read stays one job.
-                if zstd_mode() {
-                    let mut children = [0u32; SPLIT_MAX_CHILDREN];
-                    let rest = count as usize - i - 1;
-                    if let Some((group_index, n)) = split_virtual_read_locked(
-                        state,
-                        aio_index,
-                        task_file.ptr(),
-                        _file_size,
-                        rest + SPLIT_MIN_FREE_SLOTS,
-                        &mut children,
-                    ) {
-                        if virtual_count + (n - 1) + rest > J {
-                            abort();
-                        }
-                        for &child in &children[1..n] {
-                            virtual_indexes[virtual_count] = child;
-                            virtual_positions[virtual_count] = i;
-                            virtual_count += 1;
-                        }
-                        split_groups[i] = group_index;
+                // A read over >= 2 chunks becomes parallel child jobs, while the
+                // rest of the batch and SPLIT_MIN_FREE_SLOTS keep free slots (else
+                // it stays one job). Chunks are the file's read tasks: 256 KiB in
+                // zstd, `1 << block_shift` in LZ4 and pkg (zstd_split.rs).
+                let mut children = [0u32; SPLIT_MAX_CHILDREN];
+                let rest = count as usize - i - 1;
+                if let Some((group_index, n)) = split_virtual_read_locked(
+                    state,
+                    aio_index,
+                    task_file.ptr(),
+                    _file_size,
+                    rest + SPLIT_MIN_FREE_SLOTS,
+                    &mut children,
+                ) {
+                    if virtual_count + (n - 1) + rest > J {
+                        abort();
                     }
+                    for &child in &children[1..n] {
+                        virtual_indexes[virtual_count] = child;
+                        virtual_positions[virtual_count] = i;
+                        virtual_count += 1;
+                    }
+                    split_groups[i] = group_index;
+                    stats::add(stats::Stat::PackSplitReads, 1);
+                    stats::add(stats::Stat::PackSplitChildren, n as u64);
                 }
             }
             if prepare_rc == 0 && virtual_count != 0 && !ensure_workers_locked(state) {

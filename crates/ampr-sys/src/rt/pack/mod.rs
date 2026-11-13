@@ -33,7 +33,9 @@
 pub(crate) use core::ffi::{c_char, c_int, c_long, c_void, CStr};
 pub(crate) use core::mem::{offset_of, size_of, MaybeUninit};
 pub(crate) use core::ptr::{null, null_mut};
-pub(crate) use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};
+pub(crate) use core::sync::atomic::{
+    AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicU8, Ordering,
+};
 
 /// Debug counters (no-ops unless `mem_report`); use as `stats::Stat::X`,
 /// since `Stat` here is the kernel `struct stat`.
@@ -49,7 +51,8 @@ pub(crate) use super::fd_cache::{
 };
 pub(crate) use super::index::{
     ampr_index_get_entry_view, ampr_index_get_entry_view_path, ampr_index_resolve_path_to_id,
-    ampr_pack_core_make_task, ampr_pack_core_mount, ampr_pack_core_task_count,
+    ampr_pack_core_chunk_shift, ampr_pack_core_make_task, ampr_pack_core_mount,
+    ampr_pack_core_task_count,
     ampr_pack_core_validate_logical_file, ampr_pack_crc32, AmprPackBlockReadTask,
     AmprPackChunkView, AmprPackCoreView, Lz4Manifest, Stat,
 };
@@ -139,32 +142,92 @@ pub(crate) mod mmap;
 /// `AMPR_ZSTD_MMAP=1`: decode-on-access mappings and their fault handler.
 /// zstd only; an LZ4 mapping takes the disk cache copy in `mmap`.
 pub(crate) mod mmap_fault;
-/// zstd: a multi-chunk read split into parallel child jobs (aio.rs).
+/// A multi-chunk packed read split into parallel child jobs (aio.rs).
 mod zstd_split;
 pub(crate) use zstd_split::*;
+/// Pkg mode: pack 0 read straight from the .pkg `/app0/kraken.image` names.
+mod pkg;
+pub(crate) use pkg::*;
+
+// ---- pack format ----
 
 /// Pack format of this title, chosen once at module_start before any hook
-/// installs: zstd when `/app0/ampr_zstd.index` exists, else LZ4.
-static ZSTD_MODE: AtomicBool = AtomicBool::new(false);
-
-/// True when the title's packs are zstd (AMPRZPK1); false for LZ4 (AMPRPAK4).
-#[inline(always)]
-pub(crate) fn zstd_mode() -> bool {
-    ZSTD_MODE.load(Ordering::Relaxed)
+/// installs (`select_pack_format`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u8)]
+pub(crate) enum PackFormat {
+    /// No packs: loose files only, the v0.2.0 hook set.
+    Plain = 0,
+    /// AMPRPAK4 manifest and AMPRDAT3 volumes.
+    Lz4 = 1,
+    /// AMPRZPK1 index and AMPRZDT1 volumes.
+    Zstd = 2,
+    /// AMPRPAK4 manifest whose pack 0 is the title's .pkg (pkg.rs).
+    Pkg = 3,
 }
 
-/// Set once at module_start before any hook installs: `/app0` holds the
-/// zstd index or the LZ4 manifest (`AMPR_EMU_PACK_INDEX_PATH`). Only such a
-/// title can have files with no physical copy, so only it gets the hooks
-/// past the shared 78 (rt/hook.rs `hook_enabled`), the eager index load in
+impl PackFormat {
+    pub(crate) const fn from_u8(v: u8) -> Self {
+        match v {
+            1 => Self::Lz4,
+            2 => Self::Zstd,
+            3 => Self::Pkg,
+            _ => Self::Plain,
+        }
+    }
+
+    /// Name in the load notice, `/metrics` and the black box.
+    pub(crate) const fn label(self) -> &'static [u8] {
+        match self {
+            Self::Plain => b"plain",
+            Self::Lz4 => b"lz4",
+            Self::Zstd => b"zstd",
+            Self::Pkg => b"pkg",
+        }
+    }
+
+    pub(crate) const fn is_zstd(self) -> bool {
+        matches!(self, Self::Zstd)
+    }
+
+    pub(crate) const fn is_pkg(self) -> bool {
+        matches!(self, Self::Pkg)
+    }
+
+    pub(crate) const fn has_packs(self) -> bool {
+        !matches!(self, Self::Plain)
+    }
+}
+
+static PACK_FORMAT: AtomicU8 = AtomicU8::new(PackFormat::Plain as u8);
+
+#[inline(always)]
+pub(crate) fn pack_format() -> PackFormat {
+    PackFormat::from_u8(PACK_FORMAT.load(Ordering::Relaxed))
+}
+
+/// zstd packs (AMPRZPK1) only. Its `else` branches are the AMPRPAK4 code
+/// and keep a plain title too: a sceAmpr call loads the manifest on demand
+/// whatever the stat at module_start saw (any stat error reads as Plain).
+#[inline(always)]
+pub(crate) fn zstd_mode() -> bool {
+    pack_format().is_zstd()
+}
+
+/// Pkg mode: pack 0 is the .pkg `/app0/kraken.image` names (pkg.rs).
+#[inline(always)]
+pub(crate) fn pkg_mode() -> bool {
+    pack_format().is_pkg()
+}
+
+/// True when this title ships packs of any format. Only such a title can
+/// have files with no physical copy, so only it gets the hooks past the
+/// shared 78 (rt/hook.rs `hook_enabled`), the eager index load in
 /// module_start and the mmap cache sweep. A title with no packs keeps the
 /// v0.2.0 behavior.
-static PACKS_PRESENT: AtomicBool = AtomicBool::new(false);
-
-/// True when this title ships zstd packs or an LZ4 pack manifest.
 #[inline(always)]
 pub(crate) fn packs_present() -> bool {
-    PACKS_PRESENT.load(Ordering::Relaxed)
+    pack_format().has_packs()
 }
 
 /// True when one-based `file_id` names a packed file, one with no physical
@@ -282,25 +345,30 @@ pub(crate) unsafe fn select_pack_format() {
     type StatFn = unsafe extern "C" fn(*const c_char, *mut c_void) -> c_int;
     // FreeBSD struct stat is 224 bytes; room to spare.
     let mut st = [0u64; 64];
-    let found = unsafe { sys::resolve_kernel::<StatFn>(c"stat") }.is_some_and(|f| unsafe {
-        f(
-            zstd::AMPR_EMU_ZSTD_INDEX_PATH.as_ptr(),
-            st.as_mut_ptr().cast(),
-        ) == 0
-    });
-    ZSTD_MODE.store(found, Ordering::Relaxed);
     // Any stat error reads as absent: the title then gets the plain hook
     // set. Resolved here because `sys::real_posix_stat` reads the stat hook
     // slot, which stays null until the hooks install (rt/hook.rs
     // `FALLBACK_SHARED`).
-    let packs = found
-        || unsafe { sys::resolve_kernel::<StatFn>(c"stat") }.is_some_and(|f| unsafe {
-            f(AMPR_EMU_PACK_INDEX_PATH.as_ptr(), st.as_mut_ptr().cast()) == 0
-        });
-    PACKS_PRESENT.store(packs, Ordering::Relaxed);
+    let mut exists = |path: &CStr| {
+        unsafe { sys::resolve_kernel::<StatFn>(c"stat") }
+            .is_some_and(|f| unsafe { f(path.as_ptr(), st.as_mut_ptr().cast()) == 0 })
+    };
+    // A title without /app0/kraken.image costs one failed open. A pkg
+    // title wins over a zstd index also present: its manifest is AMPRPAK4.
+    let format = if unsafe { discover_pkg() } {
+        PackFormat::Pkg
+    } else if exists(zstd::AMPR_EMU_ZSTD_INDEX_PATH) {
+        PackFormat::Zstd
+    } else if exists(AMPR_EMU_PACK_INDEX_PATH) {
+        PackFormat::Lz4
+    } else {
+        PackFormat::Plain
+    };
+    PACK_FORMAT.store(format as u8, Ordering::Relaxed);
+    let packs = packs_present();
     // A crash between a cache file's create and unlink leaves it named.
-    // Both pack formats map packed files through that cache, so sweep for
-    // either; a title with no packs never creates cache files.
+    // Every pack format maps packed files through that cache, so sweep for
+    // any; a title with no packs never creates cache files.
     if packs && mmap::MMAP_MODE != 0 {
         unsafe { mmap::sweep_cache_dir() };
     }
@@ -444,6 +512,8 @@ pub(crate) const AMPR_PACK_FILE_RANDOM_ACCESS: u32 = ampr_lz4::FILE_RANDOM_ACCES
 
 pub(crate) const AMPR_PACK_CHUNK_RAW: u8 = 0;
 pub(crate) const AMPR_PACK_CHUNK_LZ4: u8 = 1;
+pub(crate) const AMPR_PACK_CHUNK_KRAKEN: u8 = ampr_pkg::CHUNK_KRAKEN;
+pub(crate) const AMPR_PACK_CHUNK_KRAKEN_FULL: u8 = ampr_pkg::CHUNK_KRAKEN_FULL;
 pub(crate) const AMPR_PACK_CHUNK_SHARED: u8 = 1 << 0;
 pub(crate) const AMPR_PACK_CHUNK_STREAMING: u8 = 1 << 1;
 
@@ -938,7 +1008,7 @@ pub(crate) struct VirtualAioGroupSlot {
     /// `aio_completion_epoch`, so `sceKernelAioWaitRequests` must poll it.
     /// Never set on a zstd split group (all children are virtual jobs).
     pub has_native_children: bool,
-    /// zstd: split-read state; `split.count == 0` for a plain group.
+    /// Split-read state; `split.count == 0` for a plain group.
     pub split: SplitGroup,
 }
 impl VirtualAioGroupSlot {
@@ -1311,6 +1381,45 @@ pub(crate) static g_pack_state_init: AtomicU32 = AtomicU32::new(0);
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const FORMATS: [PackFormat; 4] = [
+        PackFormat::Plain,
+        PackFormat::Lz4,
+        PackFormat::Zstd,
+        PackFormat::Pkg,
+    ];
+
+    #[test]
+    fn pack_format_round_trips_through_u8() {
+        for f in FORMATS {
+            assert_eq!(PackFormat::from_u8(f as u8), f);
+        }
+        assert_eq!(PackFormat::from_u8(4), PackFormat::Plain);
+        assert_eq!(PackFormat::from_u8(u8::MAX), PackFormat::Plain);
+    }
+
+    #[test]
+    fn pack_format_predicates_per_format() {
+        // (zstd, pkg, packs, label): a pkg title is not an LZ4 or zstd one.
+        let want: [(bool, bool, bool, &[u8]); 4] = [
+            (false, false, false, b"plain"),
+            (false, false, true, b"lz4"),
+            (true, false, true, b"zstd"),
+            (false, true, true, b"pkg"),
+        ];
+        for (f, w) in FORMATS.into_iter().zip(want) {
+            let got = (f.is_zstd(), f.is_pkg(), f.has_packs(), f.label());
+            assert_eq!(got, w, "{f:?}");
+        }
+    }
+
+    #[test]
+    fn accessors_follow_the_stored_format() {
+        // The host never runs select_pack_format, so the store keeps Plain.
+        assert_eq!(pack_format(), PackFormat::Plain);
+        assert!(!zstd_mode() && !pkg_mode());
+        assert!(!packs_present());
+    }
 
     #[test]
     fn reader_gate_wait_blocks_while_held_and_close_refuses_enter() {

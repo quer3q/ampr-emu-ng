@@ -6,9 +6,31 @@ Notes for coding agents working on ampr-emu-ng (version 0.3.5, GPL-3.0-or-later)
 
 ampr-emu-ng is a `no_std` Rust rewrite of drakmor/ampr_emu: the PS5 fakelib
 `libSceAmpr.sprx`, which emulates the AMPR/APR file APIs for games run from
-dumps. One runtime serves LZ4 packs (`AMPRPAK4`) and zstd packs (`AMPRZPK1`
-index, `AMPRZDT1` volumes), picked at load by whether
-`/app0/ampr_zstd.index` exists (`crates/ampr-sys/src/rt/pack/mod.rs`).
+dumps. One runtime has four modes (`PackFormat` in
+`crates/ampr-sys/src/rt/pack/mod.rs`), picked once at module_start by
+`select_pack_format` in this order: pkg when `/app0/kraken.image` (one
+line from the launcher: the .pkg path relative to /app0, e.g.
+`kraken/x.pkg`; the launcher mounts the .pkg's folder read-only at
+`/app0/kraken/`) names a regular file whose size, aligned to pack 0's
+page, is pack 0's `file_size` in the manifest (no title id, name or mtime
+match); zstd packs
+(`AMPRZPK1` index, `AMPRZDT1` volumes) when `/app0/ampr_zstd.index`
+exists; LZ4 packs (`AMPRPAK4`) when `/app0/ampr_assets.index` exists;
+plain (no packs) otherwise. Pkg shares the `AMPRPAK4` manifest format,
+read planner, caches and pipelines with LZ4 and reads pack 0 straight from
+the .pkg; pkg-specific steps dispatch to `rt/pack/pkg.rs`. A
+kraken.image path that is absolute or has an empty, `.` or `..` component
+(`safe_components`) is refused; it is
+trimmed at the first `\n` or `\r`. A writable /app0 is
+separate and applies to any title: when `access("/app0", W_OK)` succeeds at
+module_start (libkernel has no statfs), no index miss is authoritative,
+loose hits answer from the filesystem, `access(W_OK)` returns 0 on a
+directory and EROFS on a packed file, and a miss under an indexed
+directory uses that directory's indexed spelling, a creating open first
+making it if it exists only in the pack (`rt/rw.rs`, docs/writable-app0.md).
+Files a game writes are never packed, so packed files stay read-only.
+Every such change is gated on `app0_writable()`; a read-only /app0
+behaves as upstream.
 
 ## Layout
 
@@ -23,10 +45,20 @@ index, `AMPRZDT1` volumes), picked at load by whether
 - `crates/ampr-lz4`: AMPRPAK4 manifest, AMPRDAT3 header, read planning and LZ4 decode.
 - `crates/ampr-command`, `ampr-hook`: APR command encoding and x86 hook decoding.
 - `crates/ampr-zstd`: zstd pack format, decode side only (`no_std`).
+- `crates/ampr-pkg`: pkg mode, a new format that depends on `ampr-lz4`, which
+  stays as upstream: the `kraken.image` path and .pkg size checks, the
+  manifest rules `open_pkg` and chunk split `pkg_chunk`, .pkg volume size
+  and the KRAKEN chunk descriptor. Runtime glue in `rt/pack/pkg.rs`. Keep
+  pkg-only logic in these two; format-neutral logic goes to
+  `ampr-format` or the runtime.
+  Its `kraken` module (`src/kraken/`) is the KRAKEN block decoder, to be
+  replaced; the only `unsafe` code in the crate is there.
 - `ps5/`: Dockerfile, `build-docker.sh`, target spec, PRX linker script.
 - `tools/`: Python PRX post-processing and `verify_payload_prx.py`.
 - `docs/zstd-format.md`: the zstd pack format. Keep it in sync with
   `crates/ampr-zstd` and `crates/ampr-format/src/zstd.rs`.
+- `docs/writable-app0.md`: writable /app0. Keep it in sync with
+  `rt/rw.rs` and the routing in `rt/index.rs`.
 - `docs/debug-build.md`: the debug build (metrics server, tune file, op
   letters, black box).
 
@@ -45,10 +77,10 @@ Knobs and their defaults are at the top of the `Makefile`
 `AMPR_PACK_PIPELINES`, read-ahead,
 `AMPR_ZSTD_LIBC_HOOKS`, `AMPR_ZSTD_MMAP`, `AMPR_MEM_REPORT`). A knob change
 rebuilds through `out/*/obj/build-config.txt`. The two `AMPR_ZSTD_*` knobs
-keep their zstd names but apply to LZ4 packs too; only `AMPR_ZSTD_MMAP=1`
+keep their zstd names but apply to LZ4 and pkg titles too; only `AMPR_ZSTD_MMAP=1`
 (decode on access) is zstd only. Those hooks (hook ids 78 and up), the
 eager index load and the mmap cache sweep apply only to a title that ships
-packs, zstd or LZ4 (`packs_present` in `rt/pack/mod.rs`, `hook_enabled` in
+packs, zstd, LZ4 or pkg (`packs_present` in `rt/pack/mod.rs`, `hook_enabled` in
 `rt/hook.rs`); a title with no packs gets the shared ids 0..=77. Among them,
 ids 100..=109 route the game's own kernel AIO (`sceKernelAioSubmitReadCommands*`,
 poll, wait, delete, cancel) to the runtime's AIO emulation
@@ -60,7 +92,7 @@ they install in every title, packs or not. A game thread creation that
 fails with EAGAIN makes the runtime give threads back and is retried; the
 runtime-wide budget of 16 worker threads is cut and regrows by one per
 10 s quiet. The groups are capped at 4 decode workers (`AMPR_PACK_WORKERS`;
-an LZ4 title's `ampr_assets.index.runtime` profile can ask for up to 16,
+an LZ4 or pkg title's `ampr_assets.index.runtime` profile can ask for up to 16,
 `AMPR_EMU_PACK_WORKER_CAPACITY`; the worker start cuts workers until
 each has a pipeline in the Buffer ledger, 9 and 9 at 16, `buffer_split`
 in `rt/pack/worker.rs`),
@@ -75,7 +107,9 @@ one thread while it has work and none without (decode workers never go
 below one, `LoadGroup::floor`), until 10 s pass with no new failure
 (`LoadGroup`, `pressure` in `rt/thread_hooks.rs`). Ids 112..=119 (dup,
 dup2, poll, select, openat, fstatat, faccessat, readlink) exist only in the
-debug build, as pass-through probes in titles with packs (`rt/probe.rs`). The
+debug build, as pass-through probes in titles with packs (`rt/probe.rs`).
+Pkg mode and a writable /app0 add no hook ids; the hook ids are as
+upstream. The
 runtime creates its own threads through `create_internal`
 (the pre-detour slot). Save data (`rt/save.rs`) is hooked by NID in a loaded
 `libSceSaveData` module, not through the libkernel table, in every title
@@ -110,12 +144,12 @@ CI (`.github/workflows/build.yml`) runs the same commands; a pushed `v*` tag cre
   listed at `STATIC_POOL_SIZE` in `rt/runtime_memory.rs` (1.56 MiB used; a
   host test fails on a new pool call). A build-time assert checks that the
   caps plus the budget fit the pool. Both PRX builds load to the same
-  167.94 MiB (PT_LOAD memsz, below 192 MiB; v0.3.4 loaded at 200.7 MiB):
+  167.98 MiB (PT_LOAD memsz, below 192 MiB; v0.3.4 loaded at 200.7 MiB):
   the release pool is 159.83 MiB
   (`AMPR_INTERNAL_POOL_SIZE` `0x9fd4000`), the debug one 158.47 MiB
   (`AMPR_DEBUG_POOL_SIZE` `0x9e78000`), the gap being the debug build's
-  larger non-pool part (9.47 vs 8.11 MiB). `AMPR_ZSTD_MMAP=1` grows both
-  pools by 448 KiB (168.38 MiB). `dist` fails when the two totals
+  larger non-pool part (9.51 vs 8.15 MiB). `AMPR_ZSTD_MMAP=1` grows both
+  pools by 448 KiB (168.42 MiB). `dist` fails when the two totals
   differ by more than 64 KiB or reach 192 MiB (`PRX_TOTAL_LIMIT` in
   `tools/verify_payload_prx.py --prx-totals`); then update the gap in the
   Makefile. A refused allocation degrades (index: one notice, packs
@@ -154,7 +188,12 @@ CI (`.github/workflows/build.yml`) runs the same commands; a pushed `v*` tag cre
   `ampr_emu.index` builds its AMPRIDX3 whole in the Index ledger (walk
   build, 104-124 B per file at 48-byte paths) before writing and paging
   it. Pool peak outside the ledgers 0.56 MiB on a zstd title; the largest
-  index measured is 25.2 MiB. Any change that grows runtime memory needs a measurement and an updated Makefile comment.
+  index measured is 25.2 MiB. Pkg and rw mode add .bss statics outside
+  the pool, in both builds: `KRAKEN_PKG_PATH` (269 B) and
+  two atomics (9 B) in `rt/pack/pkg.rs`, `PACK_FORMAT` (1 B) in
+  `rt/pack/mod.rs` and `APP0_WRITABLE` (1 B) in `rt/rw.rs`. Any change
+  that grows runtime memory needs a measurement and an updated Makefile
+  comment.
 - Comments: plain prose `//!` and `///`, saying why, with the measured numbers
   and the source they come from (e.g. `rt/stats.rs`). Large files group items under
   `// ---- topic ----` section lines; keep that style.

@@ -1,6 +1,11 @@
-//! zstd: one game read that spans several 256 KiB chunks is split into
-//! contiguous, chunk-aligned child jobs so idle pack workers decode its
-//! chunks in parallel.
+//! One game read of a packed file that spans several chunks is split into
+//! contiguous, chunk-aligned child jobs so idle pack workers read and decode
+//! its chunks in parallel. Chunks are 256 KiB in zstd packs and
+//! `1 << block_shift` of the file record in LZ4 and pkg packs
+//! (`ampr_pack_core_chunk_shift`). Without it a pkg read ran its disk read and
+//! decodes on one worker: on one pkg title the game waited 1.48 ms per read
+//! against 1.02 ms for the same title's zstd packs, which split (debug
+//! /metrics, about 10 GB read).
 //!
 //! The caller sees one request: a virtual AIO group id whose children are the
 //! child jobs (aio.rs sceKernelAioSubmitReadCommandsMultiple). Each child writes
@@ -16,11 +21,12 @@ pub(crate) const SPLIT_MAX_CHILDREN: usize = AMPR_EMU_PACK_WORKER_CAPACITY;
 /// A read splits only while this many virtual AIO slots stay free for the
 /// rest of its batch and for other callers.
 pub(crate) const SPLIT_MIN_FREE_SLOTS: usize = AMPR_EMU_PACK_VIRTUAL_AIO_SLOTS / 4;
-/// 256 KiB zstd chunks at fixed logical offsets (rt/pack/zstd.rs).
+/// 256 KiB zstd chunks at fixed logical offsets (rt/pack/zstd.rs); the
+/// tests' geometry.
+#[cfg(test)]
 const SPLIT_CHUNK_SHIFT: u32 = ampr_format::zstd::CHUNK_SHIFT as u32;
 const _: () = assert!(
-    1u64 << SPLIT_CHUNK_SHIFT == ampr_format::zstd::CHUNK_SIZE
-        && AMPR_EMU_PACK_WORKERS as usize <= SPLIT_MAX_CHILDREN
+    AMPR_EMU_PACK_WORKERS as usize <= SPLIT_MAX_CHILDREN
         && SPLIT_MAX_CHILDREN <= SCE_KERNEL_AIO_REQUEST_NUM_MAX
 );
 
@@ -140,7 +146,7 @@ unsafe fn free_virtual_aio_count_locked(state: *const PackState) -> usize {
 }
 
 /// Splits the just-prepared virtual job `first` (Reserved; request, file,
-/// priority, origin and work class set) of a read of zstd file `file_ptr`
+/// priority, origin and work class set) of a read of packed file `file_ptr`
 /// (`file_size` bytes) into chunk-aligned children, when it spans at least
 /// two chunks and `reserve` slots stay free besides the children. Child 0 is
 /// `first`; `children[..n]` gets every child's slot. Returns (group index, n),
@@ -159,13 +165,18 @@ pub(crate) unsafe fn split_virtual_read_locked(
     }
     let length = clamp_read(req.offset, req.nbyte, file_size).ok()?;
     let offset = req.offset as u64;
+    let shift = unsafe { ampr_pack_core_chunk_shift(file_ptr) }?;
     let mut ranges = [SplitRange::EMPTY; SPLIT_MAX_CHILDREN];
     let n = plan_split(
         offset,
         length,
-        SPLIT_CHUNK_SHIFT,
-        // The worker count in use (debug builds: the `workers` knob).
-        super::super::tune::workers() as usize,
+        shift,
+        // The workers started (an LZ4 or pkg profile may ask for 1..=16, cut
+        // by buffer_split); before the first start, the tune default.
+        match (*state).requested_workers {
+            0 => super::super::tune::workers(),
+            w => w,
+        } as usize,
         &mut ranges,
     );
     if n < 2 {
@@ -173,7 +184,7 @@ pub(crate) unsafe fn split_virtual_read_locked(
     }
     // The core's task count must agree with the chunk plan.
     let tasks = unsafe { ampr_pack_core_task_count(file_ptr, offset, length) };
-    if tasks as u64 != split_chunk_span(offset, length, SPLIT_CHUNK_SHIFT) {
+    if tasks as u64 != split_chunk_span(offset, length, shift) {
         return None;
     }
     if free_virtual_aio_count_locked(state) < (n - 1) + reserve {
@@ -309,6 +320,25 @@ mod tests {
             at += r.nbyte;
         }
         assert_eq!(at, length, "children cover the request exactly");
+    }
+
+    /// LZ4 and pkg files split on their own block size (`block_shift`
+    /// 14..=20), not zstd's 256 KiB.
+    #[test]
+    fn plan_follows_the_file_block_shift() {
+        for shift in [14u32, 16, 20] {
+            let c = 1u64 << shift;
+            let mut out = [SplitRange::EMPTY; SPLIT_MAX_CHILDREN];
+            let (offset, length) = (c - 100, 3 * c);
+            let n = plan_split(offset, length, shift, 4, &mut out);
+            assert_eq!(n, 4, "shift {shift}: 4 blocks, 4 children");
+            assert_eq!(out[0].nbyte, 100);
+            for r in &out[1..n] {
+                assert_eq!((offset + r.delta) % c, 0, "shift {shift}: block start");
+            }
+            assert_eq!(out[..n].iter().map(|r| r.nbyte).sum::<u64>(), length);
+            assert_eq!(plan_split(0, c, shift, 4, &mut out), 1, "one block: no split");
+        }
     }
 
     #[test]

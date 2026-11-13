@@ -18,16 +18,18 @@ AMPR_MEM_REPORT ?= 0
 # decoder workspaces + 12 x 2 MiB I/O)
 # and a 2 MiB budget for the fixed sites (1.56 MiB used); a pool below that
 # fails the build. Both builds have the same PRX size T (PT_LOAD memsz
-# total), below 192 MiB: 167.94 MiB (v0.3.4 loaded at 200.7 MiB, so a PRX
+# total), below 192 MiB: 167.98 MiB (v0.3.4 loaded at 200.7 MiB, so a PRX
 # of this size loads). Each pool is T minus its build's non-pool part (code,
 # data, reactor storage), rounded down to a 16 KiB page. Non-pool parts:
-# release 8506402 B (8.11 MiB), debug 9929746 B (9.47 MiB; more code,
+# release 8545786 B (8.15 MiB), debug 9971570 B (9.51 MiB; more code,
 # /fsfail and retry records, rt/stats.rs), so the release pool is 1.36 MiB
 # (87 pages) larger: 159.83 vs 158.47 MiB. Deleting the physical page cache
 # took about 589 KiB off both non-pool parts (229 KiB of PackState .bss,
 # the rest code). `AMPR_ZSTD_MMAP=1` adds 448 KiB to both pools (4
-# decode-on-access decoder workspaces, Buffer ledger): T 168.38 MiB.
-# `dist` checks both totals
+# decode-on-access decoder workspaces, Buffer ledger): T 168.42 MiB.
+# Pkg mode (the KRAKEN decoder, pkg and writable-/app0 code, a few hundred
+# bytes of statics) grew the non-pool parts by 39384 B (release) and
+# 41824 B (debug). `dist` checks both totals
 # (tools/verify_payload_prx.py --prx-totals): they must match within 64 KiB
 # and stay below 192 MiB, else update the gap here.
 # The first pool allocation publishes the pool (mprotect), so the startup

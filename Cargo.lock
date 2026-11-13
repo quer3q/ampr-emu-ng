@@ -37,6 +37,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "ampr-pkg"
+version = "0.3.5"
+dependencies = [
+ "ampr-format",
+ "ampr-lz4",
+]
+
+[[package]]
 name = "ampr-sys"
 version = "0.3.5"
 dependencies = [
@@ -45,6 +53,7 @@ dependencies = [
  "ampr-format",
  "ampr-hook",
  "ampr-lz4",
+ "ampr-pkg",
 ]
 
 [[package]]

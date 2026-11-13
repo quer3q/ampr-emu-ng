@@ -167,6 +167,8 @@ pub(crate) unsafe fn decode_pipeline_chunk(
             if decoded.is_err() {
                 rc = SCE_KERNEL_ERROR_EIO;
             }
+        } else if chunk.codec == AMPR_PACK_CHUNK_KRAKEN && pkg_mode() {
+            rc = decode_kraken_chunk(worker, chunk, stored, destination);
         } else {
             rc = SCE_KERNEL_ERROR_EINVAL;
         }

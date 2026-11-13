@@ -10,7 +10,7 @@ with it, then ship the release build.
 `make AMPR_MEM_REPORT=1` (Cargo feature `mem_report`) with the pool set to
 `AMPR_DEBUG_POOL_SIZE` (`0x9e78000`, 158.47 MiB); the release pool is
 `0x9fd4000` (159.83 MiB). The smaller pool offsets the larger debug code, so
-both PRX files load to 167.94 MiB with the same ledger caps, cache and
+both PRX files load to 167.98 MiB with the same ledger caps, cache and
 thread limits.
 
 Only the debug build:
@@ -56,6 +56,9 @@ curl http://<ps5-ip>:9090/metrics
 The first line, `build ampr-emu-ng <version> <git rev> debug`, names the PRX
 that answered, so a stale build shows. `ps5/build-docker.sh` sets the git rev
 (`-dirty` when tracked files changed); a build outside it shows `unknown`.
+The second, `pack_format <plain|lz4|zstd|pkg>`, names the title's mode
+(`PackFormat::label` in `rt/pack/mod.rs`), as the load notice does. A pkg
+title shows `pkg`, never `lz4`, though it shares the LZ4 manifest format.
 
 Then one `name value` pair per line: uptime, pool used, peak and size, the
 `rt/stats.rs` counters, the ledgers (`index_mem_*`, `cache_mem_*`,
@@ -97,6 +100,11 @@ Most runs compare three numbers:
   `pack_job_ns / pack_jobs`;
 - disk read: `pread_read_ns / pread_reads` in the pread pool,
   `ext_read_ns / ext_reads` for the reactor's kernel AIO reads.
+
+In pkg mode (this title's .pkg named by `/app0/kraken.image`) chunks of the .pkg are
+read the same way, one exact-size read of their stored bytes, and count in
+the same `pack_disk_reads`, `pack_disk_bytes` and disk read times as other
+pack reads; `pack_disk_bytes / pack_disk_reads` is the average read size.
 
 ### /bench
 
@@ -177,7 +185,8 @@ of `/metrics` and in the black box; the full list is at `FsEvents` in
 
 Lookup letters of path hooks: `h` index hit, `m` miss the index answers,
 `M` miss sent to the filesystem, `d` directory, `n` index not ready, `x`
-not under `/app0`, `-` none.
+not under `/app0`, `-` none. With a writable /app0 every miss is `M`
+([writable-app0.md](writable-app0.md)).
 
 ## Black box
 
@@ -187,6 +196,14 @@ written as events happen, so it survives the crash, and holds:
 
 - the loaded modules with segment addresses, at start and after each module
   load, to map a crash RIP to a module;
+- one `pkg <how> <detail> <path or ->` line on how pkg discovery ended
+  (`log_discovery` in `rt/pack/pkg.rs`). `how` is `noimage` (no
+  kraken.image, other modes as before), `badimage` (unreadable or refused
+  path; detail the open errno or 0), `open` (the .pkg failed to open;
+  detail the errno), `notregular`, `nomanifest`, `size` (the page-aligned
+  .pkg size is not pack 0's; detail the .pkg size) or `ok` (detail the
+  .pkg size), detail in hex. The path is `/app0/` plus the kraken.image
+  line, or `-` before a valid one;
 - every failed file event `/fsfail` would keep, and every module load (`K`);
 - probe events once per (op, path), whatever their result; a served `I`
   line shows what the game did with packed files before it died.

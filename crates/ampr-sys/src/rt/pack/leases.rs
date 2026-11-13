@@ -38,10 +38,12 @@ pub(crate) unsafe fn build_pack_path(
     output: *mut c_char,
     output_size: usize,
 ) -> bool {
-    if zstd_mode() {
-        unsafe { build_pack_path_zstd(state, pack_id, output, output_size) }
-    } else {
-        unsafe { build_pack_path_lz4(state, pack_id, output, output_size) }
+    match pack_format() {
+        PackFormat::Zstd => unsafe { build_pack_path_zstd(state, pack_id, output, output_size) },
+        PackFormat::Pkg => unsafe { build_pack_path_pkg(state, pack_id, output, output_size) },
+        PackFormat::Lz4 | PackFormat::Plain => unsafe {
+            build_pack_path_lz4(state, pack_id, output, output_size)
+        },
     }
 }
 
@@ -77,7 +79,7 @@ unsafe fn build_pack_path_zstd(
     true
 }
 
-unsafe fn build_pack_path_lz4(
+pub(super) unsafe fn build_pack_path_lz4(
     state: *const PackState,
     pack_id: u16,
     output: *mut c_char,
@@ -127,14 +129,16 @@ pub(crate) unsafe fn validate_data_header(
     payload_begin: *mut u64,
     payload_end: *mut u64,
 ) -> bool {
-    if zstd_mode() {
-        unsafe {
+    match pack_format() {
+        PackFormat::Zstd => unsafe {
             validate_data_header_zstd(state, pack_id, fd, file_size, payload_begin, payload_end)
-        }
-    } else {
-        unsafe {
+        },
+        PackFormat::Pkg => unsafe {
+            validate_data_header_pkg(state, pack_id, fd, file_size, payload_begin, payload_end)
+        },
+        PackFormat::Lz4 | PackFormat::Plain => unsafe {
             validate_data_header_lz4(state, pack_id, fd, file_size, payload_begin, payload_end)
-        }
+        },
     }
 }
 
@@ -173,7 +177,7 @@ unsafe fn validate_data_header_zstd(
     true
 }
 
-unsafe fn validate_data_header_lz4(
+pub(super) unsafe fn validate_data_header_lz4(
     state: *const PackState,
     pack_id: u16,
     fd: c_int,

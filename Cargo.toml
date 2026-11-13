@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/ampr-sys", "crates/ampr-format", "crates/ampr-codec", "crates/ampr-command", "crates/ampr-hook", "crates/ampr-zstd", "crates/ampr-lz4"]
+members = ["crates/ampr-sys", "crates/ampr-format", "crates/ampr-codec", "crates/ampr-command", "crates/ampr-hook", "crates/ampr-zstd", "crates/ampr-lz4", "crates/ampr-pkg"]
 resolver = "2"
 
 [profile.release]

@@ -24,6 +24,7 @@ use super::runtime_memory::{
     ampr_internal_amm_pool_ready_has_capacity, ampr_sdk_cpu_memory_class_name,
     ampr_small_slab_alloc, ampr_small_slab_free,
 };
+use super::rw;
 use super::stats;
 use super::sync::{Condvar, Mutex, SyncCell};
 use super::sys::*;
@@ -760,7 +761,7 @@ impl Stat {
     fn is_dir(&self) -> bool {
         self.st_mode & S_IFMT == S_IFDIR
     }
-    fn is_reg(&self) -> bool {
+    pub(crate) fn is_reg(&self) -> bool {
         self.st_mode & S_IFMT == S_IFREG
     }
     fn is_lnk(&self) -> bool {
@@ -1319,10 +1320,12 @@ unsafe fn add_dirent(
         return true;
     };
     let path_ptr: *const c_char = ws.path.as_ptr().cast();
-    if has_unsupported_index_char(&ws.path[..len])
-        || unsafe { normalize_key(path_ptr, &mut ws.path_key) }.is_none()
-    {
+    if has_unsupported_index_char(&ws.path[..len]) {
         return true;
+    }
+    match unsafe { normalize_key(path_ptr, &mut ws.path_key) } {
+        Some(klen) if !is_kraken_key(&ws.path_key[..klen]) => {}
+        _ => return true,
     }
     let key: *const c_char = ws.path_key.as_ptr().cast();
     for skip in [
@@ -1827,6 +1830,19 @@ fn miss_is_authoritative(raw: &[u8], key: &[u8], links: bool) -> bool {
         && !skipped.iter().any(|p| p.to_bytes() == key)
 }
 
+/// `/app0/kraken` and below (normalized key): the read-only mount of the
+/// folder that holds the .pkg (rt/pack/pkg.rs). Its files are not the
+/// title's, so the walk skips it and lookups there go to the filesystem.
+/// Only in pkg mode: a folder title may ship its own `kraken` directory.
+fn is_kraken_key(key: &[u8]) -> bool {
+    super::pack::pkg_mode() && kraken_key_shape(key)
+}
+
+fn kraken_key_shape(key: &[u8]) -> bool {
+    key.strip_prefix(b"/app0/kraken".as_slice())
+        .is_some_and(|rest| rest.is_empty() || rest[0] == b'/')
+}
+
 /// A `Miss` lookup that could not read the index: not authoritative, so
 /// the hook asks the real call (`io_miss`).
 fn io_lookup(mut r: Lookup) -> Lookup {
@@ -1893,7 +1909,9 @@ unsafe fn lookup_resident_path(path: *const c_char, pbuf: &mut EntryPath) -> Loo
         return r;
     };
     let key = &buf[..len];
-    if !is_app0_key(key) {
+    // The kraken mount is not the title's: an index built before the walk
+    // skipped it may still list it, so it goes to the filesystem unlooked.
+    if !is_app0_key(key) || is_kraken_key(key) {
         return r;
     }
     r.state = Resident::Miss;
@@ -1920,8 +1938,17 @@ unsafe fn lookup_resident_path(path: *const c_char, pbuf: &mut EntryPath) -> Loo
     }
     r.expected_miss = true;
     let links = published().is_some_and(|c| c.links);
-    r.authoritative = miss_is_authoritative(unsafe { cstr_bytes(path) }, key, links);
+    r.authoritative = miss_authority(
+        miss_is_authoritative(unsafe { cstr_bytes(path) }, key, links),
+        rw::app0_writable(),
+    );
     r
+}
+
+/// Writable /app0: files the game creates live only on the FS, so no miss
+/// is authoritative. A read-only /app0 keeps the index's answer.
+fn miss_authority(authoritative: bool, rw: bool) -> bool {
+    authoritative && !rw
 }
 
 // ---- probe lookups (rt/probe.rs, debug only) ------------------------------------
@@ -2181,6 +2208,11 @@ unsafe fn open_resolved(
         }
         Resident::Hit => {
             if dir_flag {
+                // A writable /app0 may have replaced a loose file with a
+                // directory: the filesystem answers, as for stat and access.
+                if rw::app0_writable() && !unsafe { hit_is_packed(l) } {
+                    return unsafe { real(l.entry.path, flags, mode) };
+                }
                 set_errno(ENOTDIR);
                 return -1;
             }
@@ -2201,7 +2233,16 @@ unsafe fn open_resolved(
                     return posix_return_from_sce(rc);
                 }
             }
-            let fd = unsafe { real(l.entry.path, flags, mode) };
+            let mut fd = unsafe { real(l.entry.path, flags, mode) };
+            // A loose file the game unlinked, then removed its real parent:
+            // the index still lists both, so make the parents and retry once.
+            if fd < 0
+                && errno() == ENOENT
+                && create_needs_parents(flags, rw::app0_writable())
+                && !unsafe { hit_is_packed(l) }
+            {
+                fd = unsafe { create_in_indexed_parent(l.entry.path, flags, mode, real) };
+            }
             if fd < 0 {
                 stats::add(stats::Stat::OpenRealFailed, 1);
                 #[cfg(feature = "mem_report")]
@@ -2224,8 +2265,13 @@ unsafe fn open_resolved(
                     return posix_return_from_sce(rc);
                 }
             }
+            // A writable /app0 has no authoritative miss, so this is the
+            // real open the line below would make.
+            if create_needs_parents(flags, rw::app0_writable()) {
+                return unsafe { io_miss(l, create_in_indexed_parent(path, flags, mode, real)) };
+            }
             if !l.authoritative {
-                return unsafe { io_miss(l, real(path, flags, mode)) };
+                return unsafe { io_miss(l, with_miss_path(path, |p| real(p, flags, mode))) };
             }
             index_miss()
         }
@@ -2258,6 +2304,127 @@ unsafe fn open_resolved(
     }
 }
 
+/// `access` on an indexed file or directory: 0 or the errno. Packed files
+/// stat as 0444, so a file hit is not executable (directories are
+/// searchable). W_OK is EROFS on a read-only /app0, and on a packed file in
+/// any mode (packed files stay read-only); 0 otherwise.
+fn indexed_access_errno(state: Resident, mode: c_int, rw: bool, packed: bool) -> c_int {
+    if mode & W_OK != 0 && (!rw || (state == Resident::Hit && packed)) {
+        EROFS
+    } else if state == Resident::Hit && mode & X_OK != 0 {
+        EACCES
+    } else {
+        0
+    }
+}
+
+/// A miss opened with O_CREAT on a writable /app0 makes its real parents
+/// first; a read-only /app0 makes none.
+fn create_needs_parents(flags: c_int, rw: bool) -> bool {
+    rw && flags & O_CREAT != 0
+}
+
+/// Writable /app0: a create under an indexed directory opens the index's
+/// spelling of that directory plus the caller's leaf, so a case-sensitive
+/// install finds it, after making the directory if it is packed-only. Any
+/// other create, or a failed mkdir, opens the caller's path as given.
+/// Kept out of `open_resolved` so its path buffers stay off that frame.
+#[inline(never)]
+unsafe fn create_in_indexed_parent(
+    path: *const c_char,
+    flags: c_int,
+    mode: SceKernelMode,
+    real: RealOpen,
+) -> c_int {
+    let mut key = [0u8; RUNTIME_PATH_CAPACITY];
+    let mut target: EntryPath = [0; PATH_BUF];
+    let ok = unsafe { indexed_parent_path(path, true, &mut key, &mut target) };
+    unsafe { real(if ok { target.as_ptr().cast() } else { path }, flags, mode) }
+}
+
+/// Writable /app0: `f` gets a miss's path with its indexed parent's
+/// spelling, so a file made by `create_in_indexed_parent` is found again by
+/// the caller's spelling on a case-sensitive install. A read-only /app0, or
+/// a parent the index does not know, passes the caller's path.
+#[inline(never)]
+unsafe fn with_miss_path<R>(path: *const c_char, f: impl FnOnce(*const c_char) -> R) -> R {
+    if !rw::app0_writable() {
+        return f(path);
+    }
+    let mut key = [0u8; RUNTIME_PATH_CAPACITY];
+    let mut target: EntryPath = [0; PATH_BUF];
+    let ok = unsafe { indexed_parent_path(path, false, &mut key, &mut target) };
+    f(if ok { target.as_ptr().cast() } else { path })
+}
+
+/// Writes the NUL-terminated path under the indexed parent's spelling into
+/// `target`, making a packed-only parent first when `make`; false to keep
+/// the caller's path. `key` is scratch. The directory lookup copies a
+/// descendant's indexed path into `target`, whose first `path_length`
+/// bytes are then the directory's spelling; an index read error keeps the
+/// caller's path too.
+unsafe fn indexed_parent_path(
+    path: *const c_char,
+    make: bool,
+    key: &mut [u8],
+    target: &mut EntryPath,
+) -> bool {
+    let raw = unsafe { cstr_bytes(path) };
+    let leaf = raw.rsplit(|&b| b == b'/').next().unwrap_or(raw);
+    if leaf.is_empty() || leaf == b"." || leaf == b".." {
+        return false;
+    }
+    let Some(n) = (unsafe { normalize_key(path, key) }) else {
+        return false;
+    };
+    // A file directly in /app0 has no parent to make.
+    let cut = match key[..n].iter().rposition(|&b| b == b'/') {
+        Some(c) if c > 5 => c,
+        _ => return false,
+    };
+    let Ok(Some(e)) = (unsafe { lookup_directory_key(&key[..cut], Some(&mut *target)) }) else {
+        return false;
+    };
+    let dir = e.path_length as usize;
+    if e.path.is_null() || dir + 1 + leaf.len() >= target.len() {
+        return false;
+    }
+    if make && unsafe { rw::make_dirs(&target[..dir], key) }.is_err() {
+        return false;
+    }
+    target[dir] = b'/';
+    target[dir + 1..dir + 1 + leaf.len()].copy_from_slice(leaf);
+    target[dir + 1 + leaf.len()] = 0;
+    true
+}
+
+/// A file hit the index answers: always on a read-only /app0; on a
+/// writable one only a packed file, since a loose file can be rewritten,
+/// truncated or unlinked after the walk.
+fn hit_from_index(rw: bool, packed: bool) -> bool {
+    !rw || packed
+}
+
+/// A loose file hit on a writable /app0: stat, access and reachability ask
+/// the FS on its indexed spelling. A read-only /app0 pays one Relaxed load.
+unsafe fn live_loose_hit(l: &Lookup) -> bool {
+    let rw = rw::app0_writable();
+    l.state == Resident::Hit && !hit_from_index(rw, rw && unsafe { hit_is_packed(l) })
+}
+
+/// A hit the packs serve (`file_id_is_packed`). Before the manifest is
+/// ready, a title with packs counts its hits as packed (no real copy to
+/// ask); a title without packs has only loose files.
+unsafe fn hit_is_packed(l: &Lookup) -> bool {
+    let Some(reader) = super::pack::ManifestReader::enter() else {
+        return true;
+    };
+    if !unsafe { ampr_pack_manifest_is_resident_ready() } {
+        return super::pack::packs_present();
+    }
+    super::pack::file_id_is_packed(&reader, l.file_id)
+}
+
 /// `posix_stat_impl`.
 unsafe fn stat_impl(path: *const c_char, sb: *mut Stat) -> c_int {
     if sb.is_null() {
@@ -2278,6 +2445,9 @@ unsafe fn stat_with(path: *const c_char, sb: *mut Stat, real: RealStat, op: u8) 
 unsafe fn stat_resolved(l: &Lookup, path: *const c_char, sb: *mut Stat, real: RealStat) -> c_int {
     match l.state {
         Resident::Directory => unsafe { sb.write_unaligned(dir_stat(&l)) },
+        Resident::Hit if unsafe { live_loose_hit(l) } => {
+            return unsafe { real(l.entry.path, sb.cast()) }
+        }
         Resident::Hit => unsafe { sb.write_unaligned(file_stat(&l)) },
         Resident::Miss => {
             let mut pack_io = false;
@@ -2291,7 +2461,8 @@ unsafe fn stat_resolved(l: &Lookup, path: *const c_char, sb: *mut Stat, real: Re
                 pack_io = rc == SCE_KERNEL_ERROR_EIO;
             }
             if !l.authoritative || pack_io {
-                return unsafe { io_miss_if(l.io || pack_io, real(path, sb.cast())) };
+                let rc = unsafe { with_miss_path(path, |p| real(p, sb.cast())) };
+                return unsafe { io_miss_if(l.io || pack_io, rc) };
             }
             return index_miss();
         }
@@ -2311,6 +2482,9 @@ unsafe fn reachability_impl(path: *const c_char) -> c_int {
 
 unsafe fn reachability_resolved(l: &Lookup, path: *const c_char) -> c_int {
     match l.state {
+        Resident::Hit if unsafe { live_loose_hit(l) } => unsafe {
+            real_check_reachability(l.entry.path)
+        },
         Resident::Directory | Resident::Hit => 0,
         Resident::Miss => {
             let mut pack_io = false;
@@ -2323,7 +2497,7 @@ unsafe fn reachability_resolved(l: &Lookup, path: *const c_char) -> c_int {
                 pack_io = rc == SCE_KERNEL_ERROR_EIO;
             }
             if !l.authoritative || pack_io {
-                let rc = unsafe { real_check_reachability(path) };
+                let rc = unsafe { with_miss_path(path, |p| real_check_reachability(p)) };
                 if (l.io || pack_io) && rc == SCE_KERNEL_ERROR_ENOENT {
                     let packs = unsafe { ampr_pack_manifest_is_resident_ready() };
                     return sce_errno(io_miss_errno(ENOENT, packs));
@@ -2333,6 +2507,15 @@ unsafe fn reachability_resolved(l: &Lookup, path: *const c_char) -> c_int {
             SCE_KERNEL_ERROR_ENOENT
         }
         _ => unsafe { real_check_reachability(path) },
+    }
+}
+
+/// The first call's result when nothing changed, else the retry.
+fn retry_or(same: bool, rc: c_int, err: c_int, retry: impl FnOnce() -> c_int) -> c_int {
+    if same {
+        return_direct(rc, err)
+    } else {
+        retry()
     }
 }
 
@@ -2346,6 +2529,13 @@ unsafe fn unlink_impl(path: *const c_char) -> c_int {
     let mut pbuf: EntryPath = [0; PATH_BUF];
     let real = unsafe { maybe_resolve_path(path, &mut pbuf) };
     if real == path {
+        if rw::app0_writable() {
+            return unsafe {
+                with_miss_path(path, |p| {
+                    retry_or(p == path, rc, err, || real_posix_unlink(p))
+                })
+            };
+        }
         return return_direct(rc, err);
     }
     unsafe { real_posix_unlink(real) }
@@ -2370,6 +2560,16 @@ unsafe fn rename_impl(from: *const c_char, to: *const c_char) -> c_int {
             maybe_resolve_path(to, &mut to_buf),
         )
     };
+    if rw::app0_writable() {
+        // A miss on either side takes its indexed parent's spelling.
+        return unsafe {
+            with_miss_path(rf, |f| {
+                with_miss_path(rt, |t| {
+                    retry_or(f == from && t == to, rc, err, || real_posix_rename(f, t))
+                })
+            })
+        };
+    }
     if rf == from && rt == to {
         return return_direct(rc, err);
     }
@@ -2546,16 +2746,20 @@ pub unsafe extern "C" fn posix_access_emul(path: *const c_char, mode: c_int) -> 
     let mut pbuf: EntryPath = [0; PATH_BUF];
     let l = unsafe { lookup_resident_path(path, &mut pbuf) };
     let rc = match l.state {
-        Resident::Hit | Resident::Directory if mode & W_OK != 0 => {
-            set_errno(EROFS);
-            -1
+        Resident::Hit if unsafe { live_loose_hit(&l) } => unsafe {
+            real_access(l.entry.path, mode)
+        },
+        Resident::Hit | Resident::Directory => {
+            // live_loose_hit was false: on a writable /app0 a hit is packed.
+            let rw = rw::app0_writable();
+            match indexed_access_errno(l.state, mode, rw, rw) {
+                0 => 0,
+                e => {
+                    set_errno(e);
+                    -1
+                }
+            }
         }
-        // Packed files stat as 0444: not executable (directories are searchable).
-        Resident::Hit if mode & X_OK != 0 => {
-            set_errno(EACCES);
-            -1
-        }
-        Resident::Hit | Resident::Directory => 0,
         // The pack overlay first (packed-only directories), then the FS.
         Resident::Miss if !l.authoritative => {
             let mut st = core::mem::MaybeUninit::<Stat>::uninit();
@@ -2569,7 +2773,8 @@ pub unsafe extern "C" fn posix_access_emul(path: *const c_char, mode: c_int) -> 
                 posix_return_from_sce(rc)
             } else {
                 let pack_io = rc == SCE_KERNEL_ERROR_EIO;
-                unsafe { io_miss_if(l.io || pack_io, real_access(path, mode)) }
+                let rc = unsafe { with_miss_path(path, |p| real_access(p, mode)) };
+                unsafe { io_miss_if(l.io || pack_io, rc) }
             }
         }
         Resident::Miss => {
@@ -2725,6 +2930,9 @@ pub struct AmprPackChunkView {
     pub pack_id: u16,
     pub codec: u8,
     pub flags: u8,
+    /// KRAKEN chunks' even_len | mode << 19 (`ampr_pkg::pkg_chunk`),
+    /// in what was tail padding.
+    pub kraken: u32,
 }
 
 /// `AmprPackBlockReadTask`.
@@ -2748,7 +2956,9 @@ const _: () = {
     assert!(
         offset_of!(AmprPackChunkView, pack_id) == 16 && offset_of!(AmprPackChunkView, codec) == 18
     );
-    assert!(offset_of!(AmprPackChunkView, flags) == 19);
+    assert!(
+        offset_of!(AmprPackChunkView, flags) == 19 && offset_of!(AmprPackChunkView, kraken) == 20
+    );
     assert!(
         size_of::<AmprPackBlockReadTask>() == 40 && offset_of!(AmprPackBlockReadTask, chunk) == 16
     );
@@ -2756,13 +2966,21 @@ const _: () = {
 
 impl From<ChunkView> for AmprPackChunkView {
     fn from(v: ChunkView) -> Self {
+        // A KRAKEN location only splits right in pkg mode, where `open_pkg`
+        // admitted it; elsewhere upstream `open` refused the codec.
+        let (offset, pack_id, kraken) = if crate::rt::pack::pkg_mode() {
+            ampr_pkg::pkg_chunk(v.chunk)
+        } else {
+            (v.chunk.offset, v.chunk.pack_id, 0)
+        };
         Self {
-            offset: v.chunk.offset,
+            offset,
             stored_size: v.chunk.stored_size,
             raw_size: v.raw_size,
-            pack_id: v.chunk.pack_id,
+            pack_id,
             codec: v.chunk.codec,
             flags: v.chunk.flags,
+            kraken,
         }
     }
 }
@@ -2803,9 +3021,9 @@ pub unsafe fn ampr_pack_crc32(data: *const c_void, size: usize, seed: u32) -> u3
     unsafe { region(data.cast(), size) }.map_or(0, |b| ampr_format::crc32_seeded(b, seed))
 }
 
-/// Full `Manifest::open` validation through the mounted source, then
-/// fills `out` (empty on error); LZ4 only (zstd mounts through
-/// `zstd::zstd_mount_validate`).
+/// Full `Manifest::open` (`open_pkg` in pkg mode) validation through the
+/// mounted source, then fills `out` (empty on error); LZ4 only (zstd mounts
+/// through `zstd::zstd_mount_validate`).
 pub(crate) unsafe fn ampr_pack_core_mount(
     src: &'static IndexSource,
     out: *mut AmprPackCoreView,
@@ -2818,7 +3036,7 @@ pub(crate) unsafe fn ampr_pack_core_mount(
     if src.len() < PAK_HEADER as u64 {
         return PACK_INVALID_ARGUMENT;
     }
-    let m = match Manifest::open(src) {
+    let m = match open_manifest(src) {
         Ok(m) => m,
         Err(e) => return CoreError::from(e).code(),
     };
@@ -2835,6 +3053,19 @@ pub(crate) unsafe fn ampr_pack_core_mount(
         })
     };
     PACK_OK
+}
+
+/// `Manifest::open`, or in pkg mode `open_pkg`, which loosens validation
+/// for pack 0 (the .pkg) only. Both read through the source, resident or
+/// paged (rt/index_pages.rs). `open_pkg` returns a `view_trusted` view, so
+/// upstream `open` never sees the KRAKEN codec it refuses; `records_sorted`
+/// is then false, so the overlay order compares paths.
+fn open_manifest(src: &'static IndexSource) -> ampr_lz4::Result<Lz4Manifest> {
+    if crate::rt::pack::pkg_mode() {
+        ampr_pkg::open_pkg(src)
+    } else {
+        Manifest::open(src)
+    }
 }
 
 /// One-based `file_id` against `path`/`logical_size` of a mounted view.
@@ -2864,6 +3095,15 @@ pub unsafe fn ampr_pack_core_validate_logical_file(
             Err(e) => e.code(),
         }
     }
+}
+
+/// Log2 of the chunk size of `file`, the read task size: 256 KiB for zstd,
+/// the file record's `block_shift` for LZ4 and pkg. None for a bad record.
+pub unsafe fn ampr_pack_core_chunk_shift(file: *const u8) -> Option<u32> {
+    if zstd_mode() {
+        return Some(u32::from(ampr_format::zstd::CHUNK_SHIFT));
+    }
+    unsafe { file_record(file) }.map(|f| u32::from(f.block_shift))
 }
 
 /// Block tasks for a read of `file`; zero for a rejected request. zstd:
@@ -2983,6 +3223,40 @@ mod tests {
         // A skipped directory link hides a subtree: no ASCII miss holds.
         assert!(!miss_with(c"/app0/Data/Missing.BIN", true));
         assert!(!miss_with(c"/app0/linked/x.bin", true));
+        // Outside pkg mode (host tests) a kraken dir is the title's own.
+        assert!(miss(c"/app0/kraken"));
+        assert!(miss(c"/app0/Kraken/game.pkg"));
+        assert!(miss(c"/app0/krakenx/a.bin"));
+    }
+
+    /// `/app0/kraken` and its subtree bypass the index, in any ASCII case
+    /// and spelling; a sibling with the same prefix does not.
+    #[test]
+    fn kraken_key_shape_covers_the_mount() {
+        let shape = |p: &CStr| {
+            let mut key = [0u8; RUNTIME_PATH_CAPACITY];
+            unsafe { normalize_key(p.as_ptr(), &mut key) }
+                .is_some_and(|n| kraken_key_shape(&key[..n]))
+        };
+        for yes in [
+            c"/app0/kraken",
+            c"/app0/kraken/",
+            c"/app0/kraken/game.pkg",
+            c"/APP0//Kraken/sub/x.bin",
+            c"/app0/x/../kraken/a.pkg",
+        ] {
+            assert!(shape(yes), "{yes:?}");
+            // Not a service path: in pkg mode lookup_resident_path sends
+            // the mount to the filesystem before any miss handling.
+            assert!(!is_service_path(yes.as_ptr()), "{yes:?}");
+        }
+        for no in [
+            c"/app0/krakenx",
+            c"/app0/kraken.pkg",
+            c"/app0/data/kraken/a.pkg",
+        ] {
+            assert!(!shape(no), "{no:?}");
+        }
     }
 
     /// USB index I/O: the write loop continues short transfers and retries
@@ -3005,6 +3279,60 @@ mod tests {
         assert_eq!(out, data);
         assert!(!write_all_with(&data, |_| SCE_KERNEL_ERROR_EIO as isize));
         assert!(!write_all_with(&data, |_| SCE_KERNEL_ERROR_EINTR as isize));
+    }
+
+    /// rw mode lifts EROFS for loose files and directories only; packed
+    /// files stay read-only, and outside rw mode access answers as before.
+    #[test]
+    fn indexed_access_in_and_out_of_rw_mode() {
+        use Resident::{Directory, Hit};
+        // (state, mode, packed, read-only answer, writable answer)
+        for (state, mode, packed, ro, rw) in [
+            (Hit, 0, true, 0, 0),
+            (Hit, W_OK, true, EROFS, EROFS),
+            (Hit, W_OK, false, EROFS, 0),
+            (Directory, W_OK, false, EROFS, 0),
+            (Directory, W_OK, true, EROFS, 0),
+            (Hit, X_OK, true, EACCES, EACCES),
+            (Hit, W_OK | X_OK, true, EROFS, EROFS),
+            (Hit, W_OK | X_OK, false, EROFS, EACCES),
+            (Directory, X_OK, false, 0, 0),
+        ] {
+            assert_eq!(indexed_access_errno(state, mode, false, packed), ro);
+            assert_eq!(indexed_access_errno(state, mode, true, packed), rw);
+        }
+    }
+
+    /// A read-only /app0 answers every file hit from the index; a writable
+    /// one only packed hits, a loose one asks the FS.
+    #[test]
+    fn hit_from_index_in_and_out_of_rw_mode() {
+        assert!(hit_from_index(false, true));
+        assert!(hit_from_index(false, false));
+        assert!(hit_from_index(true, true));
+        assert!(!hit_from_index(true, false));
+    }
+
+    /// A read-only /app0 keeps an authoritative miss; a writable one never has one.
+    #[test]
+    fn miss_authority_in_and_out_of_rw_mode() {
+        assert!(miss_authority(true, false));
+        assert!(!miss_authority(false, false));
+        assert!(!miss_authority(true, true));
+        assert!(!miss_authority(false, true));
+    }
+
+    /// Only an O_CREAT open on a writable /app0 makes real parents.
+    #[test]
+    fn create_parents_only_in_rw_mode() {
+        for flags in [O_CREAT | O_WRONLY, O_CREAT | O_TRUNC | O_WRONLY] {
+            assert!(create_needs_parents(flags, true));
+            assert!(!create_needs_parents(flags, false));
+        }
+        for flags in [O_RDONLY, O_WRONLY, O_WRONLY | O_TRUNC] {
+            assert!(!create_needs_parents(flags, true));
+            assert!(!create_needs_parents(flags, false));
+        }
     }
 
     #[test]

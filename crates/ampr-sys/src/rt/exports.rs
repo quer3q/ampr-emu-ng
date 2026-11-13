@@ -138,8 +138,8 @@ pub(crate) const BUILD_REV: &str = match option_env!("AMPR_GIT_REV") {
 const BUILD_FLAVOR: &str = "debug";
 
 /// "ampr-emu-ng: v<version> (<mode>) running" into `out`; its length. Mode:
-/// "zstd" (ampr_zstd.index), "lz4" (ampr_assets.index) or "plain" (no
-/// packs, loose files only).
+/// "zstd" (ampr_zstd.index), "pkg" (this title's .pkg in /app0/kraken/), "lz4"
+/// (ampr_assets.index) or "plain" (no packs, loose files only).
 fn load_notice(mode: &[u8], out: &mut [u8; 64]) -> usize {
     let mut n = 0;
     for part in [
@@ -159,14 +159,7 @@ fn load_notice(mode: &[u8], out: &mut [u8; 64]) -> usize {
 unsafe fn notify_loaded() {
     let _ = unsafe { core::ptr::read_volatile(&raw const AMPR_EMU_VERSION) };
     let mut text = [0u8; 64];
-    let mode: &[u8] = if super::pack::zstd_mode() {
-        b"zstd"
-    } else if super::pack::packs_present() {
-        b"lz4"
-    } else {
-        b"plain"
-    };
-    let n = load_notice(mode, &mut text);
+    let n = load_notice(super::pack::pack_format().label(), &mut text);
     unsafe { notify(&text[..n]) };
 }
 
@@ -1080,6 +1073,10 @@ mod mem_report {
             .s(b" ")
             .s(super::BUILD_FLAVOR.as_bytes())
             .s(b"\n");
+        // Pack format (load notice mode): plain, lz4, zstd or pkg.
+        out.s(b"pack_format ")
+            .s(super::super::pack::pack_format().label())
+            .s(b"\n");
         out.kv("uptime_ns", monotonic_ns().saturating_sub(start_ns))
             .kv("pool_used_bytes", used as u64)
             .kv("pool_peak_bytes", peak as u64)
@@ -1425,8 +1422,13 @@ pub unsafe extern "C" fn module_start(_args: usize, _argp: *const c_void) -> c_i
     unsafe { super::tune::load() };
     // Before any hook: the mode picks the hooks and the notification text.
     unsafe { super::pack::select_pack_format() };
+    // Writable /app0: before the hooks, which consult it.
+    unsafe { super::rw::init() };
     #[cfg(feature = "mem_report")]
-    unsafe { super::blackbox::open() };
+    {
+        unsafe { super::blackbox::open() };
+        super::pack::log_discovery();
+    }
     unsafe { notify_loaded() };
     let rc = unsafe { hook::amprInstallLibkernelHooks() };
     // Packed files have no physical copy (ampr_zstd-NNN.pak or the AMPRPAK4

@@ -123,6 +123,18 @@ pub(crate) fn note(op: u8, how: u8, rc: i64, path: *const c_char) {
     }
 }
 
+/// The pkg discovery result (rt/pack/pkg.rs `log_discovery`):
+/// "pkg <how> <detail> <path or ->", detail the errno or .pkg size.
+pub(crate) fn pkg(how: &[u8], detail: u64, path: &[u8]) {
+    if FD.load(Ordering::Relaxed) < 0 {
+        return;
+    }
+    let path = path.strip_suffix(&[0]).unwrap_or(path);
+    let mut l = Line::new();
+    l.s(b"pkg ").s(how).s(b" ").x(detail).s(b" ");
+    l.s(if path.is_empty() { b"-" } else { path }).emit();
+}
+
 fn line(op: u8, how: u8, rc: i64, path: *const c_char) {
     let mut l = Line::new();
     l.s(b"fs ").s(&[op, b' ', how, b' ']).x(rc as u64).s(b" ");

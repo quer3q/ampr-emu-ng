@@ -1088,6 +1088,7 @@ pub(crate) fn zstd_read_task<S: Source + ?Sized>(
             pack_id: record.volume_id,
             codec: record.codec,
             flags: 0,
+            kraken: 0,
         },
     })
 }
