@@ -54,12 +54,15 @@ packer has to keep these rules, or the game cannot open the files it packed:
   and is not served. The zstd lookup keeps case, so the bytes of the two
   paths must match.
 - The size in the record must equal `logical_size` of the file in
-  `ampr_zstd.index`. A difference makes the mount invalid.
+  `ampr_zstd.index`. A difference makes the mount invalid, and then no
+  packed file is served.
 - `ampr_emu.index` has to pass its own checks (`Index::check`,
-  `crates/ampr-format/src/index.rs`): every path shorter than 1024 bytes
-  with no name part over 255 bytes (`kernel_path_limits`) and no NUL, and no
-  two records whose paths are equal after folding `A`-`Z` to `a`-`z` and `\`
-  to `/`. One bad record makes the whole file invalid, not only that record.
+  `crates/ampr-format/src/index.rs`). Every path starts with `/app0/`, is
+  shorter than 1024 bytes, has no name part over 255 bytes
+  (`kernel_path_limits`) and no empty, `.` or `..` part, holds no NUL or
+  `\`, and is followed by a NUL in the path blob (`checked_path`). No two
+  records have paths that are equal after folding `A`-`Z` to `a`-`z`. One
+  bad record makes the whole file invalid, not only that record.
   A title without packs then gets an index rebuilt from the folder. With
   packs the rebuilt index stays in memory and is made from a walk of the
   folder, which cannot contain the packed files because they are gone from
