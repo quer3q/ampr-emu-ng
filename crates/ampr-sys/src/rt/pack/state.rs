@@ -770,14 +770,13 @@ mod tests {
         VIRTUAL_DIRECTORY_LIVE[last].store(false, Ordering::Release);
         assert_eq!(directory_fd_slot(base), None);
 
-        // Packed numbers never decode as a directory, nor the reverse.
-        VIRTUAL_FD_LIVE[AMPR_EMU_PACK_VIRTUAL_FD_SLOTS - 1].store(true, Ordering::Release);
-        VIRTUAL_DIRECTORY_LIVE[0].store(true, Ordering::Release);
+        // Packed numbers never decode as a directory, nor the reverse. The
+        // range check alone decides this, so no live flag is set:
+        // VIRTUAL_FD_LIVE is shared with packed_fd_range_and_slot_reuse,
+        // which runs in parallel.
         let packed_top = (AMPR_EMU_PACK_VIRTUAL_FD_BASE + AMPR_EMU_PACK_VIRTUAL_FD_SLOTS - 1) as u32;
         assert_eq!(directory_fd_slot(packed_top), None);
         assert_eq!(packed_fd_slot(base), None);
-        VIRTUAL_FD_LIVE[AMPR_EMU_PACK_VIRTUAL_FD_SLOTS - 1].store(false, Ordering::Release);
-        VIRTUAL_DIRECTORY_LIVE[0].store(false, Ordering::Release);
     }
 
     #[test]
