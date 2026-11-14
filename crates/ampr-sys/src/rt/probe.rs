@@ -180,8 +180,8 @@ type SelectFn =
     unsafe extern "C" fn(c_int, *mut c_void, *mut c_void, *mut c_void, *mut c_void) -> c_int;
 
 /// FreeBSD `FD_SETSIZE`. `select` remains a pass-through probe; synthetic
-/// packed fds (512..1024) fit in a set but are not implemented by this
-/// observer.
+/// synthetic packed and directory fds (448..1024) fit in a set but are not
+/// implemented by this observer.
 const FD_SETSIZE: c_int = 1024;
 
 /// Inspects `fds` only after the original returned >= 0: it validated the

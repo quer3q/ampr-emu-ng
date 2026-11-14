@@ -36,7 +36,10 @@ AMPR_MEM_REPORT ?= 0
 # ledger caps. The rank order of an unsorted paged ampr_emu.index and the
 # pack-aware choice to read it whole (rt/index.rs, ampr-format index.rs,
 # rt/pack/manifest.rs) grew them by 52784 B (release) and 53248 B (debug).
-# `dist` checks both totals
+# Directory fds as plain numbers (320 packed slots instead of 512, a live
+# flag per directory slot, no directory generation) took 128 B (release) and
+# 384 B (debug) off them; both totals stay 168.52 MiB, 472 B apart (728 B
+# before). `dist` checks both totals
 # (tools/verify_payload_prx.py --prx-totals): they must match within 64 KiB
 # and stay below 192 MiB, else update the gap here.
 # The first pool allocation publishes the pool (mprotect), so the startup

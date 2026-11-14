@@ -473,7 +473,7 @@ pub(crate) fn now() -> u64 {
 /// kernel refused, path "native batch lane=<n>". First 64 only.
 /// b'Q' packed-fd/open failures (rt/pack/slots.rs, rt/index.rs): lookup b'H'
 /// a packed open's raw SCE error, b'R' a physical open's errno (ring only,
-/// positive), b'S' the 512-slot synthetic packed-fd table full.
+/// positive), b'S' the 320-slot synthetic packed-fd table full.
 #[cfg(feature = "mem_report")]
 pub(crate) struct FsEvents {
     pub next: usize,
