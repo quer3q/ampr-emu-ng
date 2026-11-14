@@ -41,9 +41,11 @@ const MIB: usize = 1 << 20;
 pub(crate) const INDEX_MEMORY_MAX: usize = 64 * MIB;
 
 /// Lookup tables at most, inside the cap: the fast tables of paged index
-/// files (zstd 16 B per file, 8 B per chunk and volume) and the tables derived
-/// from the indexes (zstd projection 16 B per AMPRIDX3 id and order 4 B
-/// per packed file). About 17.6 MiB at 300k files and 100 GB.
+/// files (zstd 16 B per file, 8 B per chunk and volume), the rank order of
+/// a paged AMPRIDX3 that is not sorted (4 B per file, rt/index.rs
+/// `attach_order`) and the tables derived from the indexes (zstd
+/// projection 16 B per AMPRIDX3 id and order 4 B per packed file). About
+/// 17.6 MiB at 300k files and 100 GB, plus 1.2 MiB of rank order.
 pub(crate) const INDEX_LOOKUP_MAX: usize = 48 * MIB;
 
 /// Page arena at least, once any index file is paged: half of a ~32 MiB

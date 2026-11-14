@@ -157,17 +157,95 @@ fn lz4_lookup_bytes(files: u64, chunks: u64, packs: u64) -> (usize, usize) {
 /// needs (a whole file has no fast table), else paged. Takes `fd` (kept
 /// for a paged source, else closed).
 unsafe fn lz4_index_source(fd: c_int, len: u64) -> Option<&'static IndexSource> {
-    let mut head = [0u8; ampr_lz4::PAK_HEADER];
-    let derived = match index_pages::read_head(fd, &mut head)
-        .then(|| ampr_lz4::manifest::header_counts(&head).ok())
-        .flatten()
-    {
-        Some((files, chunks, packs)) => {
-            lz4_lookup_bytes(u64::from(files), u64::from(chunks), u64::from(packs)).1
-        }
-        None => usize::MAX,
-    };
+    let derived = lz4_head_lookup_bytes(fd).map_or(usize::MAX, |(_, d)| d);
     unsafe { mount_index_source(&LZ4_SOURCE, fd, len, derived) }
+}
+
+/// `lz4_lookup_bytes` (fast, derived) of the open AMPRPAK4 file `fd` from
+/// its header alone; None on a read error or a header that is not AMPRPAK4.
+fn lz4_head_lookup_bytes(fd: c_int) -> Option<(usize, usize)> {
+    let mut head = [0u8; ampr_lz4::PAK_HEADER];
+    if !index_pages::read_head(fd, &mut head) {
+        return None;
+    }
+    let (files, chunks, packs) = ampr_lz4::manifest::header_counts(&head).ok()?;
+    Some(lz4_lookup_bytes(
+        u64::from(files),
+        u64::from(chunks),
+        u64::from(packs),
+    ))
+}
+
+// ---- pack index reserve ----
+
+/// The least Index bytes a pack index mount of a `len`-byte file can take:
+/// read whole with its `derived` tables, or paged with its `fast` table,
+/// the derived tables and the page arena floor (an AMPRIDX3 read whole
+/// takes no arena, so the pack index would take it). Each term is rounded
+/// up to whole pages, as the allocations are. Saturating.
+pub(crate) fn pack_reserve_bytes(len: u64, fast: usize, derived: usize) -> usize {
+    let page = |n: usize| {
+        n.checked_next_multiple_of(index_pages::PAGE)
+            .unwrap_or(usize::MAX)
+    };
+    let (len, fast, derived) = (
+        page(usize::try_from(len).unwrap_or(usize::MAX)),
+        page(fast),
+        page(derived),
+    );
+    let whole = len.saturating_add(derived);
+    let paged = fast
+        .saturating_add(derived)
+        .saturating_add(im::INDEX_ARENA_MIN);
+    whole.min(paged)
+}
+
+/// The least Index bytes the pack index mount still needs, from the
+/// manifest header alone, for an AMPRIDX3 of `ampr_ids` records about to
+/// be loaded first (rt/index.rs `read_whole`). The field case it covers:
+/// an AMPRIDX3 of 34.4 MB read whole left the LZ4 index (28.4 MiB of
+/// tables plus the arena floor) too little room and it was refused. 0 in
+/// a title with no packs, once a manifest load has started (`LOAD_STATE`
+/// is atomic; the mounted source cell is written by that load without a
+/// lock this caller may take) and on any open, stat or header error (the
+/// mount reports a broken file itself).
+pub(crate) unsafe fn pack_index_reserve(ampr_ids: usize) -> usize {
+    if !packs_present() || LOAD_STATE.load(Ordering::Acquire) != PACK_LOAD_UNINITIALIZED {
+        return 0;
+    }
+    let (Some(open_fn), Some(close_fn), Some(fstat_fn)) =
+        (unsafe { real_open() }, unsafe { real_close() }, unsafe {
+            real_fstat()
+        })
+    else {
+        return 0;
+    };
+    let fd = unsafe { open_fn(manifest_path().as_ptr(), SCE_KERNEL_O_RDONLY, 0 as c_int) };
+    if fd < 0 {
+        return 0;
+    }
+    let mut stat: SceKernelStat = unsafe { core::mem::zeroed() };
+    let len = (unsafe { fstat_fn(fd, &mut stat) } == 0
+        && stat.st_size >= manifest_min_bytes() as off_t
+        && stat.st_size as u64 <= AMPR_EMU_PACK_INDEX_MAX_BYTES)
+        .then_some(stat.st_size as u64);
+    let costs = len.and_then(|_| {
+        if zstd_mode() {
+            // The mount runs before AMPRIDX3 is published and counts one id
+            // per zstd file; the projection built later counts `ampr_ids`.
+            // Reserve the larger, so neither is refused.
+            let mount = zstd::head_lookup_bytes(fd, None)?;
+            let built = zstd::head_lookup_bytes(fd, Some(ampr_ids as u64))?;
+            Some((mount.0.max(built.0), mount.1.max(built.1)))
+        } else {
+            lz4_head_lookup_bytes(fd)
+        }
+    });
+    unsafe { close_fn(fd) };
+    match (len, costs) {
+        (Some(len), Some((fast, derived))) => pack_reserve_bytes(len, fast, derived),
+        _ => 0,
+    }
 }
 
 /// The fast table of a paged manifest, in one lookup allocation filled by
@@ -593,4 +671,39 @@ pub(crate) unsafe fn cache_mark_pages(state: *mut PackState, start: u32, count: 
             used,
         )
     };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The field case: an LZ4 index of 223,180 files, 1,513,210 chunks and
+    /// 18 packs needs 28,871,736 B of fast table and 892,720 B of order.
+    #[test]
+    fn lz4_lookup_bytes_of_the_field_case() {
+        let (fast, derived) = lz4_lookup_bytes(223_180, 1_513_210, 18);
+        assert_eq!((fast, derived), (28_871_736, 892_720));
+        assert_eq!(lz4_lookup_bytes(u64::MAX, 1, 1), (usize::MAX, usize::MAX));
+    }
+
+    /// The reserve is the cheaper of the two mounts: whole (file plus
+    /// derived tables) or paged (fast plus derived plus the arena floor),
+    /// saturating at usize::MAX.
+    #[test]
+    fn pack_reserve_is_the_cheaper_mount() {
+        let (arena, page) = (im::INDEX_ARENA_MIN, index_pages::PAGE);
+        let round = |n: usize| n.next_multiple_of(page);
+        assert_eq!(pack_reserve_bytes(1000, 500, 24), 2 * page);
+        assert_eq!(pack_reserve_bytes(u64::MAX, 500, 24), 2 * page + arena);
+        let (fast, derived) = lz4_lookup_bytes(223_180, 1_513_210, 18);
+        let paged = round(fast) + round(derived) + arena;
+        assert_eq!(pack_reserve_bytes(64 << 20, fast, derived), paged);
+        assert_eq!(
+            pack_reserve_bytes(10 << 20, fast, derived),
+            (10 << 20) + round(derived)
+        );
+        assert_eq!(pack_reserve_bytes(u64::MAX, usize::MAX, 1), usize::MAX);
+        assert_eq!(pack_reserve_bytes(u64::MAX, 1, usize::MAX), usize::MAX);
+        assert_eq!(pack_reserve_bytes(0, 0, 0), 0);
+    }
 }

@@ -300,17 +300,19 @@ fn published_ampr_ids() -> Option<u64> {
 /// derived tables it still needs (a whole file has no fast table), else
 /// paged. Takes `fd` (kept for a paged source, else closed).
 pub(crate) unsafe fn zstd_index_source(fd: c_int, len: u64) -> Option<&'static IndexSource> {
-    let mut head = [0u8; ampr_format::zstd::INDEX_HEADER_SIZE];
-    let derived = match index_pages::read_head(fd, &mut head)
-        .then(|| ampr_format::zstd::header_counts(&head).ok())
-        .flatten()
-    {
-        Some((files, chunks, volumes)) => {
-            lookup_bytes(files, chunks, u64::from(volumes), published_ampr_ids()).1
-        }
-        None => usize::MAX,
-    };
+    let derived = head_lookup_bytes(fd, published_ampr_ids()).map_or(usize::MAX, |(_, d)| d);
     unsafe { mount_index_source(&ZSTD_SOURCE, fd, len, derived) }
+}
+
+/// `lookup_bytes` (fast, derived) of the open index file `fd` from its
+/// header alone; None on a read error or a header that is not AMPRZPK1.
+pub(crate) fn head_lookup_bytes(fd: c_int, ampr_ids: Option<u64>) -> Option<(usize, usize)> {
+    let mut head = [0u8; ampr_format::zstd::INDEX_HEADER_SIZE];
+    if !index_pages::read_head(fd, &mut head) {
+        return None;
+    }
+    let (files, chunks, volumes) = ampr_format::zstd::header_counts(&head).ok()?;
+    Some(lookup_bytes(files, chunks, u64::from(volumes), ampr_ids))
 }
 
 /// manifest.rs `load_manifest`: runs the full `Index::open` validation

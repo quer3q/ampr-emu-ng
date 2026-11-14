@@ -145,12 +145,12 @@ CI (`.github/workflows/build.yml`) runs the same commands; a pushed `v*` tag cre
   listed at `STATIC_POOL_SIZE` in `rt/runtime_memory.rs` (1.56 MiB used; a
   host test fails on a new pool call). A build-time assert checks that the
   caps plus the budget fit the pool. Both PRX builds load to the same
-  168.47 MiB (PT_LOAD memsz, below 192 MiB; v0.3.4 loaded at 200.7 MiB):
+  168.52 MiB (PT_LOAD memsz, below 192 MiB; v0.3.4 loaded at 200.7 MiB):
   the release pool is 159.83 MiB
   (`AMPR_INTERNAL_POOL_SIZE` `0x9fd4000`), the debug one 158.47 MiB
   (`AMPR_DEBUG_POOL_SIZE` `0x9e78000`), the gap being the debug build's
-  larger non-pool part (10.01 vs 8.65 MiB). `AMPR_ZSTD_MMAP=1` grows both
-  pools by 448 KiB (168.91 MiB). `dist` fails when the two totals
+  larger non-pool part (10.06 vs 8.70 MiB). `AMPR_ZSTD_MMAP=1` grows both
+  pools by 448 KiB (168.96 MiB). `dist` fails when the two totals
   differ by more than 64 KiB or reach 192 MiB (`PRX_TOTAL_LIMIT` in
   `tools/verify_payload_prx.py --prx-totals`); then update the gap in the
   Makefile. A refused allocation degrades (index: one notice, packs
@@ -159,7 +159,12 @@ CI (`.github/workflows/build.yml`) runs the same commands; a pushed `v*` tag cre
   windows granted: there is no slow path for a read without one. Each index file
   (AMPRZPK1, AMPRPAK4, AMPRIDX3), in mount order, is read whole into
   index memory when it fits the room left with its tables
-  (`IndexSource::Resident`, `rt/index_pages.rs`); else it is read in
+  (`IndexSource::Resident`, `rt/index_pages.rs`). AMPRIDX3 loads first,
+  so it is read whole only when the least the pack index can mount with
+  still fits beside it (`pack_index_reserve` in `rt/pack/manifest.rs`,
+  from the pack index header: the file plus its derived tables, or its
+  fast and derived tables plus the 16 MiB arena floor); an AMPRIDX3 that
+  would starve the pack index is paged, sorted or not. Else a file is read in
   16 KiB pages through a page arena of at least 16 MiB
   (`INDEX_ARENA_MIN`), taken by the first paged file and grown by
   `grow_arena` to the room the tables leave. A paged file gets a fast
@@ -173,9 +178,11 @@ CI (`.github/workflows/build.yml`) runs the same commands; a pushed `v*` tag cre
   tables first, at mount, then 16 B of projection per AMPRIDX3 id and 4 B
   of order per packed file) are capped at 48 MiB (`INDEX_LOOKUP_MAX`); an
   index whose tables do not fit, or that would leave the arena below
-  16 MiB, is refused with the notice. A paged AMPRIDX3 must be sorted
-  (the runtime builder writes it sorted): an unsorted one is served only
-  read whole, else refused with the notice. Its header is checked
+  16 MiB, is refused with the notice. A paged AMPRIDX3 that is not
+  sorted (the external packer writes it unsorted) also gets a rank order,
+  4 B per file in the lookup cap, built at mount from a transient Index
+  scratch of 8 B per file plus its path blob, freed at once; when either
+  does not fit it is refused with the notice. Its header is checked
   before it takes the arena, and the arena goes back to the ledger when
   no paged file is left (a failed or replaced load). Hooks never wait on another thread
   for a page: a page another thread is loading, or a miss with no

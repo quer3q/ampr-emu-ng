@@ -144,6 +144,12 @@ pub(crate) struct Compact {
     /// The fast table of a paged file (`count` entries, `lookup_alloc`),
     /// null for an image in memory.
     pub fast: *mut FastEntry,
+    /// The rank order of a paged file that is not sorted (`count` ids,
+    /// `lookup_alloc`, `fill_order`), so `find_directory` binary-searches
+    /// it; null for a sorted or in-memory image.
+    pub order: *mut u32,
+    /// Record id order is folded path order (rt/pack/zstd.rs `build_order`
+    /// sorts itself when false); a rank `order` does not change it.
     pub sorted: bool,
     pub available: bool,
     /// The build walk saw a symlink and did not index it, so misses are not
@@ -171,6 +177,7 @@ impl Compact {
         fd: -1,
         mem: null_mut(),
         fast: null_mut(),
+        order: null_mut(),
         sorted: false,
         available: false,
         links: false,
@@ -537,6 +544,7 @@ impl Compact {
             index_pages::unregister(src);
         }
         unsafe { self.free_fast() };
+        unsafe { self.free_order() };
         // Host tests link no libkernel and register no file.
         #[cfg(not(test))]
         if self.fd >= 0 {
@@ -551,18 +559,33 @@ impl Compact {
         unsafe { self.clear() };
         *self = core::mem::replace(src, Self::EMPTY);
     }
-    /// O(1) lookup view over the validated image, with the fast table of
-    /// a paged file.
+    /// O(1) lookup view over the validated image, with the fast table and
+    /// the rank order of a paged file.
     pub fn view(&self) -> Option<Index<'_, IndexSource>> {
-        let view = Index::view_validated(self.src.as_ref()?, &self.layout).ok()?;
-        if self.fast.is_null() {
-            return Some(view);
+        let mut view = Index::view_validated(self.src.as_ref()?, &self.layout).ok()?;
+        if !self.fast.is_null() {
+            let fast = unsafe { core::slice::from_raw_parts(self.fast, self.count) };
+            view = view.with_fast(fast).ok()?;
         }
-        let fast = unsafe { core::slice::from_raw_parts(self.fast, self.count) };
-        view.with_fast(fast).ok()
+        if !self.order.is_null() {
+            // `check_compact` attached it once with the full id check.
+            let order = unsafe { core::slice::from_raw_parts(self.order, self.count) };
+            view = view.with_checked_order(order).ok()?;
+        }
+        Some(view)
     }
     fn fast_bytes(&self) -> usize {
         (self.count * size_of::<FastEntry>()).max(1)
+    }
+    fn order_bytes(&self) -> usize {
+        (self.count * size_of::<u32>()).max(1)
+    }
+    unsafe fn free_order(&mut self) {
+        if !self.order.is_null() {
+            let tag = c"apr.index.order.release".as_ptr();
+            unsafe { lookup_free(self.order.cast(), self.order_bytes(), tag) };
+            self.order = null_mut();
+        }
     }
     unsafe fn free_fast(&mut self) {
         if !self.fast.is_null() {
@@ -1439,15 +1462,35 @@ unsafe fn read_count(fd: c_int) -> Result<usize, LoadResult> {
         .map_err(load_error)
 }
 
+/// Whether an index file of `len` bytes and `count` records is read whole:
+/// it and `pack_reserve` (the least the pack index mounted after it needs,
+/// pack/manifest.rs `pack_index_reserve`, its derived tables included; a
+/// whole file has no fast table) fit `room`. Paged, it needs only its fast
+/// table and rank order, so a file that would starve the pack index is
+/// paged. With no reserve (no packs, or a manifest load already started)
+/// the tables a paged one would need are kept as the margin, as before.
+/// With one, `len` is rounded up to whole pages like the resident copy.
+fn whole_fits(len: u64, count: usize, pack_reserve: usize, room: usize) -> bool {
+    let len = usize::try_from(len).ok();
+    let (len, tables) = if pack_reserve == 0 {
+        (len, count.checked_mul(LOOKUP_PER_FILE))
+    } else {
+        let page = index_pages::PAGE;
+        (
+            len.and_then(|n| n.checked_next_multiple_of(page)),
+            Some(pack_reserve),
+        )
+    };
+    len.and_then(|n| n.checked_add(tables?))
+        .is_some_and(|n| n <= room)
+}
+
 /// The index file `fd` of `len` bytes and `count` records read whole, when
-/// it and the tables a paged one would need fit the Index room left; None
-/// otherwise (then it is paged) or on a read error.
+/// `whole_fits` the Index room left; None otherwise (then it is paged) or
+/// on a read error.
 unsafe fn read_whole(fd: c_int, len: u64, count: usize) -> Option<&'static [u8]> {
-    let fits = usize::try_from(len)
-        .ok()
-        .and_then(|n| n.checked_add(count.checked_mul(LOOKUP_PER_FILE)?))
-        .is_some_and(|n| n <= im::index_room());
-    if !fits {
+    let reserve = unsafe { super::pack::pack_index_reserve(count) };
+    if !whole_fits(len, count, reserve, im::index_room()) {
         return None;
     }
     unsafe { index_pages::read_resident(fd, len, c"apr.index.file") }
@@ -1477,9 +1520,9 @@ unsafe fn adopt_compact_index(idx: &mut FileIndexState, image: *mut u8, len: usi
 }
 
 /// Checks the image (`check_compact`) and marks `idx` available; clears
-/// it on any error. A read error is Unreadable; a fast table that does not
-/// fit, or a paged file that is not sorted, refuses the index (Memory)
-/// with the one index notice.
+/// it on any error. A read error is Unreadable; a fast table, or the rank
+/// order of a paged file that is not sorted and its build scratch, that
+/// does not fit refuses the index (Memory) with the one index notice.
 unsafe fn finish_compact(idx: &mut FileIndexState) -> LoadResult {
     let c = &mut idx.compact;
     match unsafe { check_compact(c) } {
@@ -1511,10 +1554,10 @@ fn load_error(e: ampr_format::Error) -> LoadResult {
 /// Sets `c`'s layout, count and sort flag from its source. A paged file
 /// gets its fast table first and is checked against it in one sequential
 /// pass over records and paths (`Index::check`), with no slot probe
-/// through the page cache. A paged file must be sorted: an unsorted one
-/// would answer `find_directory` with a scan of every record through the
-/// cache, so it is served only read whole (the runtime builder writes
-/// sorted images).
+/// through the page cache. A paged file that is not sorted (the external
+/// packer writes unsorted images) also gets a rank order (`attach_order`),
+/// so `find_directory` binary-searches it instead of scanning every record
+/// through the cache.
 unsafe fn check_compact(c: &mut Compact) -> Result<(), LoadResult> {
     let src = c.src.as_ref().ok_or(LoadResult::Invalid)?;
     let layout = ampr_format::index::read_layout(src).map_err(load_error)?;
@@ -1531,11 +1574,46 @@ unsafe fn check_compact(c: &mut Compact) -> Result<(), LoadResult> {
     }
     c.sorted = view.check().map_err(load_error)?;
     if paged && !c.sorted {
-        let len = ampr_format::source::Source::len(src);
-        let needed = usize::try_from(len).unwrap_or(usize::MAX);
+        unsafe { attach_order(c) }?;
+    }
+    Ok(())
+}
+
+/// The rank order of a paged unsorted index (`count` ids, one lookup
+/// allocation), filled by `Index::fill_order` from a transient Index
+/// scratch of 8 B per record plus the path blob, freed at once. Memory,
+/// with the index notice, when the scratch and the order do not fit the
+/// Index room or the order the lookup cap; Unreadable on a read error.
+/// On an error `clear` frees the order with the rest: nothing is served.
+unsafe fn attach_order(c: &mut Compact) -> Result<(), LoadResult> {
+    let src = c.src.as_ref().ok_or(LoadResult::Invalid)?;
+    let view = Index::view_validated(src, &c.layout).map_err(load_error)?;
+    let scratch_len = view.order_scratch_len().max(1);
+    let needed = scratch_len.saturating_add(c.order_bytes());
+    if im::lookup_used().saturating_add(c.order_bytes()) > im::INDEX_LOOKUP_MAX
+        || needed > im::index_room()
+    {
         unsafe { index_pages::refuse(needed) };
         return Err(LoadResult::Memory);
     }
+    let p = unsafe { lookup_alloc(c.order_bytes(), 4, c"apr.index.order".as_ptr()) };
+    if p.is_null() {
+        return Err(LoadResult::Memory);
+    }
+    c.order = p.cast();
+    let scratch = unsafe { build_alloc(scratch_len, c"apr.index.order.scratch") };
+    if scratch.is_null() {
+        return Err(LoadResult::Memory);
+    }
+    let order = unsafe { core::slice::from_raw_parts_mut(c.order, c.count) };
+    let filled = {
+        let buf = unsafe { core::slice::from_raw_parts_mut(scratch, scratch_len) };
+        view.fill_order(buf, order)
+    };
+    unsafe { title_free(scratch, c"apr.index.order.scratch.release") };
+    filled.map_err(load_error)?;
+    // The one full id check; `Compact::view` then attaches it in O(1).
+    view.with_order(order).map_err(load_error)?;
     Ok(())
 }
 
@@ -1543,7 +1621,8 @@ unsafe fn check_compact(c: &mut Compact) -> Result<(), LoadResult> {
 /// lookup allocation filled by one pass over its hash slots. Without it
 /// the index is refused: a paged lookup would probe slots through the
 /// page cache. Memory, with the index notice, when it and the pack tables
-/// built from it do not fit the lookup cap or the Index room.
+/// built from it do not fit the lookup cap or the Index room; a rank
+/// order, for an unsorted file only, is checked in `attach_order`.
 unsafe fn attach_fast(c: &mut Compact) -> Result<(), LoadResult> {
     let needed = c.count.saturating_mul(LOOKUP_PER_FILE);
     if im::lookup_used().saturating_add(needed) > im::INDEX_LOOKUP_MAX || needed > im::index_room()
@@ -3527,15 +3606,64 @@ mod tests {
             assert_eq!(view.find(b"/app0/none"), plain.find(b"/app0/none"));
             idx.compact.clear();
 
-            // An unsorted file is not paged: `find_directory` would scan
-            // every record through the cache. Refused with the notice.
+            // An unsorted file is paged with a rank order, so
+            // `find_directory` binary-searches it; its build scratch is
+            // given back at once and the order on `clear`.
             let unsorted: &'static [u8] = sized_image_in(n, 256 << 10, |i| i % 997).leak();
+            let scan = Index::open(unsorted).unwrap();
+            assert!(!scan.records_sorted());
             let src = index_pages::register_memory(unsorted.as_ptr(), unsorted.len());
             let mut idx = empty_state();
+            // Room for the tables but not the order scratch: refused with
+            // the notice, nothing kept.
+            let fill = im::index_room() - need - page;
+            let other = im::index_alloc(fill, page, c"test.other.tables".as_ptr());
+            assert!(!other.is_null());
+            let left = need + page - (n * 12).next_multiple_of(page);
+            assert!(scan.order_scratch_len() + n * 4 > left);
             idx.compact.src = Some(IndexSource::Paged(src.unwrap()));
             assert!(finish_compact(&mut idx) == LoadResult::Memory);
             assert!(im::test_take_index_notice());
-            assert!(!idx.available && idx.compact.src.is_none() && idx.compact.fast.is_null());
+            assert!(idx.compact.src.is_none() && idx.compact.order.is_null());
+            assert_eq!((im::test_index_used(), im::lookup_used()), (used + fill, 0));
+            im::index_free(other.cast(), c"test.other.tables.free".as_ptr());
+            let src = index_pages::register_memory(unsorted.as_ptr(), unsorted.len());
+            idx.compact.src = Some(IndexSource::Paged(src.unwrap()));
+            let before = im::test_index_used();
+            assert!(finish_compact(&mut idx) == LoadResult::Loaded);
+            assert!(!im::test_take_index_notice());
+            assert!(idx.available && !idx.compact.sorted && !idx.compact.order.is_null());
+            let tables = (n * 12).next_multiple_of(page) + (n * 4).next_multiple_of(page);
+            assert_eq!(im::lookup_used(), tables);
+            assert_eq!(im::test_index_used(), before + tables);
+            let view = idx.compact.view().unwrap();
+            assert!(view.has_fast() && view.has_order());
+            let keys: [&[u8]; 6] = [
+                b"/app0",
+                b"/app0/d000",
+                b"/app0/d500",
+                b"/app0/d996",
+                b"/app0/d997",
+                b"/app0/zzz",
+            ];
+            for key in keys {
+                let got = view.find_directory(key, idx.compact.sorted).unwrap();
+                let want = scan.find_directory(key, false).unwrap();
+                assert_eq!(got.is_some(), want.is_some(), "{key:?}");
+                if let Some(id) = got {
+                    let path = scan.path(&scan.record(id).unwrap(), &mut buf).unwrap();
+                    assert!(path.starts_with(key) && path[key.len()] == b'/', "{key:?}");
+                }
+            }
+            assert!(view.find_directory(b"/app0/d500", false).unwrap().is_some());
+            for id in [1, n as u32 / 2, n as u32] {
+                let path = scan.path(&scan.record(id).unwrap(), &mut buf).unwrap();
+                assert_eq!(view.find(path), Ok(Some(id)));
+            }
+            assert_eq!(view.find(b"/app0/none"), Ok(None));
+            idx.compact.clear();
+            assert_eq!(im::lookup_used(), 0);
+            assert!(idx.compact.order.is_null());
         }
         assert_eq!(im::test_index_used(), used);
         assert_eq!(im::lookup_used(), 0);
@@ -3597,5 +3725,35 @@ mod tests {
         assert!(rc == LoadResult::Invalid);
         assert!(!idx.available && idx.compact.src.is_none() && idx.compact.mem.is_null());
         assert_eq!(im::test_index_used(), used);
+    }
+
+    /// The field case: an AMPRIDX3 of 34,358,192 B and 223,180 records fits
+    /// the 64 MiB Index ledger whole alone, but with the LZ4 index after it
+    /// (223,180 files, 1,513,210 chunks, 18 packs, paged: its tables plus
+    /// the arena floor) it does not, so it is paged; paged, both fit the
+    /// ledger and the lookup cap.
+    #[test]
+    fn a_file_index_that_starves_the_pack_index_is_paged() {
+        use super::super::index_memory as im;
+        let (len, count, room) = (34_358_192u64, 223_180usize, im::INDEX_MEMORY_MAX);
+        let (fast, order) = (28_871_736usize, 892_720usize);
+        let reserve = super::super::pack::pack_reserve_bytes(u64::MAX, fast, order);
+        let round = |n: usize| n.next_multiple_of(index_pages::PAGE);
+        assert_eq!(reserve, round(fast) + round(order) + im::INDEX_ARENA_MIN);
+        assert!(whole_fits(len, count, 0, room));
+        assert!(!whole_fits(len, count, reserve, room));
+        // With a reserve the paged-only tables are not added: a file that
+        // fits beside the pack index stays whole.
+        let tight = (len as usize).next_multiple_of(index_pages::PAGE) + reserve;
+        assert!(whole_fits(len, count, reserve, tight));
+        assert!(!whole_fits(len, count, reserve, tight - 1));
+        let paged = count * (size_of::<FastEntry>() + size_of::<u32>());
+        assert!(paged + reserve <= room);
+        assert!(paged + fast + order <= im::INDEX_LOOKUP_MAX);
+        // Saturating inputs never fit.
+        assert!(!whole_fits(u64::MAX, count, 0, usize::MAX));
+        assert!(!whole_fits(0, usize::MAX, 0, usize::MAX));
+        assert!(!whole_fits(len, count, usize::MAX, usize::MAX));
+        assert!(whole_fits(0, 0, 0, 0));
     }
 }

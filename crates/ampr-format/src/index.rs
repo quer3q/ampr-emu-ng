@@ -194,6 +194,10 @@ pub struct Index<'s, S: Source + ?Sized = [u8]> {
     /// id. With it `find` reads the source only to confirm a path whose
     /// hash matches, instead of probing the on-disk slots.
     fast: Option<&'s [FastEntry]>,
+    /// The rank order (`fill_order`): `order[rank]` is the one-based id of
+    /// the record at that rank in folded order. With it `find_directory`
+    /// binary-searches an unsorted image instead of scanning every record.
+    order: Option<&'s [u32]>,
     layout: Layout,
     paths_at: u64,
     path_bytes: u64,
@@ -227,6 +231,7 @@ impl<'s, S: Source + ?Sized> Index<'s, S> {
         Ok(Self {
             src,
             fast: None,
+            order: None,
             layout: *layout,
             paths_at: layout.paths_at,
             path_bytes: layout.path_bytes,
@@ -317,6 +322,99 @@ impl<'s, S: Source + ?Sized> Index<'s, S> {
     /// Whether `find` searches the resident fast table.
     pub fn has_fast(&self) -> bool {
         self.fast.is_some()
+    }
+
+    // ---- rank order ----
+
+    /// Scratch bytes `fill_order` needs: 8 B per record (path offset and
+    /// length) plus the whole path blob, so the sort compares paths in
+    /// memory and reads the source in one sequential pass.
+    pub fn order_scratch_len(&self) -> usize {
+        self.count as usize * 8 + self.path_bytes as usize
+    }
+
+    /// Fills `order` (`len` long) with every record id in folded `compare`
+    /// order, ties by id, so a packer image that is not sorted can still
+    /// be binary-searched by `find_directory`. Reads the records in 4 KiB
+    /// blocks and the path blob in 64 KiB blocks into `scratch` (at least
+    /// `order_scratch_len`), then sorts in memory. `Invalid` for a short
+    /// `order` or `scratch` or a record outside the blob; a read error is
+    /// returned and `order` must not be used.
+    pub fn fill_order(&self, scratch: &mut [u8], order: &mut [u32]) -> Result<()> {
+        let n = self.count as usize;
+        if order.len() != n || scratch.len() < self.order_scratch_len() {
+            return Err(Error::Invalid);
+        }
+        let (table, rest) = scratch.split_at_mut(n * 8);
+        let blob = &mut rest[..self.path_bytes as usize];
+        let mut buf = [0u8; 4096];
+        let per = buf.len() / IDX_RECORD;
+        let mut id = 0usize;
+        while id < n {
+            let take = (n - id).min(per);
+            let block = &mut buf[..take * IDX_RECORD];
+            self.src
+                .read_at(IDX_HEADER as u64 + (id * IDX_RECORD) as u64, block)?;
+            for r in block.as_chunks::<IDX_RECORD>().0 {
+                let (off, len) = (u32_at(r, 0)?, u32_at(r, 4)?);
+                if len as usize >= PATH_BUF || u64::from(off) + u64::from(len) >= self.path_bytes {
+                    return Err(Error::Invalid);
+                }
+                put_u32(table, id * 8, off)?;
+                put_u32(table, id * 8 + 4, len)?;
+                id += 1;
+            }
+        }
+        for (i, chunk) in blob.chunks_mut(64 << 10).enumerate() {
+            self.src
+                .read_at(self.paths_at + (i as u64) * (64 << 10), chunk)?;
+        }
+        let (table, blob) = (&*table, &*blob);
+        for (i, slot) in order.iter_mut().enumerate() {
+            *slot = i as u32 + 1;
+        }
+        order.sort_unstable_by(|&a, &b| {
+            compare(order_path(table, blob, a), order_path(table, blob, b)).then(a.cmp(&b))
+        });
+        Ok(())
+    }
+
+    /// Makes `find_directory` search by rank through `order` (filled by
+    /// `fill_order` from this index). O(len): `Invalid` when its length
+    /// does not match or an id is outside 1..=len.
+    pub fn with_order(mut self, order: &'s [u32]) -> Result<Self> {
+        if order.len() != self.count as usize || order.iter().any(|&id| id == 0 || id > self.count)
+        {
+            return Err(Error::Invalid);
+        }
+        self.order = Some(order);
+        Ok(self)
+    }
+
+    /// `with_order` for an order `with_order` already accepted: O(1), as
+    /// the runtime takes a view per lookup; `Invalid` when its length does
+    /// not match. An id outside 1..=len would read as `OutOfRange` from
+    /// `record`, never out of bounds.
+    pub fn with_checked_order(mut self, order: &'s [u32]) -> Result<Self> {
+        if order.len() != self.count as usize {
+            return Err(Error::Invalid);
+        }
+        self.order = Some(order);
+        Ok(self)
+    }
+
+    /// Whether `find_directory` searches by the rank order.
+    pub fn has_order(&self) -> bool {
+        self.order.is_some()
+    }
+
+    /// The record id at `rank`: through the order when attached, else the
+    /// record at that position.
+    fn id_at(&self, rank: u32) -> Result<u32> {
+        match self.order {
+            Some(order) => order.get(rank as usize).copied().ok_or(Error::OutOfRange),
+            None => Ok(rank + 1),
+        }
     }
 
     /// One-based record `id`. Bounds are checked (the path and its NUL fit
@@ -486,20 +584,21 @@ impl<S: Source + ?Sized> Index<'_, S> {
         Ok(true)
     }
 
-    /// Finds a record below the normalized directory `key`. Sorted indexes
-    /// probe only the lower bound of `key/`; unsorted runtime images fall
-    /// back to a linear scan. A read error is returned, not a miss: the
-    /// caller must not answer ENOENT for it.
+    /// Finds a record below the normalized directory `key`. Sorted indexes,
+    /// and any index with a rank order (`with_order`), probe only the lower
+    /// bound of `key/`; unsorted runtime images fall back to a linear scan.
+    /// A read error is returned, not a miss: the caller must not answer
+    /// ENOENT for it.
     pub fn find_directory(&self, key: &[u8], sorted: bool) -> Result<Option<u32>> {
         let mut buf = [0u8; PATH_BUF];
-        let (first, end) = if sorted {
+        let (first, end) = if sorted || self.order.is_some() {
             if key.len() > RUNTIME_KEY_CAPACITY - 2 {
                 return Ok(None);
             }
             let (mut first, mut last) = (0u32, self.count);
             while first < last {
                 let middle = first + (last - first) / 2;
-                let rec = self.record(middle + 1)?;
+                let rec = self.record(self.id_at(middle)?)?;
                 if compare_dir_prefix(self.path(&rec, &mut buf)?, key) == Ordering::Less {
                     first = middle + 1;
                 } else {
@@ -510,7 +609,8 @@ impl<S: Source + ?Sized> Index<'_, S> {
         } else {
             (0, self.count)
         };
-        for id in first + 1..=end {
+        for rank in first..end {
+            let id = self.id_at(rank)?;
             if is_descendant(self.path(&self.record(id)?, &mut buf)?, key) {
                 return Ok(Some(id));
             }
@@ -560,6 +660,17 @@ impl<S: Source + ?Sized> Index<'_, S> {
         }
         Ok(None)
     }
+}
+
+/// Record `id`'s path in `fill_order`'s scratch. `fill_order` checked every
+/// offset and length against the blob, so the empty fallback is unreachable.
+fn order_path<'a>(table: &[u8], blob: &'a [u8], id: u32) -> &'a [u8] {
+    let at = (id as usize - 1) * 8;
+    let (Ok(off), Ok(len)) = (u32_at(table, at), u32_at(table, at + 4)) else {
+        return &[];
+    };
+    blob.get(off as usize..off as usize + len as usize)
+        .unwrap_or(&[])
 }
 
 fn folded_eq(a: &[u8], b: &[u8]) -> bool {
@@ -740,6 +851,99 @@ mod tests {
         assert_eq!(index.find(&names[0]), Err(Error::Io));
         assert_eq!(index.find_directory(b"/app0/d3", false), Err(Error::Io));
         assert_eq!(index.try_records_sorted(), Err(Error::Io));
+    }
+
+    /// An unsorted image with a rank order answers `find_directory` as the
+    /// sorted image of the same paths does, and finds what the scan finds.
+    #[test]
+    fn rank_order_searches_an_unsorted_image() {
+        // 2000 paths: the record pass crosses 4 KiB blocks and the path
+        // blob crosses 64 KiB blocks.
+        let names: Vec<Vec<u8>> = (0..2000)
+            .map(|i| std::format!("/app0/Dir{}/sub{}/file_{i}_pad.bin", i % 13, i % 5).into_bytes())
+            .collect();
+        let refs: Vec<&[u8]> = names.iter().map(|n| &n[..]).collect();
+        let mut sorted_refs = refs.clone();
+        sorted_refs.sort_by(|a, b| compare(a, b));
+        let (bytes, sorted_bytes) = (image(&refs), image(&sorted_refs));
+        let src = Counting {
+            bytes: bytes.clone(),
+            reads: Cell::new(0),
+            fail: Cell::new(false),
+        };
+        let scan = Index::open(&src).unwrap();
+        let sorted = Index::open(&sorted_bytes[..]).unwrap();
+        assert!(!scan.records_sorted() && sorted.records_sorted());
+        assert!(scan.layout().path_bytes > 64 << 10);
+        let mut scratch = std::vec![0u8; scan.order_scratch_len()];
+        let mut order = std::vec![0u32; scan.len() as usize];
+        scan.fill_order(&mut scratch, &mut order).unwrap();
+        let (mut x, mut y) = ([0u8; PATH_BUF], [0u8; PATH_BUF]);
+        let path_of = |index: &Index<'_, Counting>, id: u32, buf: &mut [u8; PATH_BUF]| {
+            index
+                .path(&index.record(id).unwrap(), buf)
+                .unwrap()
+                .to_vec()
+        };
+        let ranked: Vec<Vec<u8>> = order.iter().map(|&id| path_of(&scan, id, &mut x)).collect();
+        assert_eq!(ranked, sorted_refs);
+        let ordered = Index::open(&src).unwrap().with_order(&order).unwrap();
+        assert!(ordered.has_order() && !scan.has_order());
+        let keys: [&[u8]; 8] = [
+            b"/app0",
+            b"/app0/dir3",
+            b"/app0/dir3/sub2",
+            b"/app0/dir12/sub4",
+            b"/app0/dir1/sub",
+            b"/app0/dir3/sub9",
+            b"/app0/missing",
+            b"/app1",
+        ];
+        for key in keys {
+            let linear = scan.find_directory(key, false).unwrap();
+            let want = sorted.find_directory(key, true).unwrap();
+            let got = ordered.find_directory(key, false).unwrap();
+            assert_eq!(got.is_some(), linear.is_some(), "{key:?}");
+            assert_eq!(got.is_some(), want.is_some(), "{key:?}");
+            if let (Some(got), Some(want)) = (got, want) {
+                let w = sorted.path(&sorted.record(want).unwrap(), &mut y).unwrap();
+                assert_eq!(path_of(&ordered, got, &mut x), w, "{key:?}");
+                assert!(is_descendant(w, key));
+            }
+        }
+        // A wrong length or an id outside 1..=len is refused.
+        assert!(Index::open(&src).unwrap().with_order(&order[1..]).is_err());
+        let mut bad = order.clone();
+        bad[7] = 0;
+        assert!(Index::open(&src).unwrap().with_order(&bad).is_err());
+        bad[7] = scan.len() + 1;
+        assert!(Index::open(&src).unwrap().with_order(&bad).is_err());
+        // The O(1) attach checks only the length.
+        let checked = Index::open(&src)
+            .unwrap()
+            .with_checked_order(&order)
+            .unwrap();
+        assert_eq!(
+            checked.find_directory(b"/app0/dir3", false),
+            ordered.find_directory(b"/app0/dir3", false)
+        );
+        assert!(Index::open(&src)
+            .unwrap()
+            .with_checked_order(&order[1..])
+            .is_err());
+        // Short buffers are refused; a read error is returned.
+        let (short, mut spare) = (scan.order_scratch_len() - 1, order.clone());
+        assert_eq!(
+            scan.fill_order(&mut scratch[..short], &mut spare),
+            Err(Error::Invalid)
+        );
+        assert_eq!(
+            scan.fill_order(&mut scratch, &mut spare[1..]),
+            Err(Error::Invalid)
+        );
+        src.fail.set(true);
+        assert_eq!(scan.fill_order(&mut scratch, &mut spare), Err(Error::Io));
+        assert_eq!(ordered.find_directory(b"/app0/dir3", false), Err(Error::Io));
     }
 
     #[test]
