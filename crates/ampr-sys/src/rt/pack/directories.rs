@@ -358,7 +358,7 @@ pub(crate) unsafe fn ampr_pack_open_directory_impl(
             close_real_fd(real_fd);
             return SCE_KERNEL_ERROR_EMFILE;
         }
-        encode_virtual_directory_fd(slot, (*state).virtual_directories[slot as usize].generation)
+        encode_virtual_directory_fd(slot)
     }
 }
 
@@ -535,16 +535,13 @@ pub unsafe fn ampr_pack_try_reachability(path: *const c_char, handled: *mut bool
 }
 
 pub unsafe fn ampr_pack_is_virtual_directory_fd(fd: c_int) -> bool {
-    let mut slot = 0u32;
-    let mut generation = 0u16;
     unsafe {
-        if !decode_virtual_directory_fd(fd, &mut slot, &mut generation) {
+        let Some(slot) = decode_virtual_directory_fd(fd) else {
             return false;
-        }
+        };
         let state = pack_state();
         let _lock = DIRECTORY_MUTEXES[slot as usize].lock();
-        let s = &(*state).virtual_directories[slot as usize];
-        s.active && s.generation == generation
+        (*state).virtual_directories[slot as usize].active
     }
 }
 
@@ -553,15 +550,14 @@ pub unsafe fn ampr_pack_is_virtual_directory_fd(fd: c_int) -> bool {
 /// probes (rt/probe.rs) log it so `/fsfail` dedups by directory.
 #[cfg(feature = "mem_report")]
 pub(crate) unsafe fn virtual_directory_fd_path(fd: c_int, out: &mut [u8]) -> Option<usize> {
-    let mut slot = 0u32;
-    let mut generation = 0u16;
-    if out.is_empty() || !unsafe { decode_virtual_directory_fd(fd, &mut slot, &mut generation) } {
+    if out.is_empty() {
         return None;
     }
+    let slot = decode_virtual_directory_fd(fd)?;
     let state = unsafe { pack_state() };
     let _lock = DIRECTORY_MUTEXES[slot as usize].lock();
     let s = unsafe { &(*state).virtual_directories[slot as usize] };
-    if !s.active || s.generation != generation {
+    if !s.active {
         return None;
     }
     let n = (s.path_length as usize).min(s.path.len()).min(out.len() - 1);
@@ -577,14 +573,12 @@ pub unsafe fn ampr_pack_try_close_fd(fd: c_int, handled: *mut bool) -> c_int {
         if !handled.is_null() {
             *handled = false;
         }
-        // A tagged directory fd or an open synthetic packed fd is decided before
+        // An open synthetic directory fd or packed fd is decided before
         // pack_state(): a physical fd (the runtime's own closes reach here
         // through libkernel's `close` -> `_close` hook) must never create or
         // wait on the pack state. tune::load inside pack_state_create once
         // hung here spinning on that state.
-        let mut index = 0u32;
-        let mut generation = 0u16;
-        if decode_virtual_directory_fd(fd, &mut index, &mut generation) {
+        if let Some(index) = decode_virtual_directory_fd(fd) {
             if !handled.is_null() {
                 *handled = true;
             }
@@ -599,15 +593,14 @@ pub unsafe fn ampr_pack_try_close_fd(fd: c_int, handled: *mut bool) -> c_int {
                 // each real fd is closed exactly once.
                 let _lock = DIRECTORY_MUTEXES[index as usize].lock();
                 let slot = &mut (*state).virtual_directories[index as usize];
-                if !slot.active || slot.generation != generation {
+                if !slot.active {
                     return SCE_KERNEL_ERROR_EBADF;
                 }
                 real_fd = slot.real_fd;
-                let preserved_generation = slot.generation;
                 // `slot = {}` in place (the slot is ~5 KiB; EMPTY is zero but realFd).
                 (slot as *mut VirtualDirectorySlot).write_bytes(0, 1);
                 slot.real_fd = -1;
-                slot.generation = preserved_generation;
+                VIRTUAL_DIRECTORY_LIVE[index as usize].store(false, Ordering::Release);
             }
             if real_fd < 0 {
                 return 0;
@@ -656,10 +649,8 @@ pub unsafe fn ampr_pack_try_fstat_fd(
         if stat.is_null() {
             return SCE_KERNEL_ERROR_EFAULT;
         }
-        // Tag decode before pack_state(), as in ampr_pack_try_close_fd.
-        let mut index = 0u32;
-        let mut generation = 0u16;
-        if decode_virtual_directory_fd(fd, &mut index, &mut generation) {
+        // Range decode before pack_state(), as in ampr_pack_try_close_fd.
+        if let Some(index) = decode_virtual_directory_fd(fd) {
             if !handled.is_null() {
                 *handled = true;
             }
@@ -669,7 +660,7 @@ pub unsafe fn ampr_pack_try_fstat_fd(
                 return SCE_KERNEL_ERROR_EBADF;
             }
             let slot = &(*state).virtual_directories[index as usize];
-            if !slot.active || slot.generation != generation {
+            if !slot.active {
                 return SCE_KERNEL_ERROR_EBADF;
             }
             fill_synthetic_stat(
@@ -919,11 +910,9 @@ unsafe fn directory_read_fd(
         if !handled.is_null() {
             *handled = false;
         }
-        let mut index = 0u32;
-        let mut generation = 0u16;
-        if !decode_virtual_directory_fd(fd, &mut index, &mut generation) {
+        let Some(index) = decode_virtual_directory_fd(fd) else {
             return SCE_KERNEL_ERROR_EBADF;
-        }
+        };
         if !handled.is_null() {
             *handled = true;
         }
@@ -944,7 +933,7 @@ unsafe fn directory_read_fd(
         // The slot is guarded by its directory mutex; `state` is read alongside.
         let slot = &mut *(&raw const (*state).virtual_directories[index as usize]
             as *mut VirtualDirectorySlot);
-        if !slot.active || slot.generation != generation {
+        if !slot.active {
             return SCE_KERNEL_ERROR_EBADF;
         }
 

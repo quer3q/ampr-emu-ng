@@ -127,24 +127,29 @@ pub(crate) fn decode_virtual_fd(fd: c_int) -> Option<u32> {
     packed_fd_slot(fd as u32)
 }
 
-pub(crate) fn encode_virtual_directory_fd(slot: u32, generation: u16) -> c_int {
-    ampr_rust_virtual_encode(VIRTUAL_KIND_DIRECTORY_FD, slot, generation) as c_int
+/// The number a directory slot has: `DIRECTORY_BASE + slot`.
+pub(crate) fn encode_virtual_directory_fd(slot: u32) -> c_int {
+    (AMPR_EMU_PACK_VIRTUAL_DIRECTORY_BASE as u32 + slot) as c_int
 }
 
-pub(crate) unsafe fn decode_virtual_directory_fd(
-    fd: c_int,
-    slot: *mut u32,
-    generation: *mut u16,
-) -> bool {
-    unsafe {
-        ampr_rust_virtual_decode(
-            VIRTUAL_KIND_DIRECTORY_FD,
-            fd as u32,
-            AMPR_EMU_PACK_VIRTUAL_DIRECTORY_SLOTS as u32,
-            slot,
-            generation,
-        )
+/// Open slot named by a synthetic directory fd, or None for a number outside
+/// `DIRECTORY_BASE..DIRECTORY_BASE + SLOTS` or whose slot is closed. Callers
+/// confirm the slot under its DIRECTORY_MUTEXES entry with `active`: a slot
+/// closed and opened again keeps its number, as a kernel fd would.
+fn directory_fd_slot(value: u32) -> Option<u32> {
+    let slot = value.checked_sub(AMPR_EMU_PACK_VIRTUAL_DIRECTORY_BASE as u32)?;
+    ((slot as usize) < AMPR_EMU_PACK_VIRTUAL_DIRECTORY_SLOTS
+        && VIRTUAL_DIRECTORY_LIVE[slot as usize].load(Ordering::Acquire))
+    .then_some(slot)
+}
+
+/// Decided before `pack_state()`, like `decode_virtual_fd`: a physical fd never
+/// creates or waits on the pack state.
+pub(crate) fn decode_virtual_directory_fd(fd: c_int) -> Option<u32> {
+    if fd < 0 || g_pack_state.load(Ordering::Acquire).is_null() {
+        return None;
     }
+    directory_fd_slot(fd as u32)
 }
 
 pub(crate) fn encode_virtual_aio(slot: u32, generation: u16) -> SceKernelAioSubmitId {
@@ -738,6 +743,41 @@ mod tests {
         assert!(!pread_loop(1, 0, 4, |_, _, _| -1, || EINTR + 1), "EIO");
         assert!(!pread_loop(1, off_t::MAX as u64, 4, |_, _, _| 1, || 0));
         assert!(!pread_loop(2, 0, 4, |_, _, _| 3, || 0), "rc above request");
+    }
+
+    /// A directory fd is `DIRECTORY_BASE + slot`, claimed only while its slot
+    /// is open, and the packed and directory ranges never overlap, so a stale
+    /// number cannot decode as the other kind.
+    #[test]
+    fn directory_fd_range_and_slot_reuse() {
+        let base = AMPR_EMU_PACK_VIRTUAL_DIRECTORY_BASE as u32;
+        let end = base + AMPR_EMU_PACK_VIRTUAL_DIRECTORY_SLOTS as u32;
+        let last = AMPR_EMU_PACK_VIRTUAL_DIRECTORY_SLOTS - 1;
+        assert_eq!(end, 1024, "top of the range a title accepts");
+        assert_eq!(encode_virtual_directory_fd(0), base as c_int);
+        assert_eq!(encode_virtual_directory_fd(last as u32), end as c_int - 1);
+        // A closed slot's number is not claimed: it goes to the kernel.
+        assert_eq!(directory_fd_slot(base), None);
+        VIRTUAL_DIRECTORY_LIVE[0].store(true, Ordering::Release);
+        VIRTUAL_DIRECTORY_LIVE[last].store(true, Ordering::Release);
+        assert_eq!(directory_fd_slot(base - 1), None);
+        assert_eq!(directory_fd_slot(base), Some(0));
+        assert_eq!(directory_fd_slot(end - 1), Some(last as u32));
+        assert_eq!(directory_fd_slot(end), None);
+        // The old tagged value is not a directory fd any more.
+        assert_eq!(directory_fd_slot(0x6700_0000), None);
+        VIRTUAL_DIRECTORY_LIVE[0].store(false, Ordering::Release);
+        VIRTUAL_DIRECTORY_LIVE[last].store(false, Ordering::Release);
+        assert_eq!(directory_fd_slot(base), None);
+
+        // Packed numbers never decode as a directory, nor the reverse.
+        VIRTUAL_FD_LIVE[AMPR_EMU_PACK_VIRTUAL_FD_SLOTS - 1].store(true, Ordering::Release);
+        VIRTUAL_DIRECTORY_LIVE[0].store(true, Ordering::Release);
+        let packed_top = (AMPR_EMU_PACK_VIRTUAL_FD_BASE + AMPR_EMU_PACK_VIRTUAL_FD_SLOTS - 1) as u32;
+        assert_eq!(directory_fd_slot(packed_top), None);
+        assert_eq!(packed_fd_slot(base), None);
+        VIRTUAL_FD_LIVE[AMPR_EMU_PACK_VIRTUAL_FD_SLOTS - 1].store(false, Ordering::Release);
+        VIRTUAL_DIRECTORY_LIVE[0].store(false, Ordering::Release);
     }
 
     #[test]

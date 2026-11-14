@@ -835,7 +835,7 @@ unsafe fn virtual_read_target(fd: c_int, handled: *mut bool, rc: &mut ssize_t) -
         }
         return Some(index);
     }
-    if unsafe { decode_virtual_directory_fd(fd, null_mut(), null_mut()) } {
+    if decode_virtual_directory_fd(fd).is_some() {
         if !handled.is_null() {
             unsafe { *handled = true };
         }
@@ -1140,11 +1140,9 @@ pub unsafe fn ampr_pack_try_lseek_fd(
     }
     // Decode before pack_state(), as in ampr_pack_try_close_fd: a physical
     // fd never creates or waits on the pack state.
-    let mut index = 0u32;
-    let mut generation = 0u16;
-    if !unsafe { decode_virtual_directory_fd(fd, &mut index, &mut generation) } {
+    let Some(index) = decode_virtual_directory_fd(fd) else {
         return SCE_KERNEL_ERROR_EBADF as off_t;
-    }
+    };
     let state = unsafe { pack_state() };
     if !handled.is_null() {
         unsafe { *handled = true };
@@ -1157,7 +1155,7 @@ pub unsafe fn ampr_pack_try_lseek_fd(
         return SCE_KERNEL_ERROR_EBADF as off_t;
     }
     let slot = &mut (*state).virtual_directories[index as usize];
-    if !slot.active || slot.generation != generation {
+    if !slot.active {
         return SCE_KERNEL_ERROR_EBADF as off_t;
     }
     if slot.real_fd >= 0 {
@@ -1553,9 +1551,8 @@ unsafe fn close_pack_and_directory_fds(state: *mut PackState) {
                     directory_fds[directory_fd_count] = (*directory).real_fd;
                     directory_fd_count += 1;
                 }
-                let generation = (*directory).generation;
                 directory.write(VirtualDirectorySlot::EMPTY);
-                (*directory).generation = generation;
+                VIRTUAL_DIRECTORY_LIVE[i].store(false, Ordering::Release);
             }
         }
     }

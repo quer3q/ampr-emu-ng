@@ -101,10 +101,10 @@ pub(crate) unsafe fn lookup_virtual_aio_group_locked(
 
 /// Takes a free slot and returns the synthetic packed fd `BASE + slot`.
 /// No kernel descriptor is involved: the range is above the kernel's
-/// effective fd table (259) and below the strictest title limit (one title
-/// rejects fd >= 1024). A closed slot is reused, so the number behaves like
-/// a reused OS fd. Returns an SCE error (never a positive value) when all
-/// slots are open.
+/// effective fd table (259) and below the directory range and the strictest
+/// title limit (one title rejects fd >= 1024). A closed slot is reused, so the
+/// number behaves like a reused OS fd. Returns an SCE error (never a positive
+/// value) when all slots are open.
 pub(crate) unsafe fn allocate_virtual_fd_locked(state: *mut PackState, file_id: u32) -> c_int {
     let slots = AMPR_EMU_PACK_VIRTUAL_FD_SLOTS as u32;
     let index = ((*state).virtual_fd_cursor..slots)
@@ -306,10 +306,8 @@ pub(crate) unsafe fn allocate_virtual_directory_locked(
             if slot.active {
                 continue;
             }
-            let generation = next_generation(slot.generation) as u16;
             *slot = VirtualDirectorySlot::EMPTY;
             slot.real_fd = real_fd;
-            slot.generation = generation;
             slot.active = true;
             slot.range_begin = range_begin;
             slot.range_end = range_end;
@@ -319,6 +317,7 @@ pub(crate) unsafe fn allocate_virtual_directory_locked(
                 core::ptr::copy_nonoverlapping(path, slot.path.as_mut_ptr(), path_length as usize)
             };
             slot.path[path_length as usize] = 0;
+            VIRTUAL_DIRECTORY_LIVE[index as usize].store(true, Ordering::Release);
             (*state).virtual_directory_cursor = (index + 1) % slots;
             return index;
         }

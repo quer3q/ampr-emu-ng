@@ -1,15 +1,17 @@
-//! Virtual handle encoding: directory fds, AIO submit ids and AIO group ids
-//! share one 32-bit layout, `tag(8) | generation(16) | slot(8)`. Packed-file
-//! fds are plain synthetic numbers in `512..1024` (ampr-sys `rt/pack/mod.rs`
-//! `AMPR_EMU_PACK_VIRTUAL_FD_BASE`), not tagged handles.
+//! Virtual handle encoding: AIO submit ids and AIO group ids share one 32-bit
+//! layout, `tag(8) | generation(16) | slot(8)`. A submit id never passes a
+//! title's fd range check, so it can stay large. Packed-file fds and
+//! directory fds are plain synthetic numbers below 1024 (ampr-sys
+//! `rt/pack/mod.rs` `AMPR_EMU_PACK_VIRTUAL_FD_BASE` and
+//! `AMPR_EMU_PACK_VIRTUAL_DIRECTORY_BASE`), not tagged handles: one title
+//! rejects fd numbers >= 1024.
 
 /// Handle kinds; the discriminant is the C ABI value.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u32)]
 pub enum Kind {
     Aio = 1,
-    DirectoryFd = 2,
-    AioGroup = 3,
+    AioGroup = 2,
 }
 
 pub const TAG_MASK: u32 = 0xff00_0000;
@@ -19,8 +21,7 @@ impl Kind {
     pub fn from_u32(value: u32) -> Option<Self> {
         Some(match value {
             1 => Self::Aio,
-            2 => Self::DirectoryFd,
-            3 => Self::AioGroup,
+            2 => Self::AioGroup,
             _ => return None,
         })
     }
@@ -29,7 +30,6 @@ impl Kind {
     pub fn tag(self) -> u32 {
         match self {
             Self::Aio => 0x6600_0000,
-            Self::DirectoryFd => 0x6700_0000,
             Self::AioGroup => 0x6800_0000,
         }
     }
@@ -73,15 +73,14 @@ mod tests {
         assert_eq!(aio, 0x66be_ef03);
         assert_eq!(decode(Kind::Aio, aio, 256), Some((3, 0xbeef)));
         assert_eq!(decode(Kind::Aio, aio, 3), None);
-        assert_eq!(decode(Kind::DirectoryFd, aio, 256), None);
+        assert_eq!(decode(Kind::AioGroup, aio, 256), None);
         // A plain low fd is never a tagged handle.
         assert_eq!(decode(Kind::Aio, 3, 256), None);
         assert_eq!(Kind::from_u32(0), None);
         let group = encode(Kind::AioGroup, 255, 1);
         assert_eq!(decode(Kind::AioGroup, group, 256), Some((255, 1)));
-        assert_eq!(
-            decode(Kind::DirectoryFd, 0x6700_0000 | 9, 256),
-            Some((9, 0))
-        );
+        // The directory tag is gone: a value with it decodes as nothing.
+        assert_eq!(decode(Kind::Aio, 0x6700_0000 | 9, 256), None);
+        assert_eq!(decode(Kind::AioGroup, 0x6700_0000 | 9, 256), None);
     }
 }

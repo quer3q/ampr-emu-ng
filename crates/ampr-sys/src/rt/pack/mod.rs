@@ -643,6 +643,11 @@ pub(crate) const AMPR_EMU_PACK_RUNTIME_PROFILE_PATH: &CStr = c"/app0/ampr_assets
 pub(crate) const AMPR_EMU_PACK_ROOT_PATH: &CStr = c"/app0";
 pub(crate) const AMPR_EMU_PACK_LOGICAL_ROOT_PATH: &CStr = c"/app0";
 
+/// Directories open at once through the index (a directory missing on disk,
+/// or opened with O_DIRECTORY). The numbers are plain, `DIRECTORY_BASE + slot`
+/// (below). The only bound on a title's own directory opens is the kernel's
+/// 259-entry fd table, and the most seen at once is 7-8, so 256 is far beyond
+/// anything measured.
 pub(crate) const AMPR_EMU_PACK_VIRTUAL_DIRECTORY_SLOTS: usize = 256;
 /// Decode workers, from the Makefile's `AMPR_PACK_WORKERS` (default 4, also
 /// outside the Makefile): each has a 1 MiB decode buffer from prepare to
@@ -712,10 +717,15 @@ pub(crate) const AMPR_EMU_PACK_PREAD_MAX_BYTES: u64 = AMPR_EMU_PACK_IO_STAGING_B
 /// the same allocator (rt/fd_cache.rs `open_indexed_or_real`), so up to
 /// `CACHE_CAP` (45) of these belong to the runtime. A closed slot is reused,
 /// so this is the number of packed files open at one time, not a lifetime
-/// limit. One title held 220 during its world load; 512 is comfortable.
-pub(crate) const AMPR_EMU_PACK_VIRTUAL_FD_SLOTS: usize = 512;
+/// limit. A retail title never holds more than the kernel's 259 fd table
+/// entries open at once, plus the runtime's cached ones (`CACHE_CAP`, 45):
+/// 304 at most. One title held 220 during its world load; 320 covers the
+/// worst case and is 45% above that measured peak. A title that needs more
+/// already ran degraded on a console (it opened until EMFILE and skipped what
+/// failed), and hitting this limit gives it the same outcome.
+pub(crate) const AMPR_EMU_PACK_VIRTUAL_FD_SLOTS: usize = 320;
 /// First synthetic packed-file descriptor: a packed fd is `BASE + slot`, in
-/// `512..1024`. That range is above the kernel's effective fd table and below
+/// `448..768`. That range is above the kernel's effective fd table and below
 /// the strictest title limit:
 /// - the kernel's table tops out at 259 on the two titles measured (248
 ///   `open("/dev/null")` calls succeeded, highest fd 258), despite
@@ -727,8 +737,26 @@ pub(crate) const AMPR_EMU_PACK_VIRTUAL_FD_SLOTS: usize = 512;
 ///
 /// The range needs no kernel descriptor, so the title keeps its whole fd table
 /// for real files. The runtime serves reads, seeks, fstat, close, AIO and mmap
-/// on the synthetic number.
-pub(crate) const AMPR_EMU_PACK_VIRTUAL_FD_BASE: usize = 512;
+/// on the synthetic number. 448 leaves 189 numbers above the last real fd, so
+/// a table up to 73% larger than the measured one still cannot land a real
+/// descriptor in the range, where it would be served as packed data.
+pub(crate) const AMPR_EMU_PACK_VIRTUAL_FD_BASE: usize = 448;
+/// First synthetic directory descriptor: a directory fd is `BASE + slot`, in
+/// `768..1024`, right above the packed range and under the same title limit
+/// (fd >= 1024 is rejected by one title). Directory handles were tagged
+/// values near 1.7 billion before. Without a generation in the number, a
+/// closed slot's number is reused like a kernel fd; the live flag
+/// (`VIRTUAL_DIRECTORY_LIVE`) sends a number with no open slot to the kernel.
+pub(crate) const AMPR_EMU_PACK_VIRTUAL_DIRECTORY_BASE: usize = 768;
+/// Highest real fd measured: the kernel table is 259 entries (numbers
+/// `0..=258`) on the two titles measured.
+pub(crate) const KERNEL_FD_TABLE_TOP: usize = 258;
+const _: () = assert!(
+    AMPR_EMU_PACK_VIRTUAL_FD_BASE > KERNEL_FD_TABLE_TOP
+        && AMPR_EMU_PACK_VIRTUAL_FD_BASE + AMPR_EMU_PACK_VIRTUAL_FD_SLOTS
+            <= AMPR_EMU_PACK_VIRTUAL_DIRECTORY_BASE
+        && AMPR_EMU_PACK_VIRTUAL_DIRECTORY_BASE + AMPR_EMU_PACK_VIRTUAL_DIRECTORY_SLOTS <= 1024
+);
 pub(crate) const AMPR_EMU_PACK_VIRTUAL_AIO_SLOTS: usize = 256;
 pub(crate) const AMPR_EMU_PACK_MAX_PACKS: usize = 1024;
 /// Pack volume descriptors open at once, at most one per volume; the least
@@ -768,10 +796,13 @@ pub(crate) const PACK_CACHE_MAX_PAGES: usize =
     AMPR_EMU_PACK_DECODED_CACHE_MAX_BYTES as usize / PACK_CACHE_PAGE_BYTES;
 pub(crate) const PACK_CACHE_BITMAP_WORDS: usize = (PACK_CACHE_MAX_PAGES + 63) / 64;
 pub(crate) const INVALID_INDEX: u32 = u32::MAX;
-// ampr_format::handles::Kind; the tags live in Rust.
+// ampr_format::handles::Kind; the tags live in Rust. Packed and directory fds
+// are plain numbers, not tagged handles.
 pub(crate) const VIRTUAL_KIND_AIO: u32 = 1;
-pub(crate) const VIRTUAL_KIND_DIRECTORY_FD: u32 = 2;
-pub(crate) const VIRTUAL_KIND_AIO_GROUP: u32 = 3;
+pub(crate) const VIRTUAL_KIND_AIO_GROUP: u32 = 2;
+// `handles::encode` ORs the slot in unmasked and `decode` masks 8 bits, so a
+// tagged table past 256 would alias slot 256 onto slot 0.
+const _: () = assert!(AMPR_EMU_PACK_VIRTUAL_AIO_SLOTS <= 256);
 pub(crate) const PACK_LOAD_UNINITIALIZED: u32 = 0;
 pub(crate) const PACK_LOAD_LOADING: u32 = 1;
 pub(crate) const PACK_LOAD_READY: u32 = 2;
@@ -890,7 +921,6 @@ pub(crate) struct VirtualDirectorySlot {
     pub range_end: u32,
     pub virtual_cursor: u32,
     pub physical_hash_count: u32,
-    pub generation: u16,
     pub path_length: u16,
     pub active: bool,
     pub real_exhausted: bool,
@@ -911,7 +941,6 @@ impl VirtualDirectorySlot {
         range_end: 0,
         virtual_cursor: 0,
         physical_hash_count: 0,
-        generation: 0,
         path_length: 0,
         active: false,
         real_exhausted: false,
@@ -1348,6 +1377,12 @@ pub(crate) static VIRTUAL_FD_MUTEXES: [Mutex; AMPR_EMU_PACK_VIRTUAL_FD_SLOTS] =
 /// there (kernel table: 259).
 pub(crate) static VIRTUAL_FD_LIVE: [AtomicBool; AMPR_EMU_PACK_VIRTUAL_FD_SLOTS] =
     [const { AtomicBool::new(false) }; AMPR_EMU_PACK_VIRTUAL_FD_SLOTS];
+/// Set while a directory slot is open, like `VIRTUAL_FD_LIVE`: written under
+/// the slot's DIRECTORY_MUTEXES entry, read lock-free by
+/// `decode_virtual_directory_fd`, so a number in `768..1024` with no open slot
+/// goes to the kernel without creating or waiting on the pack state.
+pub(crate) static VIRTUAL_DIRECTORY_LIVE: [AtomicBool; AMPR_EMU_PACK_VIRTUAL_DIRECTORY_SLOTS] =
+    [const { AtomicBool::new(false) }; AMPR_EMU_PACK_VIRTUAL_DIRECTORY_SLOTS];
 pub(crate) static CACHE_MUTEX: Mutex = Mutex::new();
 /// Cold manifest publication (may include large index I/O).
 pub(crate) static MANIFEST_MUTEX: Mutex = Mutex::new();

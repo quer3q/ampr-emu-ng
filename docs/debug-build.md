@@ -196,7 +196,7 @@ of `/metrics` and in the black box; the full list is at `FsEvents` in
 | `V` | A save data icon handed over from a pack, with its result. |
 | `U` | A failed `getdents` or `getdirentries` on a virtual directory fd, lookup `d`: path `read <directory> rc=0x<8 hex>`. Each distinct result of a directory is kept once, `/fsfail` counts the repeats. Lookup `x`: path `realfail <directory> errno=<n>`, the physical `getdents` behind the directory failed with `n`, so the listing goes on with the packed entries only. |
 | `P` | A failed game thread creation: lookup `s` scePthreadCreate, `p` pthread_create, `r` its retry, `h` the `/threads` probe (black box only). |
-| `Q` | Packed fd and open failures: `H` raw SCE error of a packed open, `R` errno of a physical open (`fs` ring only), `S` the 512-slot packed-fd table full. |
+| `Q` | Packed fd and open failures: `H` raw SCE error of a packed open, `R` errno of a physical open (`fs` ring only), `S` the 320-slot packed-fd table full. |
 
 Lookup letters of path hooks: `h` index hit, `m` miss the index answers,
 `M` miss sent to the filesystem, `d` directory, `n` index not ready, `x`

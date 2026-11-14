@@ -147,7 +147,7 @@ names) and install only when the zstd index or the LZ4 manifest is in
 - `open`/`read`/`pread`/`readv`/`preadv`/`lseek`/`fstat`/`close`, `stat`,
   `getdents`/`getdirentries` and their `sceKernel*` forms on virtual pack
   fds and indexed directories.
-- Virtual pack fds are synthetic numbers `512 + slot` in `512..1024` (512
+- Virtual pack fds are synthetic numbers `448 + slot` in `448..768` (320
   slots), with no kernel descriptor behind them, so the title keeps its
   whole fd table. The kernel table tops out at 259 on two measured titles
   (248 `open("/dev/null")` calls succeeded, highest fd 258, despite
@@ -156,8 +156,16 @@ names) and install only when the zstd index or the LZ4 manifest is in
   1024..1193. Holding a `/dev/null` fd per packed fd, as an earlier design did,
   left one title ~49 of 259 descriptors, and its own `/dev/urandom`, ACM
   device and save opens failed with EMFILE. Closed slots are reused:
-  512 packed files can be open at once, including up to 45 held by the APR
-  fd cache (`rt/fd_cache.rs`).
+  320 packed files can be open at once, including up to 45 held by the APR
+  fd cache (`rt/fd_cache.rs`). A retail title holds at most 259 handles of
+  any kind, so 259 plus the 45 cached ones is 304 at worst; the most seen
+  open at once was 220.
+- Virtual directory fds are plain numbers `768 + slot` in `768..1024` (256
+  slots), above the packed range and under the same 1024 limit. They were
+  tagged values near 1.7 billion before. A number has no generation, so a
+  closed slot's number is reused like a kernel fd, and a number with no open
+  slot goes to the kernel. AIO submit and group ids stay tagged: a submit id
+  never passes a title's fd check.
 - A read-only open of an indexed directory, with or without
   `O_DIRECTORY`, gets the virtual directory. One packed install opened
   `/app0/input/` 8 times with flags 0, got ENOENT before this, and loaded
