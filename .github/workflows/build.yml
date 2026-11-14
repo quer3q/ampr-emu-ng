@@ -122,9 +122,10 @@ jobs:
           prev=$(gh release list --repo "$REPO" --exclude-drafts \
             --exclude-pre-releases --limit 1 --json tagName -q '.[0].tagName')
           {
-            echo "Beta build of main at $SHA, rebuilt on every push. Not a release:"
-            echo "it may be untested on a console. The launch notice reads"
-            echo "\"v<version>-beta.${SHA::7}\"; put that in a game report."
+            echo "⚠️ That's an automatic beta version intended for testing purposes."
+            echo "Built automatically on each push to main branch."
+            echo
+            echo "It may be untested on a console, can break games and not intended to be used as a general way - just testing."
             echo
             echo "Changes since $prev: https://github.com/$REPO/compare/$prev...$SHA"
           } > notes.md
