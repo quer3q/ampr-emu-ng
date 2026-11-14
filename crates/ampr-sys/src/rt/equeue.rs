@@ -1385,9 +1385,7 @@ unsafe fn allocate_pending_locked(registration_index: u32) -> u32 {
         return INVALID_INDEX;
     }
     let first = o.registration_pending[ri] == 0;
-    if !first
-        && o.live_pending.saturating_sub(o.registrations_with_pending) >= PENDING_EXTRA_CAPACITY
-    {
+    if !first && unsafe { pending_extras_full_locked() } {
         return INVALID_INDEX;
     }
     let index = o.pending_free_head;
@@ -1432,9 +1430,20 @@ unsafe fn release_pending_locked(index: u32) {
     }
 }
 
+/// live_pending minus registrations_with_pending is the extras in use.
+unsafe fn pending_extras_full_locked() -> bool {
+    let o = unsafe { ov() };
+    o.live_pending.saturating_sub(o.registrations_with_pending) >= PENDING_EXTRA_CAPACITY
+}
+
+/// Progress for a backpressured publish is a free extra: a first node is
+/// always granted, so a freed one does not let the refused publish through.
 unsafe fn take_pending_backpressure_progress_locked() -> bool {
     let o = unsafe { ov() };
-    if !o.pending_pool_backpressured || o.pending_free_head >= PENDING_CAPACITY {
+    if !o.pending_pool_backpressured
+        || o.pending_free_head >= PENDING_CAPACITY
+        || unsafe { pending_extras_full_locked() }
+    {
         return false;
     }
     o.pending_pool_backpressured = false;
