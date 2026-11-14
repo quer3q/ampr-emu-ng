@@ -145,12 +145,12 @@ CI (`.github/workflows/build.yml`) runs the same commands; a pushed `v*` tag cre
   listed at `STATIC_POOL_SIZE` in `rt/runtime_memory.rs` (1.56 MiB used; a
   host test fails on a new pool call). A build-time assert checks that the
   caps plus the budget fit the pool. Both PRX builds load to the same
-  167.98 MiB (PT_LOAD memsz, below 192 MiB; v0.3.4 loaded at 200.7 MiB):
+  168.47 MiB (PT_LOAD memsz, below 192 MiB; v0.3.4 loaded at 200.7 MiB):
   the release pool is 159.83 MiB
   (`AMPR_INTERNAL_POOL_SIZE` `0x9fd4000`), the debug one 158.47 MiB
   (`AMPR_DEBUG_POOL_SIZE` `0x9e78000`), the gap being the debug build's
-  larger non-pool part (9.51 vs 8.15 MiB). `AMPR_ZSTD_MMAP=1` grows both
-  pools by 448 KiB (168.42 MiB). `dist` fails when the two totals
+  larger non-pool part (10.01 vs 8.65 MiB). `AMPR_ZSTD_MMAP=1` grows both
+  pools by 448 KiB (168.91 MiB). `dist` fails when the two totals
   differ by more than 64 KiB or reach 192 MiB (`PRX_TOTAL_LIMIT` in
   `tools/verify_payload_prx.py --prx-totals`); then update the gap in the
   Makefile. A refused allocation degrades (index: one notice, packs

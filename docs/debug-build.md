@@ -10,7 +10,7 @@ with it, then ship the release build.
 `make AMPR_MEM_REPORT=1` (Cargo feature `mem_report`) with the pool set to
 `AMPR_DEBUG_POOL_SIZE` (`0x9e78000`, 158.47 MiB); the release pool is
 `0x9fd4000` (159.83 MiB). The smaller pool offsets the larger debug code, so
-both PRX files load to 167.98 MiB with the same ledger caps, cache and
+both PRX files load to 168.47 MiB with the same ledger caps, cache and
 thread limits.
 
 Only the debug build:
