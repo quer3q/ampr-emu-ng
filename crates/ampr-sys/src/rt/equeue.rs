@@ -31,7 +31,12 @@ pub(crate) const INVALID_INDEX: u32 = u32::MAX;
 const HASH_TOMBSTONE: u32 = u32::MAX;
 const QUEUE_CAPACITY: u32 = COMMAND_BUFFER_LIVE_MAX;
 const REGISTRATION_CAPACITY: u32 = 16384;
-const PENDING_CAPACITY: u32 = COMMAND_BUFFER_LIVE_MAX;
+/// Pending nodes past the first one of a registration: a second event on one
+/// id before the game reads the first (kept, never merged).
+const PENDING_EXTRA_CAPACITY: u32 = COMMAND_BUFFER_LIVE_MAX;
+/// One node per registration, as a kernel knote, plus the extras: the first
+/// event of a live registration is never refused, whatever other queues hold.
+const PENDING_CAPACITY: u32 = REGISTRATION_CAPACITY + PENDING_EXTRA_CAPACITY;
 const QUEUE_HASH_CAPACITY: u32 = QUEUE_CAPACITY * 2;
 const AMM_BUFFER_HASH_CAPACITY: u32 = QUEUE_HASH_CAPACITY;
 const REGISTRATION_HASH_CAPACITY: u32 = REGISTRATION_CAPACITY * 2;
@@ -58,6 +63,8 @@ const _: () = {
     assert!(REGISTRATION_HASH_CAPACITY.is_power_of_two());
     assert!(QUEUE_CAPACITY <= u16::MAX as u32 - 1);
     assert!(REGISTRATION_CAPACITY <= u16::MAX as u32 - 1);
+    // registration_pending is a u16 per registration.
+    assert!(PENDING_EXTRA_CAPACITY < u16::MAX as u32);
 };
 
 /// `AmprLibkernelHookId` equeue slots.
@@ -93,16 +100,6 @@ pub(crate) struct SceKernelEvent {
     pub udata: *mut c_void,
 }
 const _: () = assert!(core::mem::size_of::<SceKernelEvent>() == 32);
-impl SceKernelEvent {
-    pub const ZERO: Self = Self {
-        ident: 0,
-        filter: 0,
-        flags: 0,
-        fflags: 0,
-        data: 0,
-        udata: core::ptr::null_mut(),
-    };
-}
 
 // ---- original fn types -----------------------------------------------------
 
@@ -189,17 +186,24 @@ impl MirroredRegistration {
     };
 }
 
+/// A published EVFILT_AMPR event. ident and udata are copied at publish, so a
+/// node reserved by a private wake still carries its own request's values if
+/// the registration slot is reused before the node is appended.
 #[derive(Clone, Copy)]
 struct PendingEvent {
     next: u32,
     registration_index: u32,
-    event: SceKernelEvent,
+    ident: u32,
+    data: isize,
+    udata: *mut c_void,
 }
 impl PendingEvent {
     const ZERO: Self = Self {
         next: 0,
         registration_index: 0,
-        event: SceKernelEvent::ZERO,
+        ident: 0,
+        data: 0,
+        udata: core::ptr::null_mut(),
     };
 }
 
@@ -351,6 +355,9 @@ struct Overlay {
     live_queues: u32,
     live_registrations: u32,
     live_pending: u32,
+    /// Registrations with at least one pending node; live_pending minus this
+    /// is the extras in use.
+    registrations_with_pending: u32,
     queue_hash_tombstones: u32,
     registration_hash_tombstones: u32,
     amm_queue_hash_tombstones: u32,
@@ -363,6 +370,7 @@ struct Overlay {
     registration_hash: [u16; RHASH],
     registration_owners: [u16; RCAP],
     registration_filters: [i16; RCAP],
+    registration_pending: [u16; RCAP],
 }
 
 static OV: SyncCell<Overlay> = SyncCell::new(Overlay {
@@ -376,6 +384,7 @@ static OV: SyncCell<Overlay> = SyncCell::new(Overlay {
     live_queues: 0,
     live_registrations: 0,
     live_pending: 0,
+    registrations_with_pending: 0,
     queue_hash_tombstones: 0,
     registration_hash_tombstones: 0,
     amm_queue_hash_tombstones: 0,
@@ -388,6 +397,7 @@ static OV: SyncCell<Overlay> = SyncCell::new(Overlay {
     registration_hash: [0; RHASH],
     registration_owners: [0; RCAP],
     registration_filters: [0; RCAP],
+    registration_pending: [0; RCAP],
 });
 
 /// Overlay state; caller holds `overlay_lock()` (or is single-threaded init).
@@ -605,6 +615,7 @@ unsafe fn initialize_locked() {
         };
         o.registration_owners[i] = 0;
         o.registration_filters[i] = 0;
+        o.registration_pending[i] = 0;
     }
     for i in 0..PCAP {
         o.pending[i] = PendingEvent::ZERO;
@@ -629,6 +640,7 @@ unsafe fn initialize_locked() {
     o.live_queues = 0;
     o.live_registrations = 0;
     o.live_pending = 0;
+    o.registrations_with_pending = 0;
     o.queue_hash_tombstones = 0;
     o.registration_hash_tombstones = 0;
     o.amm_queue_hash_tombstones = 0;
@@ -1362,8 +1374,22 @@ unsafe fn remove_registration_locked(
 
 // ---- pending FIFO ----------------------------------------------------------
 
-unsafe fn allocate_pending_locked() -> u32 {
+/// Reserves a node for `registration_index`. The first pending event of a
+/// registration always gets one (PENDING_CAPACITY holds one per
+/// registration, as the kernel holds one knote per registration); further
+/// unread events on the same id share PENDING_EXTRA_CAPACITY.
+unsafe fn allocate_pending_locked(registration_index: u32) -> u32 {
     let o = unsafe { ov() };
+    let ri = registration_index as usize;
+    if ri >= RCAP {
+        return INVALID_INDEX;
+    }
+    let first = o.registration_pending[ri] == 0;
+    if !first
+        && o.live_pending.saturating_sub(o.registrations_with_pending) >= PENDING_EXTRA_CAPACITY
+    {
+        return INVALID_INDEX;
+    }
     let index = o.pending_free_head;
     if index >= PENDING_CAPACITY {
         return INVALID_INDEX;
@@ -1372,10 +1398,14 @@ unsafe fn allocate_pending_locked() -> u32 {
     o.pending_free_head = o.pending[pi].next;
     o.pending[pi] = PendingEvent {
         next: INVALID_INDEX,
-        registration_index: INVALID_INDEX,
+        registration_index,
         ..PendingEvent::ZERO
     };
     o.live_pending += 1;
+    o.registration_pending[ri] += 1;
+    if first {
+        o.registrations_with_pending += 1;
+    }
     index
 }
 
@@ -1384,6 +1414,13 @@ unsafe fn release_pending_locked(index: u32) {
         return;
     }
     let o = unsafe { ov() };
+    let ri = o.pending[index as usize].registration_index as usize;
+    if ri < RCAP && o.registration_pending[ri] != 0 {
+        o.registration_pending[ri] -= 1;
+        if o.registration_pending[ri] == 0 && o.registrations_with_pending != 0 {
+            o.registrations_with_pending -= 1;
+        }
+    }
     o.pending[index as usize] = PendingEvent {
         next: o.pending_free_head,
         registration_index: INVALID_INDEX,
@@ -1472,6 +1509,14 @@ unsafe fn drain_pending_locked(
             break;
         }
         let p = o.pending[index as usize];
+        let event = SceKernelEvent {
+            ident: p.ident as usize,
+            filter: SCE_KERNEL_EVFILT_AMPR,
+            flags: EV_ADD | EV_CLEAR,
+            fflags: 0,
+            data: p.data,
+            udata: p.udata,
+        };
         let q = &mut o.queues[qi];
         q.pending_head = p.next;
         if q.pending_head >= PENDING_CAPACITY {
@@ -1480,7 +1525,7 @@ unsafe fn drain_pending_locked(
         if q.pending_count != 0 {
             q.pending_count -= 1;
         }
-        unsafe { *events.add(count as usize) = p.event };
+        unsafe { *events.add(count as usize) = event };
         count += 1;
         unsafe { release_pending_locked(index) };
         released = true;
@@ -1721,6 +1766,12 @@ unsafe fn release_queue_locked(queue_index: u32) -> bool {
     if queue_index >= QUEUE_CAPACITY || !o.queues[qi].used {
         return false;
     }
+    // Nodes first: each one is counted against its registration.
+    while o.queues[qi].pending_head < PENDING_CAPACITY {
+        let index = o.queues[qi].pending_head;
+        o.queues[qi].pending_head = o.pending[index as usize].next;
+        unsafe { release_pending_locked(index) };
+    }
     while o.queues[qi].registration_head < REGISTRATION_CAPACITY {
         let index = o.queues[qi].registration_head;
         let ri = index as usize;
@@ -1742,11 +1793,6 @@ unsafe fn release_queue_locked(queue_index: u32) -> bool {
         if o.live_registrations != 0 {
             o.live_registrations -= 1;
         }
-    }
-    while o.queues[qi].pending_head < PENDING_CAPACITY {
-        let index = o.queues[qi].pending_head;
-        o.queues[qi].pending_head = o.pending[index as usize].next;
-        unsafe { release_pending_locked(index) };
     }
     let notify_reactor = unsafe { take_pending_backpressure_progress_locked() };
     LOCAL_WAKE_EPOCH.0[qi].fetch_add(1, Ordering::Release);
@@ -2052,22 +2098,18 @@ pub unsafe fn apr_equeue_try_publish(
                 if ridx >= REGISTRATION_CAPACITY || !o.queues[qi].wake_ready {
                     return NativeFallback;
                 }
-                let pidx = unsafe { allocate_pending_locked() };
+                // Only a second unread event on this id can be refused: the
+                // first always has its registration's node.
+                let pidx = unsafe { allocate_pending_locked(ridx) };
                 if pidx >= PENDING_CAPACITY {
                     o.pending_pool_backpressured = true;
                     return Backpressure;
                 }
                 let udata = o.registrations[ridx as usize].udata;
                 let p = &mut o.pending[pidx as usize];
-                p.registration_index = ridx;
-                p.event = SceKernelEvent {
-                    ident: id as u32 as usize,
-                    filter: SCE_KERNEL_EVFILT_AMPR,
-                    flags: EV_ADD | EV_CLEAR,
-                    fflags: 0,
-                    data: data as isize,
-                    udata,
-                };
+                p.ident = id as u32;
+                p.data = data as isize;
+                p.udata = udata;
                 // A future waiter drains an already-pending event directly. A
                 // waiter committed to the native call needs the private edge;
                 // the reserved node is published by the wake completion.
