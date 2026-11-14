@@ -1,9 +1,13 @@
 //! Save data fixes, for the system libSceSaveData the runtime does not
 //! replace:
 //!
-//! - A mount refused with SAVE_DATA_ERROR_BUSY is retried once after
-//!   unmounting every save point the service returned earlier and the game
-//!   left mounted. A title that reads its save slots at start keeps several
+//! - A mount refused with SAVE_DATA_ERROR_BUSY is first retried alone, every
+//!   50 ms for up to 2 s: BUSY is usually a save another game thread still
+//!   has open or is still committing (autosave beside a settings save), and
+//!   unmounting that point under the writer leaves a half-written save the
+//!   game no longer loads. Only a mount still BUSY after that is retried once
+//!   after unmounting every save point the service returned earlier and the
+//!   game left mounted. A title that reads its save slots at start keeps several
 //!   points mounted (/savedata0, /savedata1, /savedata2); starting a new game
 //!   over one of them mounts it again and the old points made that fail, so
 //!   the game sat on the loading screen. A failed Mount3 does not write a
@@ -99,12 +103,35 @@ unsafe fn mount_common(mount: *const c_void, result: *mut c_void) -> c_int {
     let mut rc = unsafe { orig(mount, result) };
     stats::add(Stat::SaveMounts, 1);
     if rc == SAVE_DATA_ERROR_BUSY {
+        rc = unsafe { wait_busy_mount(orig, mount, result) };
+    }
+    if rc == SAVE_DATA_ERROR_BUSY {
         if let Some(retry) = unsafe { retry_busy_mount(mount, result) } {
             rc = retry;
         }
     }
     if rc == 0 {
         unsafe { remember_mount(result) };
+    }
+    rc
+}
+
+/// A BUSY mount retried alone, unmounting nothing: a point another game thread
+/// is still writing or committing frees itself within moments. Returns the
+/// last answer, BUSY when the wait ran out.
+const BUSY_WAIT_STEP_US: u32 = 50_000;
+const BUSY_WAIT_STEPS: u32 = 40;
+unsafe fn wait_busy_mount(orig: MountFn, mount: *const c_void, result: *mut c_void) -> c_int {
+    let mut rc = SAVE_DATA_ERROR_BUSY;
+    for _ in 0..BUSY_WAIT_STEPS {
+        unsafe { super::sys::sceKernelUsleep(BUSY_WAIT_STEP_US) };
+        rc = unsafe { orig(mount, result) };
+        if rc != SAVE_DATA_ERROR_BUSY {
+            if rc == 0 {
+                stats::add(Stat::SaveBusyWaitsOk, 1);
+            }
+            break;
+        }
     }
     rc
 }

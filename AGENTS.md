@@ -114,8 +114,9 @@ runtime creates its own threads through `create_internal`
 (the pre-detour slot). Save data (`rt/save.rs`) is hooked by NID in a loaded
 `libSceSaveData` module, not through the libkernel table, in every title
 (the loader observer finds it outside `sceKernelGetModuleList`):
-`sceSaveDataMount3` retries a BUSY mount once after unmounting every save
-point the service returned earlier, and `sceSaveDataSaveIconByPath` hands a
+`sceSaveDataMount3` retries a BUSY mount alone every 50 ms for up to 2 s,
+then, still BUSY, once after unmounting every save point the service
+returned earlier, and `sceSaveDataSaveIconByPath` hands a
 packed icon to `sceSaveDataSaveIcon` as bytes.
 CI (`.github/workflows/build.yml`) runs the same commands; a pushed `v*` tag creates a draft release with both `.sprx` and `SHA256SUMS`.
 
