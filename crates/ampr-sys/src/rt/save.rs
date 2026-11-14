@@ -5,7 +5,9 @@
 //!   answer included: a game retries a BUSY mount itself. Unmounting the
 //!   game's other save points and mounting again took points a title was
 //!   still using, and it hung on close (8 of 11 mounts BUSY, debug /metrics).
-//!   The hook only counts mounts (`save_mounts`) and BUSY answers (`save_busy`).
+//!   The hook only counts mounts (`save_mounts`), BUSY answers (`save_busy`)
+//!   and non-zero answers (`save_mount_errors`, the last one in
+//!   `save_mount_last_error`).
 //! - sceSaveDataSaveIconByPath is handed the icon bytes read from the pack
 //!   through sceSaveDataSaveIcon instead of a path inside it. The save
 //!   service runs outside the game's mount namespace, so it cannot open
@@ -59,6 +61,10 @@ pub unsafe extern "C" fn mount3_emul(mount: *const c_void, result: *mut c_void) 
     if rc == SAVE_DATA_ERROR_BUSY {
         stats::add(Stat::SaveBusy, 1);
     }
+    if rc != 0 {
+        stats::add(Stat::SaveMountErrors, 1);
+        stats::set(Stat::SaveMountLastError, rc as u32 as u64);
+    }
     rc
 }
 
@@ -77,7 +83,9 @@ unsafe fn save_icon_bytes(mount_point: *const c_void, bytes: &[u8]) -> Option<(c
         data_size: bytes.len(),
         reserved: [0; 32],
     };
-    Some((unsafe { save_icon(mount_point, &icon) }, bytes.len()))
+    let rc = unsafe { save_icon(mount_point, &icon) };
+    stats::set(Stat::SaveIconLastResult, rc as u32 as u64);
+    Some((rc, bytes.len()))
 }
 
 /// Passthrough: installed so `save_original` has the real SaveIcon entry the
@@ -100,7 +108,7 @@ pub unsafe extern "C" fn save_icon_by_path_emul(
         return SCE_KERNEL_ERROR_ENOSYS;
     };
     if mount_point.is_null() || path.is_null() {
-        return unsafe { orig(mount_point, path) };
+        return unsafe { forward_icon_path(orig, mount_point, path) };
     }
     // None: a loose or missing file, which the save service opens itself.
     // A packed icon that cannot be read (empty, over READ_PACKED_MAX, no
@@ -108,7 +116,7 @@ pub unsafe extern "C" fn save_icon_by_path_emul(
     // 0: the service cannot open a packed path (0x809f000e), and that error
     // stalled a title's save; the icon is cosmetic.
     let rc = match unsafe { read_packed(path, |bytes| save_icon_bytes(mount_point, bytes)) } {
-        None => return unsafe { orig(mount_point, path) },
+        None => return unsafe { forward_icon_path(orig, mount_point, path) },
         Some(Ok(Some((0, size)))) => {
             stats::add(Stat::SaveIconBytes, size as u64);
             0
@@ -124,6 +132,18 @@ pub unsafe extern "C" fn save_icon_by_path_emul(
         }
     };
     unsafe { note_icon(path, rc) };
+    rc
+}
+
+/// The original sceSaveDataSaveIconByPath, its answer unchanged and kept in
+/// `save_icon_path_last_result`.
+unsafe fn forward_icon_path(
+    orig: SaveIconByPathFn,
+    mount_point: *const c_void,
+    path: *const c_char,
+) -> c_int {
+    let rc = unsafe { orig(mount_point, path) };
+    stats::set(Stat::SaveIconPathLastResult, rc as u32 as u64);
     rc
 }
 

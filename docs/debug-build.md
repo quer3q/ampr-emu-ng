@@ -65,7 +65,8 @@ Then one `name value` pair per line: uptime, pool used, peak and size, the
 `buffer_mem_*`, `ledger_alloc_refused`, `pool_alloc_failed`), fd and thread
 counts, the last 32 file events as `fs` lines, the knobs as `tune_` lines and
 pool use per site as `pool_now:` and `pool_peak:` lines. Counters are totals
-since load; `*_max` values reset on each scrape.
+since load; `*_max` values reset on each scrape; the `save_*_last_*` codes
+hold the last value, so do not subtract them between scrapes.
 
 The index page cache (`rt/index_pages.rs`) reads the index files that do not
 fit the Index ledger whole in 16 KiB pages through an arena of
@@ -105,6 +106,20 @@ In pkg mode (this title's .pkg named by `/app0/kraken.image`) chunks of the .pkg
 read the same way, one exact-size read of their stored bytes, and count in
 the same `pack_disk_reads`, `pack_disk_bytes` and disk read times as other
 pack reads; `pack_disk_bytes / pack_disk_reads` is the average read size.
+
+Save data (`rt/save.rs`) shows what the save service answered.
+`save_mounts` counts sceSaveDataMount3 calls, `save_busy` those answered
+SAVE_DATA_ERROR_BUSY, `save_mount_errors` those answered non-zero (BUSY
+included) and `save_mount_last_error` the last non-zero code. A packed icon
+handed over through sceSaveDataSaveIcon adds its bytes to `save_icon_bytes`
+or, refused or unreadable, 1 to `save_icon_skipped`;
+`save_icon_last_result` is what sceSaveDataSaveIcon answered the last
+packed icon, before the hook answers the game 0 for a failure.
+`save_icon_path_last_result` is what the original
+sceSaveDataSaveIconByPath answered the last call forwarded to it (a loose
+or missing icon). The three codes are the last value, not totals, and
+print as `0x` and 8 hex digits; `0x00000000` also means no such call yet.
+Every answer goes back to the game unchanged except the packed icon one.
 
 ### /bench
 

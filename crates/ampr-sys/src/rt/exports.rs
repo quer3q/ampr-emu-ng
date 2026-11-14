@@ -1121,8 +1121,12 @@ mod mem_report {
                 "pack_load_state",
                 super::super::pack::LOAD_STATE.load(core::sync::atomic::Ordering::Relaxed) as u64,
             );
-        for (name, v) in NAMES.iter().zip(read()) {
-            out.kv(name, v);
+        for (i, (name, v)) in NAMES.iter().zip(read()).enumerate() {
+            if super::super::stats::is_code(i) {
+                out.s(name.as_bytes()).s(b" ").x(v as u32).s(b"\n");
+            } else {
+                out.kv(name, v);
+            }
         }
         {
             use super::super::stats::{FS_EVENTS, FS_LOG};

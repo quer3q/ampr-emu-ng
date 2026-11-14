@@ -93,6 +93,17 @@ stats! {
     SaveBusy = "save_busy",
     SaveIconBytes = "save_icon_bytes",
     SaveIconSkipped = "save_icon_skipped",
+    /// sceSaveDataMount3 calls answered non-zero (BUSY included) and the
+    /// last such code; what sceSaveDataSaveIcon answered the last packed
+    /// icon handed over, before the hook maps a failure to 0; what the
+    /// original sceSaveDataSaveIconByPath answered the last call forwarded
+    /// to it (a loose or missing icon). The three codes are set, not
+    /// summed, and print as hex on /metrics (`is_code`); 0 there is also
+    /// "no such call yet".
+    SaveMountErrors = "save_mount_errors",
+    SaveMountLastError = "save_mount_last_error",
+    SaveIconLastResult = "save_icon_last_result",
+    SaveIconPathLastResult = "save_icon_path_last_result",
     /// Read pool size (reactor/pread_pool.rs): threads started, the most
     /// live at once, threads given back to the game, and our own creations
     /// that failed (the pool stops growing). Exits by load are
@@ -350,7 +361,8 @@ stats! {
 const N: usize = Stat::Count as usize;
 static VALUES: [AtomicU64; N] = [const { AtomicU64::new(0) }; N];
 
-/// `*_max` stats reset on every scrape; all others are monotonic counters.
+/// `*_max` stats reset on every scrape; `set` codes (`is_code`) hold the
+/// last value; all others are monotonic counters.
 #[cfg(feature = "mem_report")]
 fn resets_on_read(s: usize) -> bool {
     s == Stat::PackJobNsMax as usize
@@ -362,6 +374,14 @@ fn resets_on_read(s: usize) -> bool {
         || s == Stat::PreadPendingMax as usize
         || s == Stat::JobFirstIssueNsMax as usize
         || s == Stat::JobNotifyNsMax as usize
+}
+
+/// Stats that hold a 32-bit SCE return code, printed as hex on /metrics.
+#[cfg(feature = "mem_report")]
+pub(crate) fn is_code(s: usize) -> bool {
+    s == Stat::SaveMountLastError as usize
+        || s == Stat::SaveIconLastResult as usize
+        || s == Stat::SaveIconPathLastResult as usize
 }
 
 /// Chunks read so far (decoded-cache loads), as a 2^23-bit hash set; a false
@@ -717,6 +737,14 @@ pub(crate) fn enter(s: Stat) {
 pub(crate) fn leave(s: Stat) {
     if ON {
         VALUES[s as usize].fetch_sub(1, Relaxed);
+    }
+}
+
+/// Replaces the value (a last-seen code, not a total).
+#[inline(always)]
+pub(crate) fn set(s: Stat, v: u64) {
+    if ON {
+        VALUES[s as usize].store(v, Relaxed);
     }
 }
 
