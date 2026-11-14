@@ -1,4 +1,5 @@
-# Host tests, release + debug .sprx builds, and draft releases on v* tags.
+# Host tests, release + debug .sprx builds, draft releases on v* tags and
+# the beta pre-release on every push to main.
 name: build
 
 on:
@@ -50,8 +51,9 @@ jobs:
             out/cargo-home/git
           key: sprx-cargo-${{ hashFiles('Cargo.lock', 'ps5/Dockerfile') }}
           restore-keys: sprx-cargo-
+      # Main builds are betas: the launch notice reads v<version>-beta.<sha>.
       - name: make dist (Docker)
-        run: ./ps5/build-docker.sh dist
+        run: ./ps5/build-docker.sh dist ${{ github.ref == 'refs/heads/main' && 'AMPR_BETA=1' || '' }}
       - name: sha256
         run: sha256sum libSceAmpr.sprx libSceAmpr-debug.sprx | tee SHA256SUMS
       - uses: actions/upload-artifact@v4
@@ -80,9 +82,56 @@ jobs:
           TAG: ${{ github.ref_name }}
         run: |
           sha256sum -c SHA256SUMS
+          # Notes start at the last stable release, not at the beta tag,
+          # which already points at this commit.
+          prev=$(gh release list --repo "$GITHUB_REPOSITORY" --exclude-drafts \
+            --exclude-pre-releases --limit 1 --json tagName -q '.[0].tagName')
           gh release create "$TAG" \
             --repo "$GITHUB_REPOSITORY" \
             --title "$TAG" \
             --draft \
             --generate-notes \
+            ${prev:+--notes-start-tag "$prev"} \
             libSceAmpr.sprx libSceAmpr-debug.sprx SHA256SUMS
+
+  # One pre-release, tag `beta`, updated in place on every push to main: a
+  # fixed download URL, the "Latest" badge stays on the last v* release, and
+  # release watchers are not notified per push. Runs on main are serialized
+  # by the workflow concurrency group, so an older build never lands last.
+  # The tag moves through GITHUB_TOKEN, which starts no new workflow run.
+  beta:
+    name: beta
+    if: github.ref == 'refs/heads/main'
+    needs: [test, sprx]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: sprx
+      - name: Update beta pre-release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: |
+          sha256sum -c SHA256SUMS
+          gh api -X PATCH "repos/$REPO/git/refs/tags/beta" -f sha="$SHA" -F force=true >/dev/null \
+            || gh api "repos/$REPO/git/refs" -f ref=refs/tags/beta -f sha="$SHA" >/dev/null
+          prev=$(gh release list --repo "$REPO" --exclude-drafts \
+            --exclude-pre-releases --limit 1 --json tagName -q '.[0].tagName')
+          {
+            echo "Beta build of main at $SHA, rebuilt on every push. Not a release:"
+            echo "it may be untested on a console. The launch notice reads"
+            echo "\"v<version>-beta.${SHA::7}\"; put that in a game report."
+            echo
+            echo "Changes since $prev: https://github.com/$REPO/compare/$prev...$SHA"
+          } > notes.md
+          gh release view beta --repo "$REPO" >/dev/null 2>&1 \
+            || gh release create beta --repo "$REPO" --verify-tag --prerelease \
+                 --latest=false --title beta --notes-file notes.md
+          gh release upload beta --repo "$REPO" --clobber \
+            libSceAmpr.sprx libSceAmpr-debug.sprx SHA256SUMS
+          gh release edit beta --repo "$REPO" --prerelease --latest=false \
+            --title "beta ${SHA::7}" --notes-file notes.md

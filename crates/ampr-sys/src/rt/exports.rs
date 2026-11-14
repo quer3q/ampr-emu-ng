@@ -137,7 +137,18 @@ pub(crate) const BUILD_REV: &str = match option_env!("AMPR_GIT_REV") {
 #[cfg(feature = "mem_report")]
 const BUILD_FLAVOR: &str = "debug";
 
-/// "ampr-emu-ng: v<version> (<mode>) running" into `out`; its length. Mode:
+/// Git revision on a beta build (AMPR_BETA=1, set by CI for every push to
+/// main), so the launch notice tells a beta from the release it follows;
+/// empty otherwise.
+const BETA_REV: &str = match (option_env!("AMPR_BETA"), option_env!("AMPR_GIT_REV")) {
+    (Some(b), Some(rev)) if b.len() == 1 && b.as_bytes()[0] == b'1' => rev,
+    _ => "",
+};
+// The notice buffer is 64 bytes; "-dirty" hashes are 13.
+const _: () = assert!(BETA_REV.len() <= 16, "AMPR_GIT_REV too long for the notice");
+
+/// "ampr-emu-ng: v<version>[-beta.<rev>] (<mode>) running" into `out`; its
+/// length. Mode:
 /// "zstd" (ampr_zstd.index), "pkg" (this title's .pkg in /app0/kraken/), "lz4"
 /// (ampr_assets.index) or "plain" (no packs, loose files only).
 fn load_notice(mode: &[u8], out: &mut [u8; 64]) -> usize {
@@ -145,6 +156,8 @@ fn load_notice(mode: &[u8], out: &mut [u8; 64]) -> usize {
     for part in [
         b"ampr-emu-ng: v" as &[u8],
         VERSION.as_bytes(),
+        if BETA_REV.is_empty() { b"" } else { b"-beta." },
+        BETA_REV.as_bytes(),
         b" (",
         mode,
         b") running",
@@ -153,6 +166,15 @@ fn load_notice(mode: &[u8], out: &mut [u8; 64]) -> usize {
         n += part.len();
     }
     n
+}
+
+#[cfg(test)]
+#[test]
+fn load_notice_names_the_beta_rev() {
+    let mut out = [0u8; 64];
+    let n = load_notice(b"plain", &mut out);
+    let beta = if BETA_REV.is_empty() { String::new() } else { format!("-beta.{BETA_REV}") };
+    assert_eq!(out[..n], *format!("ampr-emu-ng: v{VERSION}{beta} (plain) running").as_bytes());
 }
 
 /// Tells the owner the module runs; also keeps AMPR_EMU_VERSION linked.

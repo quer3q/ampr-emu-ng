@@ -44,6 +44,10 @@ copies two files to the project root:
 - `libSceAmpr-debug.sprx`, the same runtime plus metrics, tuning and
   failure logs, for testing ([docs/debug-build.md](docs/debug-build.md)).
 
+Every push to main also publishes both files as the
+[beta pre-release](https://github.com/quer3q/ampr-emu-ng/releases/tag/beta);
+its launch notice reads `v<version>-beta.<commit>`.
+
 ## Thanks
 
 - [drakmor/ampr_emu](https://github.com/drakmor/ampr_emu), the C++ AMPR
