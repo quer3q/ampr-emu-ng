@@ -84,15 +84,13 @@ stats! {
     /// game creation failed, and growths back by one after 10 s quiet.
     ThreadBudgetCuts = "thread_budget_cuts",
     ThreadBudgetRegrows = "thread_budget_regrows",
-    /// Save data (rt/save.rs): mounts, a mount refused with SAVE_DATA_ERROR_BUSY
-    /// that was retried after unmounting the old copy, the retries that
-    /// succeeded, forced unmounts the save service answered, icon bytes handed
-    /// over through sceSaveDataSaveIcon, and packed icons the runtime could not
-    /// handle (the original path call is left to fail as before).
+    /// Save data (rt/save.rs): mounts, the mounts the save service answered
+    /// with SAVE_DATA_ERROR_BUSY (passed back to the game unchanged), icon
+    /// bytes handed over through sceSaveDataSaveIcon, and packed icons the
+    /// runtime could not handle (the original path call is left to fail as
+    /// before).
     SaveMounts = "save_mounts",
-    SaveBusyRetries = "save_busy_retries",
-    SaveBusyRetriesOk = "save_busy_retries_ok",
-    SaveUmountsAnswered = "save_umounts_answered",
+    SaveBusy = "save_busy",
     SaveIconBytes = "save_icon_bytes",
     SaveIconSkipped = "save_icon_skipped",
     /// Read pool size (reactor/pread_pool.rs): threads started, the most
