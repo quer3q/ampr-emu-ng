@@ -42,6 +42,29 @@ component.
 - `ampr_emu.index` (AMPRIDX3) stays as the dump tooling writes it. It
   lists every file, loose and packed, so AMPR path ids keep working.
 
+## What the runtime needs from ampr_emu.index
+
+A packed file is reachable only through its AMPRIDX3 id. At mount the
+runtime takes each AMPRIDX3 record, strips `/app0/` from its path and looks
+the rest up in `ampr_zstd.index` (`project_entry`, `rt/pack/zstd.rs`). A
+packer has to keep these rules, or the game cannot open the files it packed:
+
+- Every packed file needs a record in `ampr_emu.index` with the same path.
+  A file that is in `ampr_zstd.index` but not in `ampr_emu.index` has no id
+  and is not served. The zstd lookup keeps case, so the bytes of the two
+  paths must match.
+- The size in the record must equal `logical_size` of the file in
+  `ampr_zstd.index`. A difference makes the mount invalid.
+- `ampr_emu.index` has to pass its own checks (`Index::check`,
+  `crates/ampr-format/src/index.rs`): every path shorter than 1024 bytes
+  with no name part over 255 bytes (`kernel_path_limits`) and no NUL, and no
+  two records whose paths are equal after folding `A`-`Z` to `a`-`z` and `\`
+  to `/`. One bad record makes the whole file invalid, not only that record.
+  A title without packs then gets an index rebuilt from the folder. With
+  packs the rebuilt index stays in memory and is made from a walk of the
+  folder, which cannot contain the packed files because they are gone from
+  `/app0`, so none of them is served (`ensure_ready_slow`, `rt/index.rs`).
+
 ## ampr_zstd.index
 
 Header, 128 bytes:
