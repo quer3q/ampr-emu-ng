@@ -27,7 +27,7 @@ const LIBKERNEL: SceKernelModule = 0x2001;
 const HOOK_COUNT: usize = id::COUNT;
 const EXT_COUNT: usize = 5;
 /// Save data hooks in loaded system modules (rt/save.rs), not libkernel ids.
-const SAVE_COUNT: usize = 4;
+const SAVE_COUNT: usize = 3;
 /// `sceKernelLoadStartModule` and `sceKernelLoadStartModuleForSysmodule`.
 const LOADER_COUNT: usize = 2;
 const TRAMP_PAGES: usize =
@@ -40,8 +40,8 @@ const _: () = {
     assert!(POOL_COPY_PAGES <= 64 && TRAMP_PAGES == 4 + cfg!(feature = "mem_report") as usize);
     // 10 game AIO slots 100..=109 and 2 thread-creation slots 110..=111 in
     // both builds, and in debug builds the 8 probe slots 112..=119
-    // (rt/probe.rs). With the 5 external equeue hooks, the 4 save data hooks
-    // (rt/save.rs) and the 2 loader hooks that is 123 (release) or 131 (debug)
+    // (rt/probe.rs). With the 5 external equeue hooks, the 3 save data hooks
+    // (rt/save.rs) and the 2 loader hooks that is 122 (release) or 130 (debug)
     // trampolines: 4 pages x 32 slots = 128 in release, 5 pages = 160 in debug.
     assert!(HOOK_COUNT == 112 + 8 * cfg!(feature = "mem_report") as usize);
     assert!(HOOK_COUNT + EXT_COUNT + SAVE_COUNT + LOADER_COUNT <= TRAMP_PAGES * SLOTS_PER_PAGE);
@@ -364,9 +364,8 @@ static EXT_HOOKS: Table<HookSpec, EXT_COUNT> = Table(specs![
 // Index into `SAVE_HOOKS` and `g_amprOriginalSaveDataById`; rt/save.rs calls
 // `save_original` with these.
 pub(crate) const SAVE_MOUNT3: usize = 0;
-pub(crate) const SAVE_UMOUNT2: usize = 1;
-pub(crate) const SAVE_ICON: usize = 2;
-pub(crate) const SAVE_ICON_PATH: usize = 3;
+pub(crate) const SAVE_ICON: usize = 1;
+pub(crate) const SAVE_ICON_PATH: usize = 2;
 
 /// A symbol in a loaded system module: try the NID first (PS5 libraries
 /// export NIDs), then the plain name (debug SDKs and libkernel).
@@ -381,11 +380,6 @@ static SAVE_HOOKS: Table<SaveSpec, SAVE_COUNT> = Table([
         nid: c"ZP4e7rlzOUk",
         symbol: c"sceSaveDataMount3",
         replacement: super::save::mount3_emul as *mut c_void,
-    },
-    SaveSpec {
-        nid: c"uW4vfTwMQVo",
-        symbol: c"sceSaveDataUmount2",
-        replacement: super::save::umount2_emul as *mut c_void,
     },
     SaveSpec {
         nid: c"c88Yy54Mx0w",
