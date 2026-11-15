@@ -220,7 +220,11 @@ CI (`.github/workflows/build.yml`) runs the same commands; a pushed `v*` tag cre
 
 1. `cargo test --workspace` passes on the host.
 2. `./ps5/build-docker.sh verify` (or `dist`) passes; it runs
-   `tools/verify_payload_prx.py` on the linked PRX and SPRX.
+   `tools/verify_payload_prx.py` on the linked PRX and SPRX, and
+   `tools/check_stack_frames.py`, which fails when a hook-path function's
+   stack frame passes its budget (hooks run on the game's own small
+   stacks; v0.4.0 overflowed a save thread's). A change that grows one
+   moves the cold code out of line instead of raising the budget.
 3. Runtime behavior changes need a run on a console with
    `libSceAmpr-debug.sprx`: read `http://<ps5-ip>:9090/metrics` before and
    after and compare game wait per read, pack job and disk read time

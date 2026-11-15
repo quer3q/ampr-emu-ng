@@ -331,6 +331,7 @@ verify: all
 	  --defined $(DEFINED_LIST) \
 	  --sprx $(SPRX) \
 	  --fself-version $(PROSPERO_200_FSELF_VERSION)
+	$(PYTHON) tools/check_stack_frames.py $(PRX)
 
 # Release and debug SPRX, verified, copied to the project root.
 dist:
