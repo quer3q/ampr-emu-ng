@@ -2259,6 +2259,29 @@ fn how(l: &Lookup) -> u8 {
     }
 }
 
+/// A directory hit of `open_resolved`. Out of line: its canonical path
+/// buffer (1 KiB) would otherwise sit in the frame of every open, packed
+/// file opens included, on the game's own thread (a save thread overflowed
+/// its stack there, see manifest.rs `ensure_manifest_ready`).
+#[inline(never)]
+unsafe fn open_directory_hit(l: &Lookup, flags: c_int, mode: SceKernelMode, real: RealOpen) -> c_int {
+    let mut handled = false;
+    stats::add(stats::Stat::OpenDirectory, 1);
+    let mut canon = [0u8; RUNTIME_PATH_CAPACITY];
+    if !unsafe { copy_dir_path(l, &mut canon) } {
+        set_errno(ENAMETOOLONG);
+        return -1;
+    }
+    let canon: *const c_char = canon.as_ptr().cast();
+    if directory_open_flags(flags) && unsafe { ampr_pack_manifest_is_resident_ready() } {
+        let rc = unsafe { ampr_pack_open_directory(canon, flags, mode, &mut handled) };
+        if handled {
+            return posix_return_from_sce(rc);
+        }
+    }
+    unsafe { real(canon, flags, mode) }
+}
+
 unsafe fn open_resolved(
     l: &Lookup,
     path: *const c_char,
@@ -2269,22 +2292,7 @@ unsafe fn open_resolved(
     let dir_flag = flags & O_DIRECTORY != 0;
     let mut handled = false;
     match l.state {
-        Resident::Directory => {
-            stats::add(stats::Stat::OpenDirectory, 1);
-            let mut canon = [0u8; RUNTIME_PATH_CAPACITY];
-            if !unsafe { copy_dir_path(&l, &mut canon) } {
-                set_errno(ENAMETOOLONG);
-                return -1;
-            }
-            let canon: *const c_char = canon.as_ptr().cast();
-            if directory_open_flags(flags) && unsafe { ampr_pack_manifest_is_resident_ready() } {
-                let rc = unsafe { ampr_pack_open_directory(canon, flags, mode, &mut handled) };
-                if handled {
-                    return posix_return_from_sce(rc);
-                }
-            }
-            unsafe { real(canon, flags, mode) }
-        }
+        Resident::Directory => unsafe { open_directory_hit(l, flags, mode, real) },
         Resident::Hit => {
             if dir_flag {
                 // A writable /app0 may have replaced a loose file with a
