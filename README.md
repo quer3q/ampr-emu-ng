@@ -1,8 +1,6 @@
 # ampr-emu-ng
 
-A hard fork of [drakmor/ampr_emu](https://github.com/drakmor/ampr_emu), built for speed and stability on PKG, zstd, LZ4 and plain games.
-
-It only reads packs; to make them see [Make packs](#make-packs).
+A hard fork of [drakmor/ampr_emu](https://github.com/drakmor/ampr_emu), built to run PKG, zstd, LZ4 and plain games quickly and reliably.
 
 ## How to
 
@@ -11,21 +9,17 @@ It only reads packs; to make them see [Make packs](#make-packs).
 Copy `libSceAmpr.sprx` into the game's `fakelib/`, mount the game with
 ShadowMountPlus and turn off fakelib updates in its settings. At launch the
 console shows `ampr-emu-ng: vx.x.x (zstd) running`, where the mode is `zstd`,
-`pkg`, `lz4`, or `plain` for a game with only loose files. The virtual-fd, libc,
-mmap and game AIO hooks install only in a game with packs; the thread
-creation and save data hooks install in every game.
+`pkg`, `lz4`, or `plain` for a game with only loose files.
 
 A PKG game runs through [kraken-mount](https://github.com/quer3q/kraken-mount),
-the PKG launcher: it mounts the folder holding the .pkg at `/app0/kraken/`,
-names the .pkg in `/app0/kraken.image` and copies `libSceAmpr.sprx` from
-`/data/krakenmount/ampr/` into the game's `fakelib/`.
+the PKG launcher, which copies `libSceAmpr.sprx` into the game's `fakelib/`
+itself.
 
 ### Make packs
 
-[ps5-dump-forge](https://github.com/quer3q/ps5-dump-forge) builds zstd and
-LZ4 packs. A PKG game needs no packing:
-[kraken-mount](https://github.com/quer3q/kraken-mount) builds its manifest
-from the .pkg.
+[ps5-dump-forge](https://github.com/quer3q/ps5-dump-forge) builds PKGs, zstd
+packs and LZ4 packs. Other tools that write the same formats should work too,
+but are untested.
 
 ### Build
 
