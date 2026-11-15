@@ -437,6 +437,7 @@ pub(crate) unsafe fn release_manifest_storage(state: *mut PackState) {
     }
 }
 
+#[inline(never)]
 pub(crate) unsafe fn load_manifest(state: *mut PackState, absent: *mut bool) -> bool {
     if !absent.is_null() {
         unsafe { *absent = false };
@@ -520,10 +521,29 @@ unsafe fn load_zstd_manifest(state: *mut PackState, fd: c_int, len: u64) -> bool
 
 /// zstd: the mount also needs its AMPRIDX3 projection, built on the first
 /// call after AMPRIDX3 is published (see zstd.rs).
+///
+/// The ready answer is a few loads and no call: this runs on every packed
+/// open, on the game's own threads (a save thread's stack held only about
+/// 7 KB below the hook), and with the load inlined its frame was 0x12d8
+/// bytes (0xa8 in v0.3.5) even when nothing loaded. The load and the
+/// projection build stay out of line in `ensure_manifest_slow`.
+#[inline]
 pub(crate) unsafe fn ensure_manifest_ready() -> bool {
+    if !WORKER_STOP_REQUESTED.load(Ordering::Acquire)
+        && LOAD_STATE.load(Ordering::Acquire) == PACK_LOAD_READY
+        && (!zstd_mode() || zstd::zstd_projection_ready())
+    {
+        return true;
+    }
+    unsafe { ensure_manifest_slow() }
+}
+
+#[inline(never)]
+unsafe fn ensure_manifest_slow() -> bool {
     unsafe { ensure_manifest_loaded() && (!zstd_mode() || zstd::ensure_zstd_projection()) }
 }
 
+#[inline(never)]
 pub(crate) unsafe fn ensure_manifest_loaded() -> bool {
     let state = unsafe { pack_state() };
     loop {

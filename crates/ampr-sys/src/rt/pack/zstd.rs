@@ -428,6 +428,7 @@ pub(crate) unsafe fn zstd_mount_release() {
 /// Builds the projection once, after the manifest is ready. Returns false
 /// while AMPRIDX3 is unpublished (retry later), on stop, or when the mount
 /// is invalid; concurrent callers wait for the single builder.
+#[inline(never)]
 pub(crate) unsafe fn ensure_zstd_projection() -> bool {
     unsafe { zstd_projection_step(true) }
 }
@@ -439,6 +440,7 @@ pub(crate) unsafe fn try_zstd_projection() -> bool {
     unsafe { zstd_projection_step(false) }
 }
 
+#[inline(never)]
 unsafe fn zstd_projection_step(wait: bool) -> bool {
     loop {
         match ZSTD_PROJECTION.load(Ordering::Acquire) {
@@ -648,6 +650,7 @@ pub(crate) fn sorted_order(entries: &[ZstdEntry], order: &mut [u32]) -> usize {
 
 // ---- accessors ----------------------------------------------------------------
 
+#[inline]
 pub(crate) fn zstd_projection_ready() -> bool {
     ZSTD_PROJECTION.load(Ordering::Acquire) == PROJECTION_READY
 }
