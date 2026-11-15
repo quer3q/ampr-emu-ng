@@ -84,6 +84,14 @@ stats! {
     /// game creation failed, and growths back by one after 10 s quiet.
     ThreadBudgetCuts = "thread_budget_cuts",
     ThreadBudgetRegrows = "thread_budget_regrows",
+    /// Packed reads run on the caller's own thread because no read thread
+    /// was running or startable (rt/pack/fd_read.rs `read_inline`), the ones
+    /// whose caller had under 48 KiB of stack left (the read needs about
+    /// 32 KB), and the stack left at the last one (0 when libkernel would
+    /// not say).
+    ReadInline = "read_inline",
+    ReadInlineLowStack = "read_inline_low_stack",
+    ReadInlineStackLeft = "read_inline_stack_left",
     /// Save data (rt/save.rs): mounts, the mounts the save service answered
     /// with SAVE_DATA_ERROR_BUSY (passed back to the game unchanged), icon
     /// bytes handed over through sceSaveDataSaveIcon, and packed icons the

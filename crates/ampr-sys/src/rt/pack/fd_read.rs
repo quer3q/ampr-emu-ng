@@ -317,6 +317,60 @@ unsafe fn read_on_workers(
 
 // ---- read threads ----------------------------------------------------------
 
+/// `read_on_workers` on the caller's own thread, for a read with no read
+/// thread to hand it to. Its frames need about 32 KB (below), so the debug
+/// build counts these reads and the stack their callers had left.
+unsafe fn read_inline(
+    fd: c_int,
+    vector: &[SceKernelIovec],
+    offset: u64,
+    length: u64,
+) -> ssize_t {
+    note_inline_read();
+    unsafe { read_on_workers(fd, vector, offset, length) }
+}
+
+/// Stack left to the calling thread: its stack pointer minus the lowest
+/// address of its stack, from libkernel's thread attributes. None when
+/// libkernel lacks them or refuses.
+fn stack_left() -> Option<usize> {
+    type Attr = *mut c_void;
+    type SelfFn = unsafe extern "C" fn() -> ScePthread;
+    type InitFn = unsafe extern "C" fn(*mut Attr) -> c_int;
+    type GetFn = unsafe extern "C" fn(ScePthread, *mut Attr) -> c_int;
+    type StackFn = unsafe extern "C" fn(*const Attr, *mut *mut c_void, *mut usize) -> c_int;
+    let init = unsafe { sys::resolve_kernel::<InitFn>(c"scePthreadAttrInit") }?;
+    let get = unsafe { sys::resolve_kernel::<GetFn>(c"scePthreadAttrGet") }?;
+    let get_stack = unsafe { sys::resolve_kernel::<StackFn>(c"scePthreadAttrGetstack") }?;
+    let destroy = unsafe { sys::resolve_kernel::<InitFn>(c"scePthreadAttrDestroy") }?;
+    let this = unsafe { sys::resolve_kernel::<SelfFn>(c"scePthreadSelf") }?;
+    let mut attr: Attr = null_mut();
+    if unsafe { init(&mut attr) } != 0 {
+        return None;
+    }
+    let (mut base, mut size): (*mut c_void, usize) = (null_mut(), 0);
+    let ok = unsafe { get(this(), &mut attr) } == 0
+        && unsafe { get_stack(&attr, &mut base, &mut size) } == 0
+        && !base.is_null()
+        && size != 0;
+    let _ = unsafe { destroy(&mut attr) };
+    let here = 0u8;
+    let sp = core::ptr::addr_of!(here) as usize;
+    (ok && sp > base as usize && sp - (base as usize) <= size).then(|| sp - base as usize)
+}
+
+fn note_inline_read() {
+    if !cfg!(feature = "mem_report") {
+        return;
+    }
+    stats::add(stats::Stat::ReadInline, 1);
+    let left = stack_left().unwrap_or(0);
+    stats::set(stats::Stat::ReadInlineStackLeft, left as u64);
+    if left != 0 && left < 48 * 1024 {
+        stats::add(stats::Stat::ReadInlineLowStack, 1);
+    }
+}
+
 /// `read_on_workers` runs here, not on the caller's thread: its frames hold
 /// AIO arrays sized for 128 requests (read_on_workers 12,024 B,
 /// sceKernelAioSubmitReadCommandsMultiple 13,528 B, publish_virtual_jobs
@@ -749,7 +803,7 @@ unsafe fn read_on_read_thread(
     // also on the large-stack threads that read fine inline; only a
     // small-stack caller is at risk, as before the read threads existed.
     if !unsafe { start_read_threads() } {
-        return unsafe { read_on_workers(fd, vector, offset, length) };
+        return unsafe { read_inline(fd, vector, offset, length) };
     }
     let mut call = ReadCall {
         fd,
@@ -781,7 +835,7 @@ unsafe fn read_on_read_thread(
                     );
                 }
                 drop(g);
-                return unsafe { read_on_workers(fd, vector, offset, length) };
+                return unsafe { read_inline(fd, vector, offset, length) };
             }
         }
         if unsafe { (*READ_CALLS.get()).push(p) } {

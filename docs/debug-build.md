@@ -125,6 +125,14 @@ read the same way, one exact-size read of their stored bytes, and count in
 the same `pack_disk_reads`, `pack_disk_bytes` and disk read times as other
 pack reads; `pack_disk_bytes / pack_disk_reads` is the average read size.
 
+`read_inline` counts packed reads that ran on the caller's own thread
+because no read thread was running or startable (rt/pack/fd_read.rs
+`read_inline`; the read's frames need about 32 KB). `read_inline_stack_left`
+is the stack the last such caller had left (0 when libkernel would not say)
+and `read_inline_low_stack` counts those with under 48 KiB left. All three
+stay 0 while read threads are up. `/threads?hold=N` can make thread creation
+fail to reach this path.
+
 Save data (`rt/save.rs`) shows what the save service answered.
 `save_mounts` counts sceSaveDataMount3 calls, `save_busy` those answered
 SAVE_DATA_ERROR_BUSY, `save_mount_errors` those answered non-zero (BUSY
