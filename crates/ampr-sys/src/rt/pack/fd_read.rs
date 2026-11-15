@@ -542,7 +542,12 @@ unsafe extern "C" fn read_thread(arg: *mut c_void) -> *mut c_void {
         drop(g);
         let rc = unsafe {
             let c = &*call;
-            read_on_workers(c.fd, core::slice::from_raw_parts(c.vector, c.count), c.offset, c.length)
+            read_on_workers(
+                c.fd,
+                core::slice::from_raw_parts(c.vector, c.count),
+                c.offset,
+                c.length,
+            )
         };
         g = READ_M.lock();
         READ_LOAD.end();
@@ -649,7 +654,10 @@ unsafe fn start_read_threads() -> bool {
         && !READ_STOP.load(Ordering::Acquire)
         && !unsafe { spawn_read_thread_locked() }
     {
-        READ_START_RETRY_NS.store(now.saturating_add(READ_START_RETRY_GAP_NS), Ordering::Relaxed);
+        READ_START_RETRY_NS.store(
+            now.saturating_add(READ_START_RETRY_GAP_NS),
+            Ordering::Relaxed,
+        );
     }
     READ_THREADS_UP.load(Ordering::Relaxed) != 0
 }
@@ -767,8 +775,10 @@ unsafe fn read_on_read_thread(
                 && now >= READ_START_RETRY_NS.load(Ordering::Relaxed);
             if !(due && unsafe { spawn_read_thread_locked() }) {
                 if due {
-                    READ_START_RETRY_NS
-                        .store(now.saturating_add(READ_START_RETRY_GAP_NS), Ordering::Relaxed);
+                    READ_START_RETRY_NS.store(
+                        now.saturating_add(READ_START_RETRY_GAP_NS),
+                        Ordering::Relaxed,
+                    );
                 }
                 drop(g);
                 return unsafe { read_on_workers(fd, vector, offset, length) };
@@ -800,9 +810,7 @@ unsafe fn read_on_read_thread(
         READ_WORK_CV.notify_one();
     }
     // `done` is written under READ_M by the read thread.
-    READ_DONE_CVS[call.cv].wait_until(&mut g, || unsafe {
-        core::ptr::read_volatile(&(*p).done)
-    });
+    READ_DONE_CVS[call.cv].wait_until(&mut g, || unsafe { core::ptr::read_volatile(&(*p).done) });
     drop(g);
     call.rc
 }
@@ -1169,7 +1177,7 @@ pub unsafe fn ampr_pack_try_lseek_fd(
     slot.directory_offset = 0;
     slot.dot_emitted = false;
     slot.dot_dot_emitted = false;
-    slot.virtual_cursor = slot.range_begin;
+    slot.listing = slot.listing_first;
     slot.physical_hash_count = 0;
     slot.physical_hash_overflow = false;
     0
@@ -1782,6 +1790,9 @@ mod tests {
         assert_eq!(q.pop(), Some(1));
         // A freed slot takes the next call behind the queued ones, not first.
         assert!(q.push(4));
-        assert_eq!([q.pop(), q.pop(), q.pop(), q.pop()], [Some(2), Some(3), Some(4), None]);
+        assert_eq!(
+            [q.pop(), q.pop(), q.pop(), q.pop()],
+            [Some(2), Some(3), Some(4), None]
+        );
     }
 }

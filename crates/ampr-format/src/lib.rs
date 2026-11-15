@@ -9,6 +9,9 @@ pub mod index_key;
 pub mod overlay;
 pub mod run;
 pub mod source;
+pub mod view;
+pub mod view_join;
+pub mod view_list;
 pub mod zstd;
 
 pub const IDX_MAGIC: &[u8; 8] = b"AMPRIDX3";
@@ -114,8 +117,12 @@ pub fn folded(byte: u8) -> u8 {
 }
 
 fn hash(path: &[u8], basis: u64) -> u64 {
+    hash_parts(&[path], basis)
+}
+
+fn hash_parts(parts: &[&[u8]], basis: u64) -> u64 {
     let mut value = basis;
-    for &byte in path {
+    for &byte in parts.iter().flat_map(|p| p.iter()) {
         value = (value ^ u64::from(folded(byte))).wrapping_mul(1_099_511_628_211);
     }
     if value == 0 {
@@ -130,6 +137,11 @@ pub fn pak_path_hash(path: &[u8]) -> u64 {
 }
 pub fn idx_path_hash(path: &[u8]) -> u64 {
     hash(path, 1_469_598_103_934_665_603)
+}
+/// `idx_path_hash` of the parts joined, without a buffer to join them in
+/// (a zstd path is hashed as `/app0/` plus the stored relative path).
+pub fn idx_path_hash_parts(parts: &[&[u8]]) -> u64 {
+    hash_parts(parts, 1_469_598_103_934_665_603)
 }
 
 pub fn crc32(bytes: &[u8]) -> u32 {

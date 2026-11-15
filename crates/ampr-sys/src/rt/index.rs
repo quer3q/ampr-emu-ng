@@ -17,8 +17,8 @@
 #![allow(non_snake_case)]
 
 use super::fd_cache::{EntryPath, FileEntryView};
-use super::index_memory::{self as im, lookup_alloc, lookup_free};
-use super::index_pages::{self, IndexSource};
+use super::index_file::{pread_fd, BlobSource, FileSource, PathSource, ResidentSource, WINDOW};
+use super::index_view::{self, BuildError, ViewMem};
 use super::runtime_memory::{
     ampr_internal_amm_pool_alloc, ampr_internal_amm_pool_ensure, ampr_internal_amm_pool_free,
     ampr_internal_amm_pool_ready_has_capacity, ampr_sdk_cpu_memory_class_name,
@@ -28,8 +28,9 @@ use super::rw;
 use super::stats;
 use super::sync::{Condvar, Mutex, SyncCell};
 use super::sys::*;
-use ampr_format::index::{FastEntry, Index, Layout};
-use ampr_format::source::PATH_BUF;
+use ampr_format::index::{read_layout, Index, Layout};
+use ampr_format::source::{Source, PATH_BUF};
+use ampr_format::view::{Builder, Hit, Packs, View, NO_CHUNK};
 use core::ffi::{c_char, c_int, c_void, CStr};
 use core::ptr::{null, null_mut};
 use core::sync::atomic::{AtomicU32, AtomicU8, Ordering::*};
@@ -126,31 +127,23 @@ fn next_unreadable_loads(count: u32, result: LoadResult) -> u32 {
 
 // ---- global state ----------------------------------------------------------
 
-/// The file index (C++ FileIndexState compact* fields): the AMPRIDX3 image
-/// read at the offsets of its checked header, whole in index memory when it
-/// fits with its tables (as in v0.3.5), else through the index page cache
-/// (rt/index_pages.rs) with a resident fast table, so a large index keeps
-/// only part of itself in memory. A paged file stays open at `fd`; an image
-/// that could not be installed is served from its build buffer at `mem`.
+/// The file index (C++ FileIndexState compact* fields): the compiled view
+/// of `ampr_emu.index` (rt/index_view.rs), built once in one pass over the
+/// file and resident in one Index ledger block, plus the source its paths
+/// are read from afterwards. A path is read only to confirm a hash match
+/// or to hand a path out; sizes and mtimes come from the view's columns.
 pub(crate) struct Compact {
-    pub src: Option<IndexSource>,
-    pub layout: Layout,
     pub count: usize,
-    /// The paged index file, -1 for none or an image in memory.
-    pub fd: c_int,
-    /// The image in memory (a file read whole, or the build buffer; Index
-    /// ledger), null for a paged file.
-    pub mem: *mut u8,
-    /// The fast table of a paged file (`count` entries, `lookup_alloc`),
-    /// null for an image in memory.
-    pub fast: *mut FastEntry,
-    /// The rank order of a paged file that is not sorted (`count` ids,
-    /// `lookup_alloc`, `fill_order`), so `find_directory` binary-searches
-    /// it; null for a sorted or in-memory image.
-    pub order: *mut u32,
-    /// Record id order is folded path order (rt/pack/zstd.rs `build_order`
-    /// sorts itself when false); a rank `order` does not change it.
-    pub sorted: bool,
+    /// The finished view; None until `finish`, and on a cleared index.
+    pub view: Option<View<'static>>,
+    /// The view between the build and `finish`, so the pack index can be
+    /// joined into it before it is published.
+    pub builder: Option<Builder<'static>>,
+    /// The ledger blocks `view` and `builder` live in; the transient one
+    /// only until `finish`.
+    mem: Option<ViewMem>,
+    /// Where the view reads paths.
+    pub paths: Paths,
     pub available: bool,
     /// The build walk saw a symlink and did not index it, so misses are not
     /// authoritative (see `miss_is_authoritative`). Only a runtime build sets
@@ -158,27 +151,40 @@ pub(crate) struct Compact {
     pub links: bool,
 }
 
-const LAYOUT0: Layout = Layout {
-    count: 0,
-    records_len: 0,
-    paths_at: 0,
-    path_bytes: 0,
-    slots_at: 0,
-    slot_count: 0,
-    slots_len: 0,
-    file_len: 0,
-};
+/// The paths of the loaded index: the index file on an fd kept open for
+/// the life of the module, or, for an image the walk built and could not
+/// install, its path blob copied into the Index ledger.
+pub(crate) enum Paths {
+    None,
+    File(PathSource),
+    Blob(BlobSource<'static>),
+}
+
+impl ampr_format::source::Source for Paths {
+    fn len(&self) -> u64 {
+        match self {
+            Paths::None => 0,
+            Paths::File(f) => f.len(),
+            Paths::Blob(b) => b.len(),
+        }
+    }
+
+    fn read_at(&self, at: u64, out: &mut [u8]) -> ampr_format::Result<()> {
+        match self {
+            Paths::None => Err(ampr_format::Error::Truncated),
+            Paths::File(f) => f.read_at(at, out),
+            Paths::Blob(b) => b.read_at(at, out),
+        }
+    }
+}
 
 impl Compact {
     pub const EMPTY: Self = Self {
-        src: None,
-        layout: LAYOUT0,
         count: 0,
-        fd: -1,
-        mem: null_mut(),
-        fast: null_mut(),
-        order: null_mut(),
-        sorted: false,
+        view: None,
+        builder: None,
+        mem: None,
+        paths: Paths::None,
         available: false,
         links: false,
     };
@@ -223,8 +229,9 @@ pub(crate) fn published() -> Option<&'static Compact> {
 }
 
 /// module_stop, after the hooks are gone: lookups after this see no index.
-/// The resident image is not freed: `published()` hands out a reference
-/// without a lock or count, so a thread still inside a lookup may read it,
+/// The view and its path source are not freed: `published()` hands out a
+/// reference without a lock or count, so a thread still inside a lookup
+/// may read them,
 /// and the pool is the PRX's .bss, gone with the module.
 pub(crate) unsafe fn release_resident_index() {
     let _g = INDEX_LOCK.lock();
@@ -537,87 +544,80 @@ impl Drop for PathStack {
 // ---- resident image helpers ----------------------------------------------------
 
 impl Compact {
-    /// `clear_compact_file_index_locked`: gives back the page cache source,
-    /// the file and the in-memory image. Never on a published index.
+    /// `clear_compact_file_index_locked`: gives back the view block, the
+    /// path blob and the index fd. Never on a published index.
     pub unsafe fn clear(&mut self) {
-        if let Some(IndexSource::Paged(src)) = self.src {
-            index_pages::unregister(src);
+        self.view = None;
+        self.builder = None;
+        if let Some(mem) = self.mem.take() {
+            // SAFETY: the view and builder of the block are gone above, and
+            // an unpublished index has no reader.
+            unsafe { mem.free() };
         }
-        unsafe { self.free_fast() };
-        unsafe { self.free_order() };
-        // Host tests link no libkernel and register no file.
-        #[cfg(not(test))]
-        if self.fd >= 0 {
-            unsafe { real_physical_close(self.fd) };
+        match core::mem::replace(&mut self.paths, Paths::None) {
+            Paths::None => {}
+            // Host tests link no libkernel and open no file.
+            Paths::File(_f) => {
+                #[cfg(not(test))]
+                unsafe {
+                    real_physical_close(_f.fd())
+                };
+            }
+            Paths::Blob(b) => unsafe {
+                title_free(b.blob.as_ptr().cast_mut(), c"apr.index.paths.release")
+            },
         }
-        unsafe { title_free(self.mem, c"apr.index.build.image") };
         *self = Self::EMPTY;
     }
     /// `move_compact_file_index_locked(dst=self, src)`: clears `self`,
-    /// takes `src`'s image and leaves `src` empty.
+    /// takes `src`'s view and leaves `src` empty.
     pub unsafe fn move_from(&mut self, src: &mut Compact) {
         unsafe { self.clear() };
         *self = core::mem::replace(src, Self::EMPTY);
     }
-    /// O(1) lookup view over the validated image, with the fast table and
-    /// the rank order of a paged file.
-    pub fn view(&self) -> Option<Index<'_, IndexSource>> {
-        let mut view = Index::view_validated(self.src.as_ref()?, &self.layout).ok()?;
-        if !self.fast.is_null() {
-            let fast = unsafe { core::slice::from_raw_parts(self.fast, self.count) };
-            view = view.with_fast(fast).ok()?;
-        }
-        if !self.order.is_null() {
-            // `check_compact` attached it once with the full id check.
-            let order = unsafe { core::slice::from_raw_parts(self.order, self.count) };
-            view = view.with_checked_order(order).ok()?;
-        }
-        Some(view)
-    }
-    fn fast_bytes(&self) -> usize {
-        (self.count * size_of::<FastEntry>()).max(1)
-    }
-    fn order_bytes(&self) -> usize {
-        (self.count * size_of::<u32>()).max(1)
-    }
-    unsafe fn free_order(&mut self) {
-        if !self.order.is_null() {
-            let tag = c"apr.index.order.release".as_ptr();
-            unsafe { lookup_free(self.order.cast(), self.order_bytes(), tag) };
-            self.order = null_mut();
+    /// The built view made read-only, and the build's transient columns
+    /// given back to the Index ledger; a no-op once finished. The pack join
+    /// runs before it in a title with packs.
+    pub fn finish(&mut self) {
+        if let Some(b) = self.builder.take() {
+            self.view = Some(b.finish());
+            if let Some(mem) = self.mem.as_mut() {
+                // SAFETY: the builder is consumed above and the view reads
+                // no transient column.
+                unsafe { mem.free_scratch() };
+            }
         }
     }
-    unsafe fn free_fast(&mut self) {
-        if !self.fast.is_null() {
-            stats::sub(stats::Stat::IndexFastBytes, self.fast_bytes() as u64);
-            let tag = c"apr.index.fast.release".as_ptr();
-            unsafe { lookup_free(self.fast.cast(), self.fast_bytes(), tag) };
-            self.fast = null_mut();
-        }
+    /// The finished view.
+    pub fn view(&self) -> Option<View<'static>> {
+        self.view
     }
-    /// `compact_index_entry_view`: one-based record `id` of the image. The
-    /// path is copied into `path` (NUL-terminated) and `out.path` points
-    /// there; without `path`, `out.path` is null (size and mtime only).
-    /// `Io` when a paged read failed, which callers must not report as a
-    /// missing file.
+    /// `compact_index_entry_view`: one-based file `id`. Size and mtime come
+    /// from the view; the path is read only when `path` is given, copied
+    /// there NUL-terminated with `out.path` pointing at it. Without `path`,
+    /// `out.path` is null and `out.path_length` 0 (the view keeps no path
+    /// lengths). `Io` when the path read failed, which callers must not
+    /// report as a missing file.
     pub fn try_entry_view(
         &self,
         id: u32,
         out: &mut FileEntryView,
         path: Option<&mut EntryPath>,
     ) -> ampr_format::Result<()> {
-        let v = self.view().ok_or(ampr_format::Error::Invalid)?;
-        let r = v.record(id)?;
+        let v = self.view.ok_or(ampr_format::Error::Invalid)?;
+        if id == 0 || id > v.files() {
+            return Err(ampr_format::Error::Invalid);
+        }
         out.path = null();
+        out.path_length = 0;
         if let Some(buf) = path {
-            let n = r.path_len as usize;
-            v.path(&r, &mut buf[..n])?;
+            let n = v.path(&self.paths, id, buf)?.len();
             buf[n] = 0;
             out.path = buf.as_ptr().cast();
+            out.path_length = n as u32;
         }
-        out.path_length = r.path_len;
-        out.size = r.size as usize;
-        out.mtime = r.mtime;
+        out.size = v.size(id) as usize;
+        out.mtime = v.mtime(id);
         Ok(())
     }
 }
@@ -1399,10 +1399,10 @@ unsafe fn add_dirent(
 /// Bound on back-to-back EINTR retries of one index write call.
 const EINTR_RETRY_MAX: u32 = 64;
 
-/// `load_compact_app0_index_locked`: reads INDEX_PATH whole into index
-/// memory when it fits with its tables, else registers it with the index
-/// page cache (the fd stays open, misses read it again); validates it fully
-/// and marks `idx` available.
+/// `load_compact_app0_index_locked`: builds the view of INDEX_PATH in one
+/// pass over the file (`load_file`) and keeps the fd open for path reads.
+/// In a title with no packs the view is finished here; with packs
+/// `ensure_ready_slow` finishes it after the pack index load.
 pub(crate) unsafe fn load_compact_index(idx: &mut FileIndexState) -> LoadResult {
     unsafe { idx.compact.clear() };
     let fd = unsafe { real_posix_open(INDEX_PATH.as_ptr(), O_RDONLY, 0) };
@@ -1410,90 +1410,103 @@ pub(crate) unsafe fn load_compact_index(idx: &mut FileIndexState) -> LoadResult 
         return open_failure_result(errno());
     }
     let mut st = Stat::default();
-    let len = if unsafe { real_physical_fstat(fd, (&raw mut st).cast()) } != 0 {
-        Err(LoadResult::Unreadable)
+    let rc = if unsafe { real_physical_fstat(fd, (&raw mut st).cast()) } != 0 {
+        LoadResult::Unreadable
     } else if st.st_size < ampr_format::IDX_HEADER as i64 {
-        Err(LoadResult::Invalid)
+        LoadResult::Invalid
     } else {
-        Ok(st.st_size as u64)
+        let len = st.st_size as u64;
+        let read = |at: u64, out: &mut [u8]| pread_fd(fd, at, out);
+        unsafe { load_file(idx, len, read, view_packs()) }
     };
-    // The header is checked before any memory is committed: a corrupt file
-    // must not take the page arena (rt/index_pages.rs).
-    let src = len
-        .and_then(|len| Ok((len, unsafe { read_count(fd) }?)))
-        .and_then(|(len, count)| match unsafe { read_whole(fd, len, count) } {
-            Some(bytes) => Ok(IndexSource::Resident(bytes)),
-            None => index_pages::register_file(fd, len)
-                .map(IndexSource::Paged)
-                .ok_or(LoadResult::Memory),
-        });
-    match src {
-        Ok(src) => {
-            if let IndexSource::Resident(bytes) = src {
-                unsafe { real_physical_close(fd) };
-                idx.compact.mem = bytes.as_ptr().cast_mut();
-            } else {
-                idx.compact.fd = fd;
-            }
-            idx.compact.src = Some(src);
-            unsafe { finish_compact(idx) }
-        }
-        Err(e) => {
-            unsafe { real_physical_close(fd) };
-            e
-        }
-    }
-}
-
-/// Lookup bytes a paged index adds per record: its fast table entry and
-/// about 20 B of pack tables built from it (16 B of projection per id and
-/// 4 B of order, rt/pack/zstd.rs `lookup_bytes`).
-const LOOKUP_PER_FILE: usize = size_of::<FastEntry>() + 20;
-
-/// The record count of the index file `fd` from its checked header:
-/// Unreadable on a read error, Invalid when it is not an AMPRIDX3 header.
-unsafe fn read_count(fd: c_int) -> Result<usize, LoadResult> {
-    let mut head = [0u8; ampr_format::IDX_HEADER];
-    if !index_pages::read_head(fd, &mut head) {
-        return Err(LoadResult::Unreadable);
-    }
-    Layout::parse(&head)
-        .map(|l| l.count as usize)
-        .map_err(load_error)
-}
-
-/// Whether an index file of `len` bytes and `count` records is read whole:
-/// it and `pack_reserve` (the least the pack index mounted after it needs,
-/// pack/manifest.rs `pack_index_reserve`, its derived tables included; a
-/// whole file has no fast table) fit `room`. Paged, it needs only its fast
-/// table and rank order, so a file that would starve the pack index is
-/// paged. With no reserve (no packs, or a manifest load already started)
-/// the tables a paged one would need are kept as the margin, as before.
-/// With one, `len` is rounded up to whole pages like the resident copy.
-fn whole_fits(len: u64, count: usize, pack_reserve: usize, room: usize) -> bool {
-    let len = usize::try_from(len).ok();
-    let (len, tables) = if pack_reserve == 0 {
-        (len, count.checked_mul(LOOKUP_PER_FILE))
+    if rc == LoadResult::Loaded {
+        idx.compact.paths = Paths::File(PathSource::new(fd, st.st_size as u64));
     } else {
-        let page = index_pages::PAGE;
+        unsafe { real_physical_close(fd) };
+    }
+    rc
+}
+
+/// The pack columns the view carries for this title's pack format: LZ4
+/// and pkg titles join their records by position and compare each with the
+/// row's `pak_path_hash` (`Packs::Lz4`); a title with no packs carries none.
+fn view_packs() -> Packs {
+    match super::pack::pack_format() {
+        f if f.is_zstd() => Packs::Zstd,
+        f if f.has_packs() => Packs::Lz4,
+        _ => Packs::None,
+    }
+}
+
+/// Builds the view of an AMPRIDX3 file of `len` bytes, read through
+/// `read` (a pread that fills the slice), into `idx` and marks it
+/// available; the caller sets `idx.compact.paths`. The header is checked
+/// before any memory is taken, so a corrupt file takes nothing. The file
+/// is read through two `WINDOW` buffers from the Index ledger, given back
+/// once the view is built. Memory when the ledger refuses the windows or
+/// the view, Unreadable on a read error, Invalid for a bad file.
+unsafe fn load_file(
+    idx: &mut FileIndexState,
+    len: u64,
+    read: impl Fn(u64, &mut [u8]) -> bool,
+    packs: Packs,
+) -> LoadResult {
+    let mut head = [0u8; ampr_format::IDX_HEADER];
+    if !read(0, &mut head) {
+        return LoadResult::Unreadable;
+    }
+    if let Err(e) = Layout::parse(&head) {
+        return load_error(e);
+    }
+    let windows = unsafe { build_alloc(2 * WINDOW, c"apr.index.load.windows") };
+    if windows.is_null() {
+        return LoadResult::Memory;
+    }
+    // SAFETY: the block holds two windows, apart, used only here.
+    let (a, b) = unsafe {
         (
-            len.and_then(|n| n.checked_next_multiple_of(page)),
-            Some(pack_reserve),
+            &mut *windows.cast::<[u8; WINDOW]>(),
+            &mut *windows.add(WINDOW).cast::<[u8; WINDOW]>(),
         )
     };
-    len.and_then(|n| n.checked_add(tables?))
-        .is_some_and(|n| n <= room)
+    let src = FileSource::new(len, read, a, b);
+    let rc = unsafe { load_from(idx, &src, packs) };
+    drop(src);
+    unsafe { title_free(windows, c"apr.index.load.windows.release") };
+    rc
 }
 
-/// The index file `fd` of `len` bytes and `count` records read whole, when
-/// `whole_fits` the Index room left; None otherwise (then it is paged) or
-/// on a read error.
-unsafe fn read_whole(fd: c_int, len: u64, count: usize) -> Option<&'static [u8]> {
-    let reserve = unsafe { super::pack::pack_index_reserve(count) };
-    if !whole_fits(len, count, reserve, im::index_room()) {
-        return None;
+/// Builds the view of the AMPRIDX3 in `src` into `idx` (see `load_file`);
+/// `view::build` checks every record path and refuses two files of one
+/// folded path. The view is finished here when `packs` is `None`.
+unsafe fn load_from<S: Source + ?Sized>(
+    idx: &mut FileIndexState,
+    src: &S,
+    packs: Packs,
+) -> LoadResult {
+    let index = match read_layout(src).and_then(|l| Index::view_validated(src, &l)) {
+        Ok(index) => index,
+        Err(e) => return load_error(e),
+    };
+    // SAFETY: the builder and the view it finishes into live in `mem`,
+    // which `Compact::clear` frees only after dropping both, and a
+    // published index is never cleared.
+    match unsafe { index_view::build::<S>(&index, packs) } {
+        Ok((mem, b)) => {
+            let c = &mut idx.compact;
+            c.count = index.len() as usize;
+            c.mem = Some(mem);
+            c.builder = Some(b);
+            if packs == Packs::None {
+                c.finish();
+            }
+            c.available = true;
+            idx.available = true;
+            LoadResult::Loaded
+        }
+        Err(BuildError::Memory) => LoadResult::Memory,
+        Err(BuildError::Format(e)) => load_error(e),
     }
-    unsafe { index_pages::read_resident(fd, len, c"apr.index.file") }
 }
 
 /// Only ENOENT means there is no index to load; any other open error
@@ -1506,44 +1519,6 @@ fn open_failure_result(err: c_int) -> LoadResult {
     }
 }
 
-/// Adopts a built image (header first, `len` bytes at `image`, a
-/// `build_alloc` block that `idx` now owns) for when it cannot be installed
-/// as INDEX_PATH. It is read from memory like a file read whole (no page
-/// cache, no fast table), validated like `load_compact_index` and freed by
-/// `clear`.
-unsafe fn adopt_compact_index(idx: &mut FileIndexState, image: *mut u8, len: usize) -> LoadResult {
-    unsafe { idx.compact.clear() };
-    idx.compact.mem = image;
-    let bytes = unsafe { core::slice::from_raw_parts(image.cast_const(), len) };
-    idx.compact.src = Some(IndexSource::Resident(bytes));
-    unsafe { finish_compact(idx) }
-}
-
-/// Checks the image (`check_compact`) and marks `idx` available; clears
-/// it on any error. A read error is Unreadable; a fast table, or the rank
-/// order of a paged file that is not sorted and its build scratch, that
-/// does not fit refuses the index (Memory) with the one index notice.
-unsafe fn finish_compact(idx: &mut FileIndexState) -> LoadResult {
-    let c = &mut idx.compact;
-    match unsafe { check_compact(c) } {
-        Ok(()) => {
-            c.available = true;
-            idx.available = true;
-            // With no pack index to mount after it, this file's fast table
-            // is the last lookup table: the page arena takes the room left
-            // (the pack mounts grow it in a title with packs).
-            if !super::pack::packs_present() {
-                index_pages::grow_arena(0);
-            }
-            LoadResult::Loaded
-        }
-        Err(e) => {
-            unsafe { idx.compact.clear() };
-            e
-        }
-    }
-}
-
 fn load_error(e: ampr_format::Error) -> LoadResult {
     match e {
         ampr_format::Error::Io => LoadResult::Unreadable,
@@ -1551,97 +1526,52 @@ fn load_error(e: ampr_format::Error) -> LoadResult {
     }
 }
 
-/// Sets `c`'s layout, count and sort flag from its source. A paged file
-/// gets its fast table first and is checked against it in one sequential
-/// pass over records and paths (`Index::check`), with no slot probe
-/// through the page cache. A paged file that is not sorted (the external
-/// packer writes unsorted images) also gets a rank order (`attach_order`),
-/// so `find_directory` binary-searches it instead of scanning every record
-/// through the cache.
-unsafe fn check_compact(c: &mut Compact) -> Result<(), LoadResult> {
-    let src = c.src.as_ref().ok_or(LoadResult::Invalid)?;
-    let layout = ampr_format::index::read_layout(src).map_err(load_error)?;
-    (c.layout, c.count) = (layout, layout.count as usize);
-    let paged = !src.is_resident();
-    if paged {
-        unsafe { attach_fast(c) }?;
+/// Serves a built image (header first, `len` bytes at `image`, a
+/// `build_alloc` block this call frees) that cannot be installed as
+/// INDEX_PATH: the view is built from it, its path blob is copied into
+/// the Index ledger for later path reads (`Paths::Blob`) and the image is
+/// given back. The image, the view and the blob are held at once for the
+/// copy. Memory when the blob does not fit; `idx` is cleared on any error.
+unsafe fn adopt_compact_index(idx: &mut FileIndexState, image: *mut u8, len: usize) -> LoadResult {
+    unsafe { idx.compact.clear() };
+    let bytes = unsafe { core::slice::from_raw_parts(image.cast_const(), len) };
+    let mut rc = unsafe { load_from(idx, bytes, view_packs()) };
+    if rc == LoadResult::Loaded {
+        rc = unsafe { keep_paths(&mut idx.compact, bytes) };
     }
-    let src = c.src.as_ref().ok_or(LoadResult::Invalid)?;
-    let mut view = Index::view_validated(src, &c.layout).map_err(load_error)?;
-    if !c.fast.is_null() {
-        let fast = unsafe { core::slice::from_raw_parts(c.fast, c.count) };
-        view = view.with_fast(fast).map_err(load_error)?;
+    unsafe { title_free(image, c"apr.index.build.image") };
+    if rc != LoadResult::Loaded {
+        unsafe { idx.compact.clear() };
+        idx.available = false;
     }
-    c.sorted = view.check().map_err(load_error)?;
-    if paged && !c.sorted {
-        unsafe { attach_order(c) }?;
-    }
-    Ok(())
+    rc
 }
 
-/// The rank order of a paged unsorted index (`count` ids, one lookup
-/// allocation), filled by `Index::fill_order` from a transient Index
-/// scratch of 8 B per record plus the path blob, freed at once. Memory,
-/// with the index notice, when the scratch and the order do not fit the
-/// Index room or the order the lookup cap; Unreadable on a read error.
-/// On an error `clear` frees the order with the rest: nothing is served.
-unsafe fn attach_order(c: &mut Compact) -> Result<(), LoadResult> {
-    let src = c.src.as_ref().ok_or(LoadResult::Invalid)?;
-    let view = Index::view_validated(src, &c.layout).map_err(load_error)?;
-    let scratch_len = view.order_scratch_len().max(1);
-    let needed = scratch_len.saturating_add(c.order_bytes());
-    if im::lookup_used().saturating_add(c.order_bytes()) > im::INDEX_LOOKUP_MAX
-        || needed > im::index_room()
-    {
-        unsafe { index_pages::refuse(needed) };
-        return Err(LoadResult::Memory);
-    }
-    let p = unsafe { lookup_alloc(c.order_bytes(), 4, c"apr.index.order".as_ptr()) };
-    if p.is_null() {
-        return Err(LoadResult::Memory);
-    }
-    c.order = p.cast();
-    let scratch = unsafe { build_alloc(scratch_len, c"apr.index.order.scratch") };
-    if scratch.is_null() {
-        return Err(LoadResult::Memory);
-    }
-    let order = unsafe { core::slice::from_raw_parts_mut(c.order, c.count) };
-    let filled = {
-        let buf = unsafe { core::slice::from_raw_parts_mut(scratch, scratch_len) };
-        view.fill_order(buf, order)
+/// Copies the path blob of the checked image `bytes` into an Index ledger
+/// block that `c` owns from here on.
+unsafe fn keep_paths(c: &mut Compact, bytes: &[u8]) -> LoadResult {
+    let Ok(l) = read_layout(bytes) else {
+        return LoadResult::Invalid;
     };
-    unsafe { title_free(scratch, c"apr.index.order.scratch.release") };
-    filled.map_err(load_error)?;
-    // The one full id check; `Compact::view` then attaches it in O(1).
-    view.with_order(order).map_err(load_error)?;
-    Ok(())
-}
-
-/// The fast table of a paged index (`count` and `layout` set), one
-/// lookup allocation filled by one pass over its hash slots. Without it
-/// the index is refused: a paged lookup would probe slots through the
-/// page cache. Memory, with the index notice, when it and the pack tables
-/// built from it do not fit the lookup cap or the Index room; a rank
-/// order, for an unsorted file only, is checked in `attach_order`.
-unsafe fn attach_fast(c: &mut Compact) -> Result<(), LoadResult> {
-    let needed = c.count.saturating_mul(LOOKUP_PER_FILE);
-    if im::lookup_used().saturating_add(needed) > im::INDEX_LOOKUP_MAX || needed > im::index_room()
-    {
-        unsafe { index_pages::refuse(needed) };
-        return Err(LoadResult::Memory);
+    let (at, n) = (l.paths_at as usize, l.path_bytes as usize);
+    let Some(src) = bytes.get(at..at + n) else {
+        return LoadResult::Invalid;
+    };
+    let blob = unsafe { build_alloc(n.max(1), c"apr.index.paths") };
+    if blob.is_null() {
+        return LoadResult::Memory;
     }
-    let src = c.src.as_ref().ok_or(LoadResult::Invalid)?;
-    let view = Index::view_validated(src, &c.layout).map_err(load_error)?;
-    let p = unsafe { lookup_alloc(c.fast_bytes(), 4, c"apr.index.fast".as_ptr()) };
-    if p.is_null() {
-        return Err(LoadResult::Memory);
-    }
-    let out = unsafe { core::slice::from_raw_parts_mut(p.cast::<FastEntry>(), c.count) };
-    let filled = view.fill_fast(out);
-    c.fast = p.cast();
-    stats::add(stats::Stat::IndexFastBytes, c.fast_bytes() as u64);
-    // On an error `clear` frees the table with the rest.
-    filled.map_err(load_error)
+    // SAFETY: `blob` holds at least `n` bytes and is owned by `c` until
+    // `clear`, which outlives every reader of a published index.
+    let blob: &'static [u8] = unsafe {
+        core::ptr::copy_nonoverlapping(src.as_ptr(), blob, n);
+        core::slice::from_raw_parts(blob, n)
+    };
+    c.paths = Paths::Blob(BlobSource {
+        blob,
+        base: l.paths_at,
+    });
+    LoadResult::Loaded
 }
 
 // ---- pack manifest probe -----------------------------------------------------------
@@ -1663,7 +1593,7 @@ unsafe fn pack_manifest_present() -> bool {
 
 // ---- ensure ready (slow path) --------------------------------------------------------
 
-use super::pack::ampr_pack_ensure_manifest_ready_safe;
+use super::pack::{ampr_pack_ensure_manifest_ready_safe, ampr_pack_mount_and_join};
 
 /// `ensure_app0_index_ready_slow`: one thread loads (or, if allowed, builds)
 /// the index outside the lock while others wait on `INDEX_CV`; the result is
@@ -1701,6 +1631,9 @@ pub(crate) unsafe fn ensure_ready_slow(allow_build: bool) -> bool {
         // in memory.
         let packs = unsafe { pack_manifest_present() };
         let build = allow_build && APP0_INDEX_AUTOBUILD;
+        // `index_mount_ns`: this load, from the index read to the finished
+        // view (the pack mount and join included).
+        let started = stats::now();
         let result = unsafe { load_compact_index(&mut work) };
         let unreadable = next_unreadable_loads(UNREADABLE_LOADS.load(Relaxed), result);
         UNREADABLE_LOADS.store(unreadable, Relaxed);
@@ -1725,10 +1658,28 @@ pub(crate) unsafe fn ensure_ready_slow(allow_build: bool) -> bool {
             _ => false,
         };
         // Finish the pack snapshot at this known-safe boundary: hooks must not
-        // see the index resident before the manifest load is terminal.
+        // see the index resident before the manifest load is terminal. The
+        // view is still being built, so the pack index is joined into it
+        // here (every mount needs that and is started nowhere else).
         if final_loaded && work.available {
-            unsafe { ampr_pack_ensure_manifest_ready_safe() };
+            match work.compact.builder.as_mut() {
+                // A mount that is not ready (invalid, unavailable, stopping)
+                // may have linked some rows before it failed; none of them
+                // is served, so they go back to loose.
+                Some(b) => {
+                    if !unsafe { ampr_pack_mount_and_join(b) } {
+                        b.unlink_all();
+                    }
+                }
+                None => {
+                    unsafe { ampr_pack_ensure_manifest_ready_safe() };
+                }
+            };
         }
+        // A title with packs finishes the view here, after the pack index
+        // load; with none `load_from` already did.
+        work.compact.finish();
+        stats::set(stats::Stat::IndexMountNs, stats::since(started));
 
         let _g = INDEX_LOCK.lock();
         let idx = unsafe { state() };
@@ -1779,7 +1730,7 @@ const fn empty_view() -> FileEntryView {
     }
 }
 
-/// A lookup that could not read the index file (a page cache read error).
+/// A lookup that could not read the index file (a path read error).
 /// It is not a miss: the file may exist, so no caller answers ENOENT or
 /// "not packed" for it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1793,8 +1744,157 @@ fn io_or_none<T>(r: ampr_format::Result<Option<T>>) -> Result<Option<T>, IndexIo
     }
 }
 
+/// What the normalized `key` names in the published view. A file hit is
+/// trusted on its hash; a hit on a collision-listed id is confirmed by
+/// `View::lookup` itself.
+#[cfg(test)]
+fn view_lookup(c: &Compact, key: &[u8]) -> ampr_format::Result<Option<Hit>> {
+    let Some(view) = c.view() else {
+        return Ok(None);
+    };
+    view.lookup(&c.paths, key).map(Some)
+}
+
+/// What one lookup of a normalized key found, with the entry the hooks
+/// answer from.
+enum KeyHit {
+    /// A file: its entry and one-based id.
+    File(FileEntryView, u32),
+    /// A directory: its stored spelling (`path_length` is the key's) and
+    /// the mtime of its representative file.
+    Dir(FileEntryView),
+    Miss,
+}
+
+/// One `View::lookup` of `key` in `c`, answering a file only when
+/// `file_ok` and a directory only when `dir_ok`; anything else is a miss.
+/// A key that names both a file and a directory answers the file, so it
+/// is a miss when only a directory is wanted (a filesystem never has
+/// both). `IndexIo` when a path read failed, which is not a miss.
+fn resolve_key(
+    c: &Compact,
+    key: &[u8],
+    file_ok: bool,
+    dir_ok: bool,
+    path: Option<&mut EntryPath>,
+) -> Result<KeyHit, IndexIo> {
+    resolve_key_paths(c, key, file_ok, dir_ok, path, false)
+}
+
+/// `resolve_key`; with `lazy` a file hit, packed or loose, leaves its path
+/// unread (null) even when `path` is given. A packed file is served by id
+/// and a loose one is asked for by the game's own spelling first
+/// (`loose_call`), so the path costs a pread only a fallback uses
+/// (`hit_path`, `loose_call`).
+fn resolve_key_paths(
+    c: &Compact,
+    key: &[u8],
+    file_ok: bool,
+    dir_ok: bool,
+    path: Option<&mut EntryPath>,
+    lazy: bool,
+) -> Result<KeyHit, IndexIo> {
+    let Some(view) = c.view() else {
+        return Ok(KeyHit::Miss);
+    };
+    // A directory-only caller probes directories alone: a file of the same
+    // folded key (`Data` beside `data/` on a case-sensitive install) must
+    // not hide the directory's indexed spelling.
+    let found = if file_ok {
+        view.lookup(&c.paths, key).map(Some)
+    } else {
+        view.lookup_dir(&c.paths, key).map(|d| d.map(Hit::Dir))
+    };
+    let hit = match io_or_none(found)? {
+        Some(Hit::File(id)) if file_ok => file_entry(c, &view, id, key, path, lazy),
+        Some(Hit::Dir(d)) if dir_ok => dir_entry(c, &view, d, key, path),
+        _ => return Ok(KeyHit::Miss),
+    };
+    Ok(io_or_none(hit)?.unwrap_or(KeyHit::Miss))
+}
+
+/// File `id`'s entry for `key`. Size and mtime come from the view. With
+/// no `path` asked for, or `lazy`, the hit is trusted on its 64-bit hash
+/// and no path is read (`resolve_key_paths`; ids on the view's collision
+/// list are confirmed by `View::lookup` itself). With `path`, a packed
+/// file's path is read there, and a loose file's is read and compared
+/// (`View::confirm`), so the real call it goes to is for this exact file
+/// and a hash that matched another path is a miss.
+fn file_entry(
+    c: &Compact,
+    view: &View<'_>,
+    id: u32,
+    key: &[u8],
+    path: Option<&mut EntryPath>,
+    lazy: bool,
+) -> ampr_format::Result<Option<KeyHit>> {
+    if id == 0 || id == FILEID_INVALID || id as usize > c.count {
+        return Ok(None);
+    }
+    let mut e = FileEntryView {
+        size: view.size(id) as usize,
+        mtime: view.mtime(id),
+        ..empty_view()
+    };
+    let packed = view_packed(view, id);
+    // No path asked for (an id resolve): the hash answers, as for every
+    // lazy hit, so a resolve costs no pread.
+    if lazy || path.is_none() {
+        return Ok(Some(KeyHit::File(e, id)));
+    }
+    let given = path.is_some();
+    let mut scratch: EntryPath = [0; PATH_BUF];
+    let buf = path.unwrap_or(&mut scratch);
+    let n = if packed {
+        view.path(&c.paths, id, buf)?.len()
+    } else {
+        match view.confirm(&c.paths, id, key, buf)? {
+            Some(p) => p.len(),
+            None => return Ok(None),
+        }
+    };
+    if given {
+        buf[n] = 0;
+        e.path = buf.as_ptr().cast();
+        e.path_length = n as u32;
+    }
+    Ok(Some(KeyHit::File(e, id)))
+}
+
+/// File `id` lives in a pack: a packed record or a zstd chunk.
+fn view_packed(view: &View<'_>, id: u32) -> bool {
+    view.packed(id) || view.chunk(id) != NO_CHUNK
+}
+
+/// Directory `d`'s entry for `key`: with `path`, its representative
+/// file's path is read there (NUL-terminated at that file's length) and
+/// `path_length` is the key's, so the first `path_length` bytes are the
+/// directory's stored spelling. The mtime is that file's.
+fn dir_entry(
+    c: &Compact,
+    view: &View<'_>,
+    d: u32,
+    key: &[u8],
+    path: Option<&mut EntryPath>,
+) -> ampr_format::Result<Option<KeyHit>> {
+    let rep = view.dir(d).rep_file;
+    if c.count == 0 || rep == 0 || rep as usize > c.count {
+        return Ok(None);
+    }
+    let mut e = FileEntryView {
+        path_length: key.len() as u32,
+        mtime: view.mtime(rep),
+        ..empty_view()
+    };
+    if let Some(buf) = path {
+        view.dir_path(&c.paths, d, buf)?;
+        e.path = buf.as_ptr().cast();
+    }
+    Ok(Some(KeyHit::Dir(e)))
+}
+
 /// `lookup_app0_index_key_view`: (view, one-based id) of a file key; the
-/// view's path is copied into `path` when given (see `entry_view`).
+/// stored path is copied into `path` when given (see `file_entry`).
 unsafe fn lookup_key_view(
     key: &[u8],
     allow_build: bool,
@@ -1807,45 +1907,26 @@ unsafe fn lookup_key_view(
     let Some(c) = published().filter(|c| c.available) else {
         return Ok(None);
     };
-    let Some(view) = c.view() else {
-        return Ok(None);
-    };
-    let Some(id) = io_or_none(view.find(key))? else {
-        return Ok(None);
-    };
-    if id == 0 || id == FILEID_INVALID || id as usize > c.count {
-        return Ok(None);
+    match resolve_key(c, key, true, false, path)? {
+        KeyHit::File(e, id) => Ok(Some((e, id))),
+        _ => Ok(None),
     }
-    let mut v = empty_view();
-    io_or_none(c.try_entry_view(id, &mut v, path).map(|()| Some((v, id))))
 }
 
 /// `lookup_resident_app0_directory_key`: a representative view for a
-/// directory key that has at least one resident descendant file. Its path
-/// is that file's, copied into `path`, cut to the key's length.
+/// directory key that has at least one resident descendant file (see
+/// `dir_entry`).
 unsafe fn lookup_directory_key(
     key: &[u8],
     path: Option<&mut EntryPath>,
 ) -> Result<Option<FileEntryView>, IndexIo> {
-    let Some(c) = published().filter(|c| c.available && c.count != 0) else {
+    let Some(c) = published().filter(|c| c.available) else {
         return Ok(None);
     };
-    let Some(view) = c.view() else {
-        return Ok(None);
-    };
-    let Some(id) = io_or_none(view.find_directory(key, c.sorted))? else {
-        return Ok(None);
-    };
-    let mut e = empty_view();
-    let Some(()) = io_or_none(c.try_entry_view(id, &mut e, path).map(Some))? else {
-        return Ok(None);
-    };
-    Ok(Some(FileEntryView {
-        path: e.path,
-        path_length: key.len() as u32,
-        size: 0,
-        mtime: e.mtime,
-    }))
+    match resolve_key(c, key, false, true, path)? {
+        KeyHit::Dir(e) => Ok(Some(e)),
+        _ => Ok(None),
+    }
 }
 
 fn is_app0_key(key: &[u8]) -> bool {
@@ -1885,6 +1966,9 @@ struct Lookup {
     /// authoritative, and an ENOENT from the real call becomes EIO while
     /// packs are mounted (`io_miss`).
     io: bool,
+    /// A loose `Hit` whose stored path is unread and unconfirmed: its real
+    /// call tries the game's spelling first (`loose_call`).
+    unconfirmed: bool,
 }
 
 /// The walk indexes every regular file of /app0 under a key that folds ASCII
@@ -1958,14 +2042,20 @@ unsafe fn io_miss_if(io: bool, rc: c_int) -> c_int {
 }
 
 /// `lookup_resident_app0_path`: consumes only the immutable published image;
-/// never builds or loads the index. A page of a large index that is not
-/// resident is read from the index file by the page cache. A hook never
-/// waits on another thread here: a page another thread is loading is read
-/// from the index file by this thread, like the open() the hook replaces.
-/// The entry's path is copied into `pbuf` (a hit's path, or a directory's
-/// canonical prefix).
+/// never builds or loads the index. One `View::lookup` answers file and
+/// directory alike; paths are read by this thread from the index file
+/// (one pread, like the open() the hook replaces) and a hook never waits
+/// on another thread. The entry's path is copied into `pbuf` (a hit's
+/// path, or a directory's canonical prefix).
 #[inline(never)]
 unsafe fn lookup_resident_path(path: *const c_char, pbuf: &mut EntryPath) -> Lookup {
+    unsafe { lookup_resident(path, pbuf, false) }
+}
+
+/// `lookup_resident_path`; with `lazy` a file hit has a null `entry.path`
+/// (see `resolve_key_paths`) and a loose one is `unconfirmed`. A directory
+/// hit still reads its spelling.
+unsafe fn lookup_resident(path: *const c_char, pbuf: &mut EntryPath, lazy: bool) -> Lookup {
     let mut r = Lookup {
         state: Resident::NotApp0,
         entry: empty_view(),
@@ -1973,6 +2063,7 @@ unsafe fn lookup_resident_path(path: *const c_char, pbuf: &mut EntryPath) -> Loo
         expected_miss: false,
         authoritative: false,
         io: false,
+        unconfirmed: false,
     };
     if !unsafe { has_app0_root(path) } {
         return r;
@@ -1994,34 +2085,43 @@ unsafe fn lookup_resident_path(path: *const c_char, pbuf: &mut EntryPath) -> Loo
         return r;
     }
     r.state = Resident::Miss;
-    let file = if !trailing && len > 5 {
-        unsafe { lookup_key_view(key, false, Some(&mut *pbuf)) }
-    } else {
-        Ok(None)
+    // is_resident_ready() holds, so the published index is final. The
+    // /app0 root and a key with a trailing separator name no file.
+    let Some(c) = published() else {
+        return r;
     };
-    match file {
-        Ok(Some((e, id))) => {
+    let hit = if c.available {
+        resolve_key_paths(c, key, !trailing && len > 5, true, Some(pbuf), lazy)
+    } else {
+        Ok(KeyHit::Miss)
+    };
+    match hit {
+        Ok(KeyHit::File(e, id)) => {
             (r.state, r.entry, r.file_id) = (Resident::Hit, e, id);
+            r.unconfirmed =
+                r.entry.path.is_null() && c.view().is_some_and(|v| !view_packed(&v, id));
             return r;
         }
-        Err(IndexIo) => return io_lookup(r),
-        Ok(None) => {}
-    }
-    match unsafe { lookup_directory_key(key, Some(pbuf)) } {
-        Ok(Some(e)) => {
+        Ok(KeyHit::Dir(e)) => {
             (r.state, r.entry) = (Resident::Directory, e);
             return r;
         }
         Err(IndexIo) => return io_lookup(r),
-        Ok(None) => {}
+        Ok(KeyHit::Miss) => {}
     }
+    unsafe { miss_lookup(&mut r, path, key, c.links) };
+    r
+}
+
+/// Makes `r` the miss of `path` (normalized `key`), authoritative as
+/// `miss_is_authoritative` and `miss_authority` say.
+unsafe fn miss_lookup(r: &mut Lookup, path: *const c_char, key: &[u8], links: bool) {
+    (r.state, r.entry, r.file_id, r.unconfirmed) = (Resident::Miss, empty_view(), 0, false);
     r.expected_miss = true;
-    let links = published().is_some_and(|c| c.links);
     r.authoritative = miss_authority(
         miss_is_authoritative(unsafe { cstr_bytes(path) }, key, links),
         rw::app0_writable(),
     );
-    r
 }
 
 /// Writable /app0: files the game creates live only on the FS, so no miss
@@ -2050,18 +2150,16 @@ pub(crate) unsafe fn probe_packed_path(path: *const c_char) -> Option<u8> {
     if !is_app0_key(key) {
         return None;
     }
-    // is_resident_ready() holds, so ensure_ready inside returns at once.
-    if !trailing && len > 5 {
-        if let Ok(Some((_, id))) = unsafe { lookup_key_view(key, false, None) } {
+    let c = published().filter(|c| c.available)?;
+    match resolve_key(c, key, !trailing && len > 5, true, None).ok()? {
+        KeyHit::File(_, id) => {
             // A refused guard reads as "manifest not ready": no answer.
             let reader = super::pack::ManifestReader::enter()?;
-            return super::pack::file_id_is_packed(&reader, id).then_some(b'p');
+            super::pack::file_id_is_packed(&reader, id).then_some(b'p')
         }
+        KeyHit::Dir(_) => Some(b'd'),
+        KeyHit::Miss => None,
     }
-    unsafe { lookup_directory_key(key, None) }
-        .ok()
-        .flatten()
-        .map(|_| b'd')
 }
 
 /// Copies the indexed path of one-based file `id` into `out` (truncated,
@@ -2235,8 +2333,8 @@ unsafe fn open_with(
     op: u8,
 ) -> c_int {
     let mut pbuf: EntryPath = [0; PATH_BUF];
-    let l = unsafe { lookup_resident_path(path, &mut pbuf) };
-    let fd = unsafe { open_resolved(&l, path, flags, mode, real) };
+    let mut l = unsafe { lookup_resident(path, &mut pbuf, true) };
+    let fd = unsafe { open_resolved(&mut l, &mut pbuf, path, flags, mode, real) };
     // A file hit opened with O_DIRECTORY fails ENOTDIR, as on retail. Not
     // logged: a UE3 title tests every cooked file this way at start (~5000
     // calls on the console), which filled all 96 /fsfail slots.
@@ -2259,8 +2357,231 @@ fn how(l: &Lookup) -> u8 {
     }
 }
 
+/// The stored path of file hit `l` for a real call: `entry.path`, else
+/// (a packed hit looked up without its path) read into `pbuf` once and
+/// kept in `l`. Null with errno EIO when the read failed, ENOENT when the
+/// index is gone; never a miss the caller could answer itself.
+unsafe fn hit_path(l: &mut Lookup, pbuf: &mut EntryPath) -> *const c_char {
+    hit_path_in(published(), l, pbuf)
+}
+
+/// `hit_path` with the index `c` it reads from.
+fn hit_path_in(c: Option<&Compact>, l: &mut Lookup, pbuf: &mut EntryPath) -> *const c_char {
+    if !l.entry.path.is_null() {
+        return l.entry.path;
+    }
+    let mut e = empty_view();
+    let rc = match c {
+        Some(c) => c.try_entry_view(l.file_id, &mut e, Some(pbuf)),
+        None => Err(ampr_format::Error::Invalid),
+    };
+    match rc {
+        Ok(()) => {
+            (l.entry.path, l.entry.path_length) = (e.path, e.path_length);
+            l.entry.path
+        }
+        Err(err) => {
+            let io = matches!(err, ampr_format::Error::Io);
+            set_errno(if io { EIO } else { ENOENT });
+            null()
+        }
+    }
+}
+
+// ---- loose hits: the game's spelling first ----------------------------------------
+
+/// What the real call of an `unconfirmed` loose hit came to.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Loose {
+    /// The real call's result, errno set as it left it.
+    Done(c_int),
+    /// The stored path does not fold to the key: the hash matched another
+    /// path, so the lookup is now a miss (`miss_lookup`) for the caller to
+    /// answer as one.
+    Miss,
+    /// The stored path could not be read. Not a miss: the file is indexed
+    /// and may exist under that spelling, so the caller answers EIO.
+    Io,
+}
+
+/// The game's spelling of `key`: `path` normalized as `normalize` does
+/// (separators collapsed, `.` dropped, `..` resolved) with its case kept,
+/// or `path` itself when it is already in that form. None when the result
+/// does not fold to `key`, so the stored path goes first.
+unsafe fn game_spelling(path: *const c_char, key: &[u8], out: &mut [u8]) -> Option<*const c_char> {
+    let lower_eq = |a: &[u8]| {
+        a.len() == key.len()
+            && a.iter()
+                .zip(key)
+                .all(|(&x, &y)| x.to_ascii_lowercase() == y)
+    };
+    let raw = unsafe { cstr_bytes(path) };
+    if lower_eq(raw) {
+        return Some(path);
+    }
+    let n = spell(raw, out)?;
+    lower_eq(&out[..n]).then(|| out.as_ptr().cast())
+}
+
+/// `raw` normalized into `out` (NUL-terminated) without folding case;
+/// None when it does not fit or `..` climbs above the root.
+fn spell(raw: &[u8], out: &mut [u8]) -> Option<usize> {
+    let mut len = 0usize;
+    for comp in raw.split(|&b| b == b'/' || b == b'\\') {
+        if comp.is_empty() || comp == b"." {
+            continue;
+        }
+        if comp == b".." {
+            if len == 0 {
+                return None;
+            }
+            while out[len - 1] != b'/' {
+                len -= 1;
+            }
+            len -= 1;
+            continue;
+        }
+        let end = len + 1 + comp.len();
+        if end >= out.len() {
+            return None;
+        }
+        out[len] = b'/';
+        out[len + 1..end].copy_from_slice(comp);
+        len = end;
+    }
+    *out.get_mut(len)? = 0;
+    Some(len)
+}
+
+/// The real `call` of loose file hit `l` (file id, `key`). With
+/// `spelling`, the game's own spelling goes first: on a hit that is the
+/// file the game asked for, so no path is read. Only when it fails ENOENT
+/// or ENOTDIR (`should_try_index_fallback`), or with no `spelling`, is
+/// the stored path read into `pbuf` and confirmed (`View::confirm`): one
+/// that differs from the spelling is called once, one equal to it keeps
+/// the first answer. The path is kept in `l` for a later fallback.
+fn loose_call_in<S: Source + ?Sized>(
+    view: Option<&View<'_>>,
+    src: &S,
+    l: &mut Lookup,
+    key: &[u8],
+    spelling: Option<*const c_char>,
+    pbuf: &mut EntryPath,
+    mut call: impl FnMut(*const c_char) -> c_int,
+) -> Loose {
+    let mut first = None;
+    if let Some(s) = spelling {
+        let rc = call(s);
+        let err = if rc == -1 { errno() } else { 0 };
+        if !should_try_index_fallback(rc, err) {
+            return Loose::Done(rc);
+        }
+        first = Some((s, rc, err));
+    }
+    let Some(view) = view else {
+        return Loose::Miss;
+    };
+    let n = match view.confirm(src, l.file_id, key, pbuf) {
+        Ok(Some(p)) => p.len(),
+        Err(ampr_format::Error::Io) => return Loose::Io,
+        Ok(None) | Err(_) => return Loose::Miss,
+    };
+    pbuf[n] = 0;
+    (l.entry.path, l.entry.path_length, l.unconfirmed) = (pbuf.as_ptr().cast(), n as u32, false);
+    match first {
+        Some((s, rc, err)) if unsafe { cstr_bytes(s) } == &pbuf[..n] => {
+            Loose::Done(return_direct(rc, err))
+        }
+        _ => Loose::Done(call(l.entry.path)),
+    }
+}
+
+/// `loose_call_in` over the published index, for hook path `path`; the
+/// game's spelling goes first only with `first`. A `Miss` turns `l` into
+/// the miss of `path`; an `Io` counts as an index read error.
+#[inline(never)]
+unsafe fn loose_call(
+    l: &mut Lookup,
+    pbuf: &mut EntryPath,
+    path: *const c_char,
+    first: bool,
+    call: impl FnMut(*const c_char) -> c_int,
+) -> Loose {
+    let mut kbuf = [0u8; RUNTIME_PATH_CAPACITY];
+    let mut sbuf = [0u8; RUNTIME_PATH_CAPACITY];
+    let c = published();
+    let (Some(c), Some(len)) = (c, unsafe { normalize_key(path, &mut kbuf) }) else {
+        // No index to confirm against: a miss the index cannot answer.
+        (l.state, l.unconfirmed, l.authoritative) = (Resident::Miss, false, false);
+        return Loose::Miss;
+    };
+    let key = &kbuf[..len];
+    let spelling = if first {
+        unsafe { game_spelling(path, key, &mut sbuf) }
+    } else {
+        None
+    };
+    let r = loose_call_in(c.view().as_ref(), &c.paths, l, key, spelling, pbuf, call);
+    match r {
+        Loose::Miss => unsafe { miss_lookup(l, path, key, c.links) },
+        Loose::Io => stats::add(stats::Stat::IndexLookupIo, 1),
+        Loose::Done(_) => {}
+    }
+    r
+}
+
+/// A file hit opened by its stored path (`real`, or -1 when `hit_path`
+/// could not read it), an unconfirmed loose one by `loose_call`. None when
+/// the loose hit was a false hash match: `l` is then a miss to open as one.
+/// An O_CREAT open reads the stored path first: the game's spelling would
+/// create a second file beside one stored in another case, and on a
+/// read-only /app0 fail EROFS, not ENOENT.
+unsafe fn open_hit_path(
+    l: &mut Lookup,
+    pbuf: &mut EntryPath,
+    path: *const c_char,
+    flags: c_int,
+    mode: SceKernelMode,
+    real: RealOpen,
+) -> Option<c_int> {
+    let first = flags & O_CREAT == 0;
+    match unsafe { hit_call(l, pbuf, path, first, |p| real(p, flags, mode)) } {
+        Loose::Done(fd) => Some(fd),
+        Loose::Miss => None,
+        Loose::Io => {
+            set_errno(EIO);
+            Some(-1)
+        }
+    }
+}
+
+/// The real `call` of file hit `l`: `loose_call` for an unconfirmed loose
+/// hit, else on its stored path (`hit_path`), where a path that cannot be
+/// read is `Io`, never a miss.
+unsafe fn hit_call(
+    l: &mut Lookup,
+    pbuf: &mut EntryPath,
+    path: *const c_char,
+    first: bool,
+    mut call: impl FnMut(*const c_char) -> c_int,
+) -> Loose {
+    if l.unconfirmed {
+        return unsafe { loose_call(l, pbuf, path, first, call) };
+    }
+    let p = unsafe { hit_path(l, pbuf) };
+    if p.is_null() {
+        return Loose::Io;
+    }
+    Loose::Done(call(p))
+}
+
+/// `l` from a lazy `lookup_resident`: a file hit has a null `entry.path`,
+/// read into `pbuf` only when the open falls back to the real file
+/// (`hit_path`), or for a loose hit, when its own spelling is not found
+/// (`loose_call`).
 unsafe fn open_resolved(
-    l: &Lookup,
+    l: &mut Lookup,
+    pbuf: &mut EntryPath,
     path: *const c_char,
     flags: c_int,
     mode: SceKernelMode,
@@ -2290,7 +2611,10 @@ unsafe fn open_resolved(
                 // A writable /app0 may have replaced a loose file with a
                 // directory: the filesystem answers, as for stat and access.
                 if rw::app0_writable() && !unsafe { hit_is_packed(l) } {
-                    return unsafe { real(l.entry.path, flags, mode) };
+                    return match unsafe { open_hit_path(l, pbuf, path, flags, mode, real) } {
+                        Some(fd) => fd,
+                        None => unsafe { open_resolved(l, pbuf, path, flags, mode, real) },
+                    };
                 }
                 set_errno(ENOTDIR);
                 return -1;
@@ -2312,11 +2636,14 @@ unsafe fn open_resolved(
                     return posix_return_from_sce(rc);
                 }
             }
-            let mut fd = unsafe { real(l.entry.path, flags, mode) };
+            let Some(mut fd) = (unsafe { open_hit_path(l, pbuf, path, flags, mode, real) }) else {
+                return unsafe { open_resolved(l, pbuf, path, flags, mode, real) };
+            };
             // A loose file the game unlinked, then removed its real parent:
             // the index still lists both, so make the parents and retry once.
             if fd < 0
                 && errno() == ENOENT
+                && !l.entry.path.is_null()
                 && create_needs_parents(flags, rw::app0_writable())
                 && !unsafe { hit_is_packed(l) }
             {
@@ -2515,19 +2842,35 @@ unsafe fn stat_impl(path: *const c_char, sb: *mut Stat) -> c_int {
 
 unsafe fn stat_with(path: *const c_char, sb: *mut Stat, real: RealStat, op: u8) -> c_int {
     let mut pbuf: EntryPath = [0; PATH_BUF];
-    let l = unsafe { lookup_resident_path(path, &mut pbuf) };
-    let rc = unsafe { stat_resolved(&l, path, sb, real) };
+    let mut l = unsafe { lookup_resident(path, &mut pbuf, true) };
+    let rc = unsafe { stat_resolved(&mut l, &mut pbuf, path, sb, real) };
     stats::fs_event(op, how(&l), rc as i64, path);
     rc
 }
 
-unsafe fn stat_resolved(l: &Lookup, path: *const c_char, sb: *mut Stat, real: RealStat) -> c_int {
+/// `l` from a lazy `lookup_resident`: a file hit the index answers reads
+/// no path (a loose one is trusted on its hash, as a packed one is); a
+/// live loose hit asks the FS through `hit_call`.
+unsafe fn stat_resolved(
+    l: &mut Lookup,
+    pbuf: &mut EntryPath,
+    path: *const c_char,
+    sb: *mut Stat,
+    real: RealStat,
+) -> c_int {
     match l.state {
-        Resident::Directory => unsafe { sb.write_unaligned(dir_stat(&l)) },
+        Resident::Directory => unsafe { sb.write_unaligned(dir_stat(l)) },
         Resident::Hit if unsafe { live_loose_hit(l) } => {
-            return unsafe { real(l.entry.path, sb.cast()) }
+            return match unsafe { hit_call(l, pbuf, path, true, |p| real(p, sb.cast())) } {
+                Loose::Done(rc) => rc,
+                Loose::Miss => unsafe { stat_resolved(l, pbuf, path, sb, real) },
+                Loose::Io => {
+                    set_errno(EIO);
+                    -1
+                }
+            };
         }
-        Resident::Hit => unsafe { sb.write_unaligned(file_stat(&l)) },
+        Resident::Hit => unsafe { sb.write_unaligned(file_stat(l)) },
         Resident::Miss => {
             let mut pack_io = false;
             if unsafe { ampr_pack_manifest_is_resident_ready() } {
@@ -2553,17 +2896,26 @@ unsafe fn stat_resolved(l: &Lookup, path: *const c_char, sb: *mut Stat, real: Re
 /// `sceKernelCheckReachability_impl`.
 unsafe fn reachability_impl(path: *const c_char) -> c_int {
     let mut pbuf: EntryPath = [0; PATH_BUF];
-    let l = unsafe { lookup_resident_path(path, &mut pbuf) };
-    let rc = unsafe { reachability_resolved(&l, path) };
+    let mut l = unsafe { lookup_resident(path, &mut pbuf, true) };
+    let rc = unsafe { reachability_resolved(&mut l, &mut pbuf, path) };
     stats::fs_event(b'r', how(&l), rc as i64, path);
     rc
 }
 
-unsafe fn reachability_resolved(l: &Lookup, path: *const c_char) -> c_int {
+/// As `stat_resolved`, with SCE error codes.
+unsafe fn reachability_resolved(
+    l: &mut Lookup,
+    pbuf: &mut EntryPath,
+    path: *const c_char,
+) -> c_int {
     match l.state {
-        Resident::Hit if unsafe { live_loose_hit(l) } => unsafe {
-            real_check_reachability(l.entry.path)
-        },
+        Resident::Hit if unsafe { live_loose_hit(l) } => {
+            match unsafe { hit_call(l, pbuf, path, true, |p| real_check_reachability(p)) } {
+                Loose::Done(rc) => rc,
+                Loose::Miss => unsafe { reachability_resolved(l, pbuf, path) },
+                Loose::Io => sce_errno(EIO),
+            }
+        }
         Resident::Directory | Resident::Hit => 0,
         Resident::Miss => {
             let mut pack_io = false;
@@ -2823,11 +3175,30 @@ pub unsafe extern "C" fn posix_access_emul(path: *const c_char, mode: c_int) -> 
         return rc;
     }
     let mut pbuf: EntryPath = [0; PATH_BUF];
-    let l = unsafe { lookup_resident_path(path, &mut pbuf) };
-    let rc = match l.state {
-        Resident::Hit if unsafe { live_loose_hit(&l) } => unsafe {
-            real_access(l.entry.path, mode)
-        },
+    let mut l = unsafe { lookup_resident(path, &mut pbuf, true) };
+    let rc = unsafe { access_resolved(&mut l, &mut pbuf, path, mode) };
+    stats::fs_event(b'a', how(&l), rc as i64, path);
+    rc
+}
+
+/// `posix_access_emul` for lookup `l`, as `stat_resolved`.
+unsafe fn access_resolved(
+    l: &mut Lookup,
+    pbuf: &mut EntryPath,
+    path: *const c_char,
+    mode: c_int,
+) -> c_int {
+    match l.state {
+        Resident::Hit if unsafe { live_loose_hit(l) } => {
+            match unsafe { hit_call(l, pbuf, path, true, |p| real_access(p, mode)) } {
+                Loose::Done(rc) => rc,
+                Loose::Miss => unsafe { access_resolved(l, pbuf, path, mode) },
+                Loose::Io => {
+                    set_errno(EIO);
+                    -1
+                }
+            }
+        }
         Resident::Hit | Resident::Directory => {
             // live_loose_hit was false: on a writable /app0 a hit is packed.
             let rw = rw::app0_writable();
@@ -2858,12 +3229,10 @@ pub unsafe extern "C" fn posix_access_emul(path: *const c_char, mode: c_int) -> 
         }
         Resident::Miss => {
             let mut st = core::mem::MaybeUninit::<Stat>::uninit();
-            unsafe { stat_resolved(&l, path, st.as_mut_ptr(), real_lstat) }
+            unsafe { stat_resolved(l, pbuf, path, st.as_mut_ptr(), real_lstat) }
         }
         _ => unsafe { real_access(path, mode) },
-    };
-    stats::fs_event(b'a', how(&l), rc as i64, path);
-    rc
+    }
 }
 
 pub unsafe extern "C" fn posix_stat_emul(path: *const c_char, sb: *mut Stat) -> c_int {
@@ -2987,12 +3356,12 @@ use ampr_lz4::{FILE_RECORD, PAK_HEADER};
 const PACK_OK: c_int = 0;
 const PACK_INVALID_ARGUMENT: c_int = -1;
 
-/// The mounted AMPRPAK4 manifest: a file read whole, or paged with its
-/// records in a resident fast table (rt/pack/manifest.rs).
-pub(crate) type Lz4Manifest = Manifest<'static, IndexSource>;
+/// The mounted AMPRPAK4 manifest over the resident parts of its file
+/// (header, record sections, pack names), its records read through the
+/// fast table (rt/pack/manifest.rs `LZ4_IMAGE`).
+pub(crate) type Lz4Manifest = Manifest<'static, ResidentSource<'static>>;
 
-/// `AmprPackCoreView`: the mounted manifest and a copy of its header. The
-/// manifest may be paged, so the view holds no pointers into it.
+/// `AmprPackCoreView`: the mounted manifest and a copy of its header.
 #[derive(Clone, Copy)]
 pub(crate) struct AmprPackCoreView {
     pub manifest: Option<Lz4Manifest>,
@@ -3100,29 +3469,31 @@ pub unsafe fn ampr_pack_crc32(data: *const c_void, size: usize, seed: u32) -> u3
     unsafe { region(data.cast(), size) }.map_or(0, |b| ampr_format::crc32_seeded(b, seed))
 }
 
-/// Full `Manifest::open` (`open_pkg` in pkg mode) validation through the
-/// mounted source, then fills `out` (empty on error); LZ4 only (zstd mounts
-/// through `zstd::zstd_mount_validate`).
-pub(crate) unsafe fn ampr_pack_core_mount(
-    src: &'static IndexSource,
+/// Full `Manifest::open` (`open_pkg` when `pkg`) validation of the whole
+/// file through `check`, then fills `out` (empty on error) with a manifest
+/// over `resident`, the parts of the same file kept after the mount; LZ4
+/// and pkg only (zstd mounts through `zstd::zstd_mount_join`).
+pub(crate) unsafe fn ampr_pack_core_mount<S: Source + ?Sized>(
+    check: &S,
+    resident: &'static ResidentSource<'static>,
+    pkg: bool,
     out: *mut AmprPackCoreView,
 ) -> c_int {
-    use ampr_format::source::Source;
     if out.is_null() {
         return PACK_INVALID_ARGUMENT;
     }
     unsafe { out.write(AmprPackCoreView::EMPTY) };
-    if src.len() < PAK_HEADER as u64 {
+    let mut h = [0u8; PAK_HEADER];
+    if resident.read_at(0, &mut h).is_err() {
         return PACK_INVALID_ARGUMENT;
     }
-    let m = match open_manifest(src) {
+    // The checked manifest reads through `check`, so it is dropped; the
+    // kept one is the same header over `resident`, whose bytes are the
+    // file's, without a second pass.
+    let m = match open_manifest(check, pkg).and_then(|_| Manifest::view_trusted(resident)) {
         Ok(m) => m,
         Err(e) => return CoreError::from(e).code(),
     };
-    let mut h = [0u8; PAK_HEADER];
-    if let Err(e) = src.read_at(0, &mut h) {
-        return CoreError::from(e).code();
-    }
     // Manifest::open checked the header; the copy keeps its on-disk layout.
     let header = unsafe { core::ptr::read_unaligned(h.as_ptr().cast()) };
     unsafe {
@@ -3134,45 +3505,14 @@ pub(crate) unsafe fn ampr_pack_core_mount(
     PACK_OK
 }
 
-/// `Manifest::open`, or in pkg mode `open_pkg`, which loosens validation
-/// for pack 0 (the .pkg) only. Both read through the source, resident or
-/// paged (rt/index_pages.rs). `open_pkg` returns a `view_trusted` view, so
-/// upstream `open` never sees the KRAKEN codec it refuses; `records_sorted`
-/// is then false, so the overlay order compares paths.
-fn open_manifest(src: &'static IndexSource) -> ampr_lz4::Result<Lz4Manifest> {
-    if crate::rt::pack::pkg_mode() {
-        ampr_pkg::open_pkg(src)
+/// `Manifest::open`, or with `pkg` `open_pkg`, which loosens validation
+/// for pack 0 (the .pkg) only, so upstream `open` never sees the KRAKEN
+/// codec it refuses.
+fn open_manifest<S: Source + ?Sized>(src: &S, pkg: bool) -> ampr_lz4::Result<()> {
+    if pkg {
+        ampr_pkg::open_pkg(src).map(|_| ())
     } else {
-        Manifest::open(src)
-    }
-}
-
-/// One-based `file_id` against `path`/`logical_size` of a mounted view.
-pub unsafe fn ampr_pack_core_validate_logical_file(
-    view: *const AmprPackCoreView,
-    file_id: u32,
-    path: *const c_char,
-    path_len: usize,
-    logical_size: u64,
-) -> c_int {
-    // zstd: `file_id` is an AMPRIDX3 id, checked against the zstd pack index.
-    if zstd_mode() {
-        return unsafe {
-            zstd::zstd_core_validate_logical_file(file_id, path, path_len, logical_size)
-        };
-    }
-    {
-        let (Some(m), Some(path)) = (unsafe { view_manifest(view) }, unsafe {
-            region(path.cast(), path_len)
-        }) else {
-            return PACK_INVALID_ARGUMENT;
-        };
-        match m.validate_logical_file(file_id, path, logical_size) {
-            Ok(()) => PACK_OK,
-            // As zstd: a packed file whose index could not be read is EIO.
-            Err(CoreError::Io) => zstd::VALIDATE_IO,
-            Err(e) => e.code(),
-        }
+        Manifest::open(src).map(|_| ())
     }
 }
 
@@ -3186,7 +3526,7 @@ pub unsafe fn ampr_pack_core_chunk_shift(file: *const u8) -> Option<u32> {
 }
 
 /// Block tasks for a read of `file`; zero for a rejected request. zstd:
-/// `file` is `zstd::zstd_task_file(ampr_id)`, tasks are 256 KiB chunks.
+/// `file` points at a `zstd::ZstdExtent`, tasks are 256 KiB chunks.
 pub unsafe fn ampr_pack_core_task_count(file: *const u8, offset: u64, length: u64) -> usize {
     if zstd_mode() {
         return zstd::zstd_core_task_count(file, offset, length);
@@ -3205,7 +3545,7 @@ pub unsafe fn ampr_pack_core_make_task(
     task_index: usize,
     out: *mut AmprPackBlockReadTask,
 ) -> c_int {
-    // zstd: `file` is `zstd::zstd_task_file(ampr_id)`; `view` is unused.
+    // zstd: `file` points at a `zstd::ZstdExtent`; `view` is unused.
     if zstd_mode() {
         return unsafe { zstd::zstd_core_make_task(file, offset, length, task_index, out) };
     }
@@ -3229,7 +3569,8 @@ pub unsafe fn ampr_pack_core_make_task(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
+    use super::super::index_memory as im;
     use super::*;
 
     /// zstd runtime files and the shared AMPRIDX3 index bypass the index.
@@ -3340,7 +3681,7 @@ mod tests {
 
     /// USB index I/O: the write loop continues short transfers and retries
     /// EINTR, and fails on errors and endless EINTR. (Index file reads go
-    /// through rt/index_pages.rs and the pack `pread_loop`.)
+    /// through rt/index_file.rs `pread_fd` and the pack `pread_loop`.)
     #[test]
     fn io_loops_continue_short_transfers_and_retry_eintr() {
         let data: std::vec::Vec<u8> = (0..1000u32).map(|i| i as u8).collect();
@@ -3428,6 +3769,7 @@ mod tests {
             expected_miss: false,
             authoritative: false,
             io: false,
+            unconfirmed: false,
         };
         let st = file_stat(&l);
         assert_eq!(st.st_size, 8_130_000_000);
@@ -3479,6 +3821,7 @@ mod tests {
             expected_miss: false,
             authoritative: true,
             io: false,
+            unconfirmed: false,
         };
         l = io_lookup(l);
         assert!(l.state == Resident::Miss && l.io && !l.authoritative);
@@ -3510,7 +3853,7 @@ mod tests {
         );
     }
 
-    // ---- uninstalled image (rt/index_pages.rs memory source) ----
+    // ---- view load ----
 
     /// A sorted AMPRIDX3 image of `n` files and exactly `file_bytes` bytes:
     /// the paths take what records and hash slots leave.
@@ -3555,131 +3898,269 @@ mod tests {
         }
     }
 
-    /// A paged AMPRIDX3 file mounts only with its fast table: with less
-    /// Index room than the table and the pack tables built from it need, it
-    /// is refused with the index notice and takes nothing; with the room,
-    /// `find` answers as the plain image does and `clear` gives every byte
-    /// back. In a title with no packs the mount then grows the page arena.
+    /// An AMPRIDX3 image of `paths` in that order, file `i` of size `i`.
+    fn image_of(paths: &[&[u8]]) -> Vec<u8> {
+        let sized: Vec<(&[u8], u64)> = paths.iter().zip(0..).map(|(&p, i)| (p, i)).collect();
+        image_sized(&sized)
+    }
+
+    /// An AMPRIDX3 image of `files` (path, size) in that order.
+    fn image_sized(files: &[(&[u8], u64)]) -> Vec<u8> {
+        let (mut records, mut blob) = (Vec::new(), Vec::new());
+        for &(p, size) in files {
+            records.extend_from_slice(&(blob.len() as u32).to_le_bytes());
+            records.extend_from_slice(&(p.len() as u32).to_le_bytes());
+            records.extend_from_slice(&size.to_le_bytes());
+            records.extend_from_slice(&0i64.to_le_bytes());
+            blob.extend_from_slice(p);
+            blob.push(0);
+        }
+        let l = image_layout(files.len(), blob.len() as u64).unwrap();
+        let mut image = vec![0u8; l.map_bytes];
+        assert!(fill_image(&mut image, &l, &records, &blob));
+        image.truncate(l.file_bytes);
+        image
+    }
+
+    /// A zstd title's view of `files` (path, size) between the build and
+    /// `finish`, for the pack join tests (rt/pack/zstd.rs), in Index ledger
+    /// memory: the caller holds `POOL_TEST_LOCK` and gives it back with
+    /// `drop_view`. The image is leaked, as the view reads paths from it.
+    pub(crate) fn zstd_builder(files: &[(&[u8], u64)]) -> FileIndexState {
+        let image: &'static [u8] = image_sized(files).leak();
+        let mut idx = empty_state();
+        assert!(unsafe { load_image(&mut idx, image, Packs::Zstd) } == LoadResult::Loaded);
+        idx
+    }
+
+    /// `zstd_builder` for an LZ4 or pkg title: the view carries the
+    /// `pak_path_hash` column the LZ4 join compares (rt/pack/state.rs).
+    pub(crate) fn lz4_builder(files: &[(&[u8], u64)]) -> FileIndexState {
+        let image: &'static [u8] = image_sized(files).leak();
+        let mut idx = empty_state();
+        assert!(unsafe { load_image(&mut idx, image, Packs::Lz4) } == LoadResult::Loaded);
+        idx
+    }
+
+    pub(crate) fn drop_view(idx: &mut FileIndexState) {
+        unload(idx);
+    }
+
+    /// `load_file` over `image` in memory, reading it as the loader reads
+    /// the file; paths are then read from the image itself, which the test
+    /// owns (`unload` drops that source before `clear`).
+    unsafe fn load_image(
+        idx: &mut FileIndexState,
+        image: &'static [u8],
+        packs: Packs,
+    ) -> LoadResult {
+        let read = |at: u64, out: &mut [u8]| {
+            let bytes = image.get(at as usize..).and_then(|t| t.get(..out.len()));
+            bytes.map(|b| out.copy_from_slice(b)).is_some()
+        };
+        let rc = unsafe { load_file(idx, image.len() as u64, read, packs) };
+        if rc == LoadResult::Loaded {
+            idx.compact.paths = Paths::Blob(BlobSource {
+                blob: image,
+                base: 0,
+            });
+        }
+        rc
+    }
+
+    fn unload(idx: &mut FileIndexState) {
+        idx.compact.paths = Paths::None;
+        unsafe { idx.compact.clear() };
+    }
+
+    /// The view's own block, page-rounded as the ledger counts it.
+    fn view_bytes(idx: &FileIndexState) -> usize {
+        round_up_page(idx.compact.mem.as_ref().unwrap().bytes())
+    }
+
+    /// The view's transient block, page-rounded; 0 once given back.
+    fn scratch_bytes(idx: &FileIndexState) -> usize {
+        round_up_page(idx.compact.mem.as_ref().unwrap().scratch_bytes())
+    }
+
+    /// With packs the build's transient columns stay in the ledger until
+    /// `finish` and then go back, so the finished view holds only its own
+    /// block; a mount that failed and unlinked its rows finishes the same
+    /// way, and an index cleared before `finish` gives both blocks back.
     #[test]
-    fn a_paged_file_index_needs_its_fast_table() {
-        use super::super::index_memory as im;
+    fn finish_gives_the_transient_columns_back() {
+        let _pool = im::POOL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let files: &[(&[u8], u64)] = &[(b"/app0/a/x.bin", 10), (b"/app0/b/y.bin", 20)];
+        let used = im::test_index_used();
+        for packs in [Packs::Zstd, Packs::Lz4] {
+            for failed_mount in [false, true] {
+                let mut idx = empty_state();
+                let image: &'static [u8] = image_sized(files).leak();
+                assert!(unsafe { load_image(&mut idx, image, packs) } == LoadResult::Loaded);
+                let (view, scratch) = (view_bytes(&idx), scratch_bytes(&idx));
+                assert!(scratch > 0);
+                assert_eq!(im::test_index_used(), used + view + scratch);
+                if failed_mount {
+                    idx.compact.builder.as_mut().unwrap().unlink_all();
+                }
+                idx.compact.finish();
+                assert_eq!(scratch_bytes(&idx), 0);
+                assert_eq!(im::test_index_used(), used + view);
+                idx.compact.finish();
+                assert_eq!(im::test_index_used(), used + view);
+                unload(&mut idx);
+                assert_eq!(im::test_index_used(), used);
+            }
+            let mut idx = empty_state();
+            let image: &'static [u8] = image_sized(files).leak();
+            assert!(unsafe { load_image(&mut idx, image, packs) } == LoadResult::Loaded);
+            unload(&mut idx);
+            assert_eq!(im::test_index_used(), used);
+        }
+    }
+
+    /// An index whose records are not in folded order (as the external
+    /// packer writes them) loads into the view in one pass: the read
+    /// windows go back to the ledger, every path answers its id, size and
+    /// stored path, every directory answers with a file below it, and
+    /// `clear` gives every byte back. With packs the view waits for
+    /// `finish`, which `ensure_ready_slow` calls after the pack load.
+    #[test]
+    fn a_file_index_loads_into_the_view_and_frees_to_zero() {
+        let _pool = im::POOL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let n = 3000;
+        let image: &'static [u8] = sized_image_in(n, 256 << 10, |i| i * 7919 % 997).leak();
+        let plain = Index::open(image).unwrap();
+        assert!(!plain.records_sorted());
+        let used = im::test_index_used();
+        im::test_take_index_notice();
+        let mut idx = empty_state();
+        assert!(unsafe { load_image(&mut idx, image, Packs::None) } == LoadResult::Loaded);
+        assert!(idx.available && idx.compact.available && idx.compact.count == n);
+        assert!(idx.compact.builder.is_none() && idx.compact.view.is_some());
+        assert_eq!(im::test_index_used(), used + view_bytes(&idx));
+        assert!(!im::test_take_index_notice());
+        let c = &idx.compact;
+        let mut buf: EntryPath = [0; PATH_BUF];
+        for id in 1..=n as u32 {
+            let path = plain
+                .path(&plain.record(id).unwrap(), &mut buf)
+                .unwrap()
+                .to_vec();
+            assert_eq!(view_lookup(c, &path), Ok(Some(Hit::File(id))));
+            let mut v = empty_view();
+            let mut out: EntryPath = [0xA5; PATH_BUF];
+            assert_eq!(c.try_entry_view(id, &mut v, Some(&mut out)), Ok(()));
+            assert_eq!(v.path, out.as_ptr().cast());
+            assert_eq!(&out[..v.path_length as usize], &path[..]);
+            assert_eq!(out[v.path_length as usize], 0);
+            assert_eq!(v.size, id as usize - 1);
+            let dir = &path[..10];
+            let Ok(Some(Hit::Dir(d))) = view_lookup(c, dir) else {
+                panic!("no directory {dir:?}");
+            };
+            let rep = c.view().unwrap().dir(d).rep_file;
+            assert_eq!(c.try_entry_view(rep, &mut v, Some(&mut out)), Ok(()));
+            assert!(out[..10].eq_ignore_ascii_case(dir));
+        }
+        assert_eq!(view_lookup(c, b"/app0/d997"), Ok(Some(Hit::Miss)));
+        assert!(matches!(view_lookup(c, b"/app0"), Ok(Some(Hit::Dir(_)))));
+        let mut v = empty_view();
+        assert!(c.try_entry_view(7, &mut v, None).is_ok() && v.path.is_null());
+        assert_eq!(v.size, 6);
+        for id in [0, n as u32 + 1] {
+            assert!(c.try_entry_view(id, &mut v, None).is_err());
+        }
+        unload(&mut idx);
+        assert!(idx.compact.view.is_none() && idx.compact.mem.is_none());
+        assert_eq!(im::test_index_used(), used);
+
+        let mut idx = empty_state();
+        assert!(unsafe { load_image(&mut idx, image, Packs::Zstd) } == LoadResult::Loaded);
+        assert!(idx.compact.view.is_none() && idx.compact.builder.is_some());
+        idx.compact.finish();
+        assert!(idx.compact.builder.is_none());
+        assert_eq!(
+            view_lookup(&idx.compact, &image_path(&plain, 9)),
+            Ok(Some(Hit::File(9)))
+        );
+        unload(&mut idx);
+        assert_eq!(im::test_index_used(), used);
+    }
+
+    fn image_path(index: &Index<'_>, id: u32) -> Vec<u8> {
+        let mut buf = [0u8; PATH_BUF];
+        index
+            .path(&index.record(id).unwrap(), &mut buf)
+            .unwrap()
+            .to_vec()
+    }
+
+    /// Two files whose paths fold to one key are refused at load, as
+    /// `Index::check` refused them, and the refused load takes nothing.
+    #[test]
+    fn a_duplicate_folded_path_is_refused() {
+        let _pool = im::POOL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let used = im::test_index_used();
+        let ok: &'static [u8] = image_of(&[b"/app0/Data/a.bin", b"/app0/data/b.bin"]).leak();
+        let dup: &'static [u8] = image_of(&[b"/app0/Data/a.bin", b"/app0/data/A.BIN"]).leak();
+        let mut idx = empty_state();
+        assert!(unsafe { load_image(&mut idx, ok, Packs::None) } == LoadResult::Loaded);
+        unload(&mut idx);
+        let mut idx = empty_state();
+        assert!(unsafe { load_image(&mut idx, dup, Packs::None) } == LoadResult::Invalid);
+        assert!(!idx.available && idx.compact.view.is_none() && idx.compact.mem.is_none());
+        assert_eq!(im::test_index_used(), used);
+    }
+
+    /// A file that is not an AMPRIDX3, or that cannot be read, is refused
+    /// before memory is taken; a view the ledger cannot hold is Memory,
+    /// with the index notice, after the read windows went back.
+    #[test]
+    fn a_bad_unreadable_or_oversized_file_takes_nothing() {
         let _pool = im::POOL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let n = 3000;
         let image: &'static [u8] = sized_image(n, 256 << 10).leak();
-        let plain = Index::open(image).unwrap();
-        let paged = |idx: &mut FileIndexState| {
-            let src = unsafe { index_pages::register_memory(image.as_ptr(), image.len()) };
-            idx.compact.src = Some(IndexSource::Paged(src.unwrap()));
-            unsafe { finish_compact(idx) }
-        };
-        let page = SCE_KERNEL_PAGE_SIZE;
         let used = im::test_index_used();
-        let grows = index_pages::test_grow_calls();
         im::test_take_index_notice();
-        unsafe {
-            // Leave a page less than the tables need.
-            let need = (n * LOOKUP_PER_FILE).next_multiple_of(page);
-            let fill = im::index_room() - need + page;
-            let other = im::index_alloc(fill, page, c"test.other.tables".as_ptr());
-            assert!(!other.is_null());
-            let mut idx = empty_state();
-            assert!(paged(&mut idx) == LoadResult::Memory);
-            assert!(im::test_take_index_notice());
-            assert!(!idx.available && idx.compact.src.is_none() && idx.compact.fast.is_null());
-            assert_eq!(im::test_index_used(), used + fill);
-            assert_eq!(index_pages::test_grow_calls(), grows);
-            im::index_free(other.cast(), c"test.other.tables.free".as_ptr());
-
-            assert!(paged(&mut idx) == LoadResult::Loaded);
-            assert!(!im::test_take_index_notice());
-            assert!(idx.compact.sorted);
-            assert_eq!(index_pages::test_grow_calls(), grows + 1);
-            assert!(!idx.compact.fast.is_null());
-            assert_eq!(im::lookup_used(), (n * 12).next_multiple_of(page));
-            let view = idx.compact.view().unwrap();
-            assert!(view.has_fast());
-            let mut buf: EntryPath = [0; PATH_BUF];
-            for id in [1, n as u32 / 2, n as u32] {
-                let path = plain.path(&plain.record(id).unwrap(), &mut buf).unwrap();
-                assert_eq!(view.find(path), Ok(Some(id)));
-            }
-            assert_eq!(view.find(b"/app0/none"), plain.find(b"/app0/none"));
-            idx.compact.clear();
-
-            // An unsorted file is paged with a rank order, so
-            // `find_directory` binary-searches it; its build scratch is
-            // given back at once and the order on `clear`.
-            let unsorted: &'static [u8] = sized_image_in(n, 256 << 10, |i| i % 997).leak();
-            let scan = Index::open(unsorted).unwrap();
-            assert!(!scan.records_sorted());
-            let src = index_pages::register_memory(unsorted.as_ptr(), unsorted.len());
-            let mut idx = empty_state();
-            // Room for the tables but not the order scratch: refused with
-            // the notice, nothing kept.
-            let fill = im::index_room() - need - page;
-            let other = im::index_alloc(fill, page, c"test.other.tables".as_ptr());
-            assert!(!other.is_null());
-            let left = need + page - (n * 12).next_multiple_of(page);
-            assert!(scan.order_scratch_len() + n * 4 > left);
-            idx.compact.src = Some(IndexSource::Paged(src.unwrap()));
-            assert!(finish_compact(&mut idx) == LoadResult::Memory);
-            assert!(im::test_take_index_notice());
-            assert!(idx.compact.src.is_none() && idx.compact.order.is_null());
-            assert_eq!((im::test_index_used(), im::lookup_used()), (used + fill, 0));
-            im::index_free(other.cast(), c"test.other.tables.free".as_ptr());
-            let src = index_pages::register_memory(unsorted.as_ptr(), unsorted.len());
-            idx.compact.src = Some(IndexSource::Paged(src.unwrap()));
-            let before = im::test_index_used();
-            assert!(finish_compact(&mut idx) == LoadResult::Loaded);
-            assert!(!im::test_take_index_notice());
-            assert!(idx.available && !idx.compact.sorted && !idx.compact.order.is_null());
-            let tables = (n * 12).next_multiple_of(page) + (n * 4).next_multiple_of(page);
-            assert_eq!(im::lookup_used(), tables);
-            assert_eq!(im::test_index_used(), before + tables);
-            let view = idx.compact.view().unwrap();
-            assert!(view.has_fast() && view.has_order());
-            let keys: [&[u8]; 6] = [
-                b"/app0",
-                b"/app0/d000",
-                b"/app0/d500",
-                b"/app0/d996",
-                b"/app0/d997",
-                b"/app0/zzz",
-            ];
-            for key in keys {
-                let got = view.find_directory(key, idx.compact.sorted).unwrap();
-                let want = scan.find_directory(key, false).unwrap();
-                assert_eq!(got.is_some(), want.is_some(), "{key:?}");
-                if let Some(id) = got {
-                    let path = scan.path(&scan.record(id).unwrap(), &mut buf).unwrap();
-                    assert!(path.starts_with(key) && path[key.len()] == b'/', "{key:?}");
-                }
-            }
-            assert!(view.find_directory(b"/app0/d500", false).unwrap().is_some());
-            for id in [1, n as u32 / 2, n as u32] {
-                let path = scan.path(&scan.record(id).unwrap(), &mut buf).unwrap();
-                assert_eq!(view.find(path), Ok(Some(id)));
-            }
-            assert_eq!(view.find(b"/app0/none"), Ok(None));
-            idx.compact.clear();
-            assert_eq!(im::lookup_used(), 0);
-            assert!(idx.compact.order.is_null());
-        }
+        let mut idx = empty_state();
+        let mut bad = image.to_vec();
+        bad[0] ^= 1;
+        let bad: &'static [u8] = bad.leak();
+        assert!(unsafe { load_image(&mut idx, bad, Packs::None) } == LoadResult::Invalid);
+        let fail = |_: u64, _: &mut [u8]| false;
+        let rc = unsafe { load_file(&mut idx, image.len() as u64, fail, Packs::None) };
+        assert!(rc == LoadResult::Unreadable);
         assert_eq!(im::test_index_used(), used);
-        assert_eq!(im::lookup_used(), 0);
+        assert!(!im::test_take_index_notice());
+
+        // Room for the two windows and a page, not for the view.
+        let page = SCE_KERNEL_PAGE_SIZE;
+        let fill = im::index_room() - round_up_page(2 * WINDOW) - page;
+        let other = unsafe { im::index_alloc(fill, page, c"test.other.tables".as_ptr()) };
+        assert!(!other.is_null());
+        let rc = unsafe { load_image(&mut idx, image, Packs::None) };
+        assert!(rc == LoadResult::Memory);
+        assert!(im::test_take_index_notice());
+        assert!(!idx.available && idx.compact.mem.is_none());
+        assert_eq!(im::test_index_used(), used + fill);
+        unsafe { im::index_free(other.cast(), c"test.other.tables.free".as_ptr()) };
+        assert_eq!(im::test_index_used(), used);
     }
 
-    /// A built image that cannot be installed is served from its own
-    /// build buffer like a file read whole (no page cache, no fast table):
-    /// `adopt_compact_index` validates it, lookups and entry views copy
-    /// paths out of it, and `clear` gives the buffer back. A corrupt image
-    /// is refused and freed the same way.
+    /// A built image that cannot be installed is served from its path
+    /// blob: `adopt_compact_index` builds the view from the image, copies
+    /// the blob into the Index ledger and frees the image, so the view and
+    /// the blob are all that stay; lookups and entry views read paths from
+    /// the blob, and `clear` gives both back. A corrupt image is refused
+    /// and freed the same way.
     #[test]
-    fn an_uninstalled_image_is_served_from_memory_and_given_back() {
-        use super::super::index_memory as im;
+    fn an_uninstalled_image_is_served_from_its_path_blob_and_given_back() {
         let _pool = im::POOL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let n = 20_000;
         let image = sized_image(n, 4 << 20);
+        let plain = Index::open(&image[..]).unwrap();
+        let blob_len = plain.layout().path_bytes as usize;
         let used = im::test_index_used();
         let adopt = |image: &[u8]| {
             let mem = unsafe { build_alloc(image.len(), c"test.index.image") };
@@ -3691,69 +4172,432 @@ mod tests {
         };
         let (mut idx, rc) = adopt(&image);
         assert!(rc == LoadResult::Loaded);
-        assert!(idx.available && idx.compact.count == n);
-        assert!(idx.compact.fast.is_null());
-        assert!(idx.compact.src.is_some_and(|s| s.is_resident()));
-        let view = idx.compact.view().unwrap();
-        let mut a: EntryPath = [0xA5; PATH_BUF];
-        let rec = view.record(7).unwrap();
-        let path = view.path(&rec, &mut a).unwrap().to_vec();
-        assert_eq!(view.find(&path), Ok(Some(7)));
-        let mut v = empty_view();
-        let mut b: EntryPath = [0xA5; PATH_BUF];
-        assert_eq!(idx.compact.try_entry_view(7, &mut v, Some(&mut b)), Ok(()));
-        assert_eq!(v.path, b.as_ptr().cast());
-        assert_eq!(&b[..v.path_length as usize], &path[..]);
-        assert_eq!(b[v.path_length as usize], 0);
-        assert!(idx.compact.try_entry_view(7, &mut v, None).is_ok() && v.path.is_null());
-        assert!(idx
-            .compact
-            .try_entry_view(n as u32 + 1, &mut v, None)
-            .is_err());
+        assert!(idx.available && idx.compact.count == n && idx.compact.view.is_some());
+        let Paths::Blob(b) = &idx.compact.paths else {
+            panic!("not served from the blob");
+        };
+        assert_eq!(b.blob.len(), blob_len);
+        assert_eq!(b.base, plain.layout().paths_at);
+        let kept = view_bytes(&idx) + round_up_page(blob_len);
+        assert_eq!(im::test_index_used(), used + kept);
+        for id in [1, 7, n as u32 / 2, n as u32] {
+            let path = image_path(&plain, id);
+            assert_eq!(view_lookup(&idx.compact, &path), Ok(Some(Hit::File(id))));
+            let mut v = empty_view();
+            let mut out: EntryPath = [0xA5; PATH_BUF];
+            assert_eq!(
+                idx.compact.try_entry_view(id, &mut v, Some(&mut out)),
+                Ok(())
+            );
+            assert_eq!(&out[..v.path_length as usize], &path[..]);
+            assert_eq!(out[v.path_length as usize], 0);
+        }
         unsafe { idx.compact.clear() };
-        assert!(idx.compact.src.is_none());
+        assert!(matches!(idx.compact.paths, Paths::None));
         assert_eq!(im::test_index_used(), used);
 
+        // A path with no NUL after it fails the build's path check.
         let mut bad = image.clone();
-        let slots_at = u64::from_le_bytes(bad[32..40].try_into().unwrap()) as usize;
-        let hit = (slots_at..bad.len())
-            .step_by(16)
-            .find(|&at| bad[at + 8..at + 12] != [0; 4])
-            .unwrap();
-        bad[hit] ^= 1;
+        let at = plain.layout().paths_at as usize;
+        let len = plain.record(1).unwrap().path_len as usize;
+        bad[at + len] = b'x';
         let (idx, rc) = adopt(&bad);
         assert!(rc == LoadResult::Invalid);
-        assert!(!idx.available && idx.compact.src.is_none() && idx.compact.mem.is_null());
+        assert!(!idx.available && idx.compact.view.is_none() && idx.compact.mem.is_none());
+        assert!(matches!(idx.compact.paths, Paths::None));
         assert_eq!(im::test_index_used(), used);
     }
 
-    /// The field case: an AMPRIDX3 of 34,358,192 B and 223,180 records fits
-    /// the 64 MiB Index ledger whole alone, but with the LZ4 index after it
-    /// (223,180 files, 1,513,210 chunks, 18 packs, paged: its tables plus
-    /// the arena floor) it does not, so it is paged; paged, both fit the
-    /// ledger and the lookup cap.
+    // ---- lookups against the old index ----
+
+    /// What the old lookups answered for `key`: `Index::find` for a file
+    /// when `file_ok`, then `Index::find_directory` (record order, the
+    /// unsorted scan) for a directory, as `lookup_resident_path` probed
+    /// them. A directory answers its first file's mtime and stored path.
+    #[derive(Debug, PartialEq)]
+    enum Old {
+        File(u32, usize, i64, Vec<u8>),
+        Dir(i64, Vec<u8>),
+        Miss,
+    }
+
+    fn old_lookup(index: &Index<'_>, key: &[u8], file_ok: bool, dir_ok: bool) -> Old {
+        let mut buf = [0u8; PATH_BUF];
+        if let Some(id) = file_ok
+            .then(|| io_or_none(index.find(key)).unwrap())
+            .flatten()
+        {
+            let rec = index.record(id).unwrap();
+            let path = index.path(&rec, &mut buf).unwrap().to_vec();
+            return Old::File(id, rec.size as usize, rec.mtime, path);
+        }
+        let dir = dir_ok.then(|| io_or_none(index.find_directory(key, false)).unwrap());
+        match dir.flatten() {
+            Some(id) => {
+                let rec = index.record(id).unwrap();
+                let path = index.path(&rec, &mut buf).unwrap();
+                Old::Dir(rec.mtime, path[..key.len()].to_vec())
+            }
+            None => Old::Miss,
+        }
+    }
+
+    /// `resolve_key` in the shape of `Old`, checking the entry's path
+    /// fields on the way.
+    fn new_lookup(c: &Compact, key: &[u8], file_ok: bool, dir_ok: bool) -> Old {
+        let mut buf: EntryPath = [0xA5; PATH_BUF];
+        match resolve_key(c, key, file_ok, dir_ok, Some(&mut buf)).unwrap() {
+            KeyHit::File(e, id) => {
+                let n = e.path_length as usize;
+                assert_eq!(e.path, buf.as_ptr().cast());
+                assert_eq!(buf[n], 0);
+                let KeyHit::File(bare, bare_id) = resolve_key(c, key, true, false, None).unwrap()
+                else {
+                    panic!("{key:?} answers no file without a path buffer");
+                };
+                assert!(bare_id == id && bare.path.is_null() && bare.size == e.size);
+                Old::File(id, e.size, e.mtime, buf[..n].to_vec())
+            }
+            KeyHit::Dir(e) => {
+                assert_eq!(e.path, buf.as_ptr().cast());
+                assert_eq!((e.path_length as usize, e.size), (key.len(), 0));
+                Old::Dir(e.mtime, buf[..key.len()].to_vec())
+            }
+            KeyHit::Miss => Old::Miss,
+        }
+    }
+
+    /// An AMPRIDX3 image of `paths` in that order: file `i` has size
+    /// `7 * i + 3` and mtime `1000 - i`, so every column is told apart.
+    fn timed_image(paths: &[Vec<u8>]) -> Vec<u8> {
+        let (mut records, mut blob) = (Vec::new(), Vec::new());
+        for (i, p) in paths.iter().enumerate() {
+            records.extend_from_slice(&(blob.len() as u32).to_le_bytes());
+            records.extend_from_slice(&(p.len() as u32).to_le_bytes());
+            records.extend_from_slice(&(7 * i as u64 + 3).to_le_bytes());
+            records.extend_from_slice(&(1000 - i as i64).to_le_bytes());
+            blob.extend_from_slice(p);
+            blob.push(0);
+        }
+        let l = image_layout(paths.len(), blob.len() as u64).unwrap();
+        let mut image = vec![0u8; l.map_bytes];
+        assert!(fill_image(&mut image, &l, &records, &blob));
+        image.truncate(l.file_bytes);
+        image
+    }
+
+    /// Every path, case variant, byte prefix and miss of a test image
+    /// answers what `Index::find` and `Index::find_directory` answered:
+    /// the same kind, id, size, mtime and stored spelling, for the file
+    /// and directory probes alone and for `lookup_resident_path`'s pair.
     #[test]
-    fn a_file_index_that_starves_the_pack_index_is_paged() {
-        use super::super::index_memory as im;
-        let (len, count, room) = (34_358_192u64, 223_180usize, im::INDEX_MEMORY_MAX);
-        let (fast, order) = (28_871_736usize, 892_720usize);
-        let reserve = super::super::pack::pack_reserve_bytes(u64::MAX, fast, order);
-        let round = |n: usize| n.next_multiple_of(index_pages::PAGE);
-        assert_eq!(reserve, round(fast) + round(order) + im::INDEX_ARENA_MIN);
-        assert!(whole_fits(len, count, 0, room));
-        assert!(!whole_fits(len, count, reserve, room));
-        // With a reserve the paged-only tables are not added: a file that
-        // fits beside the pack index stays whole.
-        let tight = (len as usize).next_multiple_of(index_pages::PAGE) + reserve;
-        assert!(whole_fits(len, count, reserve, tight));
-        assert!(!whole_fits(len, count, reserve, tight - 1));
-        let paged = count * (size_of::<FastEntry>() + size_of::<u32>());
-        assert!(paged + reserve <= room);
-        assert!(paged + fast + order <= im::INDEX_LOOKUP_MAX);
-        // Saturating inputs never fit.
-        assert!(!whole_fits(u64::MAX, count, 0, usize::MAX));
-        assert!(!whole_fits(0, usize::MAX, 0, usize::MAX));
-        assert!(!whole_fits(len, count, usize::MAX, usize::MAX));
-        assert!(whole_fits(0, 0, 0, 0));
+    fn view_lookups_answer_what_the_old_index_answered() {
+        let _pool = im::POOL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut paths: Vec<Vec<u8>> = [
+            "/app0/sce_sys/param.json",
+            "/app0/Data/Maps/m1.pak",
+            "/app0/eboot.bin",
+            "/app0/data/maps/M2.pak",
+            "/app0/DATA/Sound/s.bnk",
+            "/app0/a/b/c/d/e/f.txt",
+            "/app0/a/bc",
+            "/app0/ab/c",
+            "/app0/Movies/intro.mp4",
+            "/app0/a.b/c.d",
+        ]
+        .iter()
+        .map(|p| p.as_bytes().to_vec())
+        .collect();
+        for i in 0..300 {
+            paths.push(format!("/app0/gen/D{:02}/f{:04}.dat", (i * 7) % 23, 300 - i).into_bytes());
+        }
+        let image: &'static [u8] = timed_image(&paths).leak();
+        let index = Index::open(image).unwrap();
+        let mut idx = empty_state();
+        assert!(unsafe { load_image(&mut idx, image, Packs::None) } == LoadResult::Loaded);
+        let c = &idx.compact;
+
+        let mut keys: Vec<Vec<u8>> = Vec::new();
+        for p in &paths {
+            keys.push(p.clone());
+            keys.push([p.as_slice(), b"/x"].concat());
+            keys.push([p.as_slice(), b"x"].concat());
+            keys.extend(
+                (5..p.len())
+                    .filter(|&n| p[n - 1] != b'/')
+                    .map(|n| p[..n].to_vec()),
+            );
+        }
+        for miss in [
+            "/app0/nothing",
+            "/app0/data/maps/m3.pak",
+            "/app0/gen/D99",
+            "/app0/A/B/C/D/E",
+        ] {
+            keys.push(miss.as_bytes().to_vec());
+        }
+        // Lookup keys are normalized, so folded: every spelling above folds
+        // to one key.
+        let mut keys: Vec<Vec<u8>> = keys.iter().map(|k| k.to_ascii_lowercase()).collect();
+        keys.sort();
+        keys.dedup();
+        let (mut files, mut dirs, mut misses) = (0, 0, 0);
+        for key in &keys {
+            for (file_ok, dir_ok) in [(true, true), (false, true), (true, false)] {
+                let old = old_lookup(&index, key, file_ok, dir_ok);
+                assert_eq!(
+                    new_lookup(c, key, file_ok, dir_ok),
+                    old,
+                    "{:?}",
+                    String::from_utf8_lossy(key)
+                );
+                match old {
+                    Old::File(..) => files += 1,
+                    Old::Dir(..) => dirs += 1,
+                    Old::Miss => misses += 1,
+                }
+            }
+        }
+        // Each kind was exercised, not only misses.
+        assert!(
+            files > 600 && dirs > 60 && misses > 5000,
+            "{files} {dirs} {misses}"
+        );
+        unload(&mut idx);
+    }
+
+    /// A lazy lookup (open, stat, access) finds a packed file without its
+    /// path (no pread): the hit's path is null and `hit_path` reads it only
+    /// for a real-file fallback. A lookup that is not lazy reads the path of
+    /// a packed hit and confirms a loose one; a lazy loose hit reads none.
+    #[test]
+    fn an_open_reads_a_packed_path_only_for_a_real_fallback() {
+        let _pool = im::POOL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let used = im::test_index_used();
+        let files: &[(&[u8], u64)] = &[(b"/app0/eboot.bin", 7), (b"/app0/Data/P.bin", 9)];
+        let mut idx = zstd_builder(files);
+        let b = idx.compact.builder.as_mut().unwrap();
+        b.set_chunk(2, 0);
+        assert!(b.link_packed(2));
+        idx.compact.finish();
+        let c = &idx.compact;
+        let mut buf: EntryPath = [0xA5; PATH_BUF];
+        let r = resolve_key_paths(c, b"/app0/data/p.bin", true, true, Some(&mut buf), true);
+        let Ok(KeyHit::File(e, 2)) = r else {
+            panic!("packed hit");
+        };
+        assert!(e.path.is_null() && e.size == 9);
+        let mut l = Lookup {
+            state: Resident::Hit,
+            entry: e,
+            file_id: 2,
+            expected_miss: false,
+            authoritative: false,
+            io: false,
+            unconfirmed: false,
+        };
+        let mut pbuf: EntryPath = [0; PATH_BUF];
+        let p = hit_path_in(Some(c), &mut l, &mut pbuf);
+        assert!(!p.is_null() && p == l.entry.path);
+        assert_eq!(&pbuf[..l.entry.path_length as usize], b"/app0/Data/P.bin");
+        assert_eq!(pbuf[l.entry.path_length as usize], 0);
+        // Read once: a second call keeps the path it has.
+        assert_eq!(hit_path_in(None, &mut l, &mut [0; PATH_BUF]), p);
+        // No index to read from: null, not a path.
+        l.entry.path = null();
+        assert!(hit_path_in(None, &mut l, &mut pbuf).is_null());
+
+        let r = resolve_key_paths(c, b"/app0/data/p.bin", true, true, Some(&mut buf), false);
+        let Ok(KeyHit::File(e, 2)) = r else {
+            panic!("packed hit with its path");
+        };
+        assert!(!e.path.is_null());
+        let r = resolve_key_paths(c, b"/app0/eboot.bin", true, true, Some(&mut buf), false);
+        let Ok(KeyHit::File(e, 1)) = r else {
+            panic!("loose hit");
+        };
+        assert_eq!(&buf[..e.path_length as usize], b"/app0/eboot.bin");
+        let r = resolve_key_paths(c, b"/app0/eboot.bin", true, true, Some(&mut buf), true);
+        let Ok(KeyHit::File(e, 1)) = r else {
+            panic!("lazy loose hit");
+        };
+        assert!(e.path.is_null() && e.size == 7);
+        drop_view(&mut idx);
+        assert_eq!(im::test_index_used(), used);
+    }
+
+    /// A path source that counts reads and fails them with `Io` on demand.
+    struct Counting<'a, S: Source> {
+        src: &'a S,
+        reads: core::cell::Cell<u32>,
+        fail: core::cell::Cell<bool>,
+    }
+
+    impl<S: Source> Source for Counting<'_, S> {
+        fn len(&self) -> u64 {
+            self.src.len()
+        }
+        fn read_at(&self, at: u64, out: &mut [u8]) -> ampr_format::Result<()> {
+            self.reads.set(self.reads.get() + 1);
+            if self.fail.get() {
+                return Err(ampr_format::Error::Io);
+            }
+            self.src.read_at(at, out)
+        }
+    }
+
+    fn loose_hit(id: u32) -> Lookup {
+        Lookup {
+            state: Resident::Hit,
+            entry: empty_view(),
+            file_id: id,
+            expected_miss: false,
+            authoritative: false,
+            io: false,
+            unconfirmed: true,
+        }
+    }
+
+    /// The game's spelling keeps its case and normalizes as the key does;
+    /// a path already in that form is passed as is.
+    #[test]
+    fn the_game_spelling_keeps_case() {
+        let mut out = [0u8; RUNTIME_PATH_CAPACITY];
+        let key = b"/app0/data/real.bin";
+        let p = c"/app0/Data/Real.bin".as_ptr();
+        assert_eq!(unsafe { game_spelling(p, key, &mut out) }, Some(p));
+        for raw in [c"/app0//Data/./x/../Real.bin", c"\\app0\\Data\\Real.bin"] {
+            let s = unsafe { game_spelling(raw.as_ptr(), key, &mut out) }.unwrap();
+            assert_eq!(unsafe { cstr_bytes(s) }, b"/app0/Data/Real.bin");
+        }
+        assert_eq!(spell(b"/..", &mut out), None);
+        assert_eq!(
+            unsafe { game_spelling(c"/app0/Other.bin".as_ptr(), key, &mut out) },
+            None
+        );
+    }
+
+    /// A loose hit asks for the game's spelling first and reads its stored
+    /// path only when that is not found. The real call is a stand-in for a
+    /// case-sensitive tree that holds only the stored spelling.
+    #[test]
+    fn a_loose_hit_reads_its_path_only_when_its_spelling_is_not_found() {
+        let _pool = im::POOL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let files: &[(&[u8], u64)] = &[(b"/app0/eboot.bin", 7), (b"/app0/Data/Real.bin", 5)];
+        let mut idx = zstd_builder(files);
+        idx.compact.finish();
+        let c = &idx.compact;
+        let view = c.view();
+        let src = Counting {
+            src: &c.paths,
+            reads: Default::default(),
+            fail: Default::default(),
+        };
+        let calls = core::cell::Cell::new(0u32);
+        let disk = |p: *const c_char| {
+            calls.set(calls.get() + 1);
+            if unsafe { cstr_bytes(p) } == b"/app0/Data/Real.bin" {
+                3
+            } else {
+                set_errno(ENOENT);
+                -1
+            }
+        };
+        let key = b"/app0/data/real.bin";
+        let mut pbuf: EntryPath = [0; PATH_BUF];
+        let run = |l: &mut Lookup, spelling: &CStr, pbuf: &mut EntryPath| {
+            (calls.set(0), src.reads.set(0));
+            let s = Some(spelling.as_ptr());
+            loose_call_in(view.as_ref(), &src, l, key, s, pbuf, disk)
+        };
+
+        // The game's spelling is on disk: no path read.
+        let mut l = loose_hit(2);
+        assert_eq!(
+            run(&mut l, c"/app0/Data/Real.bin", &mut pbuf),
+            Loose::Done(3)
+        );
+        assert_eq!((src.reads.get(), calls.get()), (0, 1));
+        assert!(l.unconfirmed && l.entry.path.is_null());
+
+        // Another case: one read, then the stored spelling opens.
+        let mut l = loose_hit(2);
+        assert_eq!(
+            run(&mut l, c"/app0/DATA/real.BIN", &mut pbuf),
+            Loose::Done(3)
+        );
+        assert_eq!((src.reads.get(), calls.get()), (1, 2));
+        assert!(!l.unconfirmed);
+        assert_eq!(unsafe { cstr_bytes(l.entry.path) }, b"/app0/Data/Real.bin");
+
+        // A hash that matched another file's id: a miss, no second call.
+        let mut l = loose_hit(1);
+        assert_eq!(run(&mut l, c"/app0/data/real.bin", &mut pbuf), Loose::Miss);
+        assert_eq!(calls.get(), 1);
+        unsafe { miss_lookup(&mut l, c"/app0/data/real.bin".as_ptr(), key, false) };
+        assert!(l.state == Resident::Miss && l.expected_miss && !l.unconfirmed);
+        assert_eq!(l.authoritative, !rw::app0_writable());
+
+        // The stored path equals the spelling: the first answer stands.
+        let mut l = loose_hit(1);
+        calls.set(0);
+        let eboot = loose_call_in(
+            view.as_ref(),
+            &src,
+            &mut l,
+            b"/app0/eboot.bin",
+            Some(c"/app0/eboot.bin".as_ptr()),
+            &mut pbuf,
+            disk,
+        );
+        assert_eq!(eboot, Loose::Done(-1));
+        assert_eq!((errno(), calls.get()), (ENOENT, 1));
+
+        // A read error on the retry is not ENOENT; with no spelling (an
+        // O_CREAT open) the stored path goes first and fails the same way.
+        src.fail.set(true);
+        let mut l = loose_hit(2);
+        assert_eq!(run(&mut l, c"/app0/data/real.bin", &mut pbuf), Loose::Io);
+        assert!(l.unconfirmed);
+        calls.set(0);
+        let r = loose_call_in(view.as_ref(), &src, &mut l, key, None, &mut pbuf, disk);
+        assert_eq!((r, calls.get()), (Loose::Io, 0));
+        src.fail.set(false);
+        let r = loose_call_in(view.as_ref(), &src, &mut l, key, None, &mut pbuf, disk);
+        assert_eq!((r, calls.get()), (Loose::Done(3), 1));
+        drop_view(&mut idx);
+    }
+
+    /// Stat, access and reachability look a hit up lazily: a packed file
+    /// is found with no path read. With no path source at all (every read
+    /// fails) the lazy lookup still hits and a stat answers from the index.
+    #[test]
+    fn a_stat_of_a_packed_file_reads_no_path() {
+        let _pool = im::POOL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let files: &[(&[u8], u64)] = &[(b"/app0/eboot.bin", 7), (b"/app0/Data/P.bin", 9)];
+        let mut idx = zstd_builder(files);
+        let b = idx.compact.builder.as_mut().unwrap();
+        b.set_chunk(2, 0);
+        assert!(b.link_packed(2));
+        idx.compact.finish();
+        let paths = core::mem::replace(&mut idx.compact.paths, Paths::None);
+        let c = &idx.compact;
+        let mut buf: EntryPath = [0; PATH_BUF];
+        let r = resolve_key_paths(c, b"/app0/data/p.bin", true, true, Some(&mut buf), true);
+        let Ok(KeyHit::File(e, 2)) = r else {
+            panic!("packed hit with no read");
+        };
+        let l = Lookup {
+            entry: e,
+            unconfirmed: false,
+            ..loose_hit(2)
+        };
+        let st = file_stat(&l);
+        assert_eq!((st.st_size, st.st_ino), (9, 2));
+        // The same lookup, not lazy, must read and so fails here.
+        let r = resolve_key_paths(c, b"/app0/data/p.bin", true, true, Some(&mut buf), false);
+        assert!(matches!(r, Ok(KeyHit::Miss)));
+        idx.compact.paths = paths;
+        drop_view(&mut idx);
     }
 }

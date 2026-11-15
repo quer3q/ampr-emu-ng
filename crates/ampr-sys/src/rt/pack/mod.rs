@@ -50,11 +50,9 @@ pub(crate) use super::fd_cache::{
     ampr_index_fd_pack_note_open, FileEntryView,
 };
 pub(crate) use super::index::{
-    ampr_index_get_entry_view, ampr_index_get_entry_view_path, ampr_index_resolve_path_to_id,
-    ampr_pack_core_chunk_shift, ampr_pack_core_make_task, ampr_pack_core_mount,
-    ampr_pack_core_task_count,
-    ampr_pack_core_validate_logical_file, ampr_pack_crc32, AmprPackBlockReadTask,
-    AmprPackChunkView, AmprPackCoreView, Lz4Manifest, Stat,
+    ampr_index_get_entry_view, ampr_index_resolve_path_to_id, ampr_pack_core_chunk_shift,
+    ampr_pack_core_make_task, ampr_pack_core_mount, ampr_pack_core_task_count, ampr_pack_crc32,
+    AmprPackBlockReadTask, AmprPackChunkView, AmprPackCoreView, Lz4Manifest, Stat,
 };
 pub(crate) use crate::cache_ffi::{
     ampr_rust_cache_chunk_key_hash, ampr_rust_cache_find_page_run, ampr_rust_cache_mark_pages,
@@ -64,12 +62,11 @@ pub(crate) use crate::handle_ffi::{
     ampr_rust_virtual_decode, ampr_rust_virtual_encode, ampr_rust_virtual_next_generation,
 };
 pub(crate) use crate::overlay_ffi::{
-    ampr_rust_overlay_build_order, ampr_rust_overlay_directory_range,
     ampr_rust_overlay_folded_hash, ampr_rust_overlay_normalize_path,
-    ampr_rust_overlay_packed_count, ampr_rust_overlay_packed_file_matches,
     ampr_rust_overlay_service_name_hidden,
 };
 pub(crate) use crate::volume_ffi::ampr_rust_volume_header_validate;
+pub(crate) use ampr_format::view_list::Cursor;
 
 /// `SceKernelStat` (FreeBSD `struct stat`).
 pub(crate) type SceKernelStat = Stat;
@@ -103,8 +100,6 @@ mod libkernel;
 pub(crate) use libkernel::*;
 mod align;
 pub(crate) use align::*;
-// zstd: directories walk the zstd file order (`packed_order`, rt/pack/
-// directories.rs), not the AMPRPAK4 `build_packed_file_order`.
 mod state;
 pub(crate) use state::*;
 mod manifest;
@@ -133,15 +128,15 @@ mod aio_wait;
 pub(crate) use aio_wait::*;
 mod readahead;
 pub(crate) use readahead::*;
-/// zstd mount state and accessors (reached as `zstd::x`).
-pub(crate) mod zstd;
-pub(crate) mod zstd_libc;
 /// mmap of a packed file (both formats) through a disk cache copy (hook ids
 /// 96, 97).
 pub(crate) mod mmap;
 /// `AMPR_ZSTD_MMAP=1`: decode-on-access mappings and their fault handler.
 /// zstd only; an LZ4 mapping takes the disk cache copy in `mmap`.
 pub(crate) mod mmap_fault;
+/// zstd mount state and accessors (reached as `zstd::x`).
+pub(crate) mod zstd;
+pub(crate) mod zstd_libc;
 /// A multi-chunk packed read split into parallel child jobs (aio.rs).
 mod zstd_split;
 pub(crate) use zstd_split::*;
@@ -231,29 +226,31 @@ pub(crate) fn packs_present() -> bool {
 }
 
 /// True when one-based `file_id` names a packed file, one with no physical
-/// copy that only a virtual fd can serve. zstd: the id has a record in the
-/// AMPRIDX3 projection (zstd.rs). LZ4: its AMPRPAK4 record (record index `file_id - 1`)
-/// carries `AMPR_PACK_FILE_PACKED`. False when the manifest is not loaded or
-/// the id is out of range. Lock-free, so the open hooks and the debug
+/// copy that only a virtual fd can serve. zstd: the index load joined the
+/// id to a zstd record (zstd.rs `zstd_extent`, from the view). LZ4: the
+/// join linked the id's AMPRPAK4 record (record index `file_id - 1`) to its
+/// view row (manifest.rs `join_lz4`); a record that failed the join is not
+/// packed here (`lz4_mismatch`). False when the manifest is not loaded, the
+/// index is not published or the id is out of range. Lock-free, so the open hooks and the debug
 /// probes can call it. `_reader` is the proof that the caller holds the
 /// manifest gate: every caller goes on to read the manifest and holds one
 /// `ManifestReader` across both.
 pub(crate) fn file_id_is_packed(_reader: &ManifestReader, file_id: u32) -> bool {
     if zstd_mode() {
-        return zstd::zstd_entry(file_id).is_some();
+        return zstd::zstd_extent(file_id).is_some();
     }
-    let state = g_pack_state.load(Ordering::Acquire);
-    if file_id == 0 || state.is_null() || LOAD_STATE.load(Ordering::Acquire) != PACK_LOAD_READY {
+    if LOAD_STATE.load(Ordering::Acquire) != PACK_LOAD_READY {
         return false;
     }
-    unsafe { state::lz4_file(state, file_id - 1) }
-        .is_some_and(|f| f.flags & AMPR_PACK_FILE_PACKED != 0)
+    crate::rt::index::published()
+        .and_then(|c| c.view())
+        .is_some_and(|v| v.packed(file_id))
 }
 
 // ---- manifest reader guard ----
 
 /// Counts the hook threads that read the manifest (LZ4 `header`/`files`/
-/// `core_view`, the zstd mount and projection) without a `PackSubmission`.
+/// `core_view`, the zstd mount and chunk tables) without a `PackSubmission`.
 /// Hooks stay installed while `ampr_pack_shutdown` runs (module_stop
 /// uninstalls them after it), so without this count a reader that passed
 /// the READY check could still load from storage that
@@ -365,13 +362,13 @@ pub(crate) unsafe fn select_pack_format() {
         PackFormat::Plain
     };
     PACK_FORMAT.store(format as u8, Ordering::Relaxed);
-    let packs = packs_present();
-    // A crash between a cache file's create and unlink leaves it named.
-    // Every pack format maps packed files through that cache, so sweep for
-    // any; a title with no packs never creates cache files.
-    if packs && mmap::MMAP_MODE != 0 {
-        unsafe { mmap::sweep_cache_dir() };
-    }
+    // A crash between a cache file's create and unlink leaves it named, and
+    // the next title may be one that never maps (no packs, or mapping off).
+    // Sweep and remove the folder in every title, so it does not keep
+    // showing in a file explorer; with no folder both are one failed open
+    // and one failed rmdir.
+    unsafe { mmap::sweep_cache_dir() };
+    unsafe { mmap::remove_cache_dir() };
 }
 
 // ---- SDK AIO types ------------------------------------------------------------
@@ -776,13 +773,12 @@ pub(crate) const AMPR_EMU_PACK_CACHE_ENTRY_CAP: usize = 8192;
 pub(crate) const AMPR_EMU_PACK_CACHE_PAGE_SHIFT: u32 = 14;
 pub(crate) const AMPR_EMU_PACK_CACHE_HASH_BUCKETS: usize = 16384;
 pub(crate) const AMPR_EMU_PACK_TOUCH_TABLE_SIZE: usize = 16384;
-/// Largest pack index file the loader registers (pack/manifest.rs
-/// `load_manifest`, fstat size). The file is paged, not loaded whole, but
-/// registering it still costs a page table of 2 B per 16 KiB page from the
-/// Index ledger (64 KiB at this size) and validation reads the whole payload
-/// for its CRC through the page cache before the file and chunk counts are
-/// checked; this bounds both for a corrupt or foreign file. The largest
-/// index measured is 25.2 MiB.
+/// Largest pack index file the loader opens (pack/manifest.rs
+/// `load_manifest`, fstat size). Both mounts read the file through two
+/// 64 KiB windows: a zstd index is validated by reading the whole payload
+/// for its CRC before the file and chunk counts are checked, and an
+/// AMPRPAK4 index is read once and keeps only its header, record sections
+/// and pack names. This bounds that pass for a corrupt or foreign file.
 pub(crate) const AMPR_EMU_PACK_INDEX_MAX_BYTES: u64 = 512 * 1024 * 1024;
 pub(crate) const AMPR_EMU_PACK_MAX_FILES: u64 = 2_000_000;
 pub(crate) const AMPR_EMU_PACK_MAX_CHUNKS: u64 = 16_000_000;
@@ -917,9 +913,10 @@ impl VirtualFdSlot {
 pub(crate) struct VirtualDirectorySlot {
     pub real_fd: c_int,
     pub directory_offset: c_long,
-    pub range_begin: u32,
-    pub range_end: u32,
-    pub virtual_cursor: u32,
+    /// The view cursor of the next packed entry, and where a rewind puts
+    /// it back.
+    pub listing: Cursor,
+    pub listing_first: Cursor,
     pub physical_hash_count: u32,
     pub path_length: u16,
     pub active: bool,
@@ -937,9 +934,8 @@ impl VirtualDirectorySlot {
     pub(crate) const EMPTY: Self = Self {
         real_fd: -1,
         directory_offset: 0,
-        range_begin: 0,
-        range_end: 0,
-        virtual_cursor: 0,
+        listing: Cursor::Done,
+        listing_first: Cursor::Done,
         physical_hash_count: 0,
         path_length: 0,
         active: false,
@@ -1305,12 +1301,16 @@ pub(crate) struct PackState {
     pub active_submissions: u32, // PACK_M, including singular groups.
     pub submissions_closed: bool,
 
-    /// The mounted AMPRPAK4 manifest (read through the index page cache)
-    /// and a copy of its header; `header` points at that copy when mounted.
+    /// The mounted AMPRPAK4 manifest, reading the header, record sections
+    /// and pack names the mount kept in the Index ledger (manifest.rs
+    /// `LZ4_IMAGE`), and a copy of its header; `header` points at that copy
+    /// when mounted.
     pub core_view: AmprPackCoreView,
     pub header: *const AmprPackIndexHeader,
-    pub packed_file_order: *mut u32,
-    pub packed_file_count: u32,
+    /// LZ4 and pkg: one bit per view id whose packed record failed the
+    /// join (manifest.rs `join_lz4`), an Index block; null for zstd.
+    pub lz4_mismatch: *mut u8,
+    pub lz4_mismatch_bytes: usize,
 
     pub virtual_fds: [VirtualFdSlot; AMPR_EMU_PACK_VIRTUAL_FD_SLOTS],
     pub virtual_fd_cursor: u32,
@@ -1469,12 +1469,22 @@ mod tests {
             pauses += 1;
             pauses < 1000
         });
-        assert!(!drained, "the wait must not finish while a reader holds the gate");
+        assert!(
+            !drained,
+            "the wait must not finish while a reader holds the gate"
+        );
         assert_eq!(pauses, 1000);
         assert!(GATE.enter().is_none(), "a closed gate refuses new readers");
-        assert_eq!(GATE.readers(), 1, "a refused enter leaves the count as it was");
+        assert_eq!(
+            GATE.readers(),
+            1,
+            "a refused enter leaves the count as it was"
+        );
         drop(reader);
         assert_eq!(GATE.readers(), 0);
-        assert!(GATE.wait_drained(|| false), "an empty gate drains without a pause");
+        assert!(
+            GATE.wait_drained(|| false),
+            "an empty gate drains without a pause"
+        );
     }
 }

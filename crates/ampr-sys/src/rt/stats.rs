@@ -329,30 +329,18 @@ stats! {
     MmapFaults = "mmap_faults",
     MmapFaultBytes = "mmap_fault_bytes",
     MmapFaultErrors = "mmap_fault_errors",
-    /// Index page cache (rt/index_pages.rs): 16 KiB page lookups served
-    /// from the arena, pages read from the index file and the time those
-    /// reads took, resident pages dropped to make room, pages resident
-    /// now (gauge) and the bytes of all registered index files. Misses
-    /// past the first load of each page mean the paged index files
-    /// outgrew the arena (`index_arena_bytes`).
-    IndexPageHits = "index_page_hits",
-    IndexPageMisses = "index_page_misses",
-    IndexPageMissNs = "index_page_miss_ns",
-    IndexPageEvictions = "index_page_evictions",
-    IndexPageResident = "index_page_resident",
-    /// Reads served straight from the index file, bypassing the arena:
-    /// the page was being loaded by another thread or no slot could be
-    /// evicted. A reader never waits on another thread.
-    IndexPageDirectReads = "index_page_direct_reads",
-    IndexFilesBytes = "index_files_bytes",
-    /// Page arena size: the 16 MiB floor taken by the first paged index
-    /// file plus the room the lookup tables left (rt/index_pages.rs
-    /// `grow_arena`); 0 while every index file is read whole.
-    IndexArenaBytes = "index_arena_bytes",
-    /// Resident fast tables of the paged index files (zstd: 16 B per file
-    /// for hash and size, 8 B per chunk and volume; AMPRIDX3: 12 B per file; LZ4: 48 B per
-    /// file, 12 B per chunk, 32 B per pack).
-    IndexFastBytes = "index_fast_bytes",
+    /// Index memory held for lookups once an index is mounted: the
+    /// resident block of the compiled index view (rt/index_view.rs), the
+    /// zstd chunk tables (8 B per chunk and volume, rt/pack/zstd.rs) and
+    /// the resident AMPRPAK4 parts (header, record sections and pack
+    /// names, rt/pack/manifest.rs). Each part is added when it is taken
+    /// and taken back when it is freed.
+    IndexViewBytes = "index_view_bytes",
+    /// Time of the last index load in `ensure_ready_slow` (rt/index.rs):
+    /// the index read or walk build into the view plus, in a title with
+    /// packs, the pack index mount and its join into the view. A gauge:
+    /// each load replaces it.
+    IndexMountNs = "index_mount_ns",
     /// File index lookups that could not read the index file: sent to the
     /// real call, never answered ENOENT (rt/index.rs `IndexIo`).
     IndexLookupIo = "index_lookup_io",
@@ -563,7 +551,8 @@ unsafe fn fs_fail_locked(op: u8, how: u8, rc: i64, path: *const core::ffi::c_cha
         }
     }
     if log.count >= FS_FAILS {
-        log.dropped.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        log.dropped
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         return false;
     }
     let i = log.count;
@@ -805,6 +794,19 @@ mod tests {
         assert!(fail_kept(b'h', -2, b"/app0/a.bin") && fail_kept(b'K', 5, b"/app0/x.prx"));
         assert!(!fail_kept(b'm', -2, b"/app0/a.bin"));
         assert!(!fail_kept(b'M', -2, b"/download0/user.ini"));
+    }
+
+    #[cfg(feature = "mem_report")]
+    #[test]
+    fn metrics_name_the_view_not_the_page_cache() {
+        // `/metrics` serves `NAMES`: the view and mount gauges are there,
+        // and no name of the deleted page cache or fast tables is.
+        for name in ["index_view_bytes", "index_mount_ns", "index_lookup_io"] {
+            assert!(NAMES.contains(&name), "{name}");
+        }
+        assert!(!NAMES.iter().any(|n| n.starts_with("index_page_")
+            || *n == "index_arena_bytes"
+            || *n == "index_fast_bytes"));
     }
 
     #[cfg(feature = "mem_report")]

@@ -13,10 +13,10 @@ use ampr_lz4::{
     PAK_MAGIC, PAK_PAYLOAD_CRC_AT,
 };
 
-/// `Manifest::open` with the pack 0 rules above, through any `Source`: a
-/// resident image or the runtime's index page cache, so a pkg manifest too
-/// large for the Index ledger is paged like an LZ4 one. The returned view is
-/// `view_trusted`, so `records_sorted` is false.
+/// `Manifest::open` with the pack 0 rules above, through any `Source`: the
+/// runtime validates a pkg manifest as it does an LZ4 one, reading the file
+/// through windows, and keeps only the parts it reads after the mount. The
+/// returned view is `view_trusted`, so `records_sorted` is false.
 pub fn open_pkg<S: Source + ?Sized>(src: &S) -> Result<Manifest<'_, S>> {
     check_header(src)?;
     let m = Manifest::view_trusted(src)?;

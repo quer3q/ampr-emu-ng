@@ -1,6 +1,7 @@
 //! Virtual AIO/fd/directory slot allocation and the indexed open entry points.
 
 use super::*;
+use ampr_format::view::Builder;
 
 pub(crate) unsafe fn allocate_virtual_aio_locked(state: *mut PackState) -> u32 {
     let slots = AMPR_EMU_PACK_VIRTUAL_AIO_SLOTS as u32;
@@ -148,26 +149,33 @@ pub unsafe fn ampr_pack_notify_fd_budget_progress() {
 }
 
 pub unsafe fn ampr_pack_ensure_manifest_ready_safe() -> bool {
-    // The zstd projection build inside writes the mount shutdown frees.
+    // A load another thread runs writes the mount shutdown frees.
     let Some(_reader) = ManifestReader::enter() else {
         return false;
     };
     unsafe { ensure_manifest_ready() }
 }
 
-/// zstd: packed membership is known only once the AMPRIDX3 projection is
-/// built. Hooks may run under a nonsleeping lock, so the first caller after
-/// AMPRIDX3 publication builds it inline (CPU only) and a caller that finds
-/// another thread building gets false instead of waiting.
-/// False once shutdown starts: the inline build writes the zstd mount that
-/// shutdown frees, so it runs under a `ManifestReader` (rt/pack/mod.rs).
+/// rt/index.rs `ensure_ready_slow`, before it publishes the index: mounts
+/// the pack index and joins it to the view `b` being built. Under
+/// a `ManifestReader`, as the mount writes what shutdown frees.
+pub(crate) unsafe fn ampr_pack_mount_and_join(b: &mut Builder<'_>) -> bool {
+    let Some(_reader) = ManifestReader::enter() else {
+        return false;
+    };
+    unsafe { mount_and_join(b) }
+}
+
+/// Whether the pack index is mounted, without loading or waiting: hooks
+/// may run under a nonsleeping lock. A zstd mount is ready with its chunk
+/// tables, both written before the index is published.
+/// False once shutdown starts (`ManifestReader`, rt/pack/mod.rs).
 pub unsafe fn ampr_pack_manifest_is_resident_ready() -> bool {
     let Some(_reader) = ManifestReader::enter() else {
         return false;
     };
     !g_pack_state.load(Ordering::Acquire).is_null()
         && LOAD_STATE.load(Ordering::Acquire) == PACK_LOAD_READY
-        && (!zstd_mode() || unsafe { zstd::try_zstd_projection() })
 }
 
 /// Every read-only non-directory open, in both formats: a packed file has
@@ -177,9 +185,41 @@ pub(crate) fn pack_open_flags_supported(flags: c_int) -> bool {
     (flags & O_ACCMODE) == O_RDONLY && (flags & O_DIRECTORY) == 0
 }
 
+/// What the record check of a packed open decided.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PackedCheck {
+    /// The id's pack record is this file: open a virtual fd.
+    Open,
+    /// Not served here: the caller opens the physical file.
+    Unhandled,
+    /// Served here and failed with EIO: no disk copy to fall back to.
+    Eio,
+}
+
+/// The record check of an open of a packed id, which needs no path: the
+/// index load joined every id to its record (zstd by path hash and size,
+/// LZ4 by size and `pak_path_hash` against record `id - 1`). `mismatch`:
+/// the id's LZ4 record failed that join (manifest.rs `lz4_mismatch`).
+pub(crate) fn check_packed(mismatch: bool, flags: c_int) -> PackedCheck {
+    if !mismatch {
+        return PackedCheck::Open;
+    }
+    // The AMPRIDX3 id names a pack record of another file, e.g. a walk
+    // built index whose ids follow walk order. APR opens (rt/fd_cache.rs,
+    // rt/reactor/submit.rs) pass `kAprAioOpenFlags`, which has O_NONBLOCK,
+    // and keep the v0.2.0 result: handled EIO. A game's plain open() stays
+    // unhandled, so the physical file opens if it exists on disk instead of
+    // failing here.
+    if flags & O_NONBLOCK == 0 {
+        PackedCheck::Unhandled
+    } else {
+        PackedCheck::Eio
+    }
+}
+
 pub(crate) unsafe fn ampr_pack_try_open_indexed_impl(
     file_id: u32,
-    entry: &FileEntryView,
+    _entry: &FileEntryView,
     flags: c_int,
     _mode: SceKernelMode,
     handled: *mut bool,
@@ -187,11 +227,11 @@ pub(crate) unsafe fn ampr_pack_try_open_indexed_impl(
     if !handled.is_null() {
         unsafe { *handled = false };
     }
-    if handled.is_null() || file_id == 0 || entry.path.is_null() {
+    if handled.is_null() || file_id == 0 {
         return SCE_KERNEL_ERROR_ENOENT;
     }
     let handled = unsafe { &mut *handled };
-    // Held from the load (and zstd projection build) through the record
+    // Held from the load through the record
     // validation and the fd allocation, all of which read the manifest.
     let Some(_reader) = ManifestReader::enter() else {
         return SCE_KERNEL_ERROR_ENOENT;
@@ -199,42 +239,22 @@ pub(crate) unsafe fn ampr_pack_try_open_indexed_impl(
     if !unsafe { ensure_manifest_ready() } {
         return SCE_KERNEL_ERROR_ENOENT;
     }
+    let state = unsafe { pack_state() };
     // An id that is not packed (no zstd record, or an LZ4 record without
-    // AMPR_PACK_FILE_PACKED) is a loose file: unhandled, physical open.
-    // Checked before the record validation, so a loose file whose AMPRIDX3
-    // and pack records disagree still opens its physical copy instead of
-    // failing with EIO, and a loose open hashes no path here.
-    if !file_id_is_packed(&_reader, file_id) {
+    // AMPR_PACK_FILE_PACKED) is a loose file: unhandled, physical open, and
+    // a loose open hashes no path here. An LZ4 record that failed the join
+    // is not linked either, but answers as its failed check below.
+    let mismatch = !zstd_mode() && unsafe { lz4_mismatch(state, file_id) };
+    if !mismatch && !file_id_is_packed(&_reader, file_id) {
         return SCE_KERNEL_ERROR_ENOENT;
     }
-    let state = unsafe { pack_state() };
-    let validate_rc = unsafe {
-        ampr_pack_core_validate_logical_file(
-            &(*state).core_view,
-            file_id,
-            entry.path,
-            entry.path_length as usize,
-            entry.size as u64,
-        )
-    };
-    if validate_rc == zstd::VALIDATE_IO {
-        // A packed file whose index could not be read: not a miss, and it
-        // has no disk copy to fall back to.
-        *handled = true;
-        return SCE_KERNEL_ERROR_EIO;
-    }
-    if validate_rc != AMPR_PACK_CORE_OK {
-        // The AMPRIDX3 id names a pack record of another file, e.g. a walk
-        // built index whose ids follow walk order. APR opens (rt/fd_cache.rs,
-        // rt/reactor/submit.rs) pass `kAprAioOpenFlags`, which has
-        // O_NONBLOCK, and keep the v0.2.0 result: handled EIO. A game's
-        // plain open() stays unhandled, so the physical file opens if it
-        // exists on disk instead of failing here.
-        if flags & O_NONBLOCK == 0 {
-            return SCE_KERNEL_ERROR_ENOENT;
+    match check_packed(mismatch, flags) {
+        PackedCheck::Open => {}
+        PackedCheck::Unhandled => return SCE_KERNEL_ERROR_ENOENT,
+        PackedCheck::Eio => {
+            *handled = true;
+            return SCE_KERNEL_ERROR_EIO;
         }
-        *handled = true;
-        return SCE_KERNEL_ERROR_EIO;
     }
     if !pack_open_flags_supported(flags) {
         // A write open stays unhandled and reaches the physical path, as in a
@@ -283,8 +303,7 @@ pub(crate) unsafe fn allocate_virtual_directory_locked(
     path: *const c_char,
     path_length: u16,
     real_fd: c_int,
-    range_begin: u32,
-    range_end: u32,
+    listing: Cursor,
 ) -> u32 {
     let slots = AMPR_EMU_PACK_VIRTUAL_DIRECTORY_SLOTS as u32;
     for pass in 0..2 {
@@ -309,9 +328,8 @@ pub(crate) unsafe fn allocate_virtual_directory_locked(
             *slot = VirtualDirectorySlot::EMPTY;
             slot.real_fd = real_fd;
             slot.active = true;
-            slot.range_begin = range_begin;
-            slot.range_end = range_end;
-            slot.virtual_cursor = range_begin;
+            slot.listing = listing;
+            slot.listing_first = listing;
             slot.path_length = path_length;
             unsafe {
                 core::ptr::copy_nonoverlapping(path, slot.path.as_mut_ptr(), path_length as usize)
@@ -323,4 +341,21 @@ pub(crate) unsafe fn allocate_virtual_directory_locked(
         }
     }
     INVALID_INDEX
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A joined id opens with no further check; an LZ4 record that failed
+    /// the join keeps the split of a failed record check: a plain open
+    /// unhandled, an APR open (O_NONBLOCK) handled EIO.
+    #[test]
+    fn a_mismatched_record_answers_as_a_failed_check() {
+        for flags in [0, O_NONBLOCK] {
+            assert_eq!(check_packed(false, flags), PackedCheck::Open);
+        }
+        assert_eq!(check_packed(true, 0), PackedCheck::Unhandled);
+        assert_eq!(check_packed(true, O_NONBLOCK), PackedCheck::Eio);
+    }
 }

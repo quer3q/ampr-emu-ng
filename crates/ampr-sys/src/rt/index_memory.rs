@@ -1,12 +1,12 @@
 //! Runtime memory that grows with the title, and the pack cache and
 //! buffers, carved from the PRX's static pool (rt/runtime_memory.rs) under
-//! three ledgers with hard caps: Index (index files read whole, the index
-//! page arena, the lookup tables and every build buffer sized by file
-//! count, path bytes or file size), Cache (the
+//! three ledgers with hard caps: Index (the compiled index view, the pack
+//! index tables and every build buffer sized by file count, path bytes or
+//! file size), Cache (the
 //! decoded chunk cache) and Buffer (the pipeline I/O windows and worker decode
 //! buffers). The caps plus the fixed pool sites fit the pool (checked at
-//! build time), so no ledger can take another's room and no reserve is
-//! needed. Never direct or flexible memory: the pool is PRX .bss and did not
+//! build time), so no ledger can take another's room and none needs room
+//! held back for it. Never direct or flexible memory: the pool is PRX .bss and did not
 //! lower the game's free direct memory, while our direct allocations did (a
 //! title had 42 MiB of direct memory free during play), and flexible memory
 //! had 0-28 MiB free in another title (debug /metrics `flex_*` and the
@@ -24,36 +24,36 @@ use super::sync::{SpinLock, SyncCell};
 use super::sys::*;
 use core::ffi::{c_char, c_void};
 use core::ptr::null_mut;
-use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::Relaxed};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 
 const MIB: usize = 1 << 20;
 
-/// Cap on index memory, all index allocations together: index files
-/// read whole (an index that fits is used as is, no page cache), the
-/// lookup tables, the page arena for the index files read in pages
-/// (rt/index_pages.rs), the page tables and the transient buffers (walk
-/// build, save icon, decode-on-access slots). A walk-built AMPRIDX3 is
-/// built whole first, at 104-124 bytes per file at 48-byte paths (a
-/// 24-byte record, the path, 16-32 bytes of hash slots; tests below), so
-/// a build image of 524,288 files fits (`files_the_index_cap_covers`).
-/// 64 MiB: 9 MiB more than v0.3.5's 55 MiB, taken by a larger PRX (Makefile
-/// `AMPR_INTERNAL_POOL_SIZE`), not from another ledger.
-pub(crate) const INDEX_MEMORY_MAX: usize = 64 * MIB;
-
-/// Lookup tables at most, inside the cap: the fast tables of paged index
-/// files (zstd 16 B per file, 8 B per chunk and volume), the rank order of
-/// a paged AMPRIDX3 that is not sorted (4 B per file, rt/index.rs
-/// `attach_order`) and the tables derived from the indexes (zstd
-/// projection 16 B per AMPRIDX3 id and order 4 B per packed file). About
-/// 17.6 MiB at 300k files and 100 GB, plus 1.2 MiB of rank order.
-pub(crate) const INDEX_LOOKUP_MAX: usize = 48 * MIB;
-
-/// Page arena at least, once any index file is paged: half of a ~32 MiB
-/// paged index stays resident. The arena takes this floor when the first
-/// paged file registers and the room the tables left when the mounts are
-/// done (rt/index_pages.rs `grow_arena`).
-pub(crate) const INDEX_ARENA_MIN: usize = 16 * MIB;
-const _: () = assert!(INDEX_LOOKUP_MAX + INDEX_ARENA_MIN == INDEX_MEMORY_MAX);
+/// Cap on index memory, all index allocations together: the compiled
+/// index view, the pack index tables kept after the mount (zstd chunk and
+/// volume tables, the AMPRPAK4 header, record sections and pack names and
+/// its mismatch bitmap) and the
+/// transient buffers (the 64 KiB windows a build reads an index file
+/// through, the walk build, save icon, decode-on-access slots). A
+/// walk-built AMPRIDX3 is built whole first, at 104-124 bytes per file at
+/// 48-byte paths (a 24-byte record, the path, 16-32 bytes of hash slots;
+/// tests below), so a build image of 699,050 files fits
+/// (`files_the_index_cap_covers`).
+/// The compiled index view is one block of the cap (rt/index_view.rs
+/// `layout`): at 300,000 files and the first directory capacity it is
+/// 12.6 MiB with no packs, 14.9 MiB for zstd packs and 16.0 MiB for LZ4
+/// (computed: 24 B of columns, 8 B of `path_at` and `dir_of` and 7 B of
+/// hash slots per file, plus 32 B per directory).
+/// An AMPRPAK4 mount keeps 48 B per file and 12 B per chunk (its record
+/// sections), 32 B per pack and its name plus a 16 B span,
+/// and the 128 B header; the paths are read once, at the mount, through
+/// the windows (rt/pack/manifest.rs `LZ4_IMAGE`). At 223,180 files,
+/// 1,513,210 chunks and 18 packs that is 27.5 MiB (computed), plus one
+/// mismatch bit per view id.
+/// 80 MiB: room for a zstd view of about 870,000 files at 5.5 chunks per
+/// file (computed from a 242,409-file index: 21.74 MiB with its chunk
+/// table), 16 MiB more than the 64 MiB before it, taken by a larger PRX
+/// (Makefile `AMPR_INTERNAL_POOL_SIZE`), not from another ledger.
+pub(crate) const INDEX_MEMORY_MAX: usize = 80 * MIB;
 
 /// Cap on cache memory: the 64 MiB decoded cache default, the only pack
 /// cache (rt/pack/mod.rs). A runtime profile or debug knob asking more gets
@@ -126,14 +126,16 @@ struct Block {
 
 const BLOCK0: Block = Block { ptr: 0, mapped: 0 };
 const PENDING: usize = 1;
-/// Index blocks live at once, at most: four resident (pack index image,
-/// LZ4 directory order or zstd projection and its order, the compact file
-/// index), the walk build's records, paths and directory stack (two of
-/// each while one doubles), its getdents buffer over `DENTS_POOL_MAX` and
-/// its image, the save icon buffer, the decode-on-access scratch and the
-/// debug /bench buffer: 16. The page cache (rt/index_pages.rs) adds its
-/// arena and one page table per registered source (4 at most): 21.
-const INDEX_BLOCKS: usize = 21;
+/// Index blocks live at once, at most: four resident (the compiled index
+/// view, the path blob of a walk-built index, the kept AMPRPAK4 parts or
+/// the zstd chunk and volume tables, the AMPRPAK4 mismatch bitmap), the walk
+/// build's records, paths and directory stack (two of each while one
+/// doubles), its getdents buffer over `DENTS_POOL_MAX` and its image, the
+/// one block of two 64 KiB windows an index file is read through
+/// (rt/index_file.rs; the AMPRIDX3 load gives its block back before the
+/// pack index mount takes one), the save icon buffer, the
+/// decode-on-access scratch and the debug /bench buffer: 16.
+const INDEX_BLOCKS: usize = 16;
 /// The decoded cache.
 const CACHE_BLOCKS: usize = 1;
 /// One per pipeline window, per worker decode buffer and decoder workspace,
@@ -327,15 +329,9 @@ static POOL_ALLOC_FAILED: AtomicU64 = AtomicU64::new(0);
 static LEDGER_ALLOC_REFUSED: AtomicU64 = AtomicU64::new(0);
 static LEDGER_NOTICED: AtomicBool = AtomicBool::new(false);
 static INDEX_NOTICED: AtomicBool = AtomicBool::new(false);
-/// Page arena bytes taken (rt/index_pages.rs, `note_arena`): the index
-/// notice then reports the tables against the room left beside it.
-static ARENA_BYTES: AtomicUsize = AtomicUsize::new(0);
-/// Lookup table bytes in use (`lookup_alloc`), at most `INDEX_LOOKUP_MAX`.
-static LOOKUP_USED: AtomicUsize = AtomicUsize::new(0);
 
 /// Counts a refusal and, when `notice`, sends at most one notice per
-/// process for each class: the index cap (with the size it needed; with
-/// the arena taken, the tables against the room left beside it), any
+/// process for each class: the index cap (with the size it needed), any
 /// other refusal. A transient buffer (`index_scratch_alloc`) is only
 /// counted: its caller degrades on its own and the packs stay served.
 unsafe fn refused(kind: Kind, reason: Refusal, needed: usize, mapped: usize, notice: bool) {
@@ -348,13 +344,7 @@ unsafe fn refused(kind: Kind, reason: Refusal, needed: usize, mapped: usize, not
         if INDEX_NOTICED.swap(true, Relaxed) {
             return;
         }
-        let arena = ARENA_BYTES.load(Relaxed);
-        index_cap_notice(
-            needed.saturating_sub(arena),
-            INDEX_MEMORY_MAX - arena,
-            arena != 0,
-            &mut text,
-        )
+        index_cap_notice(needed, &mut text)
     } else {
         if LEDGER_NOTICED.swap(true, Relaxed) {
             return;
@@ -415,22 +405,13 @@ impl Out<'_> {
     }
 }
 
-/// "ampr-emu-ng: index tables need 49 MiB, over the 48 MiB beside the page
-/// cache; packed files not served" once the page cache arena is taken
-/// (`tables`), else "ampr-emu-ng: index needs 65 MiB, over the 64 MiB cap;
-/// packed files not served"; its length.
-fn index_cap_notice(needed: usize, room: usize, tables: bool, buf: &mut [u8; 128]) -> usize {
+/// "ampr-emu-ng: index needs 81 MiB, over the 80 MiB cap; packed files
+/// not served"; its length.
+fn index_cap_notice(needed: usize, buf: &mut [u8; 128]) -> usize {
     let mut o = Out { buf, n: 0 };
-    if tables {
-        o.s(b"ampr-emu-ng: index tables need ").num(needed, MIB);
-        o.s(b" MiB, over the ").num(room, MIB);
-        o.s(b" MiB beside the page cache; packed files not served")
-            .n
-    } else {
-        o.s(b"ampr-emu-ng: index needs ").num(needed, MIB);
-        o.s(b" MiB, over the ").num(room, MIB);
-        o.s(b" MiB cap; packed files not served").n
-    }
+    o.s(b"ampr-emu-ng: index needs ").num(needed, MIB);
+    o.s(b" MiB, over the ").num(INDEX_MEMORY_MAX, MIB);
+    o.s(b" MiB cap; packed files not served").n
 }
 
 /// "ampr-emu-ng: cache memory refused, 64 MiB; running without it".
@@ -485,52 +466,12 @@ pub(crate) fn index_room() -> usize {
     with_kind(Kind::Index, |l| l.cap - l.used)
 }
 
-/// rt/index_pages.rs: `bytes` more (or, negative, fewer) of page arena.
-pub(crate) fn note_arena(bytes: isize) {
-    if bytes >= 0 {
-        ARENA_BYTES.fetch_add(bytes as usize, Relaxed);
-    } else {
-        ARENA_BYTES.fetch_sub(bytes.unsigned_abs(), Relaxed);
-    }
-}
-
-/// An index refused before any allocation, because its tables, its image
-/// or the arena floor do not fit: the one index notice, with the `needed`
-/// bytes against the whole cap.
+/// An index refused before any allocation, because its tables do not
+/// fit: the one index notice, with the `needed` bytes against the whole
+/// cap.
 pub(crate) unsafe fn index_refused(needed: usize) {
     let used = with_kind(Kind::Index, |l| l.used);
     unsafe { refused(Kind::Index, Refusal::LedgerCap, used + needed, needed, true) };
-}
-
-/// `index_alloc` for a lookup table (a fast table, a projection, an
-/// order): also refused, with the index notice, past `INDEX_LOOKUP_MAX`.
-/// Freed with `lookup_free` and the same `bytes`.
-pub(crate) unsafe fn lookup_alloc(bytes: usize, align: usize, tag: *const c_char) -> *mut u8 {
-    let mapped = page_round(bytes);
-    let used = LOOKUP_USED.fetch_add(mapped, Relaxed);
-    if used + mapped > INDEX_LOOKUP_MAX {
-        LOOKUP_USED.fetch_sub(mapped, Relaxed);
-        unsafe { index_refused(mapped) };
-        return null_mut();
-    }
-    let p = unsafe { index_alloc(bytes, align, tag) };
-    if p.is_null() {
-        LOOKUP_USED.fetch_sub(mapped, Relaxed);
-    }
-    p
-}
-
-/// Frees a `lookup_alloc` result of `bytes` (null is a no-op).
-pub(crate) unsafe fn lookup_free(ptr: *mut c_void, bytes: usize, tag: *const c_char) {
-    if !ptr.is_null() {
-        LOOKUP_USED.fetch_sub(page_round(bytes), Relaxed);
-        unsafe { index_free(ptr, tag) };
-    }
-}
-
-/// Lookup table bytes in use (`lookup_alloc`).
-pub(crate) fn lookup_used() -> usize {
-    LOOKUP_USED.load(Relaxed)
 }
 
 /// Index bytes (/metrics `index_mem_bytes`).
@@ -649,11 +590,11 @@ mod tests {
 
     #[test]
     fn caps_and_sites_fit_the_pool() {
-        assert_eq!(INDEX_MEMORY_MAX, 64 << 20);
+        assert_eq!(INDEX_MEMORY_MAX, 80 << 20);
         assert_eq!(CACHE_MEMORY_MAX, 64 << 20);
         assert_eq!(BUFFER_DECODERS, 4);
         assert_eq!(BUFFER_MEMORY_MAX, ((4 + 12 * 2) << 20) + 4 * (112 << 10));
-        assert_eq!(LEDGER_MEMORY_MAX, (156 << 20) + (448 << 10));
+        assert_eq!(LEDGER_MEMORY_MAX, (172 << 20) + (448 << 10));
         // Host tests build with the debug pool, the smaller of the two.
         assert_eq!(
             STATIC_POOL_SIZE,
@@ -899,29 +840,20 @@ mod tests {
             INDEX_MEMORY_MAX / MIB,
             resident_for(lo) / lo
         );
-        // 104 B/file at 48-byte paths up to 2^19 records; the hash table
-        // doubles past that, over the cap.
-        assert_eq!(lo, 524_288);
+        // 104-120 B/file at 48-byte paths; past 2^19 records the hash
+        // table doubles, and the cap ends inside that step.
+        assert_eq!(lo, 699_050);
         assert!(resident_for(lo + 1) > INDEX_MEMORY_MAX);
     }
 
-    /// With the page cache arena taken the notice names the tables and the
-    /// room beside the arena, sizes rounded up; before it, the whole cap.
+    /// The notice names the size needed, rounded up, against the cap.
     #[test]
-    fn index_notice_reports_the_table_room() {
-        let text = |needed, room, tables| {
-            let mut buf = [0u8; 128];
-            let n = index_cap_notice(needed, room, tables, &mut buf);
-            std::string::String::from_utf8(buf[..n].to_vec()).unwrap()
-        };
+    fn index_notice_reports_the_cap() {
+        let mut buf = [0u8; 128];
+        let n = index_cap_notice(INDEX_MEMORY_MAX + MIB, &mut buf);
         assert_eq!(
-            text(INDEX_LOOKUP_MAX + 1, INDEX_LOOKUP_MAX, true),
-            "ampr-emu-ng: index tables need 49 MiB, over the 48 MiB beside the page \
-             cache; packed files not served"
-        );
-        assert_eq!(
-            text(INDEX_MEMORY_MAX + MIB, INDEX_MEMORY_MAX, false),
-            "ampr-emu-ng: index needs 65 MiB, over the 64 MiB cap; packed files not served"
+            std::str::from_utf8(&buf[..n]).unwrap(),
+            "ampr-emu-ng: index needs 81 MiB, over the 80 MiB cap; packed files not served"
         );
     }
 }

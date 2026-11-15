@@ -66,7 +66,7 @@
 //! small slab, transient, released on munmap. Unmeasured on a console (Makefile).
 
 use super::super::index::{sdk_alloc, sdk_release, title_alloc, title_free, MEM_TRANSIENT};
-use super::zstd::{zstd_chunk_resident, zstd_chunks_resident, zstd_entry, zstd_index};
+use super::zstd::{zstd_chunk_resident, zstd_chunks_resident, zstd_extent};
 use super::*;
 use core::sync::atomic::{AtomicI32, AtomicU8, AtomicUsize};
 
@@ -277,7 +277,8 @@ unsafe fn make_slots() -> bool {
         if crate::rt::tune::zstd_verify() {
             let _ = decoder.set_verify_checksum(true);
         }
-        let out = unsafe { core::slice::from_raw_parts_mut(buf.add(CHUNK as usize), CHUNK as usize) };
+        let out =
+            unsafe { core::slice::from_raw_parts_mut(buf.add(CHUNK as usize), CHUNK as usize) };
         // A decoder that cannot warm up would fail its first fill; fail the
         // setup instead, so every map takes the disk cache.
         if decoder.warm_up(out).is_err() {
@@ -422,7 +423,10 @@ fn enter(addr: usize) -> Option<&'static Mapping> {
 
 /// Under FAULT_M: stores `info` in a free entry; false when all are used.
 unsafe fn register(info: MapInfo) -> bool {
-    let Some(m) = TABLE.iter().find(|m| m.phase.load(Ordering::Acquire) == FREE) else {
+    let Some(m) = TABLE
+        .iter()
+        .find(|m| m.phase.load(Ordering::Acquire) == FREE)
+    else {
         return false;
     };
     unsafe { *m.info.get() = info };
@@ -458,7 +462,8 @@ pub(crate) fn end_replace(addr: usize, len: usize, gone: bool) {
 /// The bytes a MAP_FIXED map of `len` replaces, as `try_map` reserves
 /// them: `len` rounded up to whole pages (saturating).
 pub(crate) fn replace_len(len: usize) -> usize {
-    len.checked_next_multiple_of(PAGE as usize).unwrap_or(usize::MAX)
+    len.checked_next_multiple_of(PAGE as usize)
+        .unwrap_or(usize::MAX)
 }
 
 fn overlaps(info: &MapInfo, addr: usize, end: usize) -> bool {
@@ -546,7 +551,7 @@ pub(crate) unsafe fn try_map(
     let not_cpu = prot & !SCE_KERNEL_PROT_CPU_ALL != 0;
     // LZ4 packs (AMPRPAK4) have no fixed 256 KiB chunk geometry or zstd
     // record table, so every map of one takes the disk fallback. Without
-    // this check zstd_entry would also return None there (no zstd mount),
+    // this check zstd_extent would also return None there (no zstd mount),
     // but the format, not the mount state, is the reason.
     if !zstd_mode() {
         return MapResult::Fallback;
@@ -554,14 +559,22 @@ pub(crate) unsafe fn try_map(
     if len == 0 || off < 0 || !(off as u64).is_multiple_of(FILE_OFF_ALIGN) || gpu || not_cpu {
         return MapResult::Fallback;
     }
-    let (Some(entry), Some(index)) = (zstd_entry(ampr_id), zstd_index()) else {
+    // Size and first chunk come from the view, the chunk records from the
+    // resident table: the fault handler reads memory only.
+    let Some(file) = zstd_extent(ampr_id) else {
         return MapResult::Fallback;
     };
-    // The fault handler reads chunk records from memory only.
     if !zstd_chunks_resident() {
         return MapResult::Fallback;
     }
-    let Ok(file) = index.file(u64::from(entry.zstd_id)) else {
+    // The volumes of the first and last chunk; an empty file has none and
+    // takes the disk fallback, as it did with no volume to open.
+    let volumes = file.chunk_count.checked_sub(1).and_then(|last| {
+        let first = zstd_chunk_resident(file.first_chunk)?.volume_id;
+        let last = zstd_chunk_resident(file.first_chunk.checked_add(last)?)?.volume_id;
+        Some((first, last))
+    });
+    let Some((first_volume, last_volume)) = volumes else {
         return MapResult::Fallback;
     };
     let Some(mmap) = (unsafe { kernel_slot::<MmapFn>(hook::mmap) }) else {
@@ -581,7 +594,7 @@ pub(crate) unsafe fn try_map(
     }
     let _guard = FAULT_M.lock();
     let ready = unsafe { install_handler() && make_slots() }
-        && unsafe { open_volumes(entry.first_volume, entry.last_volume) }
+        && unsafe { open_volumes(first_volume, last_volume) }
         && unsafe { cache_pread() };
     if !ready {
         return MapResult::Fallback;
@@ -599,7 +612,10 @@ pub(crate) unsafe fn try_map(
         unsafe { core::ptr::write_bytes(states, EMPTY, count) };
     }
     let release = || unsafe { sdk_release(states.cast(), count, MEM_TRANSIENT) };
-    if !TABLE.iter().any(|m| m.phase.load(Ordering::Acquire) == FREE) {
+    if !TABLE
+        .iter()
+        .any(|m| m.phase.load(Ordering::Acquire) == FREE)
+    {
         release();
         return MapResult::Fallback;
     }
@@ -620,7 +636,7 @@ pub(crate) unsafe fn try_map(
         len: len as usize,
         file_off: off as u64,
         file_size: file.logical_size,
-        first_record: entry.first_chunk,
+        first_record: file.first_chunk,
         ampr_id,
         prot,
         chunk_base,
@@ -712,7 +728,12 @@ unsafe fn install_handler() -> bool {
     let ok = unsafe { try_install() };
     HANDLER_STATE.store(if ok { 1 } else { 2 }, Ordering::Release);
     if !ok {
-        stats::fs_note(b'X', b'F', -i64::from(EIO), c"mmap-fault sigaction".as_ptr());
+        stats::fs_note(
+            b'X',
+            b'F',
+            -i64::from(EIO),
+            c"mmap-fault sigaction".as_ptr(),
+        );
     }
     ok
 }
@@ -935,16 +956,17 @@ unsafe fn fill_chunk(m: &Mapping, info: &MapInfo, chunk: u64) -> bool {
 /// whose chunks are all READY to the mapping prot (the others stay
 /// PROT_NONE).
 unsafe fn decode_and_copy(info: &MapInfo, chunk: u64, state: &AtomicU8) -> bool {
-    let Some(pread) = (unsafe { fn_from_ptr::<KernelPreadFn>(PREAD.load(Ordering::Acquire)) }) else {
+    let Some(pread) = (unsafe { fn_from_ptr::<KernelPreadFn>(PREAD.load(Ordering::Acquire)) })
+    else {
         return false;
     };
     // The record lookup reads the zstd mount, which module_stop frees once
     // the reader count is zero, so it runs under a ManifestReader (two
     // atomics, safe in the signal handler). A refused enter fails the fill
-    // as a missing mount does. The record comes from memory only (the fast
-    // table or a resident index): the page cache lock, a wait or an index
-    // pread could deadlock or stall a faulting thread, so a record that
-    // would need one fails the fill. The record is a copy, so the guard
+    // as a missing mount does. The record comes from memory only (the view
+    // and the chunk tables): a lock, a wait or an index pread could
+    // deadlock or stall a faulting thread, so a record that would need one
+    // fails the fill. The record is a copy, so the guard
     // ends with the lookup; the slot and fill spin locks below are never
     // held by shutdown, so no reader waits on them while shutdown waits
     // for readers.
@@ -988,12 +1010,24 @@ unsafe fn decode_and_copy(info: &MapInfo, chunk: u64, state: &AtomicU8) -> bool 
         return false;
     }
     let dst = (info.base + (begin - info.file_off) as usize) as *mut u8;
-    unsafe { core::ptr::copy_nonoverlapping(out.as_ptr().add((begin - chunk_begin) as usize), dst, (end - begin) as usize) };
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            out.as_ptr().add((begin - chunk_begin) as usize),
+            dst,
+            (end - begin) as usize,
+        )
+    };
     finish(state, true);
     stats::add(stats::Stat::MmapFaultBytes, end - begin);
     // Only the first and last page can hold bytes of another chunk.
     let last = last_end - 1;
-    let open = |p: u64| if unsafe { page_ready(info, p) } { info.prot } else { PROT_NONE };
+    let open = |p: u64| {
+        if unsafe { page_ready(info, p) } {
+            info.prot
+        } else {
+            PROT_NONE
+        }
+    };
     unsafe {
         protect(info, first + 1, last, info.prot)
             && protect(info, first, first + 1, open(first))
@@ -1003,7 +1037,13 @@ unsafe fn decode_and_copy(info: &MapInfo, chunk: u64, state: &AtomicU8) -> bool 
 
 /// `stored` bytes of volume fd `fd` from `at` into `buf` with the original
 /// pread; false on an error or EOF first.
-unsafe fn read_volume(pread: KernelPreadFn, fd: c_int, buf: *mut u8, stored: usize, at: off_t) -> bool {
+unsafe fn read_volume(
+    pread: KernelPreadFn,
+    fd: c_int,
+    buf: *mut u8,
+    stored: usize,
+    at: off_t,
+) -> bool {
     let mut got = 0usize;
     while got < stored {
         let n = unsafe { pread(fd, buf.add(got).cast(), stored - got, at + got as off_t) };

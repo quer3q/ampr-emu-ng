@@ -55,19 +55,25 @@ pub(crate) fn apr_update_read_desc_fd_policy(rd: &mut AprAioReadDesc, promoteFul
             && !promoteFullFile;
 }
 
-/// The file index entry of `rd`, its path copied into `path` (`out.path`
-/// points there), for an open: a desc keeps no path of its own (the index
-/// may be paged). Its size is the one `apr_prepare_aio_read_desc` checked.
-/// 0, `-EIO` when the index could not be read, else `-ENOENT`.
+/// The file index entry of `rd` for an open: a desc keeps no path of its
+/// own. With `path` the stored path is copied there (`out.path` points
+/// there, one index pread); without it `out.path` is null, which is all a
+/// packed open needs (it goes by id). Its size is the one
+/// `apr_prepare_aio_read_desc` checked. 0, `-EIO` when the index could not
+/// be read, else `-ENOENT`.
 pub(crate) fn apr_read_desc_entry(
     rd: &AprAioReadDesc,
     out: *mut FileEntryView,
-    path: &mut EntryPath,
+    path: Option<&mut EntryPath>,
 ) -> c_int {
     if out.is_null() {
         return -ENOENT;
     }
-    match unsafe { ampr_index_get_entry_view_path(rd.fileId, out, path) } {
+    let rc = match path {
+        Some(path) => unsafe { ampr_index_get_entry_view_path(rd.fileId, out, path) },
+        None => unsafe { ampr_index_get_entry_view(rd.fileId, out) },
+    };
+    match rc {
         0 => 0,
         rc if rc == -EIO => -EIO,
         _ => -ENOENT,
@@ -104,13 +110,14 @@ pub(crate) fn apr_acquire_aio_read_desc(
     if rd.bypassFdCache {
         let mut directEntry: FileEntryView = unsafe { core::mem::zeroed() };
         let mut directPath: EntryPath = [0; PATH_BUF];
-        let entryRc = apr_read_desc_entry(rd, &mut directEntry, &mut directPath);
+        let entryRc = apr_read_desc_entry(rd, &mut directEntry, None);
         if entryRc != 0 {
             set_rc(apr_read_desc_entry_error(rd, entryRc));
             return false;
         }
         // A packed direct read uses a synthetic descriptor; resolve it before
-        // applying physical direct-FD caps.
+        // applying physical direct-FD caps. It goes by id, so the path (an
+        // index pread) is read only below, for a loose file's real open.
         let mut packedHandled = false;
         let packedFd = unsafe {
             ampr_pack_try_open_indexed(
@@ -130,6 +137,11 @@ pub(crate) fn apr_acquire_aio_read_desc(
             rd.closeAfter = true;
             rd.closeAfterPhysical = false;
             return true;
+        }
+        let entryRc = apr_read_desc_entry(rd, &mut directEntry, Some(&mut directPath));
+        if entryRc != 0 {
+            set_rc(apr_read_desc_entry_error(rd, entryRc));
+            return false;
         }
         let fdCaps = ampr_index_fd_pressure_current_caps();
         let directOpen = ampr_index_fd_direct_open_count();
@@ -190,10 +202,11 @@ pub(crate) fn apr_acquire_aio_read_desc(
     }
 
     // Cache acquisition tries packed files before enforcing the physical FD
-    // budget. The entry and its path are read only when the cache has no
-    // fd for the file: the desc's size already passed the range checks.
+    // budget. The entry is read only when the cache has no fd for the file,
+    // and its path only for a loose file's real open: the desc's size
+    // already passed the range checks.
     let mut lookupFailed = false;
-    let entry = |out: &mut FileEntryView, path: &mut EntryPath| {
+    let entry = |out: &mut FileEntryView, path: Option<&mut EntryPath>| {
         let rc = apr_read_desc_entry(rd, out, path);
         // An index read error goes back as the fd (-EIO): SCE EIO below.
         lookupFailed = rc != 0 && rc != -EIO;

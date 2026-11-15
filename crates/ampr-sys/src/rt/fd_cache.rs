@@ -27,8 +27,8 @@ const NIL: u32 = u32::MAX;
 
 // ---- shared types -----------------------------------------------------------
 
-/// Caller storage for an entry's NUL-terminated path: the file index is
-/// read through the page cache, so `FileEntryView::path` cannot point into
+/// Caller storage for an entry's NUL-terminated path: the view reads
+/// paths from the index file, so `FileEntryView::path` cannot point into
 /// it. Index paths are shorter than `PATH_BUF` (the reader refuses longer).
 pub type EntryPath = [u8; ampr_format::source::PATH_BUF];
 
@@ -767,47 +767,67 @@ pub fn ampr_index_fd_cache_release_stale(now_ns: u64) -> usize {
 // ---- acquire / release ---------------------------------------------------
 
 /// `ampr_open_indexed_or_real`: packed virtual fd, else a real open (sets
-/// `physical` even on failure). Errors are in the SCE domain. None: no
-/// fd-budget headroom for the real open, checked before the syscall.
+/// `physical` even on failure). `entry(view, path)` fills the file's entry,
+/// its path only when given `Some`: a packed open goes by id, so the path
+/// (an index pread) is read only for the real open of a loose file. Ok
+/// errors are in the SCE domain, Err is `entry`'s negative POSIX errno.
+/// Ok(None): no fd-budget headroom for the real open, checked before the
+/// syscall.
 unsafe fn open_indexed_or_real(
     id: u32,
-    entry: *const FileEntryView,
+    entry: &mut impl FnMut(&mut FileEntryView, Option<&mut EntryPath>) -> c_int,
     flags: c_int,
     mode: SceKernelMode,
     physical: &mut bool,
-) -> Option<c_int> {
+) -> Result<Option<c_int>, c_int> {
     *physical = false;
+    let mut view = FileEntryView {
+        path: core::ptr::null(),
+        path_length: 0,
+        size: 0,
+        mtime: 0,
+    };
+    let rc = entry(&mut view, None);
+    if rc != 0 {
+        return Err(rc);
+    }
     let mut handled = false;
-    let fd = unsafe { ampr_pack_try_open_indexed(id, entry, flags, mode, &mut handled) };
+    let fd = unsafe { ampr_pack_try_open_indexed(id, &view, flags, mode, &mut handled) };
     if handled {
-        return Some(fd);
+        return Ok(Some(fd));
+    }
+    let mut path: EntryPath = [0; ampr_format::source::PATH_BUF];
+    let rc = entry(&mut view, Some(&mut path));
+    if rc != 0 || view.path.is_null() {
+        return Err(if rc != 0 { rc } else { -ENOENT });
     }
     if !ampr_index_fd_cache_release_open_fd_budget_headroom(1) {
-        return None;
+        return Ok(None);
     }
     *physical = true;
-    let fd = unsafe { real_posix_open((*entry).path, flags, mode) };
+    let fd = unsafe { real_posix_open(view.path, flags, mode) };
     if fd >= 0 {
-        return Some(fd);
+        return Ok(Some(fd));
     }
     // 'L': the runtime's own open of an indexed loose file, by its stored path.
-    super::stats::fs_event(b'L', b'h', fd as i64, (*entry).path);
-    Some(if fd == -1 {
+    super::stats::fs_event(b'L', b'h', fd as i64, view.path);
+    Ok(Some(if fd == -1 {
         sce_errno_from_posix(errno())
     } else {
         fd
-    })
+    }))
 }
 
 /// Returns a pinned cached fd for file `id`, opening it when `allow_open`
-/// and the cache has room. `entry` fills the file's entry view and path
-/// (0, or a negative POSIX errno) and runs only to open: a cached fd needs
-/// no index lookup or path copy. Errors are negative POSIX errno (-EAGAIN
+/// and the cache has room. `entry` fills the file's entry view, and its
+/// path when given one (0, or a negative POSIX errno), and runs only to
+/// open: a cached fd needs no index lookup or path copy, a packed open no
+/// path (`open_indexed_or_real`). Errors are negative POSIX errno (-EAGAIN
 /// when the caller should retry after a pin is released).
 pub unsafe fn ampr_index_acquire_cached_fd(
     _job_id: u64,
     id: u32,
-    entry: impl FnOnce(&mut FileEntryView, &mut EntryPath) -> c_int,
+    mut entry: impl FnMut(&mut FileEntryView, Option<&mut EntryPath>) -> c_int,
     flags: c_int,
     mode: c_int,
     allow_open: bool,
@@ -835,22 +855,14 @@ pub unsafe fn ampr_index_acquire_cached_fd(
         return -EAGAIN;
     }
 
-    let mut view = FileEntryView {
-        path: core::ptr::null(),
-        path_length: 0,
-        size: 0,
-        mtime: 0,
-    };
-    let mut path: EntryPath = [0; ampr_format::source::PATH_BUF];
-    let rc = entry(&mut view, &mut path);
-    if rc != 0 || view.path.is_null() {
-        return if rc != 0 { rc } else { -ENOENT };
-    }
     let mut physical = false;
-    let entry = &raw const view;
-    let Some(opened) =
-        (unsafe { open_indexed_or_real(id, entry, flags, mode as SceKernelMode, &mut physical) })
-    else {
+    let opened = unsafe {
+        open_indexed_or_real(id, &mut entry, flags, mode as SceKernelMode, &mut physical)
+    };
+    let Some(opened) = (match opened {
+        Ok(fd) => fd,
+        Err(rc) => return rc,
+    }) else {
         // Our own soft budget, not a kernel EMFILE: skip caching, no pressure path.
         return -EAGAIN;
     };

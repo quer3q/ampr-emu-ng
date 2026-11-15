@@ -17,18 +17,18 @@ unsafe fn timed_copy(src: *const u8, dst: *mut u8, len: usize) {
 
 /// The `file` argument of `ampr_pack_core_task_count` and
 /// `ampr_pack_core_make_task`: an AMPRPAK4 record copied out of the
-/// manifest (it is not resident), or the zstd projection record address.
+/// manifest (it is not resident), or the zstd extent taken from the view.
 /// `ptr` is valid while this value lives.
 pub(crate) enum TaskFile {
     Lz4(AmprPackFileRecord),
-    Zstd(*const u8),
+    Zstd(zstd::ZstdExtent),
 }
 
 impl TaskFile {
     pub(crate) fn ptr(&self) -> *const u8 {
         match self {
             TaskFile::Lz4(f) => f as *const AmprPackFileRecord as *const u8,
-            TaskFile::Zstd(p) => *p,
+            TaskFile::Zstd(e) => e as *const zstd::ZstdExtent as *const u8,
         }
     }
 }
@@ -45,7 +45,7 @@ pub(crate) unsafe fn packed_read_file(
         .flatten()
 }
 
-/// `packed_read_file` that reports a read error of a paged index as
+/// `packed_read_file` that reports a read error of the index file as
 /// `Err(IndexIo)`: the read fails with EIO, not ENOENT.
 pub(crate) unsafe fn try_packed_read_file(
     state: *const PackState,
@@ -56,19 +56,11 @@ pub(crate) unsafe fn try_packed_read_file(
         _ => Ok(None),
     };
     if zstd_mode() {
-        let (Some(zstd_id), Some(index)) =
-            (zstd::zstd_file_for_ampr_id(file_id), zstd::zstd_index())
-        else {
+        // Memory only, from the view (aio.rs calls this under PACK_M).
+        let Some(extent) = zstd::zstd_extent(file_id) else {
             return Ok(None);
         };
-        // A paged index answers from its fast table: no index page read
-        // (aio.rs calls this under PACK_M).
-        let size = match index.logical_size(zstd_id) {
-            Ok(size) => size,
-            Err(e) => return io(e),
-        };
-        let file = TaskFile::Zstd(zstd::zstd_task_file(file_id));
-        return Ok(Some((file, size, 0)));
+        return Ok(Some((TaskFile::Zstd(extent), extent.logical_size, 0)));
     }
     if (*state).header.is_null() || file_id == 0 {
         return Ok(None);
@@ -236,7 +228,9 @@ pub(crate) unsafe fn advance_virtual_read_aio(
         }
         // Task destination offsets are u32: a read of 4 GiB or more is cut
         // to a short read at that limit instead of failing part-way with EIO.
-        let length = (job.request.nbyte as u64).min(logical_size - offset).min(u32::MAX as u64);
+        let length = (job.request.nbyte as u64)
+            .min(logical_size - offset)
+            .min(u32::MAX as u64);
         if pipeline.task_count == 0 {
             pipeline.task_count = ampr_pack_core_task_count(file_ptr, offset, length);
             if pipeline.task_count == 0 {
@@ -494,9 +488,7 @@ unsafe fn prepare_exact_task_window(
                     && (task.chunk_index as u64) < chunk_count)
                     .then_some(task.chunk)
             })
-            .take_while(|next| {
-                next.pack_id == chunk.pack_id && !cache_holds_chunk(next)
-            })
+            .take_while(|next| next.pack_id == chunk.pack_id && !cache_holds_chunk(next))
             .map(|next| (next.offset, next.stored_size as u64));
         let Some((end, _)) = ampr_format::run::exact_run_end(
             begin,

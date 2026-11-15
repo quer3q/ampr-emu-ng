@@ -10,35 +10,36 @@ BUILD_MAKEFILE := $(lastword $(MAKEFILE_LIST))
 # 1 = debug build: TCP metrics endpoint on port 9090 (rt/exports.rs, rt/stats.rs).
 AMPR_MEM_REPORT ?= 0
 # Internal pool size in bytes, read by rt/runtime_memory.rs: all runtime
-# memory. It holds the Index 64 (index files read whole or through a page
-# cache of at least 16 MiB, plus up to 48 MiB of lookup tables) +
+# memory. It holds the Index 80 (the compiled index view, the pack index
+# tables kept after the mount and the transient build buffers) +
 # Cache 64 + Buffer 28.44 MiB ledger caps (rt/index_memory.rs; Cache is one
 # 64 MiB decoded chunk cache, chunks are read with exact-size reads and
 # no read pages are kept; buffers are 4 x 1 MiB decode + 4 x 112 KiB zstd
 # decoder workspaces + 12 x 2 MiB I/O)
 # and a 2 MiB budget for the fixed sites (1.56 MiB used); a pool below that
 # fails the build. Both builds have the same PRX size T (PT_LOAD memsz
-# total), below 192 MiB: 168.52 MiB (v0.3.4 loaded at 200.7 MiB, so a PRX
+# total), below 192 MiB: 184.44 MiB (v0.3.4 loaded at 200.7 MiB, so a PRX
 # of this size loads). Each pool is T minus its build's non-pool part (code,
 # data, reactor storage), rounded down to a 16 KiB page. Non-pool parts:
-# release 9118210 B (8.70 MiB), debug 10544330 B (10.06 MiB; more code,
+# release 9027282 B (8.61 MiB), debug 10452034 B (9.97 MiB; more code,
 # /fsfail and retry records, rt/stats.rs), so the release pool is 1.36 MiB
-# (87 pages) larger: 159.83 vs 158.47 MiB. Deleting the physical page cache
-# took about 589 KiB off both non-pool parts (229 KiB of PackState .bss,
-# the rest code). `AMPR_ZSTD_MMAP=1` adds 448 KiB to both pools (4
-# decode-on-access decoder workspaces, Buffer ledger): T 168.96 MiB.
+# (87 pages) larger: 175.83 vs 174.47 MiB; the totals are 656 B apart.
+# Raising the Index cap from 64 to 80 MiB grew both pools and totals by
+# 16 MiB (168.52 before). Moving every index onto the compiled index view
+# (rt/index_view.rs) took 101032 B (release) and 102648 B (debug) off the
+# non-pool parts. `AMPR_ZSTD_MMAP=1` adds 448 KiB to both pools (4
+# decode-on-access decoder workspaces, Buffer ledger): T 184.88 MiB
+# (computed, not built).
 # Pkg mode (the KRAKEN decoder, pkg and writable-/app0 code, a few hundred
 # bytes of statics) grew the non-pool parts by 39384 B (release) and
 # 41824 B (debug). One equeue pending node per registration (rt/equeue.rs,
 # 16384 + 4096 nodes of 32 B instead of 4096 of 40 B, plus a u16 count per
 # registration) grew them by 519640 B (release) and 519448 B (debug); the
 # pools stay as they were, since the debug pool has no room above the
-# ledger caps. The rank order of an unsorted paged ampr_emu.index and the
-# pack-aware choice to read it whole (rt/index.rs, ampr-format index.rs,
-# rt/pack/manifest.rs) grew them by 52784 B (release) and 53248 B (debug).
+# ledger caps.
 # Directory fds as plain numbers (320 packed slots instead of 512, a live
 # flag per directory slot, no directory generation) took 128 B (release) and
-# 384 B (debug) off them; both totals stay 168.52 MiB, 472 B apart (728 B
+# 384 B (debug) off them; both totals stayed 168.52 MiB, 472 B apart (728 B
 # before). `dist` checks both totals
 # (tools/verify_payload_prx.py --prx-totals): they must match within 64 KiB
 # and stay below 192 MiB, else update the gap here.
@@ -50,11 +51,11 @@ AMPR_MEM_REPORT ?= 0
 # did (a title had 42 MiB of direct memory free during play), and flexible
 # memory had 0-28 MiB free in another title (debug /metrics flex_* and the
 # former direct memory lines).
-AMPR_INTERNAL_POOL_SIZE ?= $(if $(filter 1,$(AMPR_ZSTD_MMAP)),0xa044000,0x9fd4000)
+AMPR_INTERNAL_POOL_SIZE ?= $(if $(filter 1,$(AMPR_ZSTD_MMAP)),0xb044000,0xafd4000)
 # Debug build pool (passed to it as AMPR_INTERNAL_POOL_SIZE by `dist`):
-# T minus the debug non-pool part, 158.47 MiB, the same ledger caps as
+# T minus the debug non-pool part, 174.47 MiB, the same ledger caps as
 # release; host tests build with it (rt/runtime_memory.rs).
-AMPR_DEBUG_POOL_SIZE ?= $(if $(filter 1,$(AMPR_ZSTD_MMAP)),0x9ee8000,0x9e78000)
+AMPR_DEBUG_POOL_SIZE ?= $(if $(filter 1,$(AMPR_ZSTD_MMAP)),0xaee8000,0xae78000)
 # Pread pool threads: at most 6 (tune::RELEASE_PREAD_THREADS), grown by
 # backlog and retired by load within the runtime-wide budget of 16 worker
 # threads (rt/thread_hooks.rs); a zstd title peaked at 5-6, two titles at
@@ -118,7 +119,8 @@ AMPR_ZSTD_LIBC_HOOKS ?= 0xfff
 # 2 (default): disk cache. The file is decoded once into a temp file in
 # /data/ampr_cache, unlinked before it is mapped and kept open (up to 64
 # files; the oldest is closed for a new one), and the original maps a dup of
-# that fd. It is a kernel file mapping, so
+# that fd. The folder is removed right after each unlink, at module_start
+# and at shutdown, so it does not stay visible on /data. It is a kernel file mapping, so
 # mprotect, write faults and thread stacks behave as for any file. Memory:
 # one transient 256 KiB pool buffer while the file is written.
 # 1: decode on access (rt/pack/mmap_fault.rs), zstd packs only (an LZ4

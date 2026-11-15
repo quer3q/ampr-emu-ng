@@ -8,9 +8,9 @@ with it, then ship the release build.
 
 `./ps5/build-docker.sh` (`make dist`) builds both files. The debug one is
 `make AMPR_MEM_REPORT=1` (Cargo feature `mem_report`) with the pool set to
-`AMPR_DEBUG_POOL_SIZE` (`0x9e78000`, 158.47 MiB); the release pool is
-`0x9fd4000` (159.83 MiB). The smaller pool offsets the larger debug code, so
-both PRX files load to 168.52 MiB with the same ledger caps, cache and
+`AMPR_DEBUG_POOL_SIZE` (`0xae78000`, 174.47 MiB); the release pool is
+`0xafd4000` (175.83 MiB). The smaller pool offsets the larger debug code, so
+both PRX files load to 184.44 MiB with the same ledger caps, cache and
 thread limits.
 
 Only the debug build:
@@ -68,26 +68,44 @@ pool use per site as `pool_now:` and `pool_peak:` lines. Counters are totals
 since load; `*_max` values reset on each scrape; the `save_*_last_*` codes
 hold the last value, so do not subtract them between scrapes.
 
-The index page cache (`rt/index_pages.rs`) reads the index files that do not
-fit the Index ledger whole in 16 KiB pages through an arena of
-`index_arena_bytes` (a 16 MiB floor plus the room the lookup tables left;
-0 while every index file is read whole; `index_fast_bytes` is the resident
-fast tables of the paged files): `index_page_hits` (pages
-served from the arena), `index_page_misses` and `index_page_miss_ns` (pages
-read from the file and the time spent), `index_page_evictions` (pages dropped
-to make room), `index_page_resident` (pages in the arena now),
-`index_page_direct_reads` (reads served from the file past the arena,
-because another thread was loading that page or no slot could be evicted;
-no reader waits on another thread) and `index_files_bytes` (the registered
-index files together). When
-`index_files_bytes` fits the arena, misses stop at one per page and
-evictions stay 0; growing evictions mean the index files outgrew it.
-`index_fast_bytes` covers the fast tables of all three index files (zstd
-16 B per file for hash and size, 8 B per chunk and volume; AMPRIDX3 12 B per file; LZ4 48 B per
-file, 12 B per chunk, 32 B per pack); a paged index whose fast table does
-not fit is not served (the one index notice). `index_lookup_io` counts
-file index lookups that could not read the index file: they go to the
-real call instead of answering ENOENT.
+Each title has one compiled index view (`rt/index_view.rs`, built by
+`crates/ampr-format/src/view.rs`) in the Index ledger (`index_mem_bytes`
+against `index_mem_cap_bytes`). It keeps hashes, sizes, mtimes,
+directories and the pack links resident; paths stay in the index file and
+are read with one pread each (`rt/index_file.rs`), only to confirm a hash
+match, to list a directory or to reach a loose file whose spelling the
+game did not match. `index_view_bytes` is what the
+mounted index holds for lookups: the view's resident block, the zstd chunk
+tables (8 B per chunk and volume) and the resident AMPRPAK4 parts (header,
+record sections and pack names). Each part is counted when it is taken and
+taken back when it is freed; the AMPRPAK4 parts stay held until a reload
+or a failed mount, as hooks past the reader gate may still read them. The
+build's transient columns are not in it, and the rest of `index_mem_bytes`
+is other Index users (a walk build's path blob, the LZ4 mismatch bitmap,
+the save icon buffer, `/bench`). On the host, a 242,409-file zstd index gives 21.74 MiB (columns
+8.32, file slots 2.00, directories 1.21 allocated, chunks and volumes
+10.22); no console reading of `index_view_bytes` has been taken yet.
+`index_mount_ns` is the time of the last index load: the index read, or a
+walk build, into the view plus, with packs, the pack index mount and its
+join into the view. It is set once per load, so read it once the index
+is loaded; no console number is recorded for it yet.
+
+`index_lookup_io` counts lookups that could not read a path from the index
+file. Such a lookup is never an authoritative ENOENT: a miss goes to the
+real call, and with packs mounted an ENOENT from it is answered EIO, since
+the file may be packed with no copy on disk; a hit whose stored path
+cannot be read answers EIO. A loose hit (an indexed file that is not
+packed) calls the real function with the game's own spelling first,
+normalized with its case kept, so a hit reads no path. Only when that call
+fails ENOENT or ENOTDIR, or the spelling does not fold to the index key, is
+the stored path read and confirmed, then called if it differs. A creating
+open reads the stored path first, so it never makes a second file beside
+one stored in another case. A stat or access of a hit reads no path. A
+game that spells its files as stored reads no path for its loose hits; on
+a folder install on the case-sensitive internal SSD, each access spelled in
+another case reads and confirms the stored path. `index_lookup_io` counts
+only failed reads, so a value above 0 means the index file could not be
+read.
 
 Pack chunks are read with exact-size reads, the only read path: one disk
 read covers a chunk's stored bytes, adjacent chunks coalesced.

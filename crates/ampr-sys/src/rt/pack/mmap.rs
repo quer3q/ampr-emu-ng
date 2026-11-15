@@ -9,8 +9,9 @@
 //! every map of an LZ4 packed file, takes the disk fallback. The disk
 //! fallback reads the whole file once through the virtual pread path
 //! (rt/pack/fd_read.rs, which decodes either format in
-//! rt/pack/virtual_read.rs) into an unlinked file under /data/ampr_cache,
-//! keeps that fd for the session and maps it with the caller's
+//! rt/pack/virtual_read.rs) into an unlinked file under /data/ampr_cache
+//! (the folder is removed right after the unlink), keeps that fd for the
+//! session and maps it with the caller's
 //! addr/len/prot/flags/offset. Any other fd goes to the original
 //! unchanged. Pool use: one transient 256 KiB buffer while a cache file is
 //! written; unmeasured on a console (Makefile).
@@ -93,7 +94,7 @@ unsafe fn serve(
     if flags & MAP_SHARED != 0 && prot & WRITE != 0 {
         return (Served::Failed(EACCES), b'v');
     }
-    // try_map reads the zstd projection and index, so it runs under a
+    // try_map reads the zstd mount and index, so it runs under a
     // ManifestReader. Refused once shutdown starts, it falls back to the
     // disk copy, whose reads take a PackSubmission instead. The guard is
     // dropped before that copy: it may wait on pack workers.
@@ -255,7 +256,8 @@ pub(crate) unsafe extern "C" fn sceKernelMunmap_emul(addr: *mut c_void, len: usi
 // ---- disk cache ---------------------------------------------------------------
 
 /// Cache directory on the console's data partition; every entry is swept
-/// at module_start (`sweep_cache_dir`).
+/// at module_start (`sweep_cache_dir`). It exists only while a cache file is
+/// created (`remove_cache_dir`).
 const CACHE_DIR: &CStr = c"/data/ampr_cache";
 /// Cache files kept open at once (one fd each); the oldest is closed for a
 /// new one, and a later map of it decodes it again.
@@ -331,6 +333,7 @@ static CACHE: SyncCell<CacheTable<CACHE_FILES>> = SyncCell::new(CacheTable::new(
 /// one file write it once. A pthread mutex: a write can take a while.
 static CACHE_M: Mutex = Mutex::new();
 static MKDIR: LazySym = LazySym::new(c"mkdir");
+static RMDIR: LazySym = LazySym::new(c"rmdir");
 
 const O_RDWR: c_int = 0x2;
 const O_CREAT: c_int = 0x200;
@@ -358,6 +361,34 @@ unsafe fn real_mkdir(path: *const c_char, mode: c_int) -> c_int {
     unsafe { MKDIR.get::<F>() }.map_or_else(eio, |f| unsafe { f(path, mode) })
 }
 
+type RmdirFn = unsafe extern "C" fn(*const c_char) -> c_int;
+
+/// rmdir has no hook id, like mkdir: the dynamic symbol is the real call.
+unsafe fn real_rmdir() -> Option<RmdirFn> {
+    unsafe { RMDIR.get::<RmdirFn>() }
+}
+
+/// Removes CACHE_DIR when it is empty, so no folder stays on /data for a
+/// file explorer to show. Every cache file is unlinked right after create,
+/// so the folder is empty unless a crash left a named file (swept at the
+/// next module_start). Runs after each create (`create_cache_file`), at
+/// module_start after `sweep_cache_dir` (rt/pack/mod.rs
+/// `select_pack_format`) and at pack shutdown (`close_cache`); always under
+/// CACHE_M or before any map, so no create runs between its mkdir and this.
+pub(crate) unsafe fn remove_cache_dir() {
+    if let Some(rmdir) = unsafe { real_rmdir() } {
+        unsafe { remove_dir_keeping_errno(CACHE_DIR, rmdir) };
+    }
+}
+
+/// rmdir of `dir`, every error ignored (ENOENT: already gone; ENOTEMPTY: a
+/// named file is left) and errno kept, so the caller still reports its own.
+unsafe fn remove_dir_keeping_errno(dir: &CStr, rmdir: RmdirFn) {
+    let saved = errno();
+    unsafe { rmdir(dir.as_ptr()) };
+    set_errno(saved);
+}
+
 /// errno of a failed real call, EIO if it left none.
 fn failed_errno() -> c_int {
     match errno() {
@@ -367,14 +398,15 @@ fn failed_errno() -> c_int {
 }
 
 /// Pack shutdown: closes every cached file fd, so a PRX unload in a running
-/// process leaks neither fds nor their storage. Existing mappings stay
-/// valid; they hold the unlinked files themselves.
+/// process leaks neither fds nor their storage, and removes the folder.
+/// Existing mappings stay valid; they hold the unlinked files themselves.
 pub(crate) unsafe fn close_cache() {
     let _guard = CACHE_M.lock();
     let table = unsafe { &mut *CACHE.get() };
     while let Some(fd) = table.evict_oldest() {
         unsafe { real_physical_close(fd) };
     }
+    unsafe { remove_cache_dir() };
 }
 
 /// A dup of `file_id`'s cache file fd, writing the file first from the
@@ -427,7 +459,9 @@ unsafe fn close_keeping_errno(fd: c_int) {
 
 /// Creates, unlinks and fills the cache file of `file_id`. The fd keeps the
 /// data; the kernel frees it when the process exits, crash or kill too. On
-/// any failure the fd is closed and no named file is left.
+/// any failure the fd is closed and no named file is left. The folder is
+/// made for the create and removed right after the unlink, or on a failed
+/// open or unlink, so it never stays on /data while the session runs.
 unsafe fn create_cache_file(vfd: c_int, file_id: u32) -> Result<c_int, c_int> {
     if unsafe { real_mkdir(CACHE_DIR.as_ptr(), 0o700) } != 0 && errno() != EEXIST {
         return Err(EIO);
@@ -437,14 +471,20 @@ unsafe fn create_cache_file(vfd: c_int, file_id: u32) -> Result<c_int, c_int> {
     unsafe { real_unlink(p) };
     let fd = unsafe { real_open_path(p, O_RDWR | O_CREAT | O_EXCL | O_TRUNC, 0o600) };
     if fd < 0 {
-        return Err(match failed_errno() {
+        let e = match failed_errno() {
             e @ (EMFILE | ENFILE | ENOSPC) => e,
             _ => EIO,
-        });
+        };
+        unsafe { remove_cache_dir() };
+        return Err(e);
     }
-    if unsafe { real_unlink(p) } != 0 {
+    let unlinked = unsafe { real_unlink(p) } == 0;
+    if !unlinked {
         unsafe { real_physical_close(fd) };
         unsafe { real_unlink(p) };
+    }
+    unsafe { remove_cache_dir() };
+    if !unlinked {
         return Err(EIO);
     }
     match unsafe { copy_virtual_file(vfd, fd) } {
@@ -490,9 +530,8 @@ unsafe fn copy_virtual_file(vfd: c_int, fd: c_int) -> Result<u64, c_int> {
 }
 
 /// Largest packed file `read_packed` reads whole. The buffer comes from the
-/// Index ledger's free room, which can be less (the 2 MiB the page arena
-/// leaves for transient buffers, rt/index_pages.rs `TRANSIENT_ROOM`): a larger icon is
-/// then skipped like one over this size, counted in `save_icon_skipped`
+/// Index ledger's free room, which can be less: a larger icon is then
+/// skipped like one over this size, counted in `save_icon_skipped`
 /// without the index notice (rt/save.rs `save_icon_by_path_emul`).
 pub(crate) const READ_PACKED_MAX: usize = 8 * 1024 * 1024;
 
@@ -531,7 +570,9 @@ unsafe fn read_whole(vfd: c_int) -> Option<(*mut u8, usize)> {
     if unsafe { posix_fstat_emul(vfd, &mut st) } != 0 {
         return None;
     }
-    let len = usize::try_from(st.st_size).ok().filter(|&n| n > 0 && n <= READ_PACKED_MAX)?;
+    let len = usize::try_from(st.st_size)
+        .ok()
+        .filter(|&n| n > 0 && n <= READ_PACKED_MAX)?;
     let buf = unsafe { title_alloc(len, c"apr.read-packed") };
     if buf.is_null() {
         return None;
@@ -634,7 +675,10 @@ mod tests {
         // A full table makes room by dropping its oldest entry.
         assert_eq!(t.evict_oldest(), Some(30));
         assert!(t.insert(10, 32));
-        assert_eq!((t.lookup(7), t.lookup(9), t.lookup(10)), (None, Some(31), Some(32)));
+        assert_eq!(
+            (t.lookup(7), t.lookup(9), t.lookup(10)),
+            (None, Some(31), Some(32))
+        );
     }
 
     #[test]
@@ -643,5 +687,54 @@ mod tests {
         let end = p.iter().position(|&b| b == 0).unwrap();
         assert_eq!(&p[..end], b"/data/ampr_cache/00ab12cd.tmp");
         assert_eq!(cache_path(u32::MAX)[end], 0);
+    }
+
+    extern "C" {
+        /// Host libc rmdir; the console one is resolved from libkernel.
+        fn rmdir(path: *const c_char) -> c_int;
+    }
+
+    /// The create sequence on the host filesystem: make the folder, create
+    /// a file, unlink it, remove the folder while the fd still reads the
+    /// data. A folder holding a named file (a crash left it) stays, and a
+    /// missing folder is no error; errno is kept either way.
+    #[test]
+    fn folder_goes_after_the_unlink_and_a_named_file_keeps_it() {
+        use std::io::{Read, Seek, Write};
+        let dir = std::env::temp_dir().join(format!("ampr_cache_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+        let c_dir = std::ffi::CString::new(dir.to_str().unwrap()).unwrap();
+        let file = dir.join("00000001.tmp");
+        let mut f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&file)
+            .unwrap();
+        std::fs::remove_file(&file).unwrap();
+        set_errno(EMFILE);
+        unsafe { remove_dir_keeping_errno(&c_dir, rmdir) };
+        assert_eq!(errno(), EMFILE);
+        assert!(!dir.exists());
+        f.write_all(b"kept").unwrap();
+        f.rewind().unwrap();
+        let mut back = String::new();
+        f.read_to_string(&mut back).unwrap();
+        assert_eq!(back, "kept");
+
+        // Missing folder: ENOENT is ignored.
+        set_errno(ENOSPC);
+        unsafe { remove_dir_keeping_errno(&c_dir, rmdir) };
+        assert_eq!(errno(), ENOSPC);
+
+        // A named file left behind: ENOTEMPTY is ignored, the folder stays.
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(&file, b"x").unwrap();
+        set_errno(0);
+        unsafe { remove_dir_keeping_errno(&c_dir, rmdir) };
+        assert_eq!(errno(), 0);
+        assert!(file.exists());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

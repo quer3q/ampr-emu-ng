@@ -10,7 +10,7 @@ use super::*;
 // ---- mounted volume geometry (AMPRPAK4 records, or the zstd index) -----------
 
 /// Mounted pack volumes (0 while unmounted): AMPRPAK4 `pack_count`, or the
-/// zstd volume count once its projection is ready.
+/// zstd volume count once its mount is ready.
 pub(crate) unsafe fn pack_volume_count(state: *const PackState) -> u32 {
     if zstd_mode() {
         zstd::zstd_volume_count()

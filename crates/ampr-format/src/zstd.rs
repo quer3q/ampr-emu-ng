@@ -1,7 +1,8 @@
 //! Readers for zstd pack indexes (AMPRZPK1 v1) and volumes (AMPRZDT1 v1).
 //! The convention (magics, layout, names, chunk records, the volume header) comes
 //! from the `ampr-zstd` crate, used in `no_std`; the index reader reads through a
-//! `Source`, so the runtime can page a large index instead of holding it whole.
+//! `Source`, so the runtime reads a large index at offsets instead of holding
+//! it whole.
 use crate::source::{src_bytes, src_crc32, src_u64, Source, PATH_BUF};
 use crate::{crc32_parts, u16_at, u32_at, u64_at, Error, Result};
 use ampr_zstd as format;
@@ -10,8 +11,8 @@ use core::cmp::Ordering;
 pub use format::{
     path_hash_bytes as path_hash, VolumeHeader, CHUNK_RECORD_SIZE, CHUNK_SHIFT, CHUNK_SIZE,
     FILE_RECORD_SIZE, FORMAT_VERSION, INDEX_HEADER_CRC_AT, INDEX_HEADER_SIZE, INDEX_MAGIC,
-    INDEX_NAME, INDEX_PAYLOAD_CRC_AT, MAX_VOLUMES, VOLUME_HEADER_SIZE, VOLUME_LIMIT,
-    VOLUME_PREFIX, VOLUME_RECORD_SIZE, VOLUME_SUFFIX, ZSTD_LEVELS,
+    INDEX_NAME, INDEX_PAYLOAD_CRC_AT, MAX_VOLUMES, VOLUME_HEADER_SIZE, VOLUME_LIMIT, VOLUME_PREFIX,
+    VOLUME_RECORD_SIZE, VOLUME_SUFFIX, ZSTD_LEVELS,
 };
 
 /// A file record by value: the path stays in the source at `path_at`
@@ -35,30 +36,14 @@ pub struct ChunkRecord {
     pub codec: u8,
 }
 
-/// The fast table: what lookups and read jobs need, held in memory by the
-/// caller and filled by one sequential pass (`Index::fill_fast`). With it
-/// `chunk`, `volume_size` and `logical_size` never read the source and
-/// `find` reads it only to confirm a path whose hash matches; paths and
-/// full file records stay in the source. 16 B per file and 8 B per chunk
-/// and volume (about 7.9 MiB at 300k files and 100 GB of 256 KiB chunks).
-#[derive(Clone, Copy, Debug)]
-pub struct Fast<'f> {
-    /// `path_hash` of every file record, in record (hash, path) order.
-    pub hashes: &'f [u64],
-    /// `logical_size` of every file record, in the same order: a read job
-    /// needs it and the runtime projection does not hold it.
-    pub sizes: &'f [u64],
-    /// Every packed chunk record.
-    pub chunks: &'f [u64],
-    /// Every volume size.
-    pub volumes: &'f [u64],
-}
-
 /// Reads records through `src` at absolute table offsets, so the same
-/// reader serves a resident image and the runtime's index page cache.
+/// reader serves a resident image and the runtime's file sources, which
+/// read the index file at offsets.
 pub struct Index<'s, S: Source + ?Sized = [u8]> {
     src: &'s S,
-    fast: Option<Fast<'s>>,
+    /// Resident chunk and volume tables, set by `with_chunks`; file
+    /// records and paths stay in the source.
+    tables: Option<(&'s [u64], &'s [u64])>,
     files_at: u64,
     file_count: u64,
     chunks_at: u64,
@@ -124,7 +109,7 @@ impl<'s, S: Source + ?Sized> Index<'s, S> {
         archive_id.copy_from_slice(&h[24..40]);
         let index = Self {
             src,
-            fast: None,
+            tables: None,
             files_at: files_off,
             file_count,
             chunks_at: chunks_off,
@@ -153,52 +138,15 @@ impl<'s, S: Source + ?Sized> Index<'s, S> {
         self.volume_count
     }
 
-    // ---- fast table ----
+    // ---- chunk tables ----
 
-    /// Lengths of the fast table's arrays: (files, chunks, volumes);
-    /// `hashes` and `sizes` both have `files` entries.
-    pub fn fast_lens(&self) -> (usize, usize, usize) {
-        (
-            self.file_count as usize,
-            self.chunk_count as usize,
-            self.volume_count as usize,
-        )
-    }
-
-    /// Fills the fast table in one sequential pass over the file, chunk
-    /// and volume tables, 4 KiB per source read (no_std threads have small
-    /// stacks). `Invalid` when a slice length differs from `fast_lens`.
-    pub fn fill_fast(
-        &self,
-        hashes: &mut [u64],
-        sizes: &mut [u64],
-        chunks: &mut [u64],
-        volumes: &mut [u64],
-    ) -> Result<()> {
-        let (files, chunk_n, volume_n) = self.fast_lens();
-        if hashes.len() != files
-            || sizes.len() != files
-            || chunks.len() != chunk_n
-            || volumes.len() != volume_n
-        {
-            return Err(Error::Invalid);
-        }
-        let mut buf = [0u8; 4096];
-        let per = buf.len() / FILE_RECORD_SIZE;
-        let records = hashes.chunks_mut(per).zip(sizes.chunks_mut(per));
-        for (n, (hashes, sizes)) in records.enumerate() {
-            let at = self.files_at + (n * per * FILE_RECORD_SIZE) as u64;
-            let block = &mut buf[..hashes.len() * FILE_RECORD_SIZE];
-            self.src.read_at(at, block)?;
-            for (i, (h, size)) in hashes.iter_mut().zip(sizes.iter_mut()).enumerate() {
-                *h = u64_at(block, i * FILE_RECORD_SIZE)?;
-                *size = u64_at(block, i * FILE_RECORD_SIZE + 8)?;
-            }
-        }
+    /// The chunk and volume tables in one sequential pass, through `buf`.
+    fn read_chunks(&self, buf: &mut [u8], chunks: &mut [u64], volumes: &mut [u64]) -> Result<()> {
+        let step = buf.len() / 8;
         for (table, out) in [(self.chunks_at, chunks), (self.volumes_at, volumes)] {
-            for (n, out) in out.chunks_mut(buf.len() / 8).enumerate() {
+            for (n, out) in out.chunks_mut(step).enumerate() {
                 let block = &mut buf[..out.len() * 8];
-                self.src.read_at(table + (n * 4096) as u64, block)?;
+                self.src.read_at(table + (n * step * 8) as u64, block)?;
                 for (i, v) in out.iter_mut().enumerate() {
                     *v = u64_at(block, i * 8)?;
                 }
@@ -207,20 +155,38 @@ impl<'s, S: Source + ?Sized> Index<'s, S> {
         Ok(())
     }
 
-    /// Makes lookups use `fast` (filled by `fill_fast` from this index).
-    /// `Invalid` when its lengths do not match.
-    pub fn with_fast(mut self, fast: Fast<'s>) -> Result<Self> {
-        let lens = (fast.hashes.len(), fast.chunks.len(), fast.volumes.len());
-        if lens != self.fast_lens() || fast.sizes.len() != lens.0 {
+    /// Lengths of the chunk-only form's arrays: (chunks, volumes), 8 B
+    /// each. It has no per-file part: a caller that keeps its own file
+    /// projection holds only these.
+    pub fn chunk_lens(&self) -> (usize, usize) {
+        (self.chunk_count as usize, self.volume_count as usize)
+    }
+
+    /// Fills the chunk and volume tables in one sequential pass, 4 KiB per
+    /// source read (no_std threads have small stacks). `Invalid` when a
+    /// slice length differs from `chunk_lens`.
+    pub fn fill_chunks(&self, chunks: &mut [u64], volumes: &mut [u64]) -> Result<()> {
+        if (chunks.len(), volumes.len()) != self.chunk_lens() {
             return Err(Error::Invalid);
         }
-        self.fast = Some(fast);
+        self.read_chunks(&mut [0u8; 4096], chunks, volumes)
+    }
+
+    /// Makes `chunk` and `volume_size` read `chunks` and `volumes` (filled
+    /// by `fill_chunks` from this index); `file`, `path`,
+    /// `logical_size` and `find` still read the source. `Invalid` when the
+    /// lengths do not match.
+    pub fn with_chunks(mut self, chunks: &'s [u64], volumes: &'s [u64]) -> Result<Self> {
+        if (chunks.len(), volumes.len()) != self.chunk_lens() {
+            return Err(Error::Invalid);
+        }
+        self.tables = Some((chunks, volumes));
         Ok(self)
     }
 
-    /// Whether `chunk` and `volume_size` read memory only.
-    pub fn has_fast(&self) -> bool {
-        self.fast.is_some()
+    /// Whether `chunk` and `volume_size` read memory only (`with_chunks`).
+    pub fn has_chunks(&self) -> bool {
+        self.tables.is_some()
     }
 
     fn raw_file(&self, id: u64) -> Result<[u8; FILE_RECORD_SIZE]> {
@@ -256,12 +222,9 @@ impl<'s, S: Source + ?Sized> Index<'s, S> {
         self.parse_file(&self.raw_file(id)?)
     }
 
-    /// File `id`'s logical size; with the fast table it reads memory only.
+    /// File `id`'s logical size, from its record in the source.
     pub fn logical_size(&self, id: u64) -> Result<u64> {
-        match self.fast {
-            Some(f) => f.sizes.get(id as usize).copied().ok_or(Error::OutOfRange),
-            None => Ok(self.file(id)?.logical_size),
-        }
+        Ok(self.file(id)?.logical_size)
     }
 
     /// Copies `rec`'s path into `buf`; `Invalid` when it does not fit.
@@ -273,8 +236,8 @@ impl<'s, S: Source + ?Sized> Index<'s, S> {
         if id >= self.chunk_count {
             return Err(Error::OutOfRange);
         }
-        let packed = match self.fast {
-            Some(f) => f.chunks[id as usize],
+        let packed = match self.tables {
+            Some((chunks, _)) => chunks[id as usize],
             None => src_u64(
                 self.src,
                 self.chunks_at + u64::from(id) * CHUNK_RECORD_SIZE as u64,
@@ -298,8 +261,8 @@ impl<'s, S: Source + ?Sized> Index<'s, S> {
         if id >= self.volume_count {
             return Err(Error::OutOfRange);
         }
-        match self.fast {
-            Some(f) => Ok(f.volumes[id as usize]),
+        match self.tables {
+            Some((_, volumes)) => Ok(volumes[id as usize]),
             None => src_u64(
                 self.src,
                 self.volumes_at + u64::from(id) * VOLUME_RECORD_SIZE as u64,
@@ -308,8 +271,7 @@ impl<'s, S: Source + ?Sized> Index<'s, S> {
     }
 
     /// Zero-based file id in sorted (hash, path) order. The binary search
-    /// compares hashes and reads a record's path only on an equal hash;
-    /// with the fast table it searches the resident hashes.
+    /// compares hashes and reads a record's path only on an equal hash.
     pub fn find(&self, path: &[u8]) -> Result<Option<u64>> {
         if !valid_path(path) {
             return Err(Error::Invalid);
@@ -319,18 +281,6 @@ impl<'s, S: Source + ?Sized> Index<'s, S> {
         }
         let hash = path_hash(path);
         let mut buf = [0u8; PATH_BUF];
-        if let Some(f) = self.fast {
-            // Equal hashes are in path order: stop at the first path past it.
-            let mut id = f.hashes.partition_point(|&h| h < hash);
-            while f.hashes.get(id) == Some(&hash) {
-                match self.path(&self.file(id as u64)?, &mut buf)?.cmp(path) {
-                    Ordering::Equal => return Ok(Some(id as u64)),
-                    Ordering::Greater => break,
-                    Ordering::Less => id += 1,
-                }
-            }
-            return Ok(None);
-        }
         let (mut low, mut high) = (0u64, self.file_count);
         while low < high {
             let mid = low + (high - low) / 2;
@@ -688,11 +638,10 @@ mod tests {
     }
 
     #[test]
-    fn fast_table_gives_the_same_answers_without_source_reads() {
-        // 600 files: the pass crosses 4 KiB blocks of records and chunks.
+    fn chunk_tables_answer_from_memory_and_leave_files_in_the_source() {
+        // 600 chunks: the pass crosses 4 KiB blocks of the chunk table.
         let n = 600;
         let bytes = multi(n);
-        assert_eq!(header_counts(&bytes), Ok((n as u64, n as u64, 1)));
         let src = Counting {
             bytes: bytes.clone(),
             reads: Cell::new(0),
@@ -700,72 +649,46 @@ mod tests {
         };
         let plain = Index::open(&bytes[..]).unwrap();
         let index = Index::open(&src).unwrap();
-        let (f, c, v) = index.fast_lens();
-        let (mut hashes, mut sizes, mut chunks, mut volumes) = (
-            std::vec![0; f],
-            std::vec![0; f],
-            std::vec![0; c],
-            std::vec![0; v],
-        );
+        assert_eq!(index.chunk_lens(), (n, 1));
+        let (c, v) = index.chunk_lens();
+        let (mut chunks, mut volumes) = (std::vec![0; c], std::vec![0; v]);
         assert_eq!(
-            index.fill_fast(&mut hashes[1..], &mut sizes, &mut chunks, &mut volumes),
+            index.fill_chunks(&mut chunks[1..], &mut volumes),
             Err(Error::Invalid)
         );
-        assert_eq!(
-            index.fill_fast(&mut hashes, &mut sizes[1..], &mut chunks, &mut volumes),
-            Err(Error::Invalid)
-        );
-        index
-            .fill_fast(&mut hashes, &mut sizes, &mut chunks, &mut volumes)
-            .unwrap();
-        let fast = Fast {
-            hashes: &hashes,
-            sizes: &sizes,
-            chunks: &chunks,
-            volumes: &volumes,
-        };
-        for short in [
-            Fast {
-                hashes: &hashes[1..],
-                ..fast
-            },
-            Fast {
-                sizes: &sizes[1..],
-                ..fast
-            },
-        ] {
-            assert!(Index::open(&src).unwrap().with_fast(short).is_err());
+        assert_eq!(index.fill_chunks(&mut chunks, &mut []), Err(Error::Invalid));
+        index.fill_chunks(&mut chunks, &mut volumes).unwrap();
+        for (c, v) in [(&chunks[1..], &volumes[..]), (&chunks[..], &[][..])] {
+            assert_eq!(
+                Index::open(&src).unwrap().with_chunks(c, v).err(),
+                Some(Error::Invalid)
+            );
         }
-        let index = index.with_fast(fast).unwrap();
-        assert!(index.has_fast() && !plain.has_fast());
+        let index = index.with_chunks(&chunks, &volumes).unwrap();
+        assert!(index.has_chunks() && !plain.has_chunks());
+        // Chunks and volumes from memory: a failing source is never read.
+        src.fail.set(true);
         src.reads.set(0);
-        for id in 0..n as u32 {
+        for id in 0..=n as u32 {
             assert_eq!(index.chunk(id), plain.chunk(id));
         }
-        assert_eq!(index.chunk(n as u32), plain.chunk(n as u32));
         assert_eq!(index.volume_size(0), plain.volume_size(0));
         assert_eq!(index.volume_size(1), plain.volume_size(1));
-        for id in 0..n as u64 {
-            let want = plain.file(id).unwrap().logical_size;
-            assert_eq!(index.logical_size(id), Ok(want));
-            assert_eq!(plain.logical_size(id), Ok(want));
-        }
-        assert_eq!(index.logical_size(n as u64), Err(Error::OutOfRange));
-        // A path whose hash no record has: answered from memory.
-        assert_eq!(index.find(b"none.bin"), Ok(None));
         assert_eq!(src.reads.get(), 0);
+        // Files, sizes, paths and lookups read the source as without a table.
+        assert_eq!(index.file(0).err(), Some(Error::Io));
+        assert_eq!(index.logical_size(0).err(), Some(Error::Io));
+        assert_eq!(index.find(b"none.bin").err(), Some(Error::Io));
+        assert!(src.reads.get() > 0);
+        src.fail.set(false);
         let mut buf = [0u8; PATH_BUF];
         for id in 0..n as u64 {
-            let path = plain
-                .path(&plain.file(id).unwrap(), &mut buf)
-                .unwrap()
-                .to_vec();
-            src.reads.set(0);
+            let rec = index.file(id).unwrap();
+            assert_eq!(rec, plain.file(id).unwrap());
+            assert_eq!(index.logical_size(id), Ok(rec.logical_size));
+            let path = index.path(&rec, &mut buf).unwrap().to_vec();
             assert_eq!(index.find(&path), Ok(Some(id)));
-            // The record and the path that confirm it, nothing else.
-            assert_eq!(src.reads.get(), 2);
-            assert_eq!(plain.find(&path), Ok(Some(id)));
         }
-        assert_eq!(index.find(b"d1/f0.bin"), plain.find(b"d1/f0.bin"));
+        assert_eq!(index.logical_size(n as u64), Err(Error::OutOfRange));
     }
 }

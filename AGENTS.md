@@ -53,6 +53,16 @@ behaves as upstream.
   `ampr-format` or the runtime.
   Its `kraken` module (`src/kraken/`) is the KRAKEN block decoder, to be
   replaced; the only `unsafe` code in the crate is there.
+- Index view: every title, packed or not, answers path lookups from one
+  compiled index view built from its AMPRIDX3 index. `ampr-format`
+  holds the format side: `src/view.rs` builds the per-file columns, hash
+  slots and directory records into caller memory and looks keys up,
+  `src/view_join.rs` joins a zstd or AMPRPAK4 pack index to it at mount
+  by hash, and `src/view_list.rs` lists packed directories from it. The
+  runtime side is `rt/index_view.rs` (the view's Index ledger blocks and
+  the build retry on directory capacity) and `rt/index_file.rs` (the
+  sources the build and later path reads go through: windows over the
+  index file, the kept fd, or the walk-built path blob).
 - `ps5/`: Dockerfile, `build-docker.sh`, target spec, PRX linker script.
 - `tools/`: Python PRX post-processing and `verify_payload_prx.py`.
 - `docs/zstd-format.md`: the zstd pack format. Keep it in sync with
@@ -135,7 +145,8 @@ CI (`.github/workflows/build.yml`) runs the same commands; a pushed `v*` tag cre
   heap: iced-x86 only. Keep it to that; zstd decoders use a static DCtx
   in a pool workspace (`ZstdDecoder::init_in` in `crates/ampr-codec`).
   Ledgers (`rt/index_memory.rs`):
-  Index 64 MiB (index files, lookup tables, walk build buffers, the save
+  Index 80 MiB (the compiled index view, the pack index tables kept
+  after the mount, the walk build, the 64 KiB build windows, the save
   icon buffer), Cache 64 MiB (one decoded chunk cache, carved at
   startup; pack chunks are read with exact-size reads, the only read
   path, and no read pages are cached), Buffer 28.44 MiB (4 x 1 MiB decode +
@@ -145,58 +156,53 @@ CI (`.github/workflows/build.yml`) runs the same commands; a pushed `v*` tag cre
   listed at `STATIC_POOL_SIZE` in `rt/runtime_memory.rs` (1.56 MiB used; a
   host test fails on a new pool call). A build-time assert checks that the
   caps plus the budget fit the pool. Both PRX builds load to the same
-  168.52 MiB (PT_LOAD memsz, below 192 MiB; v0.3.4 loaded at 200.7 MiB):
-  the release pool is 159.83 MiB
-  (`AMPR_INTERNAL_POOL_SIZE` `0x9fd4000`), the debug one 158.47 MiB
-  (`AMPR_DEBUG_POOL_SIZE` `0x9e78000`), the gap being the debug build's
-  larger non-pool part (10.06 vs 8.70 MiB). `AMPR_ZSTD_MMAP=1` grows both
-  pools by 448 KiB (168.96 MiB). `dist` fails when the two totals
+  184.44 MiB (PT_LOAD memsz, below 192 MiB; v0.3.4 loaded at 200.7 MiB):
+  the release pool is 175.83 MiB
+  (`AMPR_INTERNAL_POOL_SIZE` `0xafd4000`), the debug one 174.47 MiB
+  (`AMPR_DEBUG_POOL_SIZE` `0xae78000`), the gap being the debug build's
+  larger non-pool part (9.97 vs 8.61 MiB). `AMPR_ZSTD_MMAP=1` grows both
+  pools by 448 KiB (184.88 MiB, computed). `dist` fails when the two totals
   differ by more than 64 KiB or reach 192 MiB (`PRX_TOTAL_LIMIT` in
   `tools/verify_payload_prx.py --prx-totals`); then update the gap in the
   Makefile. A refused allocation degrades (index: one notice, packs
   unserved; cache off; icon skipped). Every I/O window is taken at the
   worker start, after the decode buffers, and the pipeline count is the
-  windows granted: there is no slow path for a read without one. Each index file
-  (AMPRZPK1, AMPRPAK4, AMPRIDX3), in mount order, is read whole into
-  index memory when it fits the room left with its tables
-  (`IndexSource::Resident`, `rt/index_pages.rs`). AMPRIDX3 loads first,
-  so it is read whole only when the least the pack index can mount with
-  still fits beside it (`pack_index_reserve` in `rt/pack/manifest.rs`,
-  from the pack index header: the file plus its derived tables, or its
-  fast and derived tables plus the 16 MiB arena floor); an AMPRIDX3 that
-  would starve the pack index is paged, sorted or not. Else a file is read in
-  16 KiB pages through a page arena of at least 16 MiB
-  (`INDEX_ARENA_MIN`), taken by the first paged file and grown by
-  `grow_arena` to the room the tables leave. A paged file gets a fast
-  table, built by one sequential pass at mount and resident until
-  shutdown, so lookups and read jobs run from memory and a path is read
-  only to confirm a hash match: zstd 16 B per file (hash, logical size),
-  8 B per chunk and volume;
-  AMPRIDX3 12 B per file (hash, id); LZ4 its record sections, 48 B per
-  file, 12 B per chunk, 32 B per pack (`fill_fast` in each reader). It is
-  mandatory: there is no paged-lookup fallback. Lookup tables (fast
-  tables first, at mount, then 16 B of projection per AMPRIDX3 id and 4 B
-  of order per packed file) are capped at 48 MiB (`INDEX_LOOKUP_MAX`); an
-  index whose tables do not fit, or that would leave the arena below
-  16 MiB, is refused with the notice. A paged AMPRIDX3 that is not
-  sorted (the external packer writes it unsorted) also gets a rank order,
-  4 B per file in the lookup cap, built at mount from a transient Index
-  scratch of 8 B per file plus its path blob, freed at once; when either
-  does not fit it is refused with the notice. Its header is checked
-  before it takes the arena, and the arena goes back to the ledger when
-  no paged file is left (a failed or replaced load). Hooks never wait on another thread
-  for a page: a page another thread is loading, or a miss with no
-  evictable slot, is read from the index file by the hook's thread, like
-  the open() it replaces; a read error there is never an authoritative
-  ENOENT (`index_lookup_io`). The pack
+  windows granted: there is no slow path for a read without one. A title
+  has one compiled index view, built at module_start in one pass over
+  `ampr_emu.index` through two 64 KiB windows and kept until shutdown:
+  28 B of columns per file (hash, size, mtime, path offset), 4 B more
+  with packs and 4 B more with zstd packs, 4 B hash slots at 1.5 to 3 per
+  file, 32 B per directory plus its slots, and 4 B per file (12 B with
+  LZ4 or pkg packs) of build columns given back after the build
+  (`layout` in `rt/index_view.rs`). The pack index is read once at mount
+  through two windows, its file closed after, and joined to the view by
+  hash, so an open finds a packed file by its view id with no path
+  compare. The mount keeps only what reads need: zstd its chunk and
+  volume tables (8 B per chunk and per volume); AMPRPAK4 (LZ4 and pkg)
+  its header, record sections (48 B per file, 12 B per chunk) and pack
+  names (32 B per pack plus the name), plus one mismatch bit per view id
+  for records the join refused (`LZ4_IMAGE`, `join_lz4` in
+  `rt/pack/manifest.rs`). Measured on the host from a 242,409-file zstd
+  index: 21.74 MiB resident (columns 8.32, file slots 2.00, directories
+  1.21 allocated, chunk and volume tables 10.22); 80 MiB holds a zstd
+  title of about 870,000 files at 5.5 chunks per file (computed). All of
+  it is under the one Index cap; an index that does not fit is refused
+  with the notice. Paths stay in the index file, on an fd kept open for
+  the module's life: a hook reads one with a pread on its own thread only
+  to confirm a hash hit, never waiting on another thread. A loose hit
+  calls the game's own spelling first, and a stat, access or resolve of a
+  hit reads no path. A read error is never an authoritative ENOENT
+  (`index_lookup_io`). The pack
   index is capped only by the loader's 512 MiB fstat check
   (`AMPR_EMU_PACK_INDEX_MAX_BYTES`; paths must be shorter than 1024
-  bytes). 48 MiB holds the lookup tables of about 1.6 million zstd files
-  with 100 GB of chunks (computed). A title without
-  `ampr_emu.index` builds its AMPRIDX3 whole in the Index ledger (walk
-  build, 104-124 B per file at 48-byte paths) before writing and paging
-  it. Pool peak outside the ledgers 0.56 MiB on a zstd title; the largest
-  index measured is 25.2 MiB. Pkg and rw mode add .bss statics outside
+  bytes). A title without `ampr_emu.index` builds its AMPRIDX3 whole in
+  the Index ledger (walk build, 104-124 B per file at 48-byte paths),
+  writes it and builds the view from the file; when it cannot be
+  written, the view is built from the image and its path blob is copied
+  into the ledger (`adopt_compact_index` in `rt/index.rs`). Pool peak
+  outside the ledgers was 0.56 MiB on a zstd title before the compiled
+  index view; no console run has measured it, or a title's index
+  memory, since. Pkg and rw mode add .bss statics outside
   the pool, in both builds: `KRAKEN_PKG_PATH` (269 B) and
   two atomics (9 B) in `rt/pack/pkg.rs`, `PACK_FORMAT` (1 B) in
   `rt/pack/mod.rs` and `APP0_WRITABLE` (1 B) in `rt/rw.rs`. Any change

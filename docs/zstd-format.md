@@ -7,22 +7,22 @@ this repo only decodes them (`crates/ampr-zstd`: constants, layout, volume
 header; `crates/ampr-format/src/zstd.rs`: index reader). When
 `/app0/ampr_zstd.index` exists, `libSceAmpr.sprx` mounts it instead of the
 LZ4 `ampr_assets.index`, decodes with libzstd (`ampr-codec`) and serves
-AMPR/APR reads and the file calls under What is packed. An index file
-that fits the Index ledger (64 MiB, `rt/index_memory.rs`) with its tables
-is read whole and used as is. A larger one is read on demand through a
-page cache of 16 KiB pages (an arena of at least 16 MiB, shared with the
-LZ4 manifest and `ampr_emu.index`; `crates/ampr-sys/src/rt/index_pages.rs`)
-and gets a fast table, one sequential pass at mount: the file hashes and
-logical sizes, every chunk record and the volume sizes, 8 B each (16 B
-per file), held in memory, so lookups read only the path of a record
-whose hash matches and read jobs read no index pages (a job takes the
-chunk span from the projection and the size from the fast table). The fast table and the tables built from the index
-(projection 16 B per AMPRIDX3 id, order 4 B per packed file) count
-against 48 MiB of lookup tables (`INDEX_LOOKUP_MAX`); a paged index whose
-tables do not fit is not served. The loader refuses an index file over
-512 MiB (`AMPR_EMU_PACK_INDEX_MAX_BYTES`, `rt/pack/mod.rs`): that bounds
-its page table (2 B per 16 KiB page) and the full CRC read at mount for a
-corrupt file.
+AMPR/APR reads and the file calls under What is packed. The mount reads
+the index file once, sequentially, through two 64 KiB windows from the
+Index ledger (80 MiB, `rt/index_memory.rs`): it checks the whole file, CRC
+included, fills the chunk and volume tables (8 B per chunk and per volume)
+into one Index block, joins every file record to the compiled index view
+of `ampr_emu.index` (`join_zstd`, `crates/ampr-format/src/view_join.rs`)
+and closes the file. The view then holds each packed file's first chunk
+and size, so opens and read jobs read memory only; a lookup reads at most
+the stored path of a hash hit from `ampr_emu.index`. The header alone
+sizes the tables, so an index whose tables and windows do not fit the
+room left is refused with the index notice before the file is read, and
+no packed file is served. Measured on the host from a 242,409-file index:
+21.74 MiB for the view and the tables, 10.22 MiB of it chunk and volume
+tables; no console run has measured it. The loader refuses an index file
+over 512 MiB (`AMPR_EMU_PACK_INDEX_MAX_BYTES`, `rt/pack/mod.rs`): that
+bounds the full CRC read at mount for a corrupt file.
 Every path must be shorter than 1024 bytes, the PS5 path limit.
 
 Integers are little-endian. CRC is CRC-32 (IEEE, as in `crc32fast`). The
@@ -45,14 +45,17 @@ component.
 ## What the runtime needs from ampr_emu.index
 
 A packed file is reachable only through its AMPRIDX3 id. At mount the
-runtime takes each AMPRIDX3 record, strips `/app0/` from its path and looks
-the rest up in `ampr_zstd.index` (`project_entry`, `rt/pack/zstd.rs`). A
-packer has to keep these rules, or the game cannot open the files it packed:
+runtime joins each `ampr_zstd.index` record to the view row whose path,
+`/app0/` plus the record's path and folded to lower case, has the same hash
+(`join_zstd`, `crates/ampr-format/src/view_join.rs`). A packer has to keep
+these rules, or the game cannot open the files it packed:
 
-- Every packed file needs a record in `ampr_emu.index` with the same path.
-  A file that is in `ampr_zstd.index` but not in `ampr_emu.index` has no id
-  and is not served. The zstd lookup keeps case, so the bytes of the two
-  paths must match.
+- Every packed file needs a record in `ampr_emu.index` with the same path,
+  up to ASCII case. A file that is in `ampr_zstd.index` but not in
+  `ampr_emu.index` has no id and is not served. Of two zstd records that
+  differ only in case, the first is joined and the second is not served.
+  A path whose hash another `ampr_emu.index` file shares stays loose
+  (expected never to happen with a 64-bit hash).
 - The size in the record must equal `logical_size` of the file in
   `ampr_zstd.index`. A difference makes the mount invalid, and then no
   packed file is served.
@@ -229,7 +232,9 @@ installs, about 75 s after launch) a REDengine title read through virtual
 fds: pack job 0.36 ms, disk read 0.47 ms, 59.6% decoded cache hits, pool
 peak 95.6 of 128 MiB, 7.6 MiB index. An RE Engine title through APR: wait
 per read 1.35 ms, pack job 1.11 ms, disk read 0.50 ms, 20.9% decoded cache
-hits, pool peak 90.7 MiB, 2.6 MiB index.
+hits, pool peak 90.7 MiB, 2.6 MiB index. Those index sizes are from
+before the compiled index view; no console run has measured index memory
+since.
 
 The RE Engine title is 90.6 GB unpacked, 38.4 GB packed, served 85.6 GB
 from 41.5 GB of disk reads. The .exfat image mount caps at about
@@ -252,8 +257,13 @@ later maps reuse it. Up to 64 cache files stay open; a 65th closes the
 oldest, whose data lives while mapped, and a later map decodes it again.
 mprotect, write faults and thread stacks behave as for any file mapping.
 Memory: one transient 256 KiB pool buffer per write. The
-directory is emptied at module_start when the knob is not 0 in a title
-with packs (`select_pack_format`, `rt/pack/mod.rs`; `rt/pack/mmap.rs`).
+directory is made for each create and removed right after the unlink (or
+a failed open or unlink), so it does not stay visible on `/data`; the
+open fd keeps the data. At module_start, when the knob is not 0 in a
+title with packs, it is emptied and removed (`select_pack_format`,
+`rt/pack/mod.rs`), and pack shutdown removes it again (`close_cache`,
+`rt/pack/mmap.rs`). A folder that still holds a file a crash left named
+stays until the next module_start sweep.
 
 1 (opt-in, never run on a console): zstd packed files decode on access;
 LZ4 ones take the disk cache, since the fault path reads zstd chunk

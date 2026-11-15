@@ -173,8 +173,15 @@ fn load_notice(mode: &[u8], out: &mut [u8; 64]) -> usize {
 fn load_notice_names_the_beta_rev() {
     let mut out = [0u8; 64];
     let n = load_notice(b"plain", &mut out);
-    let beta = if BETA_REV.is_empty() { String::new() } else { format!("-beta.{BETA_REV}") };
-    assert_eq!(out[..n], *format!("ampr-emu-ng: v{VERSION}{beta} (plain) running").as_bytes());
+    let beta = if BETA_REV.is_empty() {
+        String::new()
+    } else {
+        format!("-beta.{BETA_REV}")
+    };
+    assert_eq!(
+        out[..n],
+        *format!("ampr-emu-ng: v{VERSION}{beta} (plain) running").as_bytes()
+    );
 }
 
 /// Tells the owner the module runs; also keeps AMPR_EMU_VERSION linked.
@@ -336,11 +343,11 @@ mod bench_args {
 /// path. No release impact.
 #[cfg(feature = "mem_report")]
 mod mem_report {
+    use super::super::index_memory::{index_free, index_scratch_alloc};
     use super::super::pack::{
         bench_volume_path, real_aio_delete_single, real_aio_submit_single, real_aio_wait_single,
         scePthreadJoin, SceKernelAioRWRequest, SceKernelAioResult, SceKernelAioSubmitId,
     };
-    use super::super::index_memory::{index_free, index_scratch_alloc};
     use super::super::runtime_memory::{pool_tags, pool_usage, TagTotals};
     use super::super::stats::{read, NAMES};
     use super::super::sys::{
@@ -951,7 +958,9 @@ mod mem_report {
         let number = |n: &[u8]| {
             n.iter()
                 .take_while(|c| c.is_ascii_digit())
-                .fold(0usize, |v, &c| v.saturating_mul(10).saturating_add((c - b'0') as usize))
+                .fold(0usize, |v, &c| {
+                    v.saturating_mul(10).saturating_add((c - b'0') as usize)
+                })
         };
         if bench_args::param(q, b"release").is_some() {
             unsafe { lp::release() };
@@ -994,8 +1003,10 @@ mod mem_report {
     fn fsfail(out: &mut Text) {
         use super::super::stats::{FS_FAILS, FS_FAIL_LOG};
         let log = unsafe { &*FS_FAIL_LOG.get() };
-        out.kv("fsfail_distinct", log.count as u64)
-            .kv("fsfail_dropped", log.dropped.load(core::sync::atomic::Ordering::Relaxed));
+        out.kv("fsfail_distinct", log.count as u64).kv(
+            "fsfail_dropped",
+            log.dropped.load(core::sync::atomic::Ordering::Relaxed),
+        );
         for i in 0..log.count.min(FS_FAILS) {
             out.s(b"fsfail ")
                 .s(&[log.op[i], b' ', log.how[i], b' '])
@@ -1018,7 +1029,12 @@ mod mem_report {
         let mut views = [super::super::equeue::EqueueView::default(); 48];
         let count = super::super::equeue::equeue_views(&mut views);
         for v in &views[..count] {
-            out.s(if v.waiting { b"eqwait eq=" } else { b"eqpend eq=" }).u(v.eq as u64);
+            out.s(if v.waiting {
+                b"eqwait eq="
+            } else {
+                b"eqpend eq="
+            })
+            .u(v.eq as u64);
             if v.waiting {
                 out.s(b" age_ms=").u(v.age_ms).s(b" timeout_us=");
                 if v.timeout_us == u64::MAX {
@@ -1028,8 +1044,13 @@ mod mem_report {
                 }
             }
             if v.tracked {
-                out.s(b" pending=").u(v.pending.into()).s(b" regs=").u(v.registrations.into());
-                out.s(b" native_intent=").u(v.native_intent.into()).s(b" parked=");
+                out.s(b" pending=")
+                    .u(v.pending.into())
+                    .s(b" regs=")
+                    .u(v.registrations.into());
+                out.s(b" native_intent=")
+                    .u(v.native_intent.into())
+                    .s(b" parked=");
                 out.u(v.parked.into()).s(b" trigger=").u(v.trigger.into());
                 out.s(b" flags=").u(v.flags.into());
             } else {
@@ -1045,10 +1066,19 @@ mod mem_report {
             if eq == 0 {
                 continue;
             }
-            out.s(b"eqtarget eq=").u(eq as u64).s(b" id=").u(t.id.load(Relaxed).into());
-            out.s(b" writes=").u(t.writes.load(Relaxed)).s(b" data=").u(t.data.load(Relaxed));
-            out.s(b" changes=").u(t.changes.load(Relaxed)).s(b" age_ms=");
-            out.u(now.saturating_sub(t.last_ns.load(Relaxed)) / 1_000_000).s(b"\n");
+            out.s(b"eqtarget eq=")
+                .u(eq as u64)
+                .s(b" id=")
+                .u(t.id.load(Relaxed).into());
+            out.s(b" writes=")
+                .u(t.writes.load(Relaxed))
+                .s(b" data=")
+                .u(t.data.load(Relaxed));
+            out.s(b" changes=")
+                .u(t.changes.load(Relaxed))
+                .s(b" age_ms=");
+            out.u(now.saturating_sub(t.last_ns.load(Relaxed)) / 1_000_000)
+                .s(b"\n");
         }
     }
 
@@ -1068,7 +1098,8 @@ mod mem_report {
         let mut mods = [0 as c_int; 256];
         let mut n = 0usize;
         let rc = unsafe { list(mods.as_mut_ptr(), mods.len(), &mut n) };
-        out.kv("modules_rc", rc as u32 as u64).kv("modules_count", n as u64);
+        out.kv("modules_rc", rc as u32 as u64)
+            .kv("modules_count", n as u64);
         for &m in &mods[..n.min(mods.len())] {
             let mut buf = [0u8; 0x160];
             buf[..8].copy_from_slice(&0x160u64.to_ne_bytes());
@@ -1076,10 +1107,22 @@ mod mem_report {
             let name = &buf[8..0x108];
             let name = &name[..name.iter().position(|&b| b == 0).unwrap_or(name.len())];
             let seg0 = u32::from_ne_bytes(buf[0x110..0x114].try_into().unwrap_or([0; 4]));
-            out.s(b"module ").x(m as u32).s(b" ").x(rc as u32).s(b" ").s(name);
-            out.s(b" segs=").u(buf[0x148] as u64).s(b" seg0=").u(seg0 as u64).s(b" fp=");
+            out.s(b"module ")
+                .x(m as u32)
+                .s(b" ")
+                .x(rc as u32)
+                .s(b" ")
+                .s(name);
+            out.s(b" segs=")
+                .u(buf[0x148] as u64)
+                .s(b" seg0=")
+                .u(seg0 as u64)
+                .s(b" fp=");
             for &b in &buf[0x14C..0x160] {
-                out.s(&[b"0123456789abcdef"[(b >> 4) as usize], b"0123456789abcdef"[(b & 15) as usize]]);
+                out.s(&[
+                    b"0123456789abcdef"[(b >> 4) as usize],
+                    b"0123456789abcdef"[(b & 15) as usize],
+                ]);
             }
             out.s(b"\n");
         }
@@ -1176,11 +1219,14 @@ mod mem_report {
                 "flex_after_start_bytes",
                 super::FLEX_AFTER_START.load(core::sync::atomic::Ordering::Relaxed),
             );
-            out.kv("flex_free_bytes", flex(c"sceKernelAvailableFlexibleMemorySize"))
-                .kv(
-                    "flex_configured_bytes",
-                    flex(c"sceKernelConfiguredFlexibleMemorySize"),
-                );
+            out.kv(
+                "flex_free_bytes",
+                flex(c"sceKernelAvailableFlexibleMemorySize"),
+            )
+            .kv(
+                "flex_configured_bytes",
+                flex(c"sceKernelConfiguredFlexibleMemorySize"),
+            );
             // Pool ledgers (rt/index_memory.rs), all inside the static pool.
             // ledger_mem_bytes is the sum of the three; an allocation
             // refused by a cap counts in ledger_alloc_refused, a failed
@@ -1210,7 +1256,8 @@ mod mem_report {
             type RlimitFn = unsafe extern "C" fn(c_int, *mut Rlimit) -> c_int;
             type FstatFn = unsafe extern "C" fn(c_int, *mut c_void) -> c_int;
             let mut lim = Rlimit { cur: 0, max: 0 };
-            let limit = match unsafe { super::super::sys::resolve_kernel::<RlimitFn>(c"getrlimit") } {
+            let limit = match unsafe { super::super::sys::resolve_kernel::<RlimitFn>(c"getrlimit") }
+            {
                 Some(f) if unsafe { f(8, &mut lim) } == 0 && lim.cur > 0 => lim.cur as usize,
                 _ => 0,
             };
@@ -1243,7 +1290,8 @@ mod mem_report {
             out.kv("pread_threads_ceiling", ceiling)
                 .kv("pread_threads_idle", idle);
             let (counted, budget) = super::super::thread_hooks::budget_state();
-            out.kv("runtime_threads_live", counted.into()).kv("thread_budget", budget.into());
+            out.kv("runtime_threads_live", counted.into())
+                .kv("thread_budget", budget.into());
             out.kv("thread_mode", super::super::thread_hooks::pressure() as u64);
             let (workers, worker_ceiling) = super::super::pack::pack_workers_state();
             out.kv("pack_workers_ceiling", worker_ceiling as u64);
@@ -1251,7 +1299,11 @@ mod mem_report {
             // Per group (rt/thread_hooks.rs LoadGroup): live, peak, target,
             // busy median (rounded up), retired by load, under pressure.
             let groups = [
-                (&b"decode"[..], workers as u64, super::super::pack::pack_workers_load()),
+                (
+                    &b"decode"[..],
+                    workers as u64,
+                    super::super::pack::pack_workers_load(),
+                ),
                 (b"pread", live, super::super::reactor::pread_pool_load()),
                 (b"fdread", fd_live as u64, fd_load),
             ];
@@ -1462,7 +1514,7 @@ pub unsafe extern "C" fn module_start(_args: usize, _argp: *const c_void) -> c_i
     // call (an engine project descriptor in a zstd title, a data file in an
     // LZ4 one). Hooks never load the index, so
     // load AMPRIDX3 and the pack manifest here, before the game runs (zstd
-    // also mounts ampr_zstd.index and builds the id projection). Without a
+    // also mounts ampr_zstd.index and joins it to the view). Without a
     // shipped index this fails at once: ensure_ready(false) never builds one.
     // A title with no packs skips it and loads its index on the first AMPR
     // call.

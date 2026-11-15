@@ -41,8 +41,14 @@ exist, and that cost has not been measured on a console yet.
 A loose file hit is a real file the index lists, as opposed to a packed
 one. The game can rewrite, truncate or unlink it after the index was
 built, so with a writable /app0 `stat`, `lstat`, `access` and
-`sceKernelCheckReachability` of a loose hit call the real function on the
-indexed spelling (`live_loose_hit` in `rt/index.rs`). Packed hits and
+`sceKernelCheckReachability` of a loose hit call the real function
+(`live_loose_hit` in `rt/index.rs`). As for every loose open, the game's
+own spelling (normalized, case kept) goes first and costs no index read;
+only an ENOENT or ENOTDIR there reads the indexed spelling and retries
+with it when it differs (`loose_call`). An `O_CREAT` open takes the
+indexed spelling first, so it does not create a second file beside one
+stored in another case. A stored path that does not fold to the key is a
+miss, and one that cannot be read answers EIO, never ENOENT. Packed hits and
 directories are still answered from the index. A hit is packed when
 `file_id_is_packed` says so; until the pack manifest is ready, every hit in
 a title with packs counts as packed.

@@ -1,7 +1,6 @@
 //! Read-at-offset access to an index file, so the readers work the same
-//! over a resident image (`[u8]`) and over the runtime's index page cache
-//! (ampr-sys rt/index_pages.rs), which keeps only part of a large index
-//! in memory and reads the rest from the file on a miss.
+//! over a resident image (`[u8]`) and over the runtime's file sources
+//! (ampr-sys rt/index_file.rs), which read the file at offsets.
 use crate::{Error, Result};
 
 /// Longest path a reader copies out (SCE_KERNEL_PATH_MAX). Paths are read

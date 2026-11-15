@@ -2,10 +2,10 @@
 //! and decoded-cache hash table.
 
 use super::*;
-use crate::rt::index_memory::{
-    self as im, cache_alloc, cache_room, index_room, lookup_alloc, lookup_free,
-};
-use crate::rt::index_pages::{self, IndexSource};
+use crate::rt::index_file::{merge_spans, FileSource, ResidentSource, Span, WINDOW};
+use crate::rt::index_memory::{self as im, cache_alloc, cache_room};
+use ampr_format::source::Source;
+use ampr_format::view::Builder;
 
 /// The mounted index image: AMPRZPK1 in zstd mode, else AMPRPAK4.
 fn manifest_path() -> &'static CStr {
@@ -24,18 +24,22 @@ fn manifest_min_bytes() -> usize {
     }
 }
 
-/// AMPRPAK4 only: `ampr_pack_core_mount` runs the full Rust
-/// `Manifest::open` validation through the mounted source, then the
-/// runtime caps; a paged index also gets its fast table, without which
-/// it is refused with the index notice. A zstd index is mounted by
-/// `load_zstd_manifest`; its AMPRPAK4 view stays empty (`(*state).header`
-/// null), so the AMPRPAK4 paths treat nothing as packed.
-pub(crate) unsafe fn validate_manifest_layout(
+/// AMPRPAK4 only: `ampr_pack_core_mount` runs the full `Manifest::open`
+/// validation (`open_pkg` when `pkg`) over the whole file through
+/// `check`, then the runtime caps. The kept manifest reads `resident`,
+/// whose record sections become the fast table, so after the mount
+/// records and pack names are memory reads and nothing reads the file. A
+/// zstd index is mounted by `load_zstd_manifest`; its AMPRPAK4 view stays
+/// empty (`(*state).header` null), so the AMPRPAK4 paths treat nothing as
+/// packed.
+unsafe fn validate_manifest_layout<S: Source + ?Sized>(
     state: *mut PackState,
-    src: &'static IndexSource,
+    check: &S,
+    resident: &'static ResidentSource<'static>,
+    pkg: bool,
 ) -> bool {
     let mut view = AmprPackCoreView::EMPTY;
-    let mount_rc = unsafe { ampr_pack_core_mount(src, &mut view) };
+    let mount_rc = unsafe { ampr_pack_core_mount(check, resident, pkg, &mut view) };
     let header = view.header;
     if mount_rc != AMPR_PACK_CORE_OK
         || { header.file_count } > AMPR_EMU_PACK_MAX_FILES
@@ -44,247 +48,207 @@ pub(crate) unsafe fn validate_manifest_layout(
     {
         return false;
     }
-    if !src.is_resident() {
-        let Some(m) = view.manifest.and_then(|m| unsafe { attach_lz4_fast(m) }) else {
-            return false;
-        };
-        view.manifest = Some(m);
-    }
+    let Some(m) = view.manifest.and_then(|m| head_fast(m, resident.head())) else {
+        return false;
+    };
+    view.manifest = Some(m);
     (*state).core_view = view;
     (*state).header = &raw const (*state).core_view.header;
     true
 }
 
-// ---- mounted index files ----
+/// `m` reading its records from the record sections in `head`, the file
+/// from offset 0: the fast table without a second copy. `open` and
+/// `open_pkg` checked that the sections start at the header offset 72
+/// names and lie back to back.
+fn head_fast(m: Lz4Manifest, head: &'static [u8]) -> Option<Lz4Manifest> {
+    let at = usize::try_from(ampr_lz4::u64_at(head, 72).ok()?).ok()?;
+    let fast = head.get(at..at.checked_add(m.fast_len())?)?;
+    m.with_fast(fast).ok()
+}
 
-/// A pack index file as mounted: its source and the fd a paged source
-/// reads its misses from (-1 for a resident one). Written only by the
-/// single manifest loader before `LOAD_STATE` turns ready.
-pub(crate) struct MountedSource(SyncCell<Option<(IndexSource, c_int)>>);
+/// The index file as the mount's validation reads it: `head` (the file
+/// from offset 0) from memory, the rest through `rest`.
+struct HeadSource<'a, S> {
+    head: &'a [u8],
+    rest: S,
+}
 
-impl MountedSource {
-    pub(crate) const fn new() -> Self {
-        Self(SyncCell::new(None))
+impl<S: Source> Source for HeadSource<'_, S> {
+    fn len(&self) -> u64 {
+        self.rest.len()
     }
 
-    /// Whether the mounted file is read whole (no lock, no pread).
-    pub(crate) unsafe fn is_resident(&self) -> bool {
-        unsafe { &*self.0.get() }.is_some_and(|(s, _)| s.is_resident())
-    }
-
-    /// Gives the mounted file back (its memory or page registration) and
-    /// closes its fd. Only for a source no published lookup holds: a
-    /// failed mount, or a reload before the new file is mounted.
-    pub(crate) unsafe fn drop_source(&self) {
-        let Some((src, fd)) = (unsafe { &mut *self.0.get() }).take() else {
-            return;
-        };
-        unsafe { src.release(c"apr.pack.index.release") };
-        if fd >= 0 {
-            if let Some(close_fn) = unsafe { real_close() } {
-                unsafe { close_fn(fd) };
-            }
+    fn read_at(&self, at: u64, out: &mut [u8]) -> ampr_format::Result<()> {
+        let split = (self.head.len() as u64)
+            .saturating_sub(at)
+            .min(out.len() as u64) as usize;
+        let (mem, file) = out.split_at_mut(split);
+        if !mem.is_empty() {
+            self.head.read_at(at, mem)?;
         }
+        if !file.is_empty() {
+            self.rest.read_at(at + split as u64, file)?;
+        }
+        Ok(())
     }
 }
 
-/// The index file `fd` of `len` bytes as `slot`'s source, for both pack
-/// formats: read whole into index memory when the file plus `derived` (the
-/// derived tables the mount will build; a whole file needs no fast table)
-/// fit the Index room left, else registered with the page cache (rt/index_pages.rs), which
-/// keeps `fd` for its misses. A source mounted before (a reload) is
-/// given back first, so the new file and length are the ones read. Takes
-/// `fd`: closed unless kept. None when the page cache refused it.
-pub(crate) unsafe fn mount_index_source(
-    slot: &'static MountedSource,
-    fd: c_int,
+// ---- resident AMPRPAK4 parts ----
+
+/// The block holding the parts of the mounted AMPRPAK4 index file the
+/// manifest reads after the mount, and the source over them; null and
+/// empty when none is mounted. Those parts are the header and record
+/// sections (the fast table) and the pack names a pack open and a
+/// directory listing read; the file paths, most of the file, are read
+/// only by the mount's validation, and the view join compares sizes and
+/// path hashes. That is 48 B per file, 12 B per chunk, 32 B per pack and
+/// its name plus a 16 B span, and the 128 B header: 27.5 MiB at 223,180
+/// files, 1,513,210 chunks and 18 packs (computed). The mount's peak is
+/// this block plus the 128 KiB of windows, below the whole file it read
+/// into memory before. Written only by the single manifest loader before
+/// `LOAD_STATE` turns ready; it outlives the view (hooks past the reader
+/// gate may still read it) until a failed mount or a reload. The middle
+/// field is the block's size, counted in `index_view_bytes` while it is
+/// held.
+static LZ4_IMAGE: SyncCell<(*mut u8, usize, ResidentSource<'static>)> =
+    SyncCell::new((null_mut(), 0, ResidentSource::EMPTY));
+
+/// Mounts the `len`-byte AMPRPAK4 file read by `read` (fills the slice at
+/// the offset; false on an error or a short file). Its kept parts go to a
+/// new Index block (`read_resident`), which replaces the one mounted
+/// before (a reload); the validation reads the string section through two
+/// 64 KiB windows from the Index ledger, given back at the end. False
+/// after giving everything back, on a read error, a refused block (after
+/// the index notice) or a failed check: the pack index is then invalid,
+/// never absent.
+pub(crate) unsafe fn mount_lz4_file(
+    state: *mut PackState,
     len: u64,
-    derived: usize,
-) -> Option<&'static IndexSource> {
-    unsafe { slot.drop_source() };
-    let close = || {
-        if let Some(close_fn) = unsafe { real_close() } {
-            unsafe { close_fn(fd) };
-        }
-    };
-    let fits = usize::try_from(len)
-        .ok()
-        .and_then(|n| n.checked_add(derived))
-        .is_some_and(|n| n <= index_room());
-    let resident = if fits {
-        unsafe { index_pages::read_resident(fd, len, c"apr.pack.index") }
-    } else {
-        None
-    };
-    let mounted = match resident {
-        Some(bytes) => {
-            close();
-            (IndexSource::Resident(bytes), -1)
-        }
-        None => match index_pages::register_file(fd, len) {
-            Some(paged) => (IndexSource::Paged(paged), fd),
-            None => {
-                close();
-                return None;
-            }
-        },
-    };
-    let cell = unsafe { &mut *slot.0.get() };
-    Some(&cell.insert(mounted).0)
-}
-
-/// The mounted AMPRPAK4 index file (`mount_index_source`).
-static LZ4_SOURCE: MountedSource = MountedSource::new();
-
-/// The fast table of a paged AMPRPAK4 index and its `lookup_alloc` size;
-/// null for a resident one. Written only by the single manifest loader.
-static LZ4_FAST: SyncCell<(*mut u8, usize)> = SyncCell::new((null_mut(), 0));
-
-/// Lookup bytes an AMPRPAK4 mount needs beside the file: the fast table
-/// (the 48 B file, 12 B chunk and 32 B pack records) and the 4 B per file
-/// of directory order.
-fn lz4_lookup_bytes(files: u64, chunks: u64, packs: u64) -> (usize, usize) {
-    let fast = files
-        .saturating_mul(ampr_lz4::FILE_RECORD as u64)
-        .saturating_add(chunks.saturating_mul(ampr_lz4::CHUNK_RECORD as u64))
-        .saturating_add(packs.saturating_mul(ampr_lz4::PACK_RECORD as u64));
-    let size = |v: u64| usize::try_from(v).unwrap_or(usize::MAX);
-    (size(fast), size(files.saturating_mul(4)))
-}
-
-/// The AMPRPAK4 index file `fd` of `len` bytes as the mount's source, read
-/// whole when it fits the Index room with the directory order it still
-/// needs (a whole file has no fast table), else paged. Takes `fd` (kept
-/// for a paged source, else closed).
-unsafe fn lz4_index_source(fd: c_int, len: u64) -> Option<&'static IndexSource> {
-    let derived = lz4_head_lookup_bytes(fd).map_or(usize::MAX, |(_, d)| d);
-    unsafe { mount_index_source(&LZ4_SOURCE, fd, len, derived) }
-}
-
-/// `lz4_lookup_bytes` (fast, derived) of the open AMPRPAK4 file `fd` from
-/// its header alone; None on a read error or a header that is not AMPRPAK4.
-fn lz4_head_lookup_bytes(fd: c_int) -> Option<(usize, usize)> {
-    let mut head = [0u8; ampr_lz4::PAK_HEADER];
-    if !index_pages::read_head(fd, &mut head) {
-        return None;
+    read: impl Fn(u64, &mut [u8]) -> bool,
+    pkg: bool,
+) -> bool {
+    unsafe { drop_lz4_image() };
+    let tag = c"apr.pack.index.window";
+    let w = unsafe { im::index_alloc(2 * WINDOW, SCE_KERNEL_PAGE_SIZE, tag.as_ptr()) };
+    if w.is_null() {
+        return false;
     }
-    let (files, chunks, packs) = ampr_lz4::manifest::header_counts(&head).ok()?;
-    Some(lz4_lookup_bytes(
-        u64::from(files),
-        u64::from(chunks),
-        u64::from(packs),
-    ))
-}
-
-// ---- pack index reserve ----
-
-/// The least Index bytes a pack index mount of a `len`-byte file can take:
-/// read whole with its `derived` tables, or paged with its `fast` table,
-/// the derived tables and the page arena floor (an AMPRIDX3 read whole
-/// takes no arena, so the pack index would take it). Each term is rounded
-/// up to whole pages, as the allocations are. Saturating.
-pub(crate) fn pack_reserve_bytes(len: u64, fast: usize, derived: usize) -> usize {
-    let page = |n: usize| {
-        n.checked_next_multiple_of(index_pages::PAGE)
-            .unwrap_or(usize::MAX)
-    };
-    let (len, fast, derived) = (
-        page(usize::try_from(len).unwrap_or(usize::MAX)),
-        page(fast),
-        page(derived),
-    );
-    let whole = len.saturating_add(derived);
-    let paged = fast
-        .saturating_add(derived)
-        .saturating_add(im::INDEX_ARENA_MIN);
-    whole.min(paged)
-}
-
-/// The least Index bytes the pack index mount still needs, from the
-/// manifest header alone, for an AMPRIDX3 of `ampr_ids` records about to
-/// be loaded first (rt/index.rs `read_whole`). The field case it covers:
-/// an AMPRIDX3 of 34.4 MB read whole left the LZ4 index (28.4 MiB of
-/// tables plus the arena floor) too little room and it was refused. 0 in
-/// a title with no packs, once a manifest load has started (`LOAD_STATE`
-/// is atomic; the mounted source cell is written by that load without a
-/// lock this caller may take) and on any open, stat or header error (the
-/// mount reports a broken file itself).
-pub(crate) unsafe fn pack_index_reserve(ampr_ids: usize) -> usize {
-    if !packs_present() || LOAD_STATE.load(Ordering::Acquire) != PACK_LOAD_UNINITIALIZED {
-        return 0;
-    }
-    let (Some(open_fn), Some(close_fn), Some(fstat_fn)) =
-        (unsafe { real_open() }, unsafe { real_close() }, unsafe {
-            real_fstat()
-        })
-    else {
-        return 0;
-    };
-    let fd = unsafe { open_fn(manifest_path().as_ptr(), SCE_KERNEL_O_RDONLY, 0 as c_int) };
-    if fd < 0 {
-        return 0;
-    }
-    let mut stat: SceKernelStat = unsafe { core::mem::zeroed() };
-    let len = (unsafe { fstat_fn(fd, &mut stat) } == 0
-        && stat.st_size >= manifest_min_bytes() as off_t
-        && stat.st_size as u64 <= AMPR_EMU_PACK_INDEX_MAX_BYTES)
-        .then_some(stat.st_size as u64);
-    let costs = len.and_then(|_| {
-        if zstd_mode() {
-            // The mount runs before AMPRIDX3 is published and counts one id
-            // per zstd file; the projection built later counts `ampr_ids`.
-            // Reserve the larger, so neither is refused.
-            let mount = zstd::head_lookup_bytes(fd, None)?;
-            let built = zstd::head_lookup_bytes(fd, Some(ampr_ids as u64))?;
-            Some((mount.0.max(built.0), mount.1.max(built.1)))
-        } else {
-            lz4_head_lookup_bytes(fd)
-        }
+    // SAFETY: two disjoint, page-aligned windows of the block just taken.
+    let (a, b) = unsafe { (&mut *w.cast::<[u8; WINDOW]>(), &mut *w.add(WINDOW).cast()) };
+    let mounted = unsafe { read_resident(len, &read, a, b) }.is_some_and(|src| {
+        let rest = FileSource::new(len, &read, a, b);
+        let check = HeadSource {
+            head: src.head(),
+            rest,
+        };
+        unsafe { validate_manifest_layout(state, &check, src, pkg) }
     });
-    unsafe { close_fn(fd) };
-    match (len, costs) {
-        (Some(len), Some((fast, derived))) => pack_reserve_bytes(len, fast, derived),
-        _ => 0,
+    unsafe { im::index_free(w.cast(), tag.as_ptr()) };
+    if !mounted {
+        clear_manifest_view(state);
+        unsafe { drop_lz4_image() };
+    }
+    mounted
+}
+
+/// Gives the mounted parts back. Only for a file no published view
+/// reads: a failed mount, or a reload before the new file is read.
+pub(crate) unsafe fn drop_lz4_image() {
+    let (p, bytes, _) = core::mem::replace(
+        unsafe { &mut *LZ4_IMAGE.get() },
+        (null_mut(), 0, ResidentSource::EMPTY),
+    );
+    if !p.is_null() {
+        stats::sub(stats::Stat::IndexViewBytes, bytes as u64);
+        unsafe { im::index_free(p.cast(), c"apr.pack.index.release".as_ptr()) };
     }
 }
 
-/// The fast table of a paged manifest, in one lookup allocation filled by
-/// one pass over its record sections. None, with the index notice, when
-/// it and the directory order still to come do not fit the lookup cap or
-/// the Index room; None on a read error.
-unsafe fn attach_lz4_fast(m: Lz4Manifest) -> Option<Lz4Manifest> {
-    let bytes = m.fast_len();
-    let needed = bytes.saturating_add(m.file_count() as usize * size_of::<u32>());
-    if im::lookup_used().saturating_add(needed) > im::INDEX_LOOKUP_MAX || needed > index_room() {
-        unsafe { index_pages::refuse(needed) };
+/// Reads the kept parts of the `len`-byte file into one Index block laid
+/// out as [file from offset 0 to the string section][spans][pack names],
+/// mounts it in `LZ4_IMAGE` and returns its source. `a` and `b` are
+/// scratch: the pack records, then the pack name spans before they are
+/// merged. Only bounds the parts need are checked here (`open` checks the
+/// rest); None on a bad bound, a read error or a refused block.
+unsafe fn read_resident(
+    len: u64,
+    read: &impl Fn(u64, &mut [u8]) -> bool,
+    a: &mut [u8; WINDOW],
+    b: &mut [u8; WINDOW],
+) -> Option<&'static ResidentSource<'static>> {
+    let mut h = [0u8; ampr_lz4::PAK_HEADER];
+    if len < h.len() as u64 || !read(0, &mut h) {
         return None;
     }
-    let size = bytes.max(8);
-    let p = unsafe { lookup_alloc(size, 8, c"apr.pack.fast".as_ptr()) };
+    let (_, _, packs) = ampr_lz4::manifest::header_counts(&h).ok()?;
+    let at = |off| ampr_lz4::u64_at(&h, off).ok();
+    let (packs_at, strings_at, strings_len) = (at(88)?, at(96)?, at(104)?);
+    let packs = packs as usize;
+    let pack_bytes = packs * ampr_lz4::PACK_RECORD;
+    if packs > AMPR_EMU_PACK_MAX_PACKS
+        || packs_at.checked_add(pack_bytes as u64) != Some(strings_at)
+        || strings_at < h.len() as u64
+        || strings_at.checked_add(strings_len) != Some(len)
+    {
+        return None;
+    }
+    let records = &mut a[..pack_bytes];
+    if !read(packs_at, records) {
+        return None;
+    }
+    const _: () = assert!(AMPR_EMU_PACK_MAX_PACKS * size_of::<Span>() <= WINDOW);
+    // SAFETY: `b` is page aligned and holds `packs` spans (assert above).
+    let spans: &mut [Span] =
+        unsafe { core::slice::from_raw_parts_mut(b.as_mut_ptr().cast(), packs) };
+    for (s, r) in spans
+        .iter_mut()
+        .zip(records.chunks_exact(ampr_lz4::PACK_RECORD))
+    {
+        let (off, n) = (ampr_lz4::u32_at(r, 16).ok()?, ampr_lz4::u32_at(r, 20).ok()?);
+        // As `Manifest::string`: shorter than PATH_BUF, its NUL inside.
+        if n as usize >= ampr_format::source::PATH_BUF
+            || u64::from(off) + u64::from(n) >= strings_len
+        {
+            return None;
+        }
+        *s = Span {
+            at: strings_at + u64::from(off),
+            off: 0,
+            len: n + 1,
+        };
+    }
+    let (count, names) = merge_spans(spans);
+    let head_len = usize::try_from(strings_at).ok()?;
+    let spans_at = head_len.next_multiple_of(align_of::<Span>());
+    let names_at = spans_at + count * size_of::<Span>();
+    let total = names_at + names as usize;
+    let p = unsafe { im::index_alloc(total, SCE_KERNEL_PAGE_SIZE, c"apr.pack.index".as_ptr()) };
     if p.is_null() {
         return None;
     }
-    let out = unsafe { core::slice::from_raw_parts_mut(p, bytes) };
-    if m.fill_fast(out).is_err() {
-        unsafe { lookup_free(p.cast(), size, c"apr.pack.fast.invalid".as_ptr()) };
-        return None;
-    }
-    let Ok(m) = m.with_fast(out) else {
-        unsafe { lookup_free(p.cast(), size, c"apr.pack.fast.invalid".as_ptr()) };
-        return None;
+    // SAFETY: three disjoint ranges of the `total`-byte block just taken;
+    // `spans_at` is aligned for `Span`.
+    let (head, kept, bytes) = unsafe {
+        (
+            core::slice::from_raw_parts_mut(p, head_len),
+            core::slice::from_raw_parts_mut(p.add(spans_at).cast::<Span>(), count),
+            core::slice::from_raw_parts_mut(p.add(names_at), names as usize),
+        )
     };
-    unsafe { *LZ4_FAST.get() = (p, size) };
-    stats::add(stats::Stat::IndexFastBytes, size as u64);
-    Some(m)
-}
-
-/// Frees the fast table; the view that read it is already cleared.
-unsafe fn release_lz4_fast() {
-    let (p, size) = core::mem::replace(unsafe { &mut *LZ4_FAST.get() }, (null_mut(), 0));
-    if !p.is_null() {
-        stats::sub(stats::Stat::IndexFastBytes, size as u64);
-        unsafe { lookup_free(p.cast(), size, c"apr.pack.fast.release".as_ptr()) };
+    kept.copy_from_slice(&spans[..count]);
+    let ok = read(0, head)
+        && kept
+            .iter()
+            .all(|s| read(s.at, &mut bytes[s.off as usize..][..s.len as usize]));
+    if !ok {
+        unsafe { im::index_free(p.cast(), c"apr.pack.index.invalid".as_ptr()) };
+        return None;
     }
+    let slot = unsafe { &mut *LZ4_IMAGE.get() };
+    *slot = (p, total, ResidentSource::new(head, kept, bytes, len));
+    stats::add(stats::Stat::IndexViewBytes, total as u64);
+    Some(&slot.2)
 }
 
 /// The target from the pool under the cache cap, cut to what is left under
@@ -413,31 +377,28 @@ pub(crate) unsafe fn clear_manifest_view(state: *mut PackState) {
 }
 
 pub(crate) unsafe fn release_manifest_storage(state: *mut PackState) {
-    // Free the projection while the index image it was built from still exists.
+    // The zstd chunk tables go with the mount that reads them.
     if zstd_mode() {
         unsafe { zstd::zstd_mount_release() };
     }
-    if !(*state).packed_file_order.is_null() {
-        unsafe {
-            lookup_free(
-                (*state).packed_file_order as *mut c_void,
-                (*state).packed_file_count as usize * size_of::<u32>(),
-                c"apr.pack.directory-index.release".as_ptr(),
-            )
-        };
-        (*state).packed_file_order = null_mut();
+    let bits = core::mem::replace(&mut (*state).lz4_mismatch, null_mut());
+    (*state).lz4_mismatch_bytes = 0;
+    if !bits.is_null() {
+        unsafe { im::index_free(bits.cast(), c"apr.pack.mismatch.release".as_ptr()) };
     }
-    (*state).packed_file_count = 0;
-    // The index file stays mounted: hooks past the reader gate may still
-    // read it; a failed mount or a reload gives it back. The fast table
-    // goes with the view that reads it.
+    // The kept AMPRPAK4 parts stay mounted: hooks past the reader gate may
+    // still read them; a failed mount or a reload gives them back, and
+    // their `index_view_bytes` with them (`drop_lz4_image`).
     clear_manifest_view(state);
-    if !zstd_mode() {
-        unsafe { release_lz4_fast() };
-    }
 }
 
-pub(crate) unsafe fn load_manifest(state: *mut PackState, absent: *mut bool) -> bool {
+/// Mounts the pack index joined to the view `b`; none is mounted without
+/// it.
+pub(crate) unsafe fn load_manifest(
+    state: *mut PackState,
+    absent: *mut bool,
+    b: Option<&mut Builder<'_>>,
+) -> bool {
     if !absent.is_null() {
         unsafe { *absent = false };
     }
@@ -470,61 +431,116 @@ pub(crate) unsafe fn load_manifest(state: *mut PackState, absent: *mut bool) -> 
         unsafe { close_fn(fd) };
         return false;
     }
-    if zstd_mode() {
-        return unsafe { load_zstd_manifest(state, fd, stat.st_size as u64) };
-    }
-    unsafe { load_lz4_manifest(state, fd, stat.st_size as u64) }
-}
-
-/// AMPRPAK4: the index file is mounted with `mount_index_source`, whole
-/// when it fits with its tables, else paged with a resident fast table. A
-/// failed mount gives the source back.
-unsafe fn load_lz4_manifest(state: *mut PackState, fd: c_int, len: u64) -> bool {
-    let Some(source) = (unsafe { lz4_index_source(fd, len) }) else {
+    let Some(b) = b else {
+        unsafe { close_fn(fd) };
         return false;
     };
-    if !unsafe { validate_manifest_layout(state, source) } {
-        clear_manifest_view(state);
-        unsafe { LZ4_SOURCE.drop_source() };
+    if zstd_mode() {
+        return unsafe { load_zstd_manifest(state, fd, stat.st_size as u64, b) };
+    }
+    unsafe { load_lz4_manifest(state, fd, stat.st_size as u64, b) }
+}
+
+/// AMPRPAK4: the index file is mounted with its kept parts in the Index
+/// ledger (`mount_lz4_file`) and `fd` closed, then joined to the view `b`
+/// (`join_lz4`).
+unsafe fn load_lz4_manifest(
+    state: *mut PackState,
+    fd: c_int,
+    len: u64,
+    b: &mut Builder<'_>,
+) -> bool {
+    let read = |at: u64, out: &mut [u8]| unsafe {
+        pread_exact(fd, out.as_mut_ptr().cast(), out.len(), at)
+    };
+    let mounted = unsafe { mount_lz4_file(state, len, read, pkg_mode()) };
+    if let Some(close_fn) = unsafe { real_close() } {
+        unsafe { close_fn(fd) };
+    }
+    mounted && unsafe { finish_lz4_mount(state, b) }
+}
+
+/// Links each packed AMPRPAK4 record to view id `record + 1` when its size
+/// and `pak_path_hash` match that row (`view_join::join_records`), so an
+/// open by id reads no path: the per-open check of the record against the
+/// AMPRIDX3 path runs once here. A record that does not match sets its bit
+/// in the mismatch bitmap, one bit per view id from the Index ledger, and
+/// stays unlinked (`lz4_mismatch`). False when the bitmap does not fit or
+/// a record cannot be read; the caller then unlinks every row.
+pub(crate) unsafe fn join_lz4(state: *mut PackState, b: &mut Builder<'_>) -> bool {
+    let bytes = (b.files() as usize + 1).div_ceil(8);
+    let p = unsafe { im::index_alloc(bytes, 8, c"apr.pack.mismatch".as_ptr()) };
+    if p.is_null() {
         return false;
     }
-    if !unsafe { load_runtime_profile(state) } || !unsafe { build_packed_file_order(state) } {
+    let bits = unsafe { core::slice::from_raw_parts_mut(p, bytes) };
+    (*state).lz4_mismatch = p;
+    (*state).lz4_mismatch_bytes = bytes;
+    let count = (*state).core_view.manifest.map_or(0, |m| m.file_count());
+    let record = |i: u32| {
+        let f = unsafe { state::lz4_file(state, i) }.ok_or(ampr_format::Error::Invalid)?;
+        Ok((f.flags & AMPR_PACK_FILE_PACKED != 0).then_some((f.logical_size, f.path_hash)))
+    };
+    ampr_format::view_join::join_records(b, count, record, bits).is_ok()
+}
+
+/// Whether the packed AMPRPAK4 record of one-based `file_id` failed the
+/// join to its view row (`join_lz4`): an open of it answers as a failed
+/// record check did, EIO for an APR open and unhandled for a plain one.
+/// False with no mounted LZ4 index, or for an id past the bitmap.
+pub(crate) unsafe fn lz4_mismatch(state: *const PackState, file_id: u32) -> bool {
+    let (p, bytes) = unsafe { ((*state).lz4_mismatch, (*state).lz4_mismatch_bytes) };
+    let byte = file_id as usize / 8;
+    !p.is_null() && byte < bytes && unsafe { *p.add(byte) } & (1 << (file_id % 8)) != 0
+}
+
+/// Loads the runtime profile of the mounted manifest and joins its
+/// records to the view `b`, which also gives the directory listings. A
+/// failure gives the mount back.
+unsafe fn finish_lz4_mount(state: *mut PackState, b: &mut Builder<'_>) -> bool {
+    if !unsafe { load_runtime_profile(state) } || !unsafe { join_lz4(state, b) } {
         unsafe { release_manifest_storage(state) };
-        unsafe { LZ4_SOURCE.drop_source() };
+        unsafe { drop_lz4_image() };
         return false;
     }
-    // The lookup tables are built: the page arena takes the room left.
-    index_pages::grow_arena(0);
     unsafe { initialize_caches(state) };
     true
 }
 
-/// zstd: the index file is mounted with `mount_index_source`, whole when
-/// it fits with its tables, else paged with a resident fast table. A
-/// failed mount gives the source back. zstd keeps the cache defaults; its
-/// directory order and AMPRIDX3 projection come later
-/// (zstd::ensure_zstd_projection), which then grows the page arena.
-unsafe fn load_zstd_manifest(state: *mut PackState, fd: c_int, len: u64) -> bool {
-    let Some(source) = (unsafe { zstd::zstd_index_source(fd, len) }) else {
-        return false;
-    };
-    if !unsafe { zstd::zstd_mount_validate(source) } {
+/// zstd: the index file is read once through two windows, validated and
+/// joined to the view `b` with its chunk and volume tables kept in the
+/// Index ledger (zstd::zstd_mount_join), and `fd` closed. A failed mount
+/// gives the tables back. zstd keeps the cache defaults.
+unsafe fn load_zstd_manifest(
+    state: *mut PackState,
+    fd: c_int,
+    len: u64,
+    b: &mut Builder<'_>,
+) -> bool {
+    if !unsafe { zstd::zstd_mount_fd(fd, len, b) } {
         unsafe { zstd::zstd_mount_release() };
         clear_manifest_view(state);
-        unsafe { zstd::zstd_source_drop() };
         return false;
     }
     unsafe { initialize_caches(state) };
     true
 }
 
-/// zstd: the mount also needs its AMPRIDX3 projection, built on the first
-/// call after AMPRIDX3 is published (see zstd.rs).
+/// Whether the pack index is mounted. Every mount joins the pack index to
+/// the view the index load builds, so only `mount_and_join` starts it and
+/// this waits for it or answers false.
 pub(crate) unsafe fn ensure_manifest_ready() -> bool {
-    unsafe { ensure_manifest_loaded() && (!zstd_mode() || zstd::ensure_zstd_projection()) }
+    unsafe { ensure_manifest_loaded(None) }
 }
 
-pub(crate) unsafe fn ensure_manifest_loaded() -> bool {
+/// `ensure_ready_slow` (rt/index.rs), before it publishes the index:
+/// mounts the pack index and joins it to `b`.
+pub(crate) unsafe fn mount_and_join(b: &mut Builder<'_>) -> bool {
+    unsafe { ensure_manifest_loaded(Some(b)) }
+}
+
+/// The single claimed load; with `b == None` a load is never claimed.
+pub(crate) unsafe fn ensure_manifest_loaded(mut b: Option<&mut Builder<'_>>) -> bool {
     let state = unsafe { pack_state() };
     loop {
         if WORKER_STOP_REQUESTED.load(Ordering::Acquire) {
@@ -535,6 +551,9 @@ pub(crate) unsafe fn ensure_manifest_loaded() -> bool {
             return true;
         }
         if current == PACK_LOAD_UNAVAILABLE || current == PACK_LOAD_INVALID {
+            return false;
+        }
+        if current == PACK_LOAD_UNINITIALIZED && b.is_none() {
             return false;
         }
         // Claimed under MANIFEST_MUTEX with the stop flag rechecked: shutdown
@@ -554,7 +573,7 @@ pub(crate) unsafe fn ensure_manifest_loaded() -> bool {
         };
         if claimed {
             let mut absent = false;
-            let loaded = unsafe { load_manifest(state, &mut absent) };
+            let loaded = unsafe { load_manifest(state, &mut absent, b.as_deref_mut()) };
             {
                 let _lock = MANIFEST_MUTEX.lock();
                 let next = if loaded {
@@ -671,39 +690,4 @@ pub(crate) unsafe fn cache_mark_pages(state: *mut PackState, start: u32, count: 
             used,
         )
     };
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The field case: an LZ4 index of 223,180 files, 1,513,210 chunks and
-    /// 18 packs needs 28,871,736 B of fast table and 892,720 B of order.
-    #[test]
-    fn lz4_lookup_bytes_of_the_field_case() {
-        let (fast, derived) = lz4_lookup_bytes(223_180, 1_513_210, 18);
-        assert_eq!((fast, derived), (28_871_736, 892_720));
-        assert_eq!(lz4_lookup_bytes(u64::MAX, 1, 1), (usize::MAX, usize::MAX));
-    }
-
-    /// The reserve is the cheaper of the two mounts: whole (file plus
-    /// derived tables) or paged (fast plus derived plus the arena floor),
-    /// saturating at usize::MAX.
-    #[test]
-    fn pack_reserve_is_the_cheaper_mount() {
-        let (arena, page) = (im::INDEX_ARENA_MIN, index_pages::PAGE);
-        let round = |n: usize| n.next_multiple_of(page);
-        assert_eq!(pack_reserve_bytes(1000, 500, 24), 2 * page);
-        assert_eq!(pack_reserve_bytes(u64::MAX, 500, 24), 2 * page + arena);
-        let (fast, derived) = lz4_lookup_bytes(223_180, 1_513_210, 18);
-        let paged = round(fast) + round(derived) + arena;
-        assert_eq!(pack_reserve_bytes(64 << 20, fast, derived), paged);
-        assert_eq!(
-            pack_reserve_bytes(10 << 20, fast, derived),
-            (10 << 20) + round(derived)
-        );
-        assert_eq!(pack_reserve_bytes(u64::MAX, usize::MAX, 1), usize::MAX);
-        assert_eq!(pack_reserve_bytes(u64::MAX, 1, usize::MAX), usize::MAX);
-        assert_eq!(pack_reserve_bytes(0, 0, 0), 0);
-    }
 }
