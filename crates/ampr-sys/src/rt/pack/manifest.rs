@@ -393,7 +393,10 @@ pub(crate) unsafe fn release_manifest_storage(state: *mut PackState) {
 }
 
 /// Mounts the pack index joined to the view `b`; none is mounted without
-/// it.
+/// it. Out of line so its locals stay out of the frame of
+/// `ensure_manifest_loaded`, which every packed open enters on the game's
+/// own small stack.
+#[inline(never)]
 pub(crate) unsafe fn load_manifest(
     state: *mut PackState,
     absent: *mut bool,
