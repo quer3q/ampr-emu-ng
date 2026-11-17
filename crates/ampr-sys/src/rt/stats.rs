@@ -46,6 +46,11 @@ stats! {
     CacheGrownBytes = "cache_grown_bytes",
     CachePromotions = "cache_promotions",
     CacheDemotions = "cache_demotions",
+    /// Evictions a cache miss made only because all 16384 entries
+    /// (`AMPR_EMU_PACK_CACHE_ENTRY_CAP`) were taken while a free page run
+    /// was there (rt/pack/caches.rs `cache_acquire`): what a bigger entry
+    /// cap would save. Nonzero only for a title of small chunks.
+    CacheCapEvictions = "cache_cap_evictions",
     /// Reactor active reads (the game's APR read commands): submit->observed
     /// latency, polls per read, and the gap between the last "not done" poll
     /// and the "done" poll (how late a completion was noticed, upper bound).
@@ -122,6 +127,11 @@ stats! {
     PosixReads = "posix_reads",
     PosixReadNs = "posix_read_ns",
     PosixReadNsMax = "posix_read_ns_max",
+    /// Packed POSIX reads that ran with cancellation still on, because
+    /// neither `scePthreadSetcancelstate` nor `pthread_setcancelstate`
+    /// resolved or the call failed (rt/pack/fd_read.rs `no_cancel`). A
+    /// thread cancelled in such a read leaves workers writing to its stack.
+    PosixReadCancelOn = "posix_read_cancel_on",
     /// Calls into the libc entry hooks, by hook id (rt/sys.rs `hook`):
     /// 84 `_open`, 85 `_openat`, 86 `_read`, 87 `_readv`, 88 `_close`,
     /// 89 `_fstat`, 90 `_getdirentries`, 91 `access`, 92 `lstat`, 93 `fcntl`,
@@ -176,12 +186,14 @@ stats! {
     SaveUmountsShared = "save_umounts_shared",
     /// Read pool size (reactor/pread_pool.rs): threads started, the most
     /// live at once, threads given back to the game, and our own creations
-    /// that failed (the pool stops growing). Exits by load are
-    /// pread_retired_load (rt/thread_hooks.rs LoadGroup).
+    /// that failed (the pool stops growing). Exits under pressure are
+    /// pread_retired_pressure (rt/thread_hooks.rs LoadGroup). Joins of an
+    /// exited thread that failed (its slot and stack kept, retried later).
     PreadThreadsStarted = "pread_threads_started",
     PreadThreadsMax = "pread_threads_max",
     PreadThreadsYielded = "pread_threads_yielded",
     PreadThreadCreateFailed = "pread_thread_create_failed",
+    ThreadJoinFailed = "thread_join_failed",
     /// Pack volume descriptors (rt/pack/leases.rs): opens, time spent in
     /// open, and closes of the least recently used one to make room
     /// (AMPR_EMU_PACK_OPEN_PACK_FD_CAP).
@@ -189,7 +201,8 @@ stats! {
     PackFdOpenNs = "pack_fd_open_ns",
     PackFdEvictions = "pack_fd_evictions",
     /// Pack workers (rt/pack/worker.rs): threads started, given back to the
-    /// game, own creations that failed. Exits by load are decode_retired_load.
+    /// game, own creations that failed. Exits under pressure are
+    /// decode_retired_pressure.
     PackWorkersStarted = "pack_workers_started",
     PackWorkersYielded = "pack_workers_yielded",
     PackWorkerCreateFailed = "pack_worker_create_failed",
@@ -278,6 +291,10 @@ stats! {
     /// several passes counts several times.
     ReadBudgetHeld = "read_budget_held",
     ReadActiveHeld = "read_active_held",
+    /// Reactor loop passes (AprAioReactor::worker, reactor/worker.rs), one
+    /// per wake or poll deadline; per job or per read it is the fixed pass
+    /// cost the reactor pays.
+    ReactorPasses = "reactor_passes",
     /// APR jobs (command buffers) the reactor finished. job_first_issue_*:
     /// submit accepted (AprAioReactor::submit, reactor/submit.rs) -> the job's
     /// first read slice issued to kernel AIO or the pread pool
@@ -380,14 +397,11 @@ stats! {
     EqueueLocalPublished = "equeue_local_published",
     EqueueLocalBackpressure = "equeue_local_backpressure",
     EqueueLocalFallback = "equeue_local_fallback",
-    /// Both pack formats: mmap/sceKernelMmap of a virtual pack fd
-    /// (rt/pack/mmap.rs), maps served from the disk cache file, bytes written
-    /// into new cache files, and maps whose cache file could not be made
-    /// (table full, mkdir, open, read or write failed).
+    /// Debug, both pack formats: mmap/sceKernelMmap of a virtual pack fd
+    /// (rt/probe.rs probes, ids 96 and 97). Each fails: a packed file has no
+    /// physical copy.
+    #[cfg_attr(not(feature = "mem_report"), allow(dead_code))]
     MmapVirtual = "mmap_virtual",
-    MmapDisk = "mmap_disk",
-    MmapDiskBytes = "mmap_disk_bytes",
-    MmapDiskFailed = "mmap_disk_failed",
     /// Index memory held for lookups once an index is mounted: the
     /// resident block of the compiled index view (rt/index_view.rs), the
     /// zstd chunk tables (8 B per chunk and volume, rt/pack/zstd.rs) and
@@ -403,6 +417,33 @@ stats! {
     /// File index lookups that could not read the index file: sent to the
     /// real call, never answered ENOENT (rt/index.rs `IndexIo`).
     IndexLookupIo = "index_lookup_io",
+    /// Path lookup hooks (rt/index.rs), per hook id: calls and the ns
+    /// spent in each, from entry to return (`path_span`). Ids: 0 open,
+    /// 1 stat, 2 sceKernelCheckReachability, 3 unlink, 4 rename,
+    /// 78 sceKernelOpen, 79 sceKernelStat, 84 _open, 85 _openat,
+    /// 91 access, 92 lstat.
+    PathCalls0 = "path_calls_0",
+    PathNs0 = "path_ns_0",
+    PathCalls1 = "path_calls_1",
+    PathNs1 = "path_ns_1",
+    PathCalls2 = "path_calls_2",
+    PathNs2 = "path_ns_2",
+    PathCalls3 = "path_calls_3",
+    PathNs3 = "path_ns_3",
+    PathCalls4 = "path_calls_4",
+    PathNs4 = "path_ns_4",
+    PathCalls78 = "path_calls_78",
+    PathNs78 = "path_ns_78",
+    PathCalls79 = "path_calls_79",
+    PathNs79 = "path_ns_79",
+    PathCalls84 = "path_calls_84",
+    PathNs84 = "path_ns_84",
+    PathCalls85 = "path_calls_85",
+    PathNs85 = "path_ns_85",
+    PathCalls91 = "path_calls_91",
+    PathNs91 = "path_ns_91",
+    PathCalls92 = "path_calls_92",
+    PathNs92 = "path_ns_92",
 }
 
 const N: usize = Stat::Count as usize;
@@ -473,10 +514,9 @@ pub(crate) fn now() -> u64 {
 /// b'G' a gather/scatter retry that re-resolved to
 /// another file id or offset than its first resolution (path = both pairs,
 /// see `gs_retry_mismatch`). b'X' mmap and b'Y' sceKernelMmap of a virtual
-/// fd (rt/pack/mmap.rs, both builds hook them with `AMPR_PACK_MMAP` on;
-/// `/fsfail` keeps only the failed ones): path "<call> <packed file path>",
-/// lookup b'k' mapped from the disk cache file, b'v' the cache file failed
-/// or the fd is a virtual directory. b'I' a game's own
+/// fd (rt/probe.rs, debug-only pass-through probes; `/fsfail` keeps only the
+/// failed ones, which is every map of a packed file): path "<call> <packed
+/// file path>", lookup b'v'. b'I' a game's own
 /// sceKernelAioSubmitReadCommands(Multiple) with a request on a packed fd,
 /// which the runtime's AIO emulation served (rt/pack/aio.rs, logged through
 /// rt/probe.rs `note_aio_submit` whatever the result), lookup b'v'.
@@ -845,6 +885,35 @@ pub(crate) fn libc_hit(id: usize, packed: bool) {
     add(LIBC_HITS[i], 1);
     if packed {
         add(LIBC_PACKED[i], 1);
+    }
+}
+
+/// The path lookup hook ids `path_span` counts, and their
+/// (calls, ns) stats in the same order.
+const PATH_HOOKS: [(usize, Stat, Stat); 11] = [
+    (0, Stat::PathCalls0, Stat::PathNs0),
+    (1, Stat::PathCalls1, Stat::PathNs1),
+    (2, Stat::PathCalls2, Stat::PathNs2),
+    (3, Stat::PathCalls3, Stat::PathNs3),
+    (4, Stat::PathCalls4, Stat::PathNs4),
+    (78, Stat::PathCalls78, Stat::PathNs78),
+    (79, Stat::PathCalls79, Stat::PathNs79),
+    (84, Stat::PathCalls84, Stat::PathNs84),
+    (85, Stat::PathCalls85, Stat::PathNs85),
+    (91, Stat::PathCalls91, Stat::PathNs91),
+    (92, Stat::PathCalls92, Stat::PathNs92),
+];
+
+/// One call of path lookup hook `id` that started at `start` (from
+/// `now()`; 0 = no span): +1 call and its ns. Other ids are ignored.
+/// Release builds compile it to nothing.
+#[inline(always)]
+pub(crate) fn path_span(id: usize, start: u64) {
+    if ON && start != 0 {
+        if let Some(&(_, calls, ns)) = PATH_HOOKS.iter().find(|h| h.0 == id) {
+            add(calls, 1);
+            add(ns, since(start));
+        }
     }
 }
 

@@ -14,12 +14,11 @@ use crate::rt::stats::{self, Stat};
 // The pool keeps PREAD_MIN_THREADS threads and grows by one thread per
 // queued task (not yet taken; running tasks hold their own thread) beyond
 // the idle and spinning threads, up to its ceiling (tune::pread_threads, 6)
-// and the thread budget (rt/thread_hooks.rs). A thread that finishes a task
-// exits after RETIRE_STREAK such finishes in a row with more live than one
-// above the load target (thread_hooks::LoadGroup). A game thread creation
-// that fails with EAGAIN makes the pool give threads back, down to none
-// (reads then go to kernel AIO); under the pressure that follows it grows
-// only a first thread and retires to the target, down to none. A title
+// and the thread budget (rt/thread_hooks.rs). A started thread stays. A
+// game thread creation that fails with EAGAIN makes the pool give threads
+// back, down to none (reads then go to kernel AIO); under the pressure that
+// follows (thread_hooks::LoadGroup) it grows only a first thread, and a
+// thread that finishes a task leaves above one with work, none without. A title
 // saw its own scePthreadCreate fail with EAGAIN after 94 creations while 32
 // pool threads were live.
 
@@ -45,13 +44,13 @@ const SPIN_CLAIMED: u32 = 2;
 #[cfg_attr(not(feature = "mem_report"), allow(dead_code))]
 const PREAD_YIELD_WAIT_US: u64 = 50_000;
 
-/// Busy pool thread samples and the load target (rt/thread_hooks.rs), under
+/// The pool's pressure state and counters (rt/thread_hooks.rs), under
 /// preadMutex; the reactor is a single instance, so one static serves.
 static PREAD_LOAD: crate::rt::thread_hooks::LoadGroup = crate::rt::thread_hooks::LoadGroup::new(0);
 
 /// Debug /metrics: the read pool's load counters (LoadGroup::metrics).
 #[cfg(feature = "mem_report")]
-pub(crate) fn pread_pool_load() -> [u64; 5] {
+pub(crate) fn pread_pool_load() -> [u64; 3] {
     PREAD_LOAD.metrics()
 }
 
@@ -97,11 +96,7 @@ pub(crate) fn pread_pool_queue_pack(
 /// The caller holds no runtime lock (PACK_M, preadMutex, `m`).
 pub(crate) fn pread_pool_grow(n: usize) {
     if let Some(r) = reactor() {
-        for _ in 0..n {
-            if !r.spawn_pread_thread() {
-                break;
-            }
-        }
+        r.grow_pread_threads(n);
     }
 }
 
@@ -131,8 +126,8 @@ impl AprAioReactor {
     /// AMPR_EMU_PACK_PREAD_MAX_BYTES pieces, publishes the result and wakes
     /// the reactor (under `m`, so the epoch change cannot race its wait).
     /// Leaves its loop (slot EXITED, under preadMutex) on stop, on an exit
-    /// asked by ask_pread_exits, or after a task when the pool is above its
-    /// load target. After a task it may spin for the next one
+    /// asked by ask_pread_exits, or after a task under pressure when the
+    /// pool is above its target. After a task it may spin for the next one
     /// (spin_for_task) before it parks.
     unsafe fn pread_worker(this: *mut Self, thread_slot: usize) {
         let mutex = unsafe { &*addr_of!((*this).preadMutex) };
@@ -152,8 +147,8 @@ impl AprAioReactor {
         // preadMutex before the scan, so the one submit that claimed it and
         // sent one wake fewer is met by that scan.
         let mut spinner = false;
-        // A task just finished: sampled, and the next scan decides whether
-        // this thread stays.
+        // A task just finished: the next scan decides whether this thread
+        // stays.
         let mut finished = false;
         loop {
             let (slot, request, queuedNs, packCallback, packContext) = {
@@ -161,13 +156,17 @@ impl AprAioReactor {
                 if core::mem::take(&mut spinner) {
                     PREAD_SPINNING.store(SPIN_NONE, Ordering::Release);
                 }
-                if finished {
-                    PREAD_LOAD.end();
-                }
                 let mut woken = false;
                 loop {
                     let mut found: Option<usize> = None;
-                    for index in 0..AMPR_EMU_PACK_PREAD_TASKS {
+                    // No queued task (an idle wake, an exit request): no scan.
+                    let scan = match unsafe { &*addr_of!((*this).preadQueuedCount) }
+                        .load(Ordering::Acquire)
+                    {
+                        0 => 0,
+                        _ => AMPR_EMU_PACK_PREAD_TASKS,
+                    };
+                    for index in 0..scan {
                         let task = unsafe { &*addr_of!((*this).preadTasks[index]) };
                         if task.state.load(Ordering::Acquire) != PREAD_QUEUED {
                             continue;
@@ -188,8 +187,8 @@ impl AprAioReactor {
                         }
                     }
                     // Exits: one given back to the game (preadExitRequests,
-                    // down to none), or one above the load target after a
-                    // task. The last thread leaves only with no task
+                    // down to none), or one above the pressure target after
+                    // a task. The last thread leaves only with no task
                     // queued, so no queued read is stranded.
                     // Threads still being created do not count: one whose
                     // creation fails leaves no thread for a queued task.
@@ -224,7 +223,8 @@ impl AprAioReactor {
                     if let Some(slot) = found {
                         let task = unsafe { &*addr_of!((*this).preadTasks[slot]) };
                         task.state.store(PREAD_RUNNING, Ordering::Release);
-                        PREAD_LOAD.begin();
+                        unsafe { &*addr_of!((*this).preadQueuedCount) }
+                            .fetch_sub(1, Ordering::AcqRel);
                         break (
                             slot,
                             task.request,
@@ -279,11 +279,22 @@ impl AprAioReactor {
                 finished = true;
                 continue;
             }
+            // Read before DONE: the reactor may retire the task right after.
+            let (looseRead, target, generation) =
+                unsafe { ((*task).looseRead, (*task).targetSlot, (*task).targetGeneration) };
             unsafe {
                 (*task).returnValue = result;
                 (*task).state.store(PREAD_DONE, Ordering::Release)
             };
-            {
+            // A loose part wakes the reactor only when it is the read's last:
+            // the reactor finishes a read when all its parts are in, and an
+            // earlier part's wake made it run a whole pass for nothing (12
+            // passes for a read of 6 parts).
+            let wake = !looseRead
+                || unsafe { &*addr_of!((*this).preadLoosePartsLeft) }
+                    .get(target as usize)
+                    .is_none_or(|word| loose_part_finished(word, generation));
+            if wake {
                 let _wakeGuard = unsafe { (&*addr_of!((*this).m)).lock() };
                 unsafe { (*addr_of!((*this).reactorWakeEpoch)).fetch_add(1, Ordering::Release) };
                 unsafe { (&*addr_of!((*this).reactorCv)).notify_one() };
@@ -322,12 +333,7 @@ impl AprAioReactor {
         }
         let deadline = time_counter_now() + spin_us * 1000;
         loop {
-            let queued = (0..AMPR_EMU_PACK_PREAD_TASKS).any(|index| {
-                unsafe { &*addr_of!((*this).preadTasks[index]) }
-                    .state
-                    .load(Ordering::Acquire)
-                    == PREAD_QUEUED
-            });
+            let queued = unsafe { &*addr_of!((*this).preadQueuedCount) }.load(Ordering::Acquire) != 0;
             if queued || time_counter_now() >= deadline {
                 return true;
             }
@@ -360,7 +366,8 @@ impl AprAioReactor {
     }
 
     /// Adds one pool thread; false when at the ceiling, stopping, or the
-    /// creation failed (the ceiling then drops to the live count). The
+    /// creation failed (the thread budget, cut by the failure, then limits
+    /// growth; the ceiling stays). The
     /// reactor thread (loose reads), or a pack worker holding no lock
     /// (pread_pool_grow):
     /// the slot is claimed under preadMutex, so two callers never share one.
@@ -439,6 +446,11 @@ impl AprAioReactor {
     }
 
     /// Joins every EXITED pool thread (any thread may call it).
+    /// A failed join empties the slot all the same and is counted (debug
+    /// `thread_join_failed`): the handle no longer names a joinable thread,
+    /// and libkernel reuses handles, so a retry could join or wait on an
+    /// unrelated thread. Its pool stack stays reserved (rt/thread_stack.rs
+    /// frees a stack only after a join that succeeded); none was ever seen.
     pub(crate) fn reap_pread_threads(&self) {
         loop {
             let (slot, thread) = {
@@ -447,16 +459,20 @@ impl AprAioReactor {
                 // A slot whose handle is not published yet waits: its creator
                 // flags a reap once it is (spawn_pread_thread).
                 let Some(slot) = (0..self.preadSlots.len()).find(|&i| {
-                    self.preadSlots[i] == PREAD_SLOT_EXITED && !self.preadThreads[i].is_null()
+                    self.preadSlots[i] == PREAD_SLOT_EXITED
+                        && !self.preadThreads[i].is_null()
                 }) else {
                     return;
                 };
                 unsafe { (*this).preadSlots[slot] = PREAD_SLOT_JOINING };
                 (slot, self.preadThreads[slot])
             };
-            let _ = unsafe { scePthreadJoin(thread, null_mut()) };
+            let rc = unsafe { scePthreadJoin(thread, null_mut()) };
             let this = self as *const Self as *mut Self;
             let _g = self.preadMutex.lock();
+            if rc != 0 {
+                stats::add(Stat::ThreadJoinFailed, 1);
+            }
             unsafe {
                 (*this).preadThreads[slot] = null_mut();
                 (*this).preadSlots[slot] = PREAD_SLOT_EMPTY;
@@ -513,7 +529,11 @@ impl AprAioReactor {
         {
             let mut g = self.preadMutex.lock();
             let deadline = time_counter_now() + PREAD_YIELD_WAIT_US * 1000;
-            while self.preadExitRequests != 0 {
+            // Pool threads lower the count through a raw pointer while this
+            // thread waits; through `&self` the compiler may assume it never
+            // changes and read it once (clippy while_immutable_condition),
+            // so each pass reads it again.
+            while unsafe { addr_of!(self.preadExitRequests).read_volatile() } != 0 {
                 let now = time_counter_now();
                 if now >= deadline {
                     break;
@@ -526,9 +546,10 @@ impl AprAioReactor {
         self.reap_yielded_pread_threads(before)
     }
 
-    /// Queues all requests of external group `targetSlot` together, so the
-    /// pack keeps one Submitted/Completed callback pair. EAGAIN when fewer
-    /// free tasks than requests (the group stays Pending). Reactor thread only.
+    /// Queues external read `targetSlot`'s request for a pool thread (the
+    /// pack keeps one Submitted/Completed callback pair). EAGAIN with no
+    /// free task (the read stays Pending), ENOMEM with no live thread.
+    /// Reactor thread only.
     pub(crate) fn queue_pread_requests(
         &mut self,
         requests: &[SceKernelAioRWRequest],
@@ -536,27 +557,13 @@ impl AprAioReactor {
         targetGeneration: u32,
         priority: c_int,
     ) -> c_int {
-        self.queue_pread_tasks(requests, targetSlot, targetGeneration, priority, false)
-    }
-
-    /// `queue_pread_requests` for either target kind; a loose read
-    /// (loose_pread.rs) queues its part requests (one when unsplit) aimed at
-    /// its ActiveRead slot, all or none; `requestIndex` is the part index.
-    pub(crate) fn queue_pread_tasks(
-        &mut self,
-        requests: &[SceKernelAioRWRequest],
-        targetSlot: u32,
-        targetGeneration: u32,
-        priority: c_int,
-        looseRead: bool,
-    ) -> c_int {
         if requests.is_empty() || requests.len() > kAprExternalAioGroupMaxRequests {
             return SCE_KERNEL_ERROR_EINVAL;
         }
         if !self.ensure_pread_workers() {
             return SCE_KERNEL_ERROR_ENOMEM;
         }
-        let _guard = unsafe { (&*addr_of!(self.preadMutex)).lock() };
+        let guard = unsafe { (&*addr_of!(self.preadMutex)).lock() };
         // No thread (all given to the game, or none could start): callers go
         // to kernel AIO. Checked under preadMutex, and the last thread leaves
         // only with no task queued (pread_worker), so no accepted read is
@@ -565,19 +572,53 @@ impl AprAioReactor {
         if self.started() == 0 {
             return SCE_KERNEL_ERROR_ENOMEM;
         }
-        let mut slots = [0usize; kAprExternalAioGroupMaxRequests];
-        let mut found = 0usize;
-        for (index, task) in self.preadTasks.iter().enumerate() {
-            if task.state.load(Ordering::Acquire) == PREAD_FREE {
-                slots[found] = index;
-                found += 1;
-                if found == requests.len() {
-                    break;
-                }
+        let queued = self.queue_tasks_locked(requests, targetSlot, targetGeneration, priority, false);
+        drop(guard);
+        match queued {
+            Ok(grow) => {
+                self.grow_pread_threads(grow);
+                0
             }
+            Err(rc) => rc,
         }
-        if found != requests.len() {
-            return SCE_KERNEL_ERROR_EAGAIN;
+    }
+
+    /// Under preadMutex (the caller checked `started`): queues `requests`
+    /// for one target into free tasks, all or none (EAGAIN when fewer are
+    /// free), and wakes threads for them. A loose read (loose_pread.rs)
+    /// queues its parts aimed at its ActiveRead slot; `requestIndex` is the
+    /// part index. Ok: how many threads to start (grow_pread_threads, after
+    /// the caller drops preadMutex).
+    pub(super) fn queue_tasks_locked(
+        &mut self,
+        requests: &[SceKernelAioRWRequest],
+        targetSlot: u32,
+        targetGeneration: u32,
+        priority: c_int,
+        looseRead: bool,
+    ) -> Result<usize, c_int> {
+        let count = requests.len();
+        if count == 0 || count > kAprExternalAioGroupMaxRequests {
+            return Err(SCE_KERNEL_ERROR_EINVAL);
+        }
+        let mut slots = [0usize; kAprExternalAioGroupMaxRequests];
+        let tasks = &self.preadTasks;
+        let found = take_free_tasks(
+            AMPR_EMU_PACK_PREAD_TASKS,
+            self.preadFreeHint as usize,
+            &mut slots[..count],
+            |index| tasks[index].state.load(Ordering::Acquire) == PREAD_FREE,
+        );
+        if found != count {
+            return Err(SCE_KERNEL_ERROR_EAGAIN);
+        }
+        if looseRead {
+            // Set before any part is QUEUED: a thread reads it only after it
+            // took a part under preadMutex.
+            let Some(word) = self.preadLoosePartsLeft.get(targetSlot as usize) else {
+                abort();
+            };
+            word.store(loose_parts_word(targetGeneration, count as u32), Ordering::Release);
         }
         for (requestIndex, request) in requests.iter().enumerate() {
             let task = &mut self.preadTasks[slots[requestIndex]];
@@ -594,19 +635,23 @@ impl AprAioReactor {
             task.packContext = null_mut();
             task.state.store(PREAD_QUEUED, Ordering::Release);
         }
-        self.preadPendingCount += requests.len() as u32;
+        self.preadFreeHint = ((slots[count - 1] + 1) % AMPR_EMU_PACK_PREAD_TASKS) as u32;
+        self.preadPendingCount += count as u32;
         stats::max(Stat::PreadPendingMax, self.preadPendingCount as u64);
-        let grow = self.wake_pread_threads_locked(requests.len());
-        drop(_guard);
-        // On the reactor thread: when every pool thread is busy, it is the
-        // only thread that can start one, and deferring to a pool thread
-        // left the queue behind one slow pread.
-        for _ in 0..grow {
+        self.preadQueuedCount.fetch_add(count as u32, Ordering::AcqRel);
+        Ok(self.wake_pread_threads_locked(count))
+    }
+
+    /// Starts up to `n` pool threads with no runtime lock held. On the
+    /// reactor thread: when every pool thread is busy, it is the only thread
+    /// that can start one, and deferring to a pool thread left the queue
+    /// behind one slow pread.
+    pub(super) fn grow_pread_threads(&self, n: usize) {
+        for _ in 0..n {
             if !self.spawn_pread_thread() {
                 break;
             }
         }
-        0
     }
 
     /// Under preadMutex, after `tasks` tasks were queued: wakes a thread per
@@ -639,11 +684,7 @@ impl AprAioReactor {
         // the ceiling (spawn_pread_thread stops there). Running tasks hold
         // their own thread and do not count; a thread that finishes one
         // rescans before it waits.
-        let queued = self
-            .preadTasks
-            .iter()
-            .filter(|task| task.state.load(Ordering::Acquire) == PREAD_QUEUED)
-            .count();
+        let queued = self.preadQueuedCount.load(Ordering::Acquire) as usize;
         let spinning = PREAD_SPINNING.load(Ordering::Acquire) != SPIN_NONE;
         queued.saturating_sub(self.preadIdle as usize + spinning as usize)
     }
@@ -679,8 +720,9 @@ impl AprAioReactor {
                     abort();
                 }
                 self.preadLooseCount -= 1;
-                self.finish_loose_pread(target, part);
-                progressed = true;
+                // Progress only when the read is finished: an earlier part
+                // changes nothing the rest of the pass acts on.
+                progressed |= self.finish_loose_pread(target, part);
                 continue;
             }
             let reference = ExternalAioRef {
@@ -739,7 +781,9 @@ impl AprAioReactor {
             let mut g = self.preadMutex.lock();
             self.preadStop = true;
             self.preadCv.notify_all();
-            while self.preadThreadCount != 0 {
+            // Exiting threads lower the count through a raw pointer: read it
+            // again each pass, as in yield_pread_threads.
+            while unsafe { addr_of!(self.preadThreadCount).read_volatile() } != 0 {
                 let _ = self.preadExitCv.wait_for_us(&mut g, 100_000);
             }
         }
@@ -806,14 +850,20 @@ impl AprAioReactor {
         if self.preadStop || self.started() == 0 {
             return Err(SCE_KERNEL_ERROR_ENOMEM);
         }
-        let Some(index) = self
-            .preadTasks
-            .iter()
-            .position(|task| task.state.load(Ordering::Acquire) == PREAD_FREE)
-        else {
+        let mut slot = [0usize; 1];
+        let tasks = &self.preadTasks;
+        if take_free_tasks(
+            AMPR_EMU_PACK_PREAD_TASKS,
+            self.preadFreeHint as usize,
+            &mut slot,
+            |index| tasks[index].state.load(Ordering::Acquire) == PREAD_FREE,
+        ) == 0
+        {
             return Err(SCE_KERNEL_ERROR_EAGAIN);
-        };
+        }
+        let index = slot[0];
         unsafe {
+            (*this).preadFreeHint = ((index + 1) % AMPR_EMU_PACK_PREAD_TASKS) as u32;
             let task = &mut (*this).preadTasks[index];
             task.request = *request;
             task.targetSlot = u32::MAX;
@@ -828,6 +878,7 @@ impl AprAioReactor {
             task.packContext = context;
             task.state.store(PREAD_QUEUED, Ordering::Release);
         }
+        self.preadQueuedCount.fetch_add(1, Ordering::AcqRel);
         if crate::rt::tune::ON {
             // Pack tasks are not in preadPendingCount (the reactor never
             // retires them): count the table instead.
@@ -869,6 +920,63 @@ impl AprAioReactor {
             firstExternalInSubmitBatch: false,
         };
         unsafe { callback(context, &n) };
+    }
+}
+
+// ---- task table ----
+
+/// Collects up to `out.len()` indexes of free tasks (`free`) into `out`,
+/// scanning the `n` tasks cyclically from `hint`, and returns how many it
+/// found. The hint is one past the last task queued: tasks are taken in
+/// that order and freed in about that order, so the scan meets free tasks
+/// first instead of walking every busy one from index 0.
+pub(super) fn take_free_tasks(
+    n: usize,
+    hint: usize,
+    out: &mut [usize],
+    free: impl Fn(usize) -> bool,
+) -> usize {
+    let mut found = 0;
+    for k in 0..n {
+        if found == out.len() {
+            break;
+        }
+        let index = (hint + k) % n;
+        if free(index) {
+            out[found] = index;
+            found += 1;
+        }
+    }
+    found
+}
+
+/// The parts-left word of a loose read queued at `generation` (its
+/// ActiveRead listGeneration, never 0) with `parts` part tasks.
+pub(super) const fn loose_parts_word(generation: u32, parts: u32) -> u64 {
+    ((generation as u64) << 32) | parts as u64
+}
+
+/// A part task of the loose read at `generation` is DONE (stored before
+/// this call, so the last part's count proves every part is visible as
+/// DONE): counts it off `word` and returns true when it was the last part,
+/// whose thread then wakes the reactor. Another generation in the word
+/// means the reactor already retired every part (any pass drains DONE
+/// tasks) and the slot holds a newer read: nothing to count, no wake
+/// needed. A count already 0 (not expected) wakes, as a wake is harmless.
+pub(super) fn loose_part_finished(word: &AtomicU64, generation: u32) -> bool {
+    let mut current = word.load(Ordering::Acquire);
+    loop {
+        if (current >> 32) as u32 != generation {
+            return false;
+        }
+        let left = current as u32;
+        if left == 0 {
+            return true;
+        }
+        match word.compare_exchange_weak(current, current - 1, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return left == 1,
+            Err(now) => current = now,
+        }
     }
 }
 
@@ -956,6 +1064,40 @@ mod tests {
             || last.get(),
         );
         (result, read, calls.get())
+    }
+
+    #[test]
+    fn free_task_scan_starts_at_the_hint_and_wraps() {
+        let free = [true, false, true, false, false, true];
+        let mut out = [0usize; 3];
+        assert_eq!(take_free_tasks(6, 3, &mut out, |i| free[i]), 3);
+        assert_eq!(out, [5, 0, 2]);
+        let mut two = [0usize; 2];
+        assert_eq!(take_free_tasks(6, 1, &mut two, |i| free[i]), 2);
+        assert_eq!(two, [2, 5]);
+        // Too few free: the count found, so the caller refuses all.
+        let mut four = [0usize; 4];
+        assert_eq!(take_free_tasks(6, 0, &mut four, |i| free[i]), 3);
+        assert_eq!(take_free_tasks(6, 4, &mut four, |_| false), 0);
+    }
+
+    #[test]
+    fn only_the_last_loose_part_wakes() {
+        let word = AtomicU64::new(loose_parts_word(7, 3));
+        assert!(!loose_part_finished(&word, 7));
+        assert!(!loose_part_finished(&word, 7));
+        assert!(loose_part_finished(&word, 7), "third of three");
+        // A read that was retired and its slot reused by a newer read: an
+        // old part's thread neither counts nor wakes.
+        word.store(loose_parts_word(8, 2), Ordering::Relaxed);
+        assert!(!loose_part_finished(&word, 7));
+        assert_eq!(word.load(Ordering::Relaxed), loose_parts_word(8, 2));
+        // A late part of a retired read whose slot was not reused: the
+        // count is spent, so it wakes once more, which is harmless.
+        let spent = AtomicU64::new(loose_parts_word(9, 0));
+        assert!(loose_part_finished(&spent, 9));
+        let one = AtomicU64::new(loose_parts_word(u32::MAX, 1));
+        assert!(loose_part_finished(&one, u32::MAX), "an unsplit read");
     }
 
     #[test]

@@ -27,8 +27,8 @@ const UNIT: usize = SCE_KERNEL_PAGE_SIZE;
 const UNITS: usize = STACK_MEMORY_MAX / UNIT;
 const WORDS: usize = UNITS.div_ceil(64);
 /// Largest stack taken from the block, 128 KiB: the decode workers take
-/// 64 KiB (pack/worker.rs `WORKER_STACK_MIN`) and the pread threads 32 KiB
-/// (reactor/pread_pool.rs); a larger one (a worker stack knob) is
+/// 64 KiB (pack/worker.rs `WORKER_STACK_MIN`) and the pread threads 64 KiB
+/// (reactor/pread_pool.rs `PREAD_STACK_BYTES`); a larger one (a worker stack knob) is
 /// libkernel's.
 pub(crate) const MAX_STACK: usize = 128 << 10;
 /// Stacks live at once: the 16-thread budget plus the reactor and the
@@ -89,6 +89,14 @@ struct Rec {
     used: bool,
     /// Thread handle once created; 0 while the creation runs.
     thread: usize,
+    /// While the creation runs: where libkernel writes the handle (the
+    /// creator's `thread` argument), so a join before `bind` finds the
+    /// record; 0 once bound, cancelled or matched by such a join.
+    out: usize,
+    /// The thread was joined before `bind`: `bind` frees the stack.
+    gone: bool,
+    /// A join of the unbound thread is running (`detach` to `release`).
+    joining: bool,
     /// First page (the guard) and page count, guard included.
     at: u16,
     n: u16,
@@ -97,6 +105,9 @@ struct Rec {
 const REC0: Rec = Rec {
     used: false,
     thread: 0,
+    out: 0,
+    gone: false,
+    joining: false,
     at: 0,
     n: 0,
 };
@@ -129,6 +140,9 @@ impl Stacks {
         self.recs[r] = Rec {
             used: true,
             thread: 0,
+            out: 0,
+            gone: false,
+            joining: false,
             at: at as u16,
             n: n as u16,
         };
@@ -142,6 +156,22 @@ impl Stacks {
             return None;
         }
         self.recs.iter().position(|r| r.used && r.thread == thread)
+    }
+
+    /// The record of a creation still running whose handle, written to its
+    /// `out`, is `thread`: a thread joined before its creator bound it.
+    fn find_unbound(&self, thread: usize) -> Option<usize> {
+        if thread == 0 {
+            return None;
+        }
+        self.recs.iter().position(|r| {
+            // Read under LOCK: `out` is the creator's and stays valid until
+            // its bind or cancel clears it, also under LOCK.
+            r.used
+                && r.thread == 0
+                && r.out != 0
+                && unsafe { (r.out as *const usize).read_volatile() } == thread
+        })
     }
 
     /// Frees record `r` and its pages.
@@ -174,8 +204,9 @@ unsafe fn guard(base: usize, rec: Rec, on: bool) -> bool {
 }
 
 /// A `size`-byte stack (rounded up to whole pages) with its guard page;
-/// None when it is not to come from the block.
-pub(crate) unsafe fn take(size: usize) -> Option<Slot> {
+/// None when it is not to come from the block. `out`: where the creation
+/// writes the thread handle, valid until `bind` or `cancel`.
+pub(crate) unsafe fn take(size: usize, out: *mut *mut c_void) -> Option<Slot> {
     if size == 0 || size > MAX_STACK {
         return None;
     }
@@ -196,6 +227,7 @@ pub(crate) unsafe fn take(size: usize) -> Option<Slot> {
             return None;
         }
         let r = s.reserve(n + 1)?;
+        s.recs[r].out = out as usize;
         (s.base, r, s.recs[r])
     };
     if !unsafe { guard(base, rec, true) } {
@@ -211,20 +243,28 @@ pub(crate) unsafe fn take(size: usize) -> Option<Slot> {
     })
 }
 
-/// Records the thread that runs on `slot`, so its join frees it. Another
-/// record bound to the same handle belongs to a thread that was joined
-/// before its creator got here (libkernel reuses the handle of a joined
-/// thread): that thread is gone, so its stack is freed now.
+/// Records the thread that runs on `slot`, so its join frees it. A thread
+/// already joined (`detach` found it by its handle before this) is gone:
+/// its stack is freed now. Another record bound to the same handle belongs
+/// to a thread that was joined before its creator got here, by a handle
+/// read from elsewhere (libkernel reuses the handle of a joined thread):
+/// that thread is gone too, so its stack is freed now.
 pub(crate) fn bind(slot: Slot, thread: *mut c_void) {
     let stale = {
         let _g = LOCK.lock();
         let s = unsafe { &mut *STACKS.get() };
-        let stale = s.find(thread as usize);
-        if let Some(r) = stale {
-            s.recs[r].thread = 0;
+        let r = slot.rec;
+        s.recs[r].out = 0;
+        if s.recs[r].gone {
+            Some(r)
+        } else {
+            let stale = s.find(thread as usize);
+            if let Some(o) = stale {
+                s.recs[o].thread = 0;
+            }
+            s.recs[r].thread = thread as usize;
+            stale
         }
-        s.recs[slot.rec].thread = thread as usize;
-        stale
     };
     if let Some(r) = stale {
         unsafe { give_back(r) };
@@ -236,27 +276,75 @@ pub(crate) unsafe fn cancel(slot: Slot) {
     unsafe { give_back(slot.rec) };
 }
 
+/// A record detached for a join: (record, handle, the creator's `out` when
+/// the thread was not bound yet, else 0).
+pub(crate) type Detached = (usize, usize, usize);
+
 /// Before scePthreadJoin for `thread`: detaches its record while the
 /// handle still names it. Once the join returns, libkernel may give the
 /// handle to a new thread, and a lookup by handle then would find the new
-/// thread's record and free a live stack.
-pub(crate) fn detach(thread: *mut c_void) -> Option<(usize, usize)> {
+/// thread's record and free a live stack. A thread whose creator has not
+/// bound it yet is found by its `out` and marked `joining`.
+pub(crate) fn detach(thread: *mut c_void) -> Option<Detached> {
     let _g = LOCK.lock();
     let s = unsafe { &mut *STACKS.get() };
-    let r = s.find(thread as usize)?;
-    s.recs[r].thread = 0;
-    Some((r, thread as usize))
+    if let Some(r) = s.find(thread as usize) {
+        s.recs[r].thread = 0;
+        return Some((r, thread as usize, 0));
+    }
+    let r = s.find_unbound(thread as usize)?;
+    let out = s.recs[r].out;
+    s.recs[r].out = 0;
+    s.recs[r].joining = true;
+    Some((r, thread as usize, out))
 }
 
 /// After the join: frees the detached stack when the join returned 0,
-/// else binds it back to its still-running thread.
-pub(crate) unsafe fn release(rec: Option<(usize, usize)>, joined: bool) {
-    let Some((r, thread)) = rec else { return };
-    if joined {
-        unsafe { give_back(r) };
-    } else {
+/// else binds it back to its still-running thread. A thread joined before
+/// its creator bound it is freed by that bind (`gone`), or here when the
+/// bind ran during the join.
+pub(crate) unsafe fn release(rec: Option<Detached>, joined: bool) {
+    let Some((r, thread, out)) = rec else { return };
+    if out == 0 {
+        if joined {
+            unsafe { give_back(r) };
+        } else {
+            let _g = LOCK.lock();
+            unsafe { (*STACKS.get()).recs[r].thread = thread };
+        }
+        return;
+    }
+    let free = {
         let _g = LOCK.lock();
-        unsafe { (*STACKS.get()).recs[r].thread = thread };
+        let s = unsafe { &mut *STACKS.get() };
+        let rec = &mut s.recs[r];
+        // Not `joining` any more: a later bind of the reused handle freed
+        // it as stale, and the record may be another stack's now.
+        if !rec.joining {
+            return;
+        }
+        rec.joining = false;
+        match (joined, rec.thread != 0) {
+            // Bound during the join: the thread is gone, free it now.
+            (true, true) => {
+                rec.thread = 0;
+                true
+            }
+            (true, false) => {
+                rec.gone = true;
+                false
+            }
+            // Still running; a later join may find it again while unbound.
+            (false, bound) => {
+                if !bound {
+                    rec.out = out;
+                }
+                false
+            }
+        }
+    };
+    if free {
+        unsafe { give_back(r) };
     }
 }
 
@@ -295,6 +383,12 @@ fn count() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The tests that use the global STACKS run one at a time.
+    fn serial() -> std::sync::MutexGuard<'static, ()> {
+        static M: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        M.lock().unwrap_or_else(|e| e.into_inner())
+    }
 
     fn stacks() -> Stacks {
         Stacks {
@@ -364,13 +458,14 @@ mod tests {
 
     #[test]
     fn a_reused_handle_never_frees_a_live_stack() {
+        let _serial = serial();
         let taken = || unsafe { (*STACKS.get()).taken };
-        let a = unsafe { take(64 << 10) }.expect("pool stack");
+        let a = unsafe { take(64 << 10, core::ptr::null_mut()) }.expect("pool stack");
         let a_rec = a.rec;
         bind(a, 0xa000 as *mut c_void);
         // Join of A: detached before the join, so the handle can be reused.
         let rec = detach(0xa000 as *mut c_void);
-        let b = unsafe { take(64 << 10) }.expect("pool stack");
+        let b = unsafe { take(64 << 10, core::ptr::null_mut()) }.expect("pool stack");
         let b_rec = b.rec;
         bind(b, 0xa000 as *mut c_void);
         unsafe { release(rec, true) };
@@ -383,13 +478,49 @@ mod tests {
         // A thread joined before its creator bound it: the next bind of
         // the same handle frees the stale stack.
         let before = taken();
-        let c = unsafe { take(64 << 10) }.expect("pool stack");
+        let c = unsafe { take(64 << 10, core::ptr::null_mut()) }.expect("pool stack");
         let c_rec = c.rec;
         bind(c, 0xa000 as *mut c_void);
         assert!(!unsafe { (*STACKS.get()).recs[b_rec].used });
         assert!(unsafe { (*STACKS.get()).recs[c_rec].used });
         assert_eq!(taken(), before);
         unsafe { release(detach(0xa000 as *mut c_void), true) };
+    }
+
+    /// A thread joined before its creator bound it: found by the handle
+    /// in the creator's `out`, freed by the bind after a join; a failed
+    /// join leaves it to be found again, and a bind during the join leaves
+    /// the free to the join's release.
+    #[test]
+    fn a_join_before_bind_frees_the_stack() {
+        let _serial = serial();
+        let used = |r: usize| unsafe { (*STACKS.get()).recs[r].used };
+        // The creators' handle locations, as libkernel writes them.
+        let out: *mut *mut c_void = Box::into_raw(Box::new(core::ptr::null_mut()));
+        let out2: *mut *mut c_void = Box::into_raw(Box::new(core::ptr::null_mut()));
+        let a = unsafe { take(64 << 10, out) }.expect("pool stack");
+        let a_rec = a.rec;
+        unsafe { *out = 0xd000 as *mut c_void };
+        assert_eq!(detach(0xe000 as *mut c_void), None);
+        let rec = detach(0xd000 as *mut c_void);
+        assert!(rec.is_some());
+        unsafe { release(rec, false) }; // failed join: found again
+        let rec = detach(0xd000 as *mut c_void);
+        unsafe { release(rec, true) };
+        assert!(used(a_rec));
+        bind(a, unsafe { *out });
+        assert!(!used(a_rec));
+        // Bound while the join ran: the release frees it.
+        let b = unsafe { take(64 << 10, out2) }.expect("pool stack");
+        let b_rec = b.rec;
+        unsafe { *out2 = 0xd100 as *mut c_void };
+        let rec = detach(0xd100 as *mut c_void);
+        bind(b, unsafe { *out2 });
+        assert!(used(b_rec));
+        unsafe { release(rec, true) };
+        assert!(!used(b_rec));
+        assert_eq!(detach(0xd100 as *mut c_void), None);
+        unsafe { drop((Box::from_raw(out), Box::from_raw(out2))) };
     }
 
     #[test]

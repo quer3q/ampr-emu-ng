@@ -152,7 +152,7 @@ Contiguous chunks are one byte range in one volume, so a batch is one
 pread whose chunks the decode workers decode in parallel. The pread is
 exact-size: it covers the chunks' stored bytes, not rounded to pages, and
 never past the volume's end. Read bytes are not cached; decoded chunks go
-to the decoded cache, the rest of the runtime pool (134.98 MiB release at
+to the decoded cache, the rest of the runtime pool (137.11 MiB release at
 the mount, then grown into the Index ledger's idle room once the index is
 built: 204 MiB on a title using 5.6 MiB of Index). A game read spanning several chunks is split
 into chunk-aligned child jobs (`rt/pack/pack_split.rs`).
@@ -205,7 +205,7 @@ names) and install only when the zstd index or the LZ4 manifest is in
 - libc stdio and dirent (`fopen`, `fread`, `opendir`, ...) through the
   libkernel internal-entry hooks `_open` .. `sceKernelFcntl`, all on by
   default (Makefile `AMPR_PACK_LIBC_HOOKS = 0xfff`).
-- `mmap`/`sceKernelMmap` (below).
+- Not served: `mmap`/`sceKernelMmap` of a packed file fails (below).
 - The game's own kernel AIO (`sceKernelAioSubmitReadCommands*`, poll,
   wait, delete, cancel) on a packed file, by the runtime's AIO emulation
   (`rt/pack/aio.rs`, `rt/pack/aio_wait.rs`); other fds go to the kernel.
@@ -245,30 +245,17 @@ baseline.
 
 ## mmap of packed files
 
-A packed file has no physical copy, so mmap of its virtual fd fails on
-its own. Makefile `AMPR_PACK_MMAP` picks the fix; 0 leaves the call
-unhooked. MAP_ANON maps and other fds go to the original. At 2 a
-MAP_SHARED map with PROT_WRITE fails with EACCES, as for any O_RDONLY fd.
+A packed file has no physical copy, so mmap of its virtual fd fails.
+The runtime does not serve it: no measured game mmapped a packed file
+(`mmap_virtual` 0 on three fully packed games). The release build does
+not hook mmap; the debug build installs mmap and `sceKernelMmap` (ids 96
+and 97) as pass-through probes that log such a map in `/fsfail` (op `X`
+or `Y`, lookup `v`) and count it in `mmap_virtual` (`rt/probe.rs`).
 
-2 (default, also when the variable is absent): disk cache, for zstd and
-LZ4 packs. The first map decodes the whole file once, inside that mmap
-call and under one lock, in 256 KiB pieces into a temp file under
-`/data/ampr_cache` (`/data` needs the decoded size free). The file is
-unlinked, its fd kept, and a dup of it mapped with the caller's arguments;
-later maps reuse it. Up to 64 cache files stay open; a 65th closes the
-oldest, whose data lives while mapped, and a later map decodes it again.
-mprotect, write faults and thread stacks behave as for any file mapping.
-Memory: one transient 256 KiB pool buffer per write. The
-directory is made for each create and removed right after the unlink (or
-a failed open or unlink), so it does not stay visible on `/data`; the
-open fd keeps the data. At module_start, when the knob is not 0 in a
-title with packs, it is emptied and removed (`select_pack_format`,
-`rt/pack/mod.rs`), and pack shutdown removes it again (`close_cache`,
-`rt/pack/mmap.rs`). A folder that still holds a file a crash left named
-stays until the next module_start sweep.
-
-1 was decode on access (zstd packed files decoded in a SIGSEGV/SIGBUS
-handler on first touch) and is removed; the build refuses it. No measured
-game mmapped a packed file (`mmap_virtual` 0 on three fully packed games),
-so it never served one, and eight of its limits were unsolved. Its
-munmap hooks, ids 98 and 99, stay unused.
+Both earlier fixes are removed: decode on access (zstd packed files
+decoded in a SIGSEGV/SIGBUS handler on first touch; munmap hooks ids 98
+and 99, unused since) and the disk cache (`AMPR_PACK_MMAP=2`, a decoded
+copy under `/data/ampr_cache`, ids 96 and 97 in release). The Makefile
+refuses `AMPR_PACK_MMAP`. module_start in every title removes a
+`/data/ampr_cache` an older build left (`remove_old_cache_dir` in
+`rt/pack/mod.rs`); when the folder does not open it does nothing more.

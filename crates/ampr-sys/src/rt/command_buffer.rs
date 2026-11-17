@@ -36,7 +36,6 @@ pub struct PackedOpLayout {
 const _: () = assert!(size_of::<PackedOpLayout>() == 8);
 
 use super::amm::{ammWriteMapCommand2, ammWriteMapDirectCommand};
-use super::equeue::apr_equeue_note_command_buffer_event;
 
 // ---- packing ----------------------------------------------------------------
 
@@ -514,12 +513,7 @@ pub unsafe fn ampr_cb_write_kernel_event_queue_04_00(
     o.u32b = id as u32;
     o.u64a = data;
     o.u8a = at_sop as u8;
-    let rc = unsafe { append(cb, o) };
-    if rc == 0 {
-        // The header is the first member, so its address is the object's `this`.
-        unsafe { apr_equeue_note_command_buffer_event(cb.cast(), eq) };
-    }
-    rc
+    unsafe { append(cb, o) }
 }
 
 /// Shared body of the WriteAddressFrom{Time,}Counter{,Pair} records.

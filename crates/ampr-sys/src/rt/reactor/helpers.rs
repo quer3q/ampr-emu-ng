@@ -187,16 +187,4 @@ const _: () = {
     assert!(apr_read_is_single_quantum_full_file(0, Q, Q));
     assert!(!apr_read_is_single_quantum_full_file(0, Q + 1, Q + 1));
     assert!(!apr_read_is_single_quantum_full_file(0, Q / 2, Q));
-    assert!(
-        AMPR_EMU_LOOSE_COALESCE_MAX_COMMANDS >= 1
-            && AMPR_EMU_LOOSE_COALESCE_MAX_COMMANDS <= u8::MAX as u32
-    );
-    assert!(
-        AMPR_EMU_LOOSE_GS_COALESCE_MAX_COMMANDS >= 1
-            && AMPR_EMU_LOOSE_GS_COALESCE_MAX_COMMANDS <= AMPR_EMU_LOOSE_COALESCE_MAX_COMMANDS
-    );
-    assert!(
-        AMPR_EMU_LOOSE_GS_COALESCE_MAX_BYTES != 0
-            && AMPR_EMU_LOOSE_GS_COALESCE_MAX_BYTES <= AMPR_EMU_LOOSE_COALESCE_MAX_BYTES
-    );
 };

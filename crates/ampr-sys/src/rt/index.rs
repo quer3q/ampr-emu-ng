@@ -20,7 +20,7 @@ use super::fd_cache::{EntryPath, FileEntryView};
 use super::index_file::{pread_fd, BlobSource, FileSource, PathSource, ResidentSource, WINDOW};
 use super::index_view::{self, BuildError, ViewMem};
 use super::runtime_memory::{
-    ampr_internal_amm_pool_alloc, ampr_internal_amm_pool_ensure, ampr_internal_amm_pool_free,
+    ampr_internal_amm_pool_alloc, ampr_internal_amm_pool_free,
     ampr_internal_amm_pool_ready_has_capacity, ampr_sdk_cpu_memory_class_name,
     ampr_small_slab_alloc, ampr_small_slab_free,
 };
@@ -33,7 +33,7 @@ use ampr_format::source::{Source, PATH_BUF};
 use ampr_format::view::{Builder, Hit, Packs, View, NO_CHUNK};
 use core::ffi::{c_char, c_int, c_void, CStr};
 use core::ptr::{null, null_mut};
-use core::sync::atomic::{AtomicU32, AtomicU8, Ordering::*};
+use core::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, AtomicU8, Ordering::*};
 
 // ---- constants -------------------------------------------------------------
 
@@ -44,15 +44,18 @@ pub(crate) const INDEX_BACKUP_PATH: &CStr = c"/app0/ampr_emu.index.bak";
 pub(crate) const INDEX_MAGIC: [u8; 8] = *b"AMPRIDX3";
 pub(crate) const INDEX_VERSION: u32 = 3;
 pub(crate) const INDEX_LOAD_WAIT_US: u64 = 500_000;
-pub(crate) const INDEX_MAX_PATH: usize = 4096;
 pub(crate) const KERNEL_PATH_MAX: usize = 1024; // SCE_KERNEL_PATH_MAX
 pub(crate) const RUNTIME_PATH_CAPACITY: usize = KERNEL_PATH_MAX + 1;
+/// The walk's path buffers and `PathStack` slots: a path the key
+/// normalize refuses (1024 bytes or more) is skipped anyway, so a longer
+/// buffer (4096 before) only held paths that were dropped after the copy.
+pub(crate) const INDEX_MAX_PATH: usize = RUNTIME_PATH_CAPACITY;
 pub(crate) const FILEID_INVALID: u32 = u32::MAX; // SCE_AMPR_APR_FILEID_INVALID
 /// alignof(std::max_align_t), the C++ default allocation alignment.
 const MAX_ALIGN: usize = 16;
 
-/// `AmprSharedSdkCpuMemoryClass`.
-pub(crate) const MEM_PERSISTENT: u8 = 0;
+/// `AmprSharedSdkCpuMemoryClass`: only transient allocations remain (the
+/// persistent class, which could create the pool, had no caller).
 pub(crate) const MEM_TRANSIENT: u8 = 1;
 
 // ---- on-disk AMPRIDX3 types ------------------------------------------------
@@ -104,8 +107,8 @@ pub(crate) enum LoadResult {
     /// (a USB hiccup, EINTR past the retry bound). Not a reason to rebuild:
     /// a rebuild would replace a shipped index whose file IDs packs and
     /// traces depend on. The load is retried on the next ensure_ready that
-    /// may build (`allow_build` and autobuild on); other calls return
-    /// unavailable. Without packs, after `UNREADABLE_LOAD_LIMIT` in a row it is
+    /// may build (`allow_build` and autobuild on) once its backoff has
+    /// passed (`next_retry_at`); other calls return unavailable. Without packs, after `UNREADABLE_LOAD_LIMIT` in a row it is
     /// built in memory, never installed; with packs it is only retried.
     Unreadable,
 }
@@ -123,6 +126,33 @@ fn next_unreadable_loads(count: u32, result: LoadResult) -> u32 {
     } else {
         0
     }
+}
+
+/// Backoff after an Unreadable load: the first retry waits 100 ms and each
+/// one after doubles it, up to 2 s. Without it a title with packs, which
+/// only retries, ran the open, fstat and view build again on every
+/// `ensure_ready(true)` caller while the file stayed unreadable. Without
+/// packs the three loads before the walk build span 300 ms.
+const UNREADABLE_RETRY_NS: u64 = 100_000_000;
+const UNREADABLE_RETRY_MAX_NS: u64 = 2_000_000_000;
+/// Monotonic ns before which no load is retried; 0 after any other result.
+/// Written by the single `loading` thread before it clears `loading` under
+/// `INDEX_LOCK`, read under that lock.
+static RETRY_AT_NS: AtomicU64 = AtomicU64::new(0);
+
+/// When the next load may run after `run` Unreadable loads in a row, the
+/// last at `now`; 0 (at once) after a run of 0 or with no clock.
+fn next_retry_at(now: u64, run: u32) -> u64 {
+    if run == 0 || now == 0 {
+        return 0;
+    }
+    let shift = (run - 1).min(16);
+    now.saturating_add((UNREADABLE_RETRY_NS << shift).min(UNREADABLE_RETRY_MAX_NS))
+}
+
+/// Whether a load may run at `now`; always with no clock (`now` 0).
+fn retry_due(now: u64, retry_at: u64) -> bool {
+    retry_at == 0 || now == 0 || now >= retry_at
 }
 
 // ---- global state ----------------------------------------------------------
@@ -239,13 +269,21 @@ pub(crate) unsafe fn release_resident_index() {
     unsafe { state() }.available = false;
 }
 
-/// `App0IndexBuildWorkspace`: key/path scratch for the single runtime builder.
+/// The index fd kept open for path reads (`Paths::File`), or -1. The
+/// close hooks refuse it (rt/pack/aio.rs): a game that closes that number
+/// (a double close, a stale fd) would otherwise close the index under
+/// the lookups, and once the number is reused a path pread returns another
+/// file's bytes, read as a false authoritative ENOENT.
+static KEPT_FD: AtomicI32 = AtomicI32::new(-1);
+
+/// Whether `fd` is the index fd the lookups read paths from.
+#[inline]
+pub(crate) fn is_kept_index_fd(fd: c_int) -> bool {
+    fd >= 0 && KEPT_FD.load(Relaxed) == fd
+}
+
+/// `App0IndexBuildWorkspace`: path scratch for the single runtime builder.
 pub(crate) struct BuildWorkspace {
-    pub index_key: [u8; INDEX_MAX_PATH],
-    pub temp_index_key: [u8; INDEX_MAX_PATH],
-    pub backup_index_key: [u8; INDEX_MAX_PATH],
-    pub command_log_key: [u8; INDEX_MAX_PATH],
-    pub debug_log_key: [u8; INDEX_MAX_PATH],
     pub dir: [u8; INDEX_MAX_PATH],
     pub path: [u8; INDEX_MAX_PATH],
     pub path_key: [u8; INDEX_MAX_PATH],
@@ -253,11 +291,6 @@ pub(crate) struct BuildWorkspace {
 
 /// `FileIndexState::loading` serializes the only user.
 pub(crate) static WORKSPACE: SyncCell<BuildWorkspace> = SyncCell::new(BuildWorkspace {
-    index_key: [0; INDEX_MAX_PATH],
-    temp_index_key: [0; INDEX_MAX_PATH],
-    backup_index_key: [0; INDEX_MAX_PATH],
-    command_log_key: [0; INDEX_MAX_PATH],
-    debug_log_key: [0; INDEX_MAX_PATH],
     dir: [0; INDEX_MAX_PATH],
     path: [0; INDEX_MAX_PATH],
     path_key: [0; INDEX_MAX_PATH],
@@ -271,6 +304,14 @@ pub(crate) unsafe fn normalize_key_result(
     path: *const c_char,
     out: &mut [u8],
 ) -> Result<(usize, bool), c_int> {
+    unsafe { normalize_key_full(path, out) }.map(|k| (k.len, k.had_trailing_separator))
+}
+
+/// `normalize_key_result` with the whole `Key` (its `plain` flag too).
+pub(crate) unsafe fn normalize_key_full(
+    path: *const c_char,
+    out: &mut [u8],
+) -> Result<ampr_format::index_key::Key, c_int> {
     use ampr_format::index_key::{normalize, KeyError, PATH_MAX};
     let Some(first) = out.first_mut() else {
         return Err(EFAULT);
@@ -287,7 +328,7 @@ pub(crate) unsafe fn normalize_key_result(
         .find(|&i| unsafe { *p.add(i) } == 0)
         .ok_or(ENAMETOOLONG)?;
     match normalize(unsafe { core::slice::from_raw_parts(p, len) }, out) {
-        Ok(k) => Ok((k.len, k.had_trailing_separator)),
+        Ok(k) => Ok(k),
         Err(KeyError::Invalid) => Err(EINVAL),
         Err(KeyError::NameTooLong) => Err(ENAMETOOLONG),
     }
@@ -307,11 +348,6 @@ pub(crate) unsafe fn cstr_bytes<'a>(p: *const c_char) -> &'a [u8] {
     } else {
         unsafe { CStr::from_ptr(p) }.to_bytes()
     }
-}
-
-/// `compare_index_path_key`: folded comparison, -1/0/1; null reads as "".
-pub(crate) unsafe fn compare_key(path: *const c_char, key: *const c_char) -> i32 {
-    ampr_format::index_key::compare(unsafe { cstr_bytes(path) }, unsafe { cstr_bytes(key) }) as i32
 }
 
 /// `ampr_round_up_page_size`: usize::MAX on overflow.
@@ -339,16 +375,15 @@ pub(crate) fn align_up_u64(v: u64, a: u64) -> u64 {
 
 // ---- SDK CPU memory ----------------------------------------------------------
 
-/// `ampr_alloc_sdk_cpu_memory`: small slab first, then the internal AMM pool
-/// (only persistent allocations may create the pool).
+/// `ampr_alloc_sdk_cpu_memory`: small slab first, then the internal AMM pool,
+/// which this never creates.
 pub(crate) unsafe fn sdk_alloc(size: usize, class: u8) -> *mut c_void {
     if size == 0 {
         return null_mut();
     }
     let name = unsafe { ampr_sdk_cpu_memory_class_name(class) };
-    let may_create = class == MEM_PERSISTENT;
     let mut slot = 0usize;
-    let small = unsafe { ampr_small_slab_alloc(size, MAX_ALIGN, &mut slot, name, may_create) };
+    let small = unsafe { ampr_small_slab_alloc(size, MAX_ALIGN, &mut slot, name, false) };
     if !small.is_null() {
         return small;
     }
@@ -356,12 +391,7 @@ pub(crate) unsafe fn sdk_alloc(size: usize, class: u8) -> *mut c_void {
     if mapped == usize::MAX {
         return null_mut();
     }
-    let usable = if may_create {
-        unsafe { ampr_internal_amm_pool_ensure(mapped, name) }
-    } else {
-        unsafe { ampr_internal_amm_pool_ready_has_capacity(mapped, MAX_ALIGN) }
-    };
-    if !usable {
+    if !unsafe { ampr_internal_amm_pool_ready_has_capacity(mapped, MAX_ALIGN) } {
         super::index_memory::note_pool_failure();
         return null_mut();
     }
@@ -440,8 +470,9 @@ impl Drop for ScratchBuffer {
     }
 }
 
-/// `AmprIndexPathStack`: LIFO of NUL-terminated paths in fixed 4 KiB slots,
-/// grown by doubling (from 256, 1 MiB) in index memory (rt/index_memory.rs):
+/// `AmprIndexPathStack`: LIFO of NUL-terminated paths in fixed
+/// `INDEX_MAX_PATH` (1025 B) slots, grown by doubling (from 256, 256 KiB)
+/// in index memory (rt/index_memory.rs):
 /// it grows with the directories waiting to be scanned.
 pub(crate) struct PathStack {
     base: *mut u8,
@@ -550,6 +581,8 @@ impl Compact {
             Paths::None => {}
             // Host tests link no libkernel and open no file.
             Paths::File(_f) => {
+                // Unguarded before the close, so the number is free to reuse.
+                let _ = KEPT_FD.compare_exchange(_f.fd(), -1, Relaxed, Relaxed);
                 #[cfg(not(test))]
                 unsafe {
                     real_physical_close(_f.fd())
@@ -740,6 +773,29 @@ const DT_LNK: u8 = 10;
 /// AMPR_EMU_COMMAND_LOG_PATH / AMPR_EMU_DEBUG_LOG_PATH (excluded from the index).
 const COMMAND_LOG_PATH: &CStr = c"/app0/ampr_commands.bin";
 const DEBUG_LOG_PATH: &CStr = c"/app0/ampr_emu.log";
+
+/// The runtime's own /app0 files, which the walk never indexes. Each is
+/// its own normalized key (lowercase, single `/`), so a key compares to it
+/// as bytes; a test checks that.
+const SKIPPED_KEYS: [&CStr; 5] = [
+    INDEX_PATH,
+    INDEX_TEMP_PATH,
+    INDEX_BACKUP_PATH,
+    COMMAND_LOG_PATH,
+    DEBUG_LOG_PATH,
+];
+
+/// Whether `key`, a normalized key or a spelling of one (any ASCII case),
+/// is one of `SKIPPED_KEYS`.
+fn is_skipped_key(key: &[u8]) -> bool {
+    let folded_eq = |p: &[u8]| {
+        p.len() == key.len()
+            && p.iter()
+                .zip(key)
+                .all(|(&a, &b)| a == ampr_format::folded(b))
+    };
+    SKIPPED_KEYS.iter().any(|p| folded_eq(p.to_bytes()))
+}
 /// AMPR_EMU_APP0_INDEX_AUTOBUILD.
 pub(crate) const APP0_INDEX_AUTOBUILD: bool = true;
 
@@ -1217,17 +1273,6 @@ pub(crate) unsafe fn build_app0_index(idx: &mut FileIndexState, install: bool) {
         return;
     }
     let ws = unsafe { &mut *WORKSPACE.get() };
-    for (path, key) in [
-        (INDEX_PATH, &mut ws.index_key),
-        (INDEX_TEMP_PATH, &mut ws.temp_index_key),
-        (INDEX_BACKUP_PATH, &mut ws.backup_index_key),
-        (COMMAND_LOG_PATH, &mut ws.command_log_key),
-        (DEBUG_LOG_PATH, &mut ws.debug_log_key),
-    ] {
-        if unsafe { normalize_key(path.as_ptr(), key) }.is_none() {
-            return;
-        }
-    }
     while !dirs.is_empty() {
         if !dirs.pop(&mut ws.dir) || !unsafe { scan_dir(ws, &mut dirs, &mut builder) } {
             return;
@@ -1339,20 +1384,9 @@ unsafe fn add_dirent(
         return true;
     }
     match unsafe { normalize_key(path_ptr, &mut ws.path_key) } {
-        Some(klen) if !is_kraken_key(&ws.path_key[..klen]) => {}
+        Some(klen)
+            if !is_kraken_key(&ws.path_key[..klen]) && !is_skipped_key(&ws.path_key[..klen]) => {}
         _ => return true,
-    }
-    let key: *const c_char = ws.path_key.as_ptr().cast();
-    for skip in [
-        &ws.index_key,
-        &ws.temp_index_key,
-        &ws.backup_index_key,
-        &ws.command_log_key,
-        &ws.debug_log_key,
-    ] {
-        if unsafe { compare_key(key, skip.as_ptr().cast()) } == 0 {
-            return true;
-        }
     }
     let path = &ws.path[..len];
     if d_type == DT_DIR {
@@ -1413,6 +1447,7 @@ pub(crate) unsafe fn load_compact_index(idx: &mut FileIndexState) -> LoadResult 
     };
     if rc == LoadResult::Loaded {
         idx.compact.paths = Paths::File(PathSource::new(fd, st.st_size as u64));
+        KEPT_FD.store(fd, Relaxed);
     } else {
         unsafe { real_physical_close(fd) };
     }
@@ -1605,6 +1640,11 @@ pub(crate) unsafe fn ensure_ready_slow(allow_build: bool) -> bool {
             if idx.load_attempted && (!allow_build || !APP0_INDEX_AUTOBUILD) {
                 return idx.available;
             }
+            if idx.load_attempted
+                && !retry_due(super::sys::monotonic_ns(), RETRY_AT_NS.load(Relaxed))
+            {
+                return idx.available;
+            }
             idx.load_attempted = true;
             idx.loading = true;
             idx.available = false;
@@ -1629,6 +1669,10 @@ pub(crate) unsafe fn ensure_ready_slow(allow_build: bool) -> bool {
         let result = unsafe { load_compact_index(&mut work) };
         let unreadable = next_unreadable_loads(UNREADABLE_LOADS.load(Relaxed), result);
         UNREADABLE_LOADS.store(unreadable, Relaxed);
+        RETRY_AT_NS.store(
+            next_retry_at(super::sys::monotonic_ns(), unreadable),
+            Relaxed,
+        );
         let final_loaded = match result {
             LoadResult::Loaded => true,
             LoadResult::Memory => {
@@ -1758,9 +1802,10 @@ fn view_lookup(c: &Compact, key: &[u8]) -> ampr_format::Result<Option<Hit>> {
 enum KeyHit {
     /// A file: its entry and one-based id.
     File(FileEntryView, u32),
-    /// A directory: its stored spelling (`path_length` is the key's) and
-    /// the mtime of its representative file.
-    Dir(FileEntryView),
+    /// A directory: its stored spelling (`path_length` is the key's; the
+    /// path is null when not read) and the mtime of its representative
+    /// file, and its view directory id.
+    Dir(FileEntryView, u32),
     Miss,
 }
 
@@ -1779,8 +1824,8 @@ fn resolve_key(
     resolve_key_paths(c, key, file_ok, dir_ok, path, false)
 }
 
-/// `resolve_key`; with `lazy` a file hit, packed or loose, leaves its path
-/// unread (null) even when `path` is given. A packed file is served by id
+/// `resolve_key`; with `lazy` a hit, a file packed or loose or a
+/// directory, leaves its path unread (null) even when `path` is given. A packed file is served by id
 /// and a loose one is asked for by the game's own spelling first
 /// (`loose_call`), so the path costs a pread only a fallback uses
 /// (`hit_path`, `loose_call`).
@@ -1805,7 +1850,7 @@ fn resolve_key_paths(
     };
     let hit = match io_or_none(found)? {
         Some(Hit::File(id)) if file_ok => file_entry(c, &view, id, key, path, lazy),
-        Some(Hit::Dir(d)) if dir_ok => dir_entry(c, &view, d, key, path),
+        Some(Hit::Dir(d)) if dir_ok => dir_entry(c, &view, d, key, path, lazy),
         _ => return Ok(KeyHit::Miss),
     };
     Ok(io_or_none(hit)?.unwrap_or(KeyHit::Miss))
@@ -1874,6 +1919,7 @@ fn dir_entry(
     d: u32,
     key: &[u8],
     path: Option<&mut EntryPath>,
+    lazy: bool,
 ) -> ampr_format::Result<Option<KeyHit>> {
     let rep = view.dir(d).rep_file;
     if c.count == 0 || rep == 0 || rep as usize > c.count {
@@ -1884,11 +1930,13 @@ fn dir_entry(
         mtime: view.mtime(rep),
         ..empty_view()
     };
-    if let Some(buf) = path {
+    // Only an open uses the spelling; a lazy stat, access or
+    // reachability of a directory reads none (`dir_path` reads it later).
+    if let Some(buf) = path.filter(|_| !lazy) {
         view.dir_path(&c.paths, d, buf)?;
         e.path = buf.as_ptr().cast();
     }
-    Ok(Some(KeyHit::Dir(e)))
+    Ok(Some(KeyHit::Dir(e, d)))
 }
 
 /// `lookup_app0_index_key_view`: (view, one-based id) of a file key; the
@@ -1922,7 +1970,7 @@ unsafe fn lookup_directory_key(
         return Ok(None);
     };
     match resolve_key(c, key, false, true, path)? {
-        KeyHit::Dir(e) => Ok(Some(e)),
+        KeyHit::Dir(e, _) => Ok(Some(e)),
         _ => Ok(None),
     }
 }
@@ -1967,6 +2015,62 @@ struct Lookup {
     /// A loose `Hit` whose stored path is unread and unconfirmed: its real
     /// call tries the game's spelling first (`loose_call`).
     unconfirmed: bool,
+    /// A `Miss` the published view answered with no read error, from a
+    /// lazy lookup. Every packed file and packed directory is a view row
+    /// (the pack index is joined to the view by id), so the pack overlay
+    /// cannot find more and the hooks do not ask it (`pack_miss`); a test
+    /// checks that over the view fixtures.
+    final_miss: bool,
+    /// A `Directory`'s view directory id, so a lazy lookup that did not
+    /// read its spelling can read it when an open needs it (`dir_path`).
+    dir: u32,
+    /// A `Hit` the view links to a pack (`view_packed`), read once at the
+    /// lookup so `hit_is_packed` enters no manifest gate.
+    packed: bool,
+    /// The pack manifest's resident-ready state, asked once per call:
+    /// 0 not asked yet, 1 not ready, 2 ready (`packs_ready`).
+    packs: core::cell::Cell<u8>,
+}
+
+impl Lookup {
+    const fn empty() -> Self {
+        Self {
+            state: Resident::NotApp0,
+            entry: empty_view(),
+            file_id: 0,
+            expected_miss: false,
+            authoritative: false,
+            io: false,
+            unconfirmed: false,
+            final_miss: false,
+            dir: 0,
+            packed: false,
+            packs: core::cell::Cell::new(0),
+        }
+    }
+
+    /// `ampr_pack_manifest_is_resident_ready`, entered once per lookup:
+    /// each entry is two SeqCst read-modify-writes on the shared gate line
+    /// (rt/pack/mod.rs `ManifestReader`), and a call asked it up to three
+    /// times. Once the index is published the mount is terminal, so the
+    /// answer holds for the call; a shutdown that starts after it is
+    /// caught by the gate each pack call enters itself.
+    fn packs_ready(&self) -> bool {
+        match self.packs.get() {
+            0 => {
+                let ready = unsafe { ampr_pack_manifest_is_resident_ready() };
+                self.packs.set(if ready { 2 } else { 1 });
+                ready
+            }
+            v => v == 2,
+        }
+    }
+
+    /// Whether a pack lookup of this miss can find anything: not after a
+    /// final view miss, and only with the manifest ready.
+    fn pack_miss(&self) -> bool {
+        !self.final_miss && self.packs_ready()
+    }
 }
 
 /// The walk indexes every regular file of /app0 under a key that folds ASCII
@@ -1977,18 +2081,10 @@ struct Lookup {
 /// its Unicode upcase table while keys fold ASCII only. Those go to the FS.
 /// With `links` (the walk skipped a symlink) no miss is authoritative: the
 /// link and anything under it are absent from the index.
-fn miss_is_authoritative(raw: &[u8], key: &[u8], links: bool) -> bool {
-    let skipped = [
-        INDEX_PATH,
-        INDEX_TEMP_PATH,
-        INDEX_BACKUP_PATH,
-        COMMAND_LOG_PATH,
-        DEBUG_LOG_PATH,
-    ];
-    !links
-        && !raw.iter().any(|&b| b >= 0x80)
-        && !has_unsupported_index_char(raw)
-        && !skipped.iter().any(|p| p.to_bytes() == key)
+/// `plain` is `Key::plain` of the game's path (no byte >= 0x80 and no
+/// tab/LF/CR), taken in the normalize pass.
+fn miss_is_authoritative(plain: bool, key: &[u8], links: bool) -> bool {
+    !links && plain && !is_skipped_key(key)
 }
 
 /// `/app0/kraken` and below (normalized key): the read-only mount of the
@@ -2006,10 +2102,10 @@ fn kraken_key_shape(key: &[u8]) -> bool {
 
 /// A `Miss` lookup that could not read the index: not authoritative, so
 /// the hook asks the real call (`io_miss`).
-fn io_lookup(mut r: Lookup) -> Lookup {
+fn io_lookup(r: &mut Lookup) {
     stats::add(stats::Stat::IndexLookupIo, 1);
     (r.state, r.io, r.authoritative) = (Resident::Miss, true, false);
-    r
+    (r.final_miss, r.packed) = (false, false);
 }
 
 /// The errno a hook returns when the real call answered `err` for a path
@@ -2051,18 +2147,10 @@ unsafe fn lookup_resident_path(path: *const c_char, pbuf: &mut EntryPath) -> Loo
 }
 
 /// `lookup_resident_path`; with `lazy` a file hit has a null `entry.path`
-/// (see `resolve_key_paths`) and a loose one is `unconfirmed`. A directory
-/// hit still reads its spelling.
+/// (see `resolve_key_paths`) and a loose one is `unconfirmed`; a directory
+/// hit leaves its spelling unread too (`dir_path` reads it for an open).
 unsafe fn lookup_resident(path: *const c_char, pbuf: &mut EntryPath, lazy: bool) -> Lookup {
-    let mut r = Lookup {
-        state: Resident::NotApp0,
-        entry: empty_view(),
-        file_id: 0,
-        expected_miss: false,
-        authoritative: false,
-        io: false,
-        unconfirmed: false,
-    };
+    let mut r = Lookup::empty();
     if !unsafe { has_app0_root(path) } {
         return r;
     }
@@ -2073,9 +2161,10 @@ unsafe fn lookup_resident(path: *const c_char, pbuf: &mut EntryPath, lazy: bool)
     // A path that fails to normalize or folds outside /app0 goes to the
     // kernel, which returns the real target or the right errno.
     let mut buf = [0u8; RUNTIME_PATH_CAPACITY];
-    let Ok((len, trailing)) = (unsafe { normalize_key_result(path, &mut buf) }) else {
+    let Ok(k) = (unsafe { normalize_key_full(path, &mut buf) }) else {
         return r;
     };
+    let (len, trailing) = (k.len, k.had_trailing_separator);
     let key = &buf[..len];
     // The kraken mount is not the title's: an index built before the walk
     // skipped it may still list it, so it goes to the filesystem unlooked.
@@ -2096,28 +2185,37 @@ unsafe fn lookup_resident(path: *const c_char, pbuf: &mut EntryPath, lazy: bool)
     match hit {
         Ok(KeyHit::File(e, id)) => {
             (r.state, r.entry, r.file_id) = (Resident::Hit, e, id);
-            r.unconfirmed =
-                r.entry.path.is_null() && c.view().is_some_and(|v| !view_packed(&v, id));
+            r.packed = c.view().is_some_and(|v| view_packed(&v, id));
+            r.unconfirmed = r.entry.path.is_null() && !r.packed;
             return r;
         }
-        Ok(KeyHit::Dir(e)) => {
-            (r.state, r.entry) = (Resident::Directory, e);
+        Ok(KeyHit::Dir(e, d)) => {
+            (r.state, r.entry, r.dir) = (Resident::Directory, e, d);
             return r;
         }
-        Err(IndexIo) => return io_lookup(r),
+        Err(IndexIo) => {
+            io_lookup(&mut r);
+            return r;
+        }
         Ok(KeyHit::Miss) => {}
     }
-    unsafe { miss_lookup(&mut r, path, key, c.links) };
+    miss_lookup(&mut r, k.plain, key, c.links);
+    // A lazy lookup reads no path, so its miss is the view's own answer;
+    // one that confirmed a loose path may have missed on a hash that a
+    // directory of the key shares.
+    r.final_miss = lazy && c.available;
     r
 }
 
-/// Makes `r` the miss of `path` (normalized `key`), authoritative as
-/// `miss_is_authoritative` and `miss_authority` say.
-unsafe fn miss_lookup(r: &mut Lookup, path: *const c_char, key: &[u8], links: bool) {
+/// Makes `r` the miss of normalized `key` (`plain` as `Key::plain` of the
+/// game's path), authoritative as `miss_is_authoritative` and
+/// `miss_authority` say.
+fn miss_lookup(r: &mut Lookup, plain: bool, key: &[u8], links: bool) {
     (r.state, r.entry, r.file_id, r.unconfirmed) = (Resident::Miss, empty_view(), 0, false);
+    (r.final_miss, r.packed) = (false, false);
     r.expected_miss = true;
     r.authoritative = miss_authority(
-        miss_is_authoritative(unsafe { cstr_bytes(path) }, key, links),
+        miss_is_authoritative(plain, key, links),
         rw::app0_writable(),
     );
 }
@@ -2155,7 +2253,7 @@ pub(crate) unsafe fn probe_packed_path(path: *const c_char) -> Option<u8> {
             let reader = super::pack::ManifestReader::enter()?;
             super::pack::file_id_is_packed(&reader, id).then_some(b'p')
         }
-        KeyHit::Dir(_) => Some(b'd'),
+        KeyHit::Dir(..) => Some(b'd'),
         KeyHit::Miss => None,
     }
 }
@@ -2300,6 +2398,24 @@ fn dir_stat(l: &Lookup) -> Stat {
     }
 }
 
+/// The stored spelling of directory hit `l` for an open: `entry.path`,
+/// else (a lazy lookup) read into `pbuf` once and kept in `l`. False when
+/// the read failed or the index is gone; the caller then treats `l` as a
+/// lookup that could not read the index (`io_lookup`).
+fn dir_path_in(c: Option<&Compact>, l: &mut Lookup, pbuf: &mut EntryPath) -> bool {
+    if !l.entry.path.is_null() {
+        return true;
+    }
+    let Some((c, view)) = c.and_then(|c| Some((c, c.view()?))) else {
+        return false;
+    };
+    if view.dir_path(&c.paths, l.dir, pbuf).is_err() {
+        return false;
+    }
+    l.entry.path = pbuf.as_ptr().cast();
+    true
+}
+
 /// `copy_indexed_directory_path`.
 unsafe fn copy_dir_path(l: &Lookup, out: &mut [u8]) -> bool {
     let len = l.entry.path_length as usize;
@@ -2402,23 +2518,9 @@ enum Loose {
     Io,
 }
 
-/// The game's spelling of `key`: `path` normalized as `normalize` does
-/// (separators collapsed, `.` dropped, `..` resolved) with its case kept,
-/// or `path` itself when it is already in that form. None when the result
-/// does not fold to `key`, so the stored path goes first.
-unsafe fn game_spelling(path: *const c_char, key: &[u8], out: &mut [u8]) -> Option<*const c_char> {
-    let lower_eq = |a: &[u8]| {
-        a.len() == key.len()
-            && a.iter()
-                .zip(key)
-                .all(|(&x, &y)| x.to_ascii_lowercase() == y)
-    };
-    let raw = unsafe { cstr_bytes(path) };
-    if lower_eq(raw) {
-        return Some(path);
-    }
-    let n = spell(raw, out)?;
-    lower_eq(&out[..n]).then(|| out.as_ptr().cast())
+/// Whether `raw` is `Key::plain`: no byte >= 0x80, no tab/LF/CR.
+fn key_plain(raw: &[u8]) -> bool {
+    !raw.iter().any(|&b| b >= 0x80) && !has_unsupported_index_char(raw)
 }
 
 /// `raw` normalized into `out` (NUL-terminated) without folding case;
@@ -2505,23 +2607,26 @@ unsafe fn loose_call(
     first: bool,
     call: impl FnMut(*const c_char) -> c_int,
 ) -> Loose {
-    let mut kbuf = [0u8; RUNTIME_PATH_CAPACITY];
+    // The game's spelling, normalized without folding, is the key in the
+    // game's case: the confirm and the skip list fold, so the path is not
+    // normalized a second time for a folded key. The hook's lookup already
+    // normalized it, so `spell` cannot fail on a hit.
     let mut sbuf = [0u8; RUNTIME_PATH_CAPACITY];
-    let c = published();
-    let (Some(c), Some(len)) = (c, unsafe { normalize_key(path, &mut kbuf) }) else {
+    let raw = unsafe { cstr_bytes(path) };
+    let (Some(c), Some(len)) = (published(), spell(raw, &mut sbuf)) else {
         // No index to confirm against: a miss the index cannot answer.
         (l.state, l.unconfirmed, l.authoritative) = (Resident::Miss, false, false);
         return Loose::Miss;
     };
-    let key = &kbuf[..len];
-    let spelling = if first {
-        unsafe { game_spelling(path, key, &mut sbuf) }
-    } else {
-        None
+    let key = &sbuf[..len];
+    let spelling = match first {
+        true if raw == key => Some(path),
+        true => Some(sbuf.as_ptr().cast()),
+        false => None,
     };
     let r = loose_call_in(c.view().as_ref(), &c.paths, l, key, spelling, pbuf, call);
     match r {
-        Loose::Miss => unsafe { miss_lookup(l, path, key, c.links) },
+        Loose::Miss => miss_lookup(l, key_plain(raw), key, c.links),
         Loose::Io => stats::add(stats::Stat::IndexLookupIo, 1),
         Loose::Done(_) => {}
     }
@@ -2589,6 +2694,10 @@ unsafe fn open_resolved(
     let mut handled = false;
     match l.state {
         Resident::Directory => {
+            if !dir_path_in(published(), l, pbuf) {
+                io_lookup(l);
+                return unsafe { open_resolved(l, pbuf, path, flags, mode, real) };
+            }
             stats::add(stats::Stat::OpenDirectory, 1);
             let mut canon = [0u8; RUNTIME_PATH_CAPACITY];
             if !unsafe { copy_dir_path(&l, &mut canon) } {
@@ -2596,7 +2705,7 @@ unsafe fn open_resolved(
                 return -1;
             }
             let canon: *const c_char = canon.as_ptr().cast();
-            if directory_open_flags(flags) && unsafe { ampr_pack_manifest_is_resident_ready() } {
+            if directory_open_flags(flags) && l.packs_ready() {
                 let rc = unsafe { ampr_pack_open_directory(canon, flags, mode, &mut handled) };
                 if handled {
                     return posix_return_from_sce(rc);
@@ -2621,7 +2730,7 @@ unsafe fn open_resolved(
             // an AMPRPAK4 volume), so a packed hit opens a virtual fd; a loose
             // one (unhandled) opens the physical file below.
             stats::add(stats::Stat::OpenHit, 1);
-            if unsafe { ampr_pack_manifest_is_resident_ready() } {
+            if l.packs_ready() {
                 let rc = unsafe {
                     ampr_pack_try_open_indexed(l.file_id, &l.entry, flags, mode, &mut handled)
                 };
@@ -2662,7 +2771,7 @@ unsafe fn open_resolved(
             if is_service_path(path) {
                 return unsafe { real(path, flags, mode) };
             }
-            if directory_open_flags(flags) && unsafe { ampr_pack_manifest_is_resident_ready() } {
+            if directory_open_flags(flags) && l.pack_miss() {
                 let rc =
                     unsafe { ampr_pack_open_virtual_directory(path, flags, mode, &mut handled) };
                 if handled {
@@ -2689,9 +2798,7 @@ unsafe fn open_resolved(
                 },
                 1,
             );
-            if directory_open_flags(flags)
-                && unsafe { has_app0_root(path) && ampr_pack_manifest_is_resident_ready() }
-            {
+            if directory_open_flags(flags) && unsafe { has_app0_root(path) } && l.packs_ready() {
                 let rc = unsafe { ampr_pack_open_directory(path, flags, mode, &mut handled) };
                 if handled {
                     return posix_return_from_sce(rc);
@@ -2816,17 +2923,16 @@ unsafe fn live_loose_hit(l: &Lookup) -> bool {
     l.state == Resident::Hit && !hit_from_index(rw, rw && unsafe { hit_is_packed(l) })
 }
 
-/// A hit the packs serve (`file_id_is_packed`). Before the manifest is
-/// ready, a title with packs counts its hits as packed (no real copy to
-/// ask); a title without packs has only loose files.
+/// A hit the packs serve: with the manifest ready, the view's link the
+/// lookup read (`Lookup::packed`, what `file_id_is_packed` reads from the
+/// same view). Before the manifest is ready, or once shutdown has started,
+/// a title with packs counts its hits as packed (no real copy to ask); a
+/// title without packs has only loose files.
 unsafe fn hit_is_packed(l: &Lookup) -> bool {
-    let Some(reader) = super::pack::ManifestReader::enter() else {
-        return true;
-    };
-    if !unsafe { ampr_pack_manifest_is_resident_ready() } {
+    if !l.packs_ready() {
         return super::pack::packs_present();
     }
-    super::pack::file_id_is_packed(&reader, l.file_id)
+    l.packed
 }
 
 /// `posix_stat_impl`.
@@ -2871,7 +2977,7 @@ unsafe fn stat_resolved(
         Resident::Hit => unsafe { sb.write_unaligned(file_stat(l)) },
         Resident::Miss => {
             let mut pack_io = false;
-            if unsafe { ampr_pack_manifest_is_resident_ready() } {
+            if l.pack_miss() {
                 let mut handled = false;
                 let rc = unsafe { ampr_pack_try_stat_path(path, sb, &mut handled) };
                 if handled {
@@ -2917,7 +3023,7 @@ unsafe fn reachability_resolved(
         Resident::Directory | Resident::Hit => 0,
         Resident::Miss => {
             let mut pack_io = false;
-            if unsafe { ampr_pack_manifest_is_resident_ready() } {
+            if l.pack_miss() {
                 let mut handled = false;
                 let rc = unsafe { ampr_pack_try_reachability(path, &mut handled) };
                 if handled {
@@ -2928,7 +3034,7 @@ unsafe fn reachability_resolved(
             if !l.authoritative || pack_io {
                 let rc = unsafe { with_miss_path(path, |p| real_check_reachability(p)) };
                 if (l.io || pack_io) && rc == SCE_KERNEL_ERROR_ENOENT {
-                    let packs = unsafe { ampr_pack_manifest_is_resident_ready() };
+                    let packs = l.packs_ready();
                     return sce_errno(io_miss_errno(ENOENT, packs));
                 }
                 return rc;
@@ -3016,7 +3122,10 @@ pub unsafe extern "C" fn posix_open_emul(path: *const c_char, flags: c_int, mode
     } else {
         0
     };
-    unsafe { open_impl(path, flags, mode) }
+    let t = stats::now();
+    let fd = unsafe { open_impl(path, flags, mode) };
+    stats::path_span(hook::open, t);
+    fd
 }
 
 // ---- libkernel's internal path entry points (libc fopen, opendir) ----
@@ -3127,6 +3236,15 @@ pub unsafe extern "C" fn underscore_open_emul(
     flags: c_int,
     mode: c_int,
 ) -> c_int {
+    let t = stats::now();
+    let rc = unsafe { underscore_open_body(path, flags, mode) };
+    stats::path_span(hook::_open, t);
+    rc
+}
+
+/// `underscore_open_emul` without its debug span.
+#[inline(always)]
+unsafe fn underscore_open_body(path: *const c_char, flags: c_int, mode: c_int) -> c_int {
     if super::hook::observed_only(hook::_open) {
         let rc = unsafe { real_underscore_open_raw(path, flags, mode) };
         unsafe { observe_note(path, b'O', rc) };
@@ -3154,6 +3272,20 @@ pub unsafe extern "C" fn underscore_openat_emul(
     flags: c_int,
     mode: c_int,
 ) -> c_int {
+    let t = stats::now();
+    let rc = unsafe { underscore_openat_body(dirfd, path, flags, mode) };
+    stats::path_span(hook::_openat, t);
+    rc
+}
+
+/// `underscore_openat_emul` without its debug span.
+#[inline(always)]
+unsafe fn underscore_openat_body(
+    dirfd: c_int,
+    path: *const c_char,
+    flags: c_int,
+    mode: c_int,
+) -> c_int {
     if path.is_null() || (unsafe { *path } != b'/' as c_char && dirfd != AT_FDCWD) {
         stats::libc_hit(hook::_openat, false);
         return unsafe { real_openat(dirfd, path, flags, mode) };
@@ -3170,6 +3302,15 @@ pub unsafe extern "C" fn underscore_openat_emul(
 }
 
 pub unsafe extern "C" fn posix_lstat_emul(path: *const c_char, sb: *mut Stat) -> c_int {
+    let t = stats::now();
+    let rc = unsafe { posix_lstat_body(path, sb) };
+    stats::path_span(hook::lstat, t);
+    rc
+}
+
+/// `posix_lstat_emul` without its debug span.
+#[inline(always)]
+unsafe fn posix_lstat_body(path: *const c_char, sb: *mut Stat) -> c_int {
     stats::libc_hit(hook::lstat, false);
     if super::hook::observed_only(hook::lstat) {
         let rc = unsafe { real_lstat(path, sb.cast()) };
@@ -3187,6 +3328,15 @@ pub unsafe extern "C" fn posix_lstat_emul(path: *const c_char, sb: *mut Stat) ->
 /// authoritative miss takes the stat routing (pack overlay, else ENOENT);
 /// others the original.
 pub unsafe extern "C" fn posix_access_emul(path: *const c_char, mode: c_int) -> c_int {
+    let t = stats::now();
+    let rc = unsafe { posix_access_body(path, mode) };
+    stats::path_span(hook::access, t);
+    rc
+}
+
+/// `posix_access_emul` without its debug span.
+#[inline(always)]
+unsafe fn posix_access_body(path: *const c_char, mode: c_int) -> c_int {
     stats::libc_hit(hook::access, false);
     if super::hook::observed_only(hook::access) {
         let rc = unsafe { real_access(path, mode) };
@@ -3233,7 +3383,7 @@ unsafe fn access_resolved(
         Resident::Miss if !l.authoritative => {
             let mut st = core::mem::MaybeUninit::<Stat>::uninit();
             let mut handled = false;
-            let rc = if unsafe { ampr_pack_manifest_is_resident_ready() } {
+            let rc = if l.pack_miss() {
                 unsafe { ampr_pack_try_stat_path(path, st.as_mut_ptr(), &mut handled) }
             } else {
                 0
@@ -3255,31 +3405,54 @@ unsafe fn access_resolved(
 }
 
 pub unsafe extern "C" fn posix_stat_emul(path: *const c_char, sb: *mut Stat) -> c_int {
-    unsafe { stat_impl(path, sb) }
+    let t = stats::now();
+    let rc = unsafe { stat_impl(path, sb) };
+    stats::path_span(hook::stat, t);
+    rc
 }
+
+/// Hook ids of `sceKernelOpen` and `sceKernelStat` (rt/sys.rs `hook`, the
+/// 78..=83 group), for the debug path spans.
+const HOOK_SCE_OPEN: usize = 78;
+const HOOK_SCE_STAT: usize = 79;
 
 pub unsafe extern "C" fn sceKernelOpen_emul(
     path: *const c_char,
     flags: c_int,
     mode: SceKernelMode,
 ) -> c_int {
-    sce_result(unsafe { open_impl(path, flags, mode) })
+    let t = stats::now();
+    let rc = sce_result(unsafe { open_impl(path, flags, mode) });
+    stats::path_span(HOOK_SCE_OPEN, t);
+    rc
 }
 
 pub unsafe extern "C" fn sceKernelStat_emul(path: *const c_char, sb: *mut Stat) -> c_int {
-    sce_result(unsafe { stat_impl(path, sb) })
+    let t = stats::now();
+    let rc = sce_result(unsafe { stat_impl(path, sb) });
+    stats::path_span(HOOK_SCE_STAT, t);
+    rc
 }
 
 pub unsafe extern "C" fn sceKernelCheckReachability_emul(path: *const c_char) -> c_int {
-    unsafe { reachability_impl(path) }
+    let t = stats::now();
+    let rc = unsafe { reachability_impl(path) };
+    stats::path_span(hook::sceKernelCheckReachability, t);
+    rc
 }
 
 pub unsafe extern "C" fn posix_unlink_emul(path: *const c_char) -> c_int {
-    unsafe { unlink_impl(path) }
+    let t = stats::now();
+    let rc = unsafe { unlink_impl(path) };
+    stats::path_span(hook::unlink, t);
+    rc
 }
 
 pub unsafe extern "C" fn posix_rename_emul(from: *const c_char, to: *const c_char) -> c_int {
-    unsafe { rename_impl(from, to) }
+    let t = stats::now();
+    let rc = unsafe { rename_impl(from, to) };
+    stats::path_span(hook::rename, t);
+    rc
 }
 
 pub unsafe fn ampr_index_ensure_ready_safe() -> bool {
@@ -3643,7 +3816,13 @@ pub(crate) mod tests {
         let miss_with = |raw: &CStr, links: bool| {
             let mut key = [0u8; RUNTIME_PATH_CAPACITY];
             let len = unsafe { normalize_key(raw.as_ptr(), &mut key) }.unwrap();
-            miss_is_authoritative(raw.to_bytes(), &key[..len], links)
+            assert_eq!(key_plain(raw.to_bytes()), {
+                let mut k = [0u8; RUNTIME_PATH_CAPACITY];
+                unsafe { normalize_key_full(raw.as_ptr(), &mut k) }
+                    .unwrap()
+                    .plain
+            });
+            miss_is_authoritative(key_plain(raw.to_bytes()), &key[..len], links)
         };
         let miss = |raw: &CStr| miss_with(raw, false);
         // ASCII case variants fold to the indexed key: the miss holds on exFAT too.
@@ -3789,6 +3968,7 @@ pub(crate) mod tests {
             authoritative: false,
             io: false,
             unconfirmed: false,
+            ..Lookup::empty()
         };
         let st = file_stat(&l);
         assert_eq!(st.st_size, 8_130_000_000);
@@ -3841,8 +4021,9 @@ pub(crate) mod tests {
             authoritative: true,
             io: false,
             unconfirmed: false,
+            ..Lookup::empty()
         };
-        l = io_lookup(l);
+        io_lookup(&mut l);
         assert!(l.state == Resident::Miss && l.io && !l.authoritative);
         assert_eq!(how(&l), b'M');
         assert_eq!(io_miss_errno(ENOENT, true), EIO);
@@ -3852,6 +4033,35 @@ pub(crate) mod tests {
 
     /// Only ENOENT means the index is missing; unreadable loads count only
     /// in a row, saturating.
+    /// An Unreadable load waits 100 ms, then 200, 400, ... up to 2 s
+    /// before the next; any other result, or no clock, retries at once.
+    #[test]
+    fn an_unreadable_index_backs_off() {
+        let ms = 1_000_000u64;
+        assert_eq!(next_retry_at(5 * ms, 0), 0);
+        assert_eq!(next_retry_at(0, 3), 0);
+        assert_eq!(next_retry_at(5 * ms, 1), 105 * ms);
+        assert_eq!(next_retry_at(5 * ms, 2), 205 * ms);
+        assert_eq!(next_retry_at(5 * ms, 5), 1605 * ms);
+        assert_eq!(next_retry_at(5 * ms, 6), 2005 * ms);
+        assert_eq!(next_retry_at(5 * ms, u32::MAX), 2005 * ms);
+        assert!(retry_due(1, 0) && retry_due(0, 9) && retry_due(9, 9));
+        assert!(!retry_due(8, 9));
+    }
+
+    /// The kept fd is refused only while the index holds it.
+    #[test]
+    fn the_kept_index_fd_is_guarded_until_cleared() {
+        let _pool = im::POOL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(!is_kept_index_fd(-1));
+        let mut c = Compact::EMPTY;
+        c.paths = Paths::File(PathSource::new(9_999, 0));
+        KEPT_FD.store(9_999, Relaxed);
+        assert!(is_kept_index_fd(9_999) && !is_kept_index_fd(9_998));
+        unsafe { c.clear() };
+        assert!(!is_kept_index_fd(9_999));
+    }
+
     #[test]
     fn load_results_missing_vs_unreadable() {
         assert!(open_failure_result(ENOENT) == LoadResult::Missing);
@@ -4277,7 +4487,7 @@ pub(crate) mod tests {
                 assert!(bare_id == id && bare.path.is_null() && bare.size == e.size);
                 Old::File(id, e.size, e.mtime, buf[..n].to_vec())
             }
-            KeyHit::Dir(e) => {
+            KeyHit::Dir(e, _) => {
                 assert_eq!(e.path, buf.as_ptr().cast());
                 assert_eq!((e.path_length as usize, e.size), (key.len(), 0));
                 Old::Dir(e.mtime, buf[..key.len()].to_vec())
@@ -4414,6 +4624,7 @@ pub(crate) mod tests {
             authoritative: false,
             io: false,
             unconfirmed: false,
+            ..Lookup::empty()
         };
         let mut pbuf: EntryPath = [0; PATH_BUF];
         let p = hit_path_in(Some(c), &mut l, &mut pbuf);
@@ -4474,26 +4685,36 @@ pub(crate) mod tests {
             authoritative: false,
             io: false,
             unconfirmed: true,
+            ..Lookup::empty()
         }
     }
 
-    /// The game's spelling keeps its case and normalizes as the key does;
-    /// a path already in that form is passed as is.
+    /// The game's spelling keeps its case and normalizes as the key does
+    /// (`loose_call` passes a path already in that form as is), so it folds
+    /// to the key `normalize` makes and the skip list matches it in any case.
     #[test]
     fn the_game_spelling_keeps_case() {
         let mut out = [0u8; RUNTIME_PATH_CAPACITY];
-        let key = b"/app0/data/real.bin";
-        let p = c"/app0/Data/Real.bin".as_ptr();
-        assert_eq!(unsafe { game_spelling(p, key, &mut out) }, Some(p));
-        for raw in [c"/app0//Data/./x/../Real.bin", c"\\app0\\Data\\Real.bin"] {
-            let s = unsafe { game_spelling(raw.as_ptr(), key, &mut out) }.unwrap();
-            assert_eq!(unsafe { cstr_bytes(s) }, b"/app0/Data/Real.bin");
+        for raw in [
+            &b"/app0/Data/Real.bin"[..],
+            b"/app0//Data/./x/../Real.bin",
+            b"\\app0\\Data\\Real.bin",
+        ] {
+            let n = spell(raw, &mut out).unwrap();
+            assert_eq!(&out[..n + 1], b"/app0/Data/Real.bin\0");
+            let mut key = [0u8; RUNTIME_PATH_CAPACITY];
+            let k = ampr_format::index_key::normalize(raw, &mut key).unwrap();
+            assert_eq!(&key[..k.len], out[..n].to_ascii_lowercase().as_slice());
         }
         assert_eq!(spell(b"/..", &mut out), None);
-        assert_eq!(
-            unsafe { game_spelling(c"/app0/Other.bin".as_ptr(), key, &mut out) },
-            None
-        );
+        assert!(is_skipped_key(b"/APP0/Ampr_Emu.Index") && is_skipped_key(b"/app0/ampr_emu.log"));
+        assert!(!is_skipped_key(b"/app0/ampr_emu.indexx"));
+        // Each skipped name is its own normalized key.
+        for p in SKIPPED_KEYS {
+            let mut key = [0u8; RUNTIME_PATH_CAPACITY];
+            let n = unsafe { normalize_key(p.as_ptr(), &mut key) }.unwrap();
+            assert_eq!(&key[..n], p.to_bytes());
+        }
     }
 
     /// A loose hit asks for the game's spelling first and reads its stored
@@ -4553,7 +4774,7 @@ pub(crate) mod tests {
         let mut l = loose_hit(1);
         assert_eq!(run(&mut l, c"/app0/data/real.bin", &mut pbuf), Loose::Miss);
         assert_eq!(calls.get(), 1);
-        unsafe { miss_lookup(&mut l, c"/app0/data/real.bin".as_ptr(), key, false) };
+        miss_lookup(&mut l, true, key, false);
         assert!(l.state == Resident::Miss && l.expected_miss && !l.unconfirmed);
         assert_eq!(l.authoritative, !rw::app0_writable());
 
@@ -4584,6 +4805,107 @@ pub(crate) mod tests {
         src.fail.set(false);
         let r = loose_call_in(view.as_ref(), &src, &mut l, key, None, &mut pbuf, disk);
         assert_eq!((r, calls.get()), (Loose::Done(3), 1));
+        drop_view(&mut idx);
+    }
+
+    /// A lazy lookup's miss is final. Over view fixtures with packed
+    /// and loose files in mixed-case directories, every probe the view
+    /// misses is missed by the pack overlay's own lookups too: the id
+    /// resolve (`ampr_index_resolve_path_to_id`: same key, files only, no
+    /// path read) and the directory listing (`packed_dir_in`: the overlay
+    /// normalize, then `View::lookup_dir`, which finds every directory a
+    /// packed one could be). So the hooks skip both (`Lookup::pack_miss`).
+    #[test]
+    fn a_view_miss_leaves_nothing_for_the_pack_lookups() {
+        let _pool = im::POOL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let files: &[(&[u8], u64)] = &[
+            (b"/app0/eboot.bin", 7),
+            (b"/app0/Data/P.bin", 9),
+            (b"/app0/Data/Sub/Q.pak", 3),
+            (b"/app0/data2/r.bin", 4),
+            (b"/app0/Movies/Intro.MP4", 5),
+            (b"/app0/a/b/c/d/e.txt", 6),
+        ];
+        let mut idx = zstd_builder(files);
+        let b = idx.compact.builder.as_mut().unwrap();
+        for (id, first) in [(2u32, 0u32), (3, 1), (5, 2)] {
+            b.set_chunk(id, first);
+            assert!(b.link_packed(id));
+        }
+        idx.compact.finish();
+        let c = &idx.compact;
+        let view = c.view().unwrap();
+        let mut probes: Vec<Vec<u8>> = Vec::new();
+        for &(p, _) in files {
+            let leaf = p.iter().rposition(|&b| b == b'/').unwrap();
+            let (dir, name) = (&p[..leaf], &p[leaf + 1..]);
+            for v in [
+                p.to_vec(),
+                p.to_ascii_uppercase(),
+                [p, b"x"].concat(),
+                p[..p.len() - 1].to_vec(),
+                [p, b"/"].concat(),
+                [dir, b"/./", name].concat(),
+                [dir, b"/zz/../", name].concat(),
+                [dir, b"//", name].concat(),
+                [dir, b"/zz"].concat(),
+                [dir, b"/zz/"].concat(),
+                [dir, b"x"].concat(),
+                [dir, b"/"].concat(),
+                dir.to_vec(),
+                dir.to_ascii_uppercase(),
+                [dir, b"/..", b"/", name].concat(),
+                p.iter()
+                    .map(|&b| if b == b'/' { b'\\' } else { b })
+                    .collect(),
+            ] {
+                probes.push(v);
+            }
+        }
+        for extra in [
+            &b"/app0"[..],
+            b"/app0/",
+            b"/APP0",
+            b"/app0/.",
+            b"/app0/a/b/c/d",
+            b"/app0/a/b/x",
+        ] {
+            probes.push(extra.to_vec());
+        }
+        let (mut hits, mut misses) = (0, 0);
+        for raw in &probes {
+            let mut buf = [0u8; RUNTIME_PATH_CAPACITY];
+            let Ok(k) = ampr_format::index_key::normalize(raw, &mut buf) else {
+                continue;
+            };
+            let key = &buf[..k.len];
+            if !is_app0_key(key) {
+                continue;
+            }
+            let file_ok = !k.had_trailing_separator && k.len > 5;
+            let mut pbuf: EntryPath = [0; PATH_BUF];
+            match resolve_key_paths(c, key, file_ok, true, Some(&mut pbuf), true) {
+                Ok(KeyHit::Miss) => misses += 1,
+                Ok(_) => {
+                    hits += 1;
+                    continue;
+                }
+                Err(IndexIo) => panic!("no read fails here"),
+            }
+            let name = String::from_utf8_lossy(raw);
+            if file_ok {
+                assert!(
+                    matches!(resolve_key(c, key, true, false, None), Ok(KeyHit::Miss)),
+                    "{name}: the id resolve found a file"
+                );
+            }
+            let mut norm = [0u8; KERNEL_PATH_MAX];
+            if let Some(n) = ampr_format::overlay::normalize_path(raw.iter().copied(), &mut norm) {
+                let found = view.lookup_dir(&c.paths, &norm[..n as usize]).unwrap();
+                assert!(found.is_none(), "{name}: the listing found a directory");
+            }
+        }
+        assert!(hits > 40 && misses > 30, "{hits} hits, {misses} misses");
         drop_view(&mut idx);
     }
 

@@ -10,3 +10,7 @@ path = "src/lib.rs"
 [dependencies]
 # The shared zstd pack convention (`no_std`).
 ampr-zstd.path = "../ampr-zstd"
+# CRC-32 of index payloads (slice-by-16 without std, instead of a byte
+# table). Already in the build through ampr-zstd, so no new crate; pinned
+# and `default-features = false` as there.
+crc32fast = { version = "=1.5.3", default-features = false }

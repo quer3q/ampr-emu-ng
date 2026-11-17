@@ -53,13 +53,26 @@ unsafe fn create_raw(
     arg: *mut c_void,
     name: *const c_char,
 ) -> c_int {
-    match unsafe { kernel_slot::<SceCreateFn>(sys::hook::scePthreadCreate) } {
-        Some(f) => unsafe { f(thread, attr, entry, arg, name) },
-        // Not detoured (before install): the import is the original.
-        None => unsafe {
-            super::reactor::scePthreadCreate(thread.cast(), attr.cast(), entry, arg, name)
-        },
-    }
+    unsafe { original_create()(thread, attr, entry, arg, name) }
+}
+
+/// libkernel's scePthreadCreate: the detour's trampoline, or with an empty
+/// slot the import. The slot is filled before the detour is written and
+/// emptied only after the original bytes are back (rt/hook.rs), so with it
+/// empty the import is the original, not the hook.
+fn original_create() -> SceCreateFn {
+    unsafe { kernel_slot::<SceCreateFn>(sys::hook::scePthreadCreate) }.unwrap_or(create_import)
+}
+
+/// The scePthreadCreate import as a `SceCreateFn`.
+unsafe extern "C" fn create_import(
+    thread: *mut *mut c_void,
+    attr: *const c_void,
+    entry: ThreadEntry,
+    arg: *mut c_void,
+    name: *const c_char,
+) -> c_int {
+    unsafe { super::reactor::scePthreadCreate(thread.cast(), attr.cast(), entry, arg, name) }
 }
 
 type AttrFn = unsafe extern "C" fn(*mut *mut c_void) -> c_int;
@@ -108,7 +121,7 @@ pub(crate) unsafe fn create_internal_stack(
             n => n,
         };
         if let Some(put) = unsafe { ATTR_SET_STACK.get::<SetStackFn>() } {
-            slot = unsafe { super::thread_stack::take(size) };
+            slot = unsafe { super::thread_stack::take(size, thread) };
             if let Some(s) = &slot {
                 set = unsafe { put(&mut attr, s.addr, s.size) } == 0;
             }
@@ -224,9 +237,9 @@ pub(crate) unsafe extern "C" fn scePthreadCreate_emul(
     arg: *mut c_void,
     name: *const c_char,
 ) -> c_int {
-    let Some(f) = (unsafe { kernel_slot::<SceCreateFn>(sys::hook::scePthreadCreate) }) else {
-        return SCE_KERNEL_ERROR_EAGAIN;
-    };
+    // An empty slot (the uninstall window) takes the import, as the
+    // runtime's own creations do, instead of failing the game's creation.
+    let f = original_create();
     let rc = unsafe { f(thread, attr, entry, arg, name) };
     note(b's', rc.into(), b"scePthreadCreate", name);
     // Until it succeeds or the runtime has nothing left to give: games do not
@@ -487,69 +500,22 @@ pub(crate) unsafe fn create_counted(
     rc
 }
 
-// ---- load-based retirement ----
+// ---- pressure-mode retirement ----
 //
-// Each group (pack workers, read pool) keeps its last
-// LOAD_SAMPLES busy-thread counts, taken at every job start and finish under
-// the group's lock. A thread that finishes its work with none left to take
-// leaves while the group has more live threads than `load_target` + 1
-// (`load_target`: the window's peak busy count, at least 1) for
-// RETIRE_STREAK finishes in a row; a finish with work queued resets the
-// streak and never retires, so a burst does not shed threads it then
-// recreates. No idle timer:
-// peak busy was 4 decode workers (~0.2 cores of work) and 4-5 disk threads
-// with 9-11 runtime threads live on two titles (debug /metrics), and a game
-// creation failed with 6 decoders alive. Normal-mode retirement is off by
-// default (tune::retire_load): a started thread stays; the debug knob
-// `retire_load=1` turns it back on. In pressure
-// mode (a game creation failed with EAGAIN in the last tune::regrow_ns, 5 s)
-// idle threads leave at once and each group keeps at most one: while it has
-// work, or the one it started after the yield (`LoadGroup::held`), so a
-// read stream does not create and retire a thread per read. The decode
-// workers never go below one (`LoadGroup::floor`).
+// A runtime thread, once started, stays: peak busy was 4 decode workers
+// (~0.2 cores of work) and 4-5 disk threads with 9-11 runtime threads live
+// on two titles (debug /metrics). Retiring by load churned: decode workers
+// retired and restarted 164 times in 120 s, 509 in 159 s and 217 in 147 s
+// on three runs (debug /metrics), and it was off by default before it was
+// removed. Threads leave only in pressure mode (a game creation failed with
+// EAGAIN in the last tune::regrow_ns, 5 s): idle threads leave at once and
+// each group keeps at most one, while it has work or the one it started
+// after the yield (`LoadGroup::held`), so a read stream does not create and
+// retire a thread per read. The decode workers never go below one
+// (`LoadGroup::floor`).
 
-/// Busy-count samples kept per group: 8192, about 2.7 s at the ~1500 pack
-/// jobs/s (two samples each) one title ran. The target was once the median
-/// of the window: reads are idle most of the time, so it stayed at 1 or 2
-/// whatever a burst needed, and over 64 samples (~20 ms) it flipped between
-/// 0 and 1 and decode workers retired and restarted 1.4 times a second
-/// (164 in 120 s, debug /metrics). A running histogram keeps the peak
-/// O(LOAD_BUCKETS) at any window.
-const LOAD_SAMPLES: usize = 8192;
-/// Finishes in a row above the target before a thread retires (normal mode).
-const RETIRE_STREAK: u32 = 8;
-/// Samples are clamped below this (every group cap is lower).
-const LOAD_BUCKETS: usize = 16;
 /// Last game creation failure (settled), ns; 0: none, normal mode.
 static PRESSURE_NS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-
-/// Highest busy count in `samples`, clamped to LOAD_BUCKETS - 1; 0 when
-/// empty. The runtime keeps a running histogram instead (LoadGroup), tests
-/// use this.
-#[cfg(test)]
-pub(crate) fn load_peak(samples: &[u8]) -> u32 {
-    let mut count = [0u32; LOAD_BUCKETS];
-    for &s in samples {
-        count[(s as usize).min(LOAD_BUCKETS - 1)] += 1;
-    }
-    peak_of(&count)
-}
-
-/// The highest non-empty bucket of a histogram over LOAD_BUCKETS; 0 when
-/// all are empty.
-fn peak_of(count: &[u32; LOAD_BUCKETS]) -> u32 {
-    count.iter().rposition(|&c| c != 0).unwrap_or(0) as u32
-}
-
-/// Threads a group may keep: normal, the window's `peak` busy count in
-/// [1, cap]; pressure, 1 while `hold` (work, or a thread restarted under
-/// pressure, `LoadGroup::started`), else 0.
-pub(crate) fn load_target(peak: u32, cap: u32, pressure: bool, hold: bool) -> u32 {
-    if pressure {
-        return (hold as u32).min(cap);
-    }
-    peak.clamp(1, cap.max(1))
-}
 
 /// Exits a yield asks of a group with `live` threads: up to `want`, leaving
 /// `keep` and not asking twice for the `pending` exits already asked.
@@ -603,22 +569,13 @@ pub(crate) fn pressure() -> bool {
     false
 }
 
-/// Load samples and debug counters of one thread group; every method runs
+/// Debug counters and pressure state of one thread group; every method runs
 /// under the group's lock, so Relaxed atomics are enough.
 pub(crate) struct LoadGroup {
-    ring: [core::sync::atomic::AtomicU8; LOAD_SAMPLES],
-    /// Samples per busy count over the ring's current contents.
-    hist: [core::sync::atomic::AtomicU32; LOAD_BUCKETS],
-    taken: core::sync::atomic::AtomicU32,
-    busy: core::sync::atomic::AtomicU32,
     peak: core::sync::atomic::AtomicU32,
+    /// Threads the group may keep at the last retirement check.
     target: core::sync::atomic::AtomicU32,
-    /// Peak busy count over the window at the last retirement check.
-    busy_peak: core::sync::atomic::AtomicU32,
-    retired_load: core::sync::atomic::AtomicU32,
     retired_pressure: core::sync::atomic::AtomicU32,
-    /// Finishes in a row with the group above its target (normal mode).
-    over: core::sync::atomic::AtomicU32,
     /// Threads the group never retires below: 1 for the decode workers, whose
     /// queued jobs have no other thread to run on; 0 for the read groups,
     /// whose reads go to kernel AIO or run inline at none.
@@ -630,51 +587,17 @@ pub(crate) struct LoadGroup {
 }
 
 impl LoadGroup {
-    /// A group that keeps at least `floor` threads.
+    /// A group that keeps at least `floor` threads. All zero but `floor`,
+    /// so a group static stays in .bss.
     pub(crate) const fn new(floor: u32) -> Self {
-        use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU8};
+        use core::sync::atomic::{AtomicBool, AtomicU32};
         Self {
-            ring: [const { AtomicU8::new(0) }; LOAD_SAMPLES],
-            hist: [const { AtomicU32::new(0) }; LOAD_BUCKETS],
-            taken: AtomicU32::new(0),
-            busy: AtomicU32::new(0),
             peak: AtomicU32::new(0),
-            target: AtomicU32::new(1),
-            busy_peak: AtomicU32::new(0),
-            retired_load: AtomicU32::new(0),
+            target: AtomicU32::new(0),
             retired_pressure: AtomicU32::new(0),
-            over: AtomicU32::new(0),
             floor,
             held: AtomicBool::new(false),
         }
-    }
-    fn sample(&self, busy: u32) {
-        use core::sync::atomic::Ordering::Relaxed;
-        let taken = self.taken.load(Relaxed);
-        // Wraps after 2^32 samples; keep it at or above LOAD_SAMPLES so a full
-        // ring stays full.
-        let next = taken.checked_add(1).unwrap_or(LOAD_SAMPLES as u32);
-        self.taken.store(next, Relaxed);
-        let i = taken as usize % LOAD_SAMPLES;
-        if taken as usize >= LOAD_SAMPLES {
-            let old = self.ring[i].load(Relaxed) as usize;
-            self.hist[old].fetch_sub(1, Relaxed);
-        }
-        let v = busy.min(LOAD_BUCKETS as u32 - 1) as u8;
-        self.ring[i].store(v, Relaxed);
-        self.hist[v as usize].fetch_add(1, Relaxed);
-    }
-    /// A thread took work.
-    pub(crate) fn begin(&self) {
-        let busy = self.busy.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
-        self.sample(busy);
-    }
-    /// A thread finished its work.
-    pub(crate) fn end(&self) {
-        use core::sync::atomic::Ordering::Relaxed;
-        let busy = self.busy.load(Relaxed).saturating_sub(1);
-        self.busy.store(busy, Relaxed);
-        self.sample(busy);
     }
     /// A thread started; `live` counts it.
     pub(crate) fn started(&self, live: u32) {
@@ -699,82 +622,40 @@ impl LoadGroup {
     pub(crate) fn may_grow(&self, live: u32) -> bool {
         live == 0 || !pressure()
     }
-    /// A thread that finished its work leaves now: `live` (it included) is
-    /// above the target. `has_work`: work it could take next. Counts it.
+    /// A thread that finished its work leaves now: pressure mode, and
+    /// `live` (it included) is above the target. `has_work`: work it could
+    /// take next. Counts it.
     pub(crate) fn retire_due(&self, live: u32, cap: u32, has_work: bool) -> bool {
-        let retire = super::tune::retire_load();
-        self.retire_due_with(live, cap, has_work, pressure(), retire)
+        self.retire_due_with(live, cap, has_work, pressure())
     }
-    /// `retire_due` with the mode passed in; `retire`: normal-mode
-    /// retirement on (tune::retire_load).
-    fn retire_due_with(
-        &self,
-        live: u32,
-        cap: u32,
-        has_work: bool,
-        pressure: bool,
-        retire: bool,
-    ) -> bool {
+    /// `retire_due` with the mode passed in.
+    fn retire_due_with(&self, live: u32, cap: u32, has_work: bool, pressure: bool) -> bool {
         use core::sync::atomic::Ordering::Relaxed;
-        let mut count = [0u32; LOAD_BUCKETS];
-        for (c, h) in count.iter_mut().zip(&self.hist) {
-            *c = h.load(Relaxed);
-        }
-        let busy_peak = peak_of(&count);
         if !pressure {
             self.held.store(false, Relaxed);
+            return false;
         }
+        // One thread while there is work or a restarted one is held, else 0.
         let hold = has_work || self.held.load(Relaxed);
-        let target = load_target(busy_peak, cap, pressure, hold);
-        self.busy_peak.store(busy_peak, Relaxed);
+        let target = (hold as u32).min(cap);
         self.target.store(target, Relaxed);
-        // Normal mode never retires a thread with work queued: `has_work`
-        // was once used only under pressure, so a burst shorter than the
-        // window shed a thread every RETIRE_STREAK finishes and the queue
-        // created it again (read from code, not seen on a console).
-        if !pressure && (has_work || !retire) {
-            self.over.store(0, Relaxed);
+        if live <= target.max(self.floor) {
             return false;
         }
-        // Normal mode keeps one thread above the target: retiring at the
-        // target made a burst start a thread and retire it right after,
-        // 509 decode worker retirements in 159 s on a console (debug
-        // /metrics, decode_retired_load). Pressure mode retires to the target.
-        let keep = (if pressure { target } else { target + 1 }).max(self.floor);
-        if live <= keep {
-            self.over.store(0, Relaxed);
-            return false;
-        }
-        // Normal mode also waits for RETIRE_STREAK finishes in a row above
-        // it: a title whose busy median flipped between 0 and 1 still retired
-        // and restarted 1.5 decode workers per second with the margin alone
-        // (217 in 147 s, debug /metrics).
-        if !pressure {
-            let over = self.over.load(Relaxed) + 1;
-            if over < RETIRE_STREAK {
-                self.over.store(over, Relaxed);
-                return false;
-            }
-            self.over.store(0, Relaxed);
-        }
-        let counter = if pressure { &self.retired_pressure } else { &self.retired_load };
-        counter.fetch_add(1, Relaxed);
+        self.retired_pressure.fetch_add(1, Relaxed);
         true
     }
     /// `n` threads left on a failed game creation's request.
     pub(crate) fn yielded(&self, n: u32) {
         self.retired_pressure.fetch_add(n, core::sync::atomic::Ordering::Relaxed);
     }
-    /// Debug /metrics: (peak live, target, peak busy over the window,
-    /// retired by load, retired under pressure).
+    /// Debug /metrics: (peak live, target, retired under pressure).
     #[cfg_attr(not(feature = "mem_report"), allow(dead_code))]
-    pub(crate) fn metrics(&self) -> [u64; 5] {
+    pub(crate) fn metrics(&self) -> [u64; 3] {
         use core::sync::atomic::Ordering::Relaxed;
         [
             self.peak.load(Relaxed).into(),
             self.target.load(Relaxed).into(),
-            self.busy_peak.load(Relaxed).into(),
-            self.retired_load.load(Relaxed).into(),
             self.retired_pressure.load(Relaxed).into(),
         ]
     }
@@ -952,35 +833,6 @@ mod tests {
         }
     }
 
-    /// The peak: empty, unsorted input, a single high sample among idle
-    /// ones (a burst the median never saw), clamping.
-    #[test]
-    fn load_peak_of_window() {
-        assert_eq!(load_peak(&[]), 0);
-        assert_eq!(load_peak(&[0, 0, 0]), 0);
-        assert_eq!(load_peak(&[3]), 3);
-        assert_eq!(load_peak(&[4, 1, 3]), 4);
-        let mut idle = [0u8; 100];
-        idle[57] = 5;
-        assert_eq!(load_peak(&idle), 5);
-        assert_eq!(load_peak(&[200, 200]), 15); // clamped to 15
-    }
-
-    /// Normal mode: the window's peak busy count, clamped to [1, cap], so
-    /// never 0. Pressure: 1 with work, 0 without.
-    #[test]
-    fn load_target_math() {
-        assert_eq!(load_target(0, 4, false, false), 1); // floor 1
-        assert_eq!(load_target(0, 0, false, true), 1); // cap 0 still keeps 1
-        assert_eq!(load_target(1, 4, false, false), 1);
-        assert_eq!(load_target(3, 4, false, false), 3);
-        assert_eq!(load_target(4, 6, false, true), 4);
-        assert_eq!(load_target(7, 4, false, true), 4); // clamped
-        assert_eq!(load_target(8, 6, true, true), 1); // pressure: one
-        assert_eq!(load_target(8, 6, true, false), 0); // pressure: none
-        assert_eq!(load_target(0, 0, true, true), 0);
-    }
-
     /// A yield leaves `keep` and does not ask twice; the decode workers
     /// pass keep 1, so they never give their last.
     #[test]
@@ -993,91 +845,24 @@ mod tests {
         assert_eq!(exits_to_ask(1, 4, 0, 0), 1);
     }
 
-    /// The histogram follows the ring: a full window of 4s replaced by a
-    /// full window of 1s gives peak 1 only once the last 4 has left it.
+    /// Normal mode never retires; pressure: one thread stays while there
+    /// is work, none without, those retirements are counted, and the target
+    /// never passes the cap.
     #[test]
-    fn load_window_evicts_old_samples() {
-        use core::sync::atomic::Ordering::Relaxed;
+    fn load_group_retires_under_pressure_only() {
         let g = LoadGroup::new(0);
-        let peak = |g: &LoadGroup| {
-            let mut count = [0u32; LOAD_BUCKETS];
-            for (c, h) in count.iter_mut().zip(&g.hist) {
-                *c = h.load(Relaxed);
-            }
-            peak_of(&count)
-        };
-        for _ in 0..LOAD_SAMPLES {
-            g.sample(4);
+        for live in 0..8 {
+            assert!(!g.retire_due_with(live, 4, false, false));
+            assert!(!g.retire_due_with(live, 4, true, false));
         }
-        assert_eq!(peak(&g), 4);
-        for _ in 0..LOAD_SAMPLES - 1 {
-            g.sample(1);
-        }
-        assert_eq!(peak(&g), 4); // one 4 left
-        g.sample(1);
-        assert_eq!(peak(&g), 1);
-        assert_eq!(g.hist.iter().map(|h| h.load(Relaxed)).sum::<u32>(), LOAD_SAMPLES as u32);
-    }
-
-    /// Retirement: normal mode keeps one thread above the target (target
-    /// 2: 3 stay, a 4th leaves after RETIRE_STREAK finishes in a row), never
-    /// with work queued, never with `retire_load` off, and counts by load.
-    #[test]
-    fn load_group_retires_above_target() {
-        let g = LoadGroup::new(0);
-        let due = |live, cap, work| g.retire_due_with(live, cap, work, false, true);
-        assert!(!due(1, 4, false)); // no samples: target 1, floor
-        assert!(!due(2, 4, false)); // target + 1 stays
-        // Above target + 1: leaves on the RETIRE_STREAK-th finish in a row.
-        for _ in 1..RETIRE_STREAK {
-            assert!(!due(3, 4, false));
-        }
-        assert!(due(3, 4, false));
-        // A finish at or below target + 1 restarts the streak.
-        for _ in 1..RETIRE_STREAK {
-            assert!(!due(3, 4, false));
-        }
-        assert!(!due(2, 4, false));
-        assert!(!due(3, 4, false));
-        // So does a finish with work queued, which never retires.
-        for _ in 0..4 * RETIRE_STREAK {
-            assert!(!due(3, 4, true));
-        }
-        for _ in 1..RETIRE_STREAK {
-            assert!(!due(3, 4, false));
-        }
-        assert!(due(3, 4, false));
-        for _ in 0..2 {
-            g.begin();
-        }
-        for _ in 0..40 {
-            g.end();
-            g.begin();
-        }
-        // Samples alternate 2 and 1 busy: peak 2, target 2, 3 stay.
-        assert!(!due(2, 4, false)); // no retirement below target
-        for _ in 0..4 * RETIRE_STREAK {
-            assert!(!due(3, 6, false)); // target + 1 stays
-            assert!(!due(5, 6, true)); // work queued
-        }
-        // retire_load off: no normal-mode retirement, and the streak restarts.
-        let off = |live| g.retire_due_with(live, 6, false, false, false);
-        for _ in 0..4 * RETIRE_STREAK {
-            assert!(!off(6));
-        }
-        for _ in 1..RETIRE_STREAK {
-            assert!(!due(5, 6, false));
-        }
-        assert!(due(5, 6, false));
-        assert_eq!(g.metrics()[1..4], [2, 2, 3]); // target, peak busy, by load
-        // Pressure: one thread stays while there is work, none without,
-        // those retirements count apart, and the knob does not apply.
-        let hot = |live, work| g.retire_due_with(live, 4, work, true, false);
+        let hot = |live, work| g.retire_due_with(live, 4, work, true);
         assert!(hot(2, true));
         assert!(!hot(1, true));
         assert!(hot(1, false));
         assert!(!hot(0, false));
-        assert_eq!(g.metrics()[4], 2);
+        assert_eq!(g.metrics()[2], 2);
+        assert!(g.retire_due_with(1, 0, true, true)); // cap 0: target 0
+        assert_eq!(g.metrics()[1], 0);
         g.started_with(3, false);
         g.started_with(2, false);
         assert_eq!(g.metrics()[0], 3);
@@ -1090,7 +875,7 @@ mod tests {
     #[test]
     fn pressure_keeps_restarted_thread() {
         let g = LoadGroup::new(0);
-        let hot = |live, work| g.retire_due_with(live, 4, work, true, true);
+        let hot = |live, work| g.retire_due_with(live, 4, work, true);
         assert!(hot(1, false)); // started before the pressure: leaves
         g.started_with(1, true); // restarted under pressure
         assert!(!hot(1, false)); // kept with no work
@@ -1099,11 +884,11 @@ mod tests {
         g.asked(); // a later failed creation asks again
         assert!(hot(1, false));
         g.started_with(1, true);
-        assert!(!g.retire_due_with(1, 4, false, false, true)); // normal: floor 1
+        assert!(!g.retire_due_with(1, 4, false, false)); // normal mode: stays
         assert!(hot(1, false)); // normal mode dropped it
         let decode = LoadGroup::new(1);
-        assert!(!decode.retire_due_with(1, 4, false, true, true)); // floor 1
-        assert!(decode.retire_due_with(2, 4, false, true, true));
-        assert!(!decode.retire_due_with(1, 4, false, false, true));
+        assert!(!decode.retire_due_with(1, 4, false, true)); // floor 1
+        assert!(decode.retire_due_with(2, 4, false, true));
+        assert!(!decode.retire_due_with(1, 4, false, false));
     }
 }

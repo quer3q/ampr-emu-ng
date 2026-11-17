@@ -66,9 +66,8 @@ pub struct CacheStats {
     pub pins: usize,
     pub evictable: usize,
     pub probationary: usize,
-    pub protected_entries: usize,
 }
-const _: () = assert!(core::mem::size_of::<CacheStats>() == 64);
+const _: () = assert!(core::mem::size_of::<CacheStats>() == 56);
 const _: () = assert!(core::mem::offset_of!(CacheStats, evictable) == 40);
 
 use super::pack::{ampr_pack_notify_fd_budget_progress, ampr_pack_try_open_indexed};
@@ -411,7 +410,6 @@ impl State {
             pins: self.phys_open_pins,
             evictable: self.phys_evictable,
             probationary: self.lru_len,
-            protected_entries: 0,
         }
     }
 }
@@ -825,7 +823,6 @@ unsafe fn open_indexed_or_real(
 /// path (`open_indexed_or_real`). Errors are negative POSIX errno (-EAGAIN
 /// when the caller should retry after a pin is released).
 pub unsafe fn ampr_index_acquire_cached_fd(
-    _job_id: u64,
     id: u32,
     mut entry: impl FnMut(&mut FileEntryView, Option<&mut EntryPath>) -> c_int,
     flags: c_int,

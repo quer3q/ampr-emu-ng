@@ -1,8 +1,8 @@
-//! Inline detours into libkernel, the external equeue producers, the save
-//! data entries of a loaded libSceSaveData (rt/save.rs) and the two module
-//! loaders; the original/fallback slot tables; and the memory-protection
-//! `_emul` hooks that promote AMPR-write mappings to CPU_RW. APR equeue is
-//! always local (rt/equeue.rs).
+//! Inline detours into libkernel, the save data entries of a loaded
+//! libSceSaveData (rt/save.rs) and the two module loaders; the
+//! original/fallback slot tables; and the memory-protection `_emul` hooks
+//! that promote AMPR-write mappings to CPU_RW. The equeue hooks (ids
+//! 50..=54) are in rt/equeue.rs.
 #![allow(non_snake_case, non_upper_case_globals)]
 
 use core::ffi::{c_char, c_int, c_void};
@@ -21,11 +21,14 @@ const MAX_STOLEN: usize = 64;
 const PAGE: usize = sys::SCE_KERNEL_PAGE_SIZE;
 const TRAMP_SIZE: usize = 512;
 const SLOTS_PER_PAGE: usize = PAGE / TRAMP_SIZE;
-const POOL_COPY_PAGES: usize = 64;
+/// Scratch for `sceKernelMemoryPoolBatch` copies: 4 pages hold 2048 entries
+/// of 32 B (upstream's 64 pages, 1 MiB, held 32768; no batch size was ever
+/// measured). A larger batch is passed through on the caller's array, its
+/// prot bits not adjusted.
+const POOL_COPY_PAGES: usize = 4;
 const POOL_COPY_CAP: usize = POOL_COPY_PAGES * PAGE;
 const LIBKERNEL: SceKernelModule = 0x2001;
 const HOOK_COUNT: usize = id::COUNT;
-const EXT_COUNT: usize = 5;
 /// Save data hooks in loaded system modules (rt/save.rs), not libkernel ids.
 #[cfg(not(feature = "mem_report"))]
 const SAVE_COUNT: usize = 4;
@@ -34,22 +37,27 @@ const SAVE_COUNT: usize = 4;
 const SAVE_COUNT: usize = 4 + super::save::probe::COUNT;
 /// `sceKernelLoadStartModule` and `sceKernelLoadStartModuleForSysmodule`.
 const LOADER_COUNT: usize = 2;
+/// Ids that never install: the removed equeue queue classification hooks.
+/// They keep their numbers, as 98 and 99 do.
+const UNUSED_EQUEUE_IDS: core::ops::RangeInclusive<usize> = 55..=63;
 const TRAMP_PAGES: usize =
-    (HOOK_COUNT + EXT_COUNT + SAVE_COUNT + LOADER_COUNT + SLOTS_PER_PAGE - 1) / SLOTS_PER_PAGE;
+    (HOOK_COUNT + SAVE_COUNT + LOADER_COUNT + SLOTS_PER_PAGE - 1) / SLOTS_PER_PAGE;
 const PROT_ALL: c_int = sys::SCE_KERNEL_PROT_CPU_ALL;
 const PROT_RX: c_int = sys::SCE_KERNEL_PROT_CPU_READ | sys::SCE_KERNEL_PROT_CPU_EXEC;
 
 const _: () = {
     assert!(PAGE % TRAMP_SIZE == 0 && SLOTS_PER_PAGE <= 32);
+    assert!(JUMP_SIZE < MAX_STOLEN);
     assert!(POOL_COPY_PAGES <= 64 && TRAMP_PAGES == 4 + cfg!(feature = "mem_report") as usize);
     // 10 game AIO slots 100..=109 and 2 thread-creation slots 110..=111 in
     // both builds, and in debug builds the 8 probe slots 112..=119
-    // (rt/probe.rs). With the 5 external equeue hooks, the 4 save data hooks
-    // (rt/save.rs; debug adds 13 save call probes) and the 2 loader hooks that
-    // is 123 (release) or 144 (debug)
-    // trampolines: 4 pages x 32 slots = 128 in release, 5 pages = 160 in debug.
+    // (rt/probe.rs). With the 4 save data hooks (rt/save.rs; debug adds 13
+    // save call probes) and the 2 loader hooks that is 118 (release) or 139
+    // (debug) trampolines: 4 pages x 32 slots = 128 in release, 5 pages =
+    // 160 in debug. Ids 55..=63 never install, nor 96..=99 in release and
+    // 98 and 99 in debug, so at most 105 (release) or 128 (debug) are used.
     assert!(HOOK_COUNT == 112 + 8 * cfg!(feature = "mem_report") as usize);
-    assert!(HOOK_COUNT + EXT_COUNT + SAVE_COUNT + LOADER_COUNT <= TRAMP_PAGES * SLOTS_PER_PAGE);
+    assert!(HOOK_COUNT + SAVE_COUNT + LOADER_COUNT <= TRAMP_PAGES * SLOTS_PER_PAGE);
 };
 
 // ---- detour state (guarded by HOOK_LOCK) -------------------------------------
@@ -74,13 +82,11 @@ const DETOUR0: Detour = Detour {
 
 struct State {
     hooks: [Detour; HOOK_COUNT],
-    ext: [Detour; EXT_COUNT],
     save: [Detour; SAVE_COUNT],
     loader: Detour,
     /// `sceKernelLoadStartModuleForSysmodule`, the loader path for native
     /// system libraries such as libSceSaveData.
     loader_sys: Detour,
-    ext_coverage_safe: bool,
     tramp: Tramps,
 }
 
@@ -92,11 +98,9 @@ struct Tramps {
 
 static STATE: SyncCell<State> = SyncCell::new(State {
     hooks: [DETOUR0; HOOK_COUNT],
-    ext: [DETOUR0; EXT_COUNT],
     save: [DETOUR0; SAVE_COUNT],
     loader: DETOUR0,
     loader_sys: DETOUR0,
-    ext_coverage_safe: false,
     tramp: Tramps {
         used: [0; TRAMP_PAGES],
         prot: [0; TRAMP_PAGES],
@@ -106,6 +110,10 @@ static HOOK_LOCK: SpinLock = SpinLock::new();
 static INSTALLED: AtomicU32 = AtomicU32::new(0);
 static ORIGINAL_LOAD_START_MODULE: AtomicPtr<c_void> = AtomicPtr::new(null_mut());
 static ORIGINAL_LOAD_FOR_SYSMODULE: AtomicPtr<c_void> = AtomicPtr::new(null_mut());
+/// `install_save_listed`'s module list, guarded by `HOOK_LOCK`: a static
+/// so its 1 KiB is not on the game thread that loads a module (it was on
+/// the loader hook's stack chain).
+static MODULES: SyncCell<[SceKernelModule; 256]> = SyncCell::new([0; 256]);
 
 #[repr(C, align(16384))]
 struct Pages<const N: usize>([[u8; PAGE]; N]);
@@ -120,21 +128,15 @@ static POOL_COPY_USED: AtomicU64 = AtomicU64::new(0);
 // `_emul` targets defined in other rt modules; taken by address only.
 // Detour targets retain the C ABI; take their Rust definitions by address.
 use super::equeue::{
-    apr_equeue_overlay_set_hook_availability, apr_equeue_overlay_shutdown,
-    sceAgcDriverAddEqEvent_emul, sceKernelAddAmprEvent_emul, sceKernelAddAmprSystemEvent_emul,
-    sceKernelAddFileEvent_emul, sceKernelAddHRTimerEvent_emul, sceKernelAddReadEvent_emul,
-    sceKernelAddTimerEvent_emul, sceKernelAddUserEventEdge_emul, sceKernelAddUserEvent_emul,
-    sceKernelAddWriteEvent_emul, sceKernelCreateEqueue_emul, sceKernelDeleteAmprEvent_emul,
-    sceKernelDeleteAmprSystemEvent_emul, sceKernelDeleteEqueue_emul, sceKernelWaitEqueue_emul,
-    sceVideoOutAddFlipEvent_emul, sceVideoOutAddOutputModeEvent_emul,
-    sceVideoOutAddPreVblankStartEvent_emul, sceVideoOutAddVblankEvent_emul,
+    apr_equeue_overlay_set_hook_availability, apr_equeue_overlay_shutdown, slot as eq_slot,
+    sceKernelAddAmprEvent_emul, sceKernelCreateEqueue_emul, sceKernelDeleteAmprEvent_emul,
+    sceKernelDeleteEqueue_emul, sceKernelWaitEqueue_emul,
 };
 use super::index::{
     posix_access_emul, posix_lstat_emul, posix_open_emul, posix_rename_emul, posix_stat_emul,
     posix_unlink_emul, sceKernelCheckReachability_emul, sceKernelOpen_emul, sceKernelStat_emul,
     underscore_open_emul, underscore_openat_emul,
 };
-use super::pack::mmap::{mmap_emul, sceKernelMmap_emul};
 use super::pack::pack_libc::{
     posix_fcntl_emul, sceKernelFcntl_emul, underscore_close_emul, underscore_fcntl_emul,
     underscore_fstat_emul, underscore_getdirentries_emul, underscore_read_emul,
@@ -189,8 +191,8 @@ const M: bool = true;
 const O: bool = false;
 use super::amm as a;
 
-/// The replacement of an unused id (98, 99): `hook_enabled` never installs
-/// one, so it is never called.
+/// The replacement of an unused id (55..=63, 98, 99): `hook_enabled` never
+/// installs one, so it is never called.
 unsafe extern "C" fn unused_slot() {}
 
 /// `HOOKS` from one entry list, plus its symbols and mandatory flags alone
@@ -262,15 +264,19 @@ hook_table! {
     c"sceKernelDeleteEqueue" => sceKernelDeleteEqueue_emul, O;
     c"sceKernelAddAmprEvent" => sceKernelAddAmprEvent_emul, O;
     c"sceKernelDeleteAmprEvent" => sceKernelDeleteAmprEvent_emul, O;
-    c"sceKernelAddTimerEvent" => sceKernelAddTimerEvent_emul, O;
-    c"sceKernelAddReadEvent" => sceKernelAddReadEvent_emul, O;
-    c"sceKernelAddWriteEvent" => sceKernelAddWriteEvent_emul, O;
-    c"sceKernelAddFileEvent" => sceKernelAddFileEvent_emul, O;
-    c"sceKernelAddUserEvent" => sceKernelAddUserEvent_emul, O;
-    c"sceKernelAddUserEventEdge" => sceKernelAddUserEventEdge_emul, O;
-    c"sceKernelAddHRTimerEvent" => sceKernelAddHRTimerEvent_emul, O;
-    c"sceKernelAddAmprSystemEvent" => sceKernelAddAmprSystemEvent_emul, O;
-    c"sceKernelDeleteAmprSystemEvent" => sceKernelDeleteAmprSystemEvent_emul, O;
+    // Ids 55..=63: unused, never installed (`hook_enabled`). They held the
+    // equeue queue classification (non-AMPR adds and AMPR system events),
+    // which fed only debug flags; the later ids keep their numbers. Id 60's
+    // SDK fallback still adds the overlay's hidden wake (rt/equeue.rs).
+    c"sceKernelAddTimerEvent" => unused_slot, O;
+    c"sceKernelAddReadEvent" => unused_slot, O;
+    c"sceKernelAddWriteEvent" => unused_slot, O;
+    c"sceKernelAddFileEvent" => unused_slot, O;
+    c"sceKernelAddUserEvent" => unused_slot, O;
+    c"sceKernelAddUserEventEdge" => unused_slot, O;
+    c"sceKernelAddHRTimerEvent" => unused_slot, O;
+    c"sceKernelAddAmprSystemEvent" => unused_slot, O;
+    c"sceKernelDeleteAmprSystemEvent" => unused_slot, O;
     c"sceKernelClose" => sceKernelClose_emul, M;
     c"close" => posix_close_emul, M;
     c"fstat" => posix_fstat_emul, M;
@@ -311,11 +317,17 @@ hook_table! {
     c"fcntl" => posix_fcntl_emul, O;
     c"_fcntl" => underscore_fcntl_emul, O;
     c"sceKernelFcntl" => sceKernelFcntl_emul, O;
-    // Both pack formats, `AMPR_PACK_MMAP` != 0: mmap of a virtual pack fd
-    // maps a disk cache copy of the packed file (rt/pack/mmap.rs); other
-    // fds call the original.
-    c"mmap" => mmap_emul, O;
-    c"sceKernelMmap" => sceKernelMmap_emul, O;
+    // Ids 96 and 97: debug-only pass-through probes (rt/probe.rs), so a map
+    // of a packed file, which fails, shows in `/fsfail`. Release never
+    // installs them (`hook_enabled`); they held the removed mmap disk cache.
+    #[cfg(feature = "mem_report")]
+    c"mmap" => probe::mmap_probe, O;
+    #[cfg(feature = "mem_report")]
+    c"sceKernelMmap" => probe::sceKernelMmap_probe, O;
+    #[cfg(not(feature = "mem_report"))]
+    c"mmap" => unused_slot, O;
+    #[cfg(not(feature = "mem_report"))]
+    c"sceKernelMmap" => unused_slot, O;
     // Ids 98 and 99: unused, never installed (`hook_enabled`). They held the
     // munmap hooks of decode on access, which was removed; the later ids
     // keep their numbers.
@@ -359,15 +371,6 @@ hook_table! {
     #[cfg(feature = "mem_report")]
     c"readlink" => probe::readlink_probe, O;
 }
-
-/// `g_externalEqueueHooks`: order is `AmprExternalEqueueHookId`.
-static EXT_HOOKS: Table<HookSpec, EXT_COUNT> = Table(specs![
-    c"sceAgcDriverAddEqEvent" => sceAgcDriverAddEqEvent_emul, O;
-    c"sceVideoOutAddFlipEvent" => sceVideoOutAddFlipEvent_emul, O;
-    c"sceVideoOutAddVblankEvent" => sceVideoOutAddVblankEvent_emul, O;
-    c"sceVideoOutAddPreVblankStartEvent" => sceVideoOutAddPreVblankStartEvent_emul, O;
-    c"sceVideoOutAddOutputModeEvent" => sceVideoOutAddOutputModeEvent_emul, O;
-]);
 
 // ---- save data hooks (rt/save.rs) ------------------------------------------
 
@@ -565,13 +568,15 @@ const FALLBACK_SHARED: [*mut c_void; 78] = {
         sceKernelDeleteEqueue,
         sceKernelAddAmprEvent,
         sceKernelDeleteAmprEvent,
-        sceKernelAddTimerEvent,
-        sceKernelAddReadEvent,
-        sceKernelAddWriteEvent,
-        sceKernelAddFileEvent,
-        sceKernelAddUserEvent,
+        // 55..=63 never install; only 60's fallback is called (the
+        // equeue's hidden wake), so it is the one import kept.
+        NUL,
+        NUL,
+        NUL,
+        NUL,
+        NUL,
         sceKernelAddUserEventEdge,
-        sceKernelAddHRTimerEvent,
+        NUL,
         NUL,
         NUL,
         NUL,
@@ -598,9 +603,6 @@ static SDK_FALLBACK: Table<*mut c_void, HOOK_COUNT> = Table(FALLBACK);
 /// Original libkernel entry per hook id; read via `sys::kernel_slot`.
 #[no_mangle]
 pub static mut g_amprOriginalLibkernelById: [*mut c_void; HOOK_COUNT] = FALLBACK;
-/// Original external equeue producer per `AmprExternalEqueueHookId`.
-#[no_mangle]
-pub static mut g_amprOriginalExternalEqueueById: [*mut c_void; EXT_COUNT] = [NUL; EXT_COUNT];
 /// Original save data entry per `SAVE_*` index.
 #[no_mangle]
 pub static mut g_amprOriginalSaveDataById: [*mut c_void; SAVE_COUNT] = [NUL; SAVE_COUNT];
@@ -614,10 +616,6 @@ unsafe fn store_slot(slot: *mut *mut c_void, v: *mut c_void) {
 
 fn lib_slot(i: usize) -> *mut *mut c_void {
     unsafe { addr_of_mut!(g_amprOriginalLibkernelById[i]) }
-}
-
-fn ext_slot(i: usize) -> *mut *mut c_void {
-    unsafe { addr_of_mut!(g_amprOriginalExternalEqueueById[i]) }
 }
 
 fn save_slot(i: usize) -> *mut *mut c_void {
@@ -1201,7 +1199,9 @@ unsafe fn install_writable(
     let base = src as usize;
     let mut b = Buf { p: tramp, len: 0 };
     let (mut stolen, mut terminal, mut internal, mut tail) = (0usize, false, 0usize, 0usize);
-    while stolen < JUMP_SIZE && stolen < MAX_STOLEN {
+    // JUMP_SIZE < MAX_STOLEN, and the decode check below keeps each
+    // instruction inside MAX_STOLEN.
+    while stolen < JUMP_SIZE {
         let p = unsafe { src.add(stolen) };
         let hs = ampr_hook::decode(window(p));
         let len = usize::from(hs.len);
@@ -1664,13 +1664,17 @@ pub(crate) const fn observed_only(id: usize) -> bool {
 /// that ships packs (`packs_present`, decided in rt/pack/mod.rs
 /// `select_pack_format`): an LZ4 pack can hold files with no physical copy
 /// too, so a game's plain open(), libc and mmap calls must reach them. A
-/// title with no packs gets the shared 78 only. Of the ids past 78, 84..96 also need their `PACK_LIBC_HOOKS`
-/// bit (or, in debug builds, `observed_only`), 96 and 97
-/// need `AMPR_PACK_MMAP` on (rt/pack/mmap.rs), 98 and 99 are unused and
+/// title with no packs gets the shared 78 only, less 55..=63, which never
+/// install (`UNUSED_EQUEUE_IDS`). Of the ids past 78, 84..96 also need their `PACK_LIBC_HOOKS`
+/// bit (or, in debug builds, `observed_only`), 96 and 97 (mmap probes,
+/// rt/probe.rs) install only in debug builds, 98 and 99 are unused and
 /// never install, 100..=109 (the game's kernel AIO, rt/pack/aio.rs) need nothing more,
 /// 110..=111 (thread creation) install in every title, and 112..=119 exist
-/// only in debug builds (rt/probe.rs). Both knobs apply to every pack format.
+/// only in debug builds (rt/probe.rs). The knob applies to every pack format.
 fn hook_enabled(id: usize) -> bool {
+    if UNUSED_EQUEUE_IDS.contains(&id) {
+        return false;
+    }
     if id < FALLBACK_SHARED.len() {
         return true;
     }
@@ -1684,7 +1688,7 @@ fn hook_enabled(id: usize) -> bool {
         return false;
     }
     if id == id::mmap || id == id::sceKernelMmap {
-        return super::pack::mmap::MMAP_MODE != 0;
+        return cfg!(feature = "mem_report");
     }
     if id == id::munmap || id == id::sceKernelMunmap {
         return false;
@@ -1723,18 +1727,6 @@ unsafe fn refresh(st: &mut State) {
         };
         unsafe { store_slot(lib_slot(i), v) };
     }
-    for (i, d) in st.ext.iter().enumerate() {
-        unsafe {
-            store_slot(
-                ext_slot(i),
-                if d.installed {
-                    d.trampoline
-                } else {
-                    null_mut()
-                },
-            )
-        };
-    }
     for (i, d) in st.save.iter().enumerate() {
         unsafe {
             store_slot(
@@ -1761,13 +1753,12 @@ unsafe fn refresh(st: &mut State) {
     ORIGINAL_LOAD_FOR_SYSMODULE.store(l, Release);
     INSTALLED.store((any_mandatory && mandatory_all) as u32, Release);
 
-    let h = |i: usize| st.hooks[i].installed;
-    let overlay = h(51) && h(52) && h(53) && h(54);
-    // Classification turns queue tracking on: an untracked queue gets AMPR
-    // events from the kernel, which merges two of one id before the game
-    // reads them (a save load hung that way).
-    let classification = h(50) && (55..=63).all(h) && st.loader.installed && st.ext_coverage_safe;
-    unsafe { apr_equeue_overlay_set_hook_availability(overlay, classification) };
+    // Queue tracking needs only the equeue's own ids 50..=54. It once also
+    // needed the classification hooks, the loader hook and all module
+    // producers; one undecodable prologue among them turned it off.
+    let tracking = (eq_slot::sceKernelCreateEqueue..=eq_slot::sceKernelDeleteAmprEvent)
+        .all(|i| st.hooks[i].installed);
+    unsafe { apr_equeue_overlay_set_hook_availability(tracking) };
 }
 
 /// Installs the save data hooks this module exports. A module loaded by
@@ -1799,80 +1790,47 @@ unsafe fn install_save(st: &mut State, module: SceKernelModule) {
     }
 }
 
-/// `install_external_equeue_hooks`: hook producers in any loaded module.
-unsafe fn install_external(st: &mut State, lib: SceKernelModule) -> bool {
-    if st.ext.iter().all(|d| d.installed) && st.save.iter().all(|d| d.installed) {
-        return true;
+/// Installs the save data hooks from every module `sceKernelGetModuleList`
+/// returns. Save data lives in a loaded libSceSaveData, not libkernel; a
+/// missing module is normal before the game loads it, and the loader
+/// observer runs this again after every module load. Caller holds
+/// `HOOK_LOCK`, which guards `MODULES`.
+unsafe fn install_save_listed(st: &mut State, lib: SceKernelModule) {
+    if st.save.iter().all(|d| d.installed) {
+        return;
     }
     type ListFn = unsafe extern "C" fn(*mut SceKernelModule, usize, *mut usize) -> c_int;
     let list = unsafe { resolve(lib, c"sceKernelGetModuleList".as_ptr()) };
     let Some(list) = (unsafe { sys::fn_from_ptr::<ListFn>(list) }) else {
-        return false;
+        return;
     };
-    let mut mods = [0 as SceKernelModule; 256];
+    let mods = unsafe { &mut *MODULES.get() };
     let mut n = 0usize;
     if unsafe { list(mods.as_mut_ptr(), mods.len(), &mut n) } != 0 {
-        return false;
+        return;
     }
-    let mut safe = n <= mods.len();
-    n = n.min(mods.len());
-    for i in 0..EXT_COUNT {
-        if st.ext[i].installed {
-            continue;
-        }
-        let spec = &EXT_HOOKS.0[i];
-        let mut target = null_mut();
-        for &m in &mods[..n] {
-            if unsafe { sys::sceKernelDlsym(m, spec.symbol.as_ptr(), &mut target) } == 0
-                && !target.is_null()
-            {
-                break;
-            }
-            target = null_mut();
-        }
-        if target.is_null() {
-            continue;
-        }
-        if !unsafe {
-            install(
-                &mut st.tramp,
-                ext_slot(i),
-                &mut st.ext[i],
-                target,
-                spec.replacement,
-            )
-        } {
-            safe = false;
-        }
-    }
-
-    // Save data lives in a loaded libSceSaveData, not libkernel. A missing
-    // module is normal before the game loads it; the loader observer runs
-    // this again after every module load. Failure here does not affect the
-    // equeue coverage `safe` reports.
-    for &m in &mods[..n] {
+    for &m in &mods[..n.min(mods.len())] {
         unsafe { install_save(st, m) };
     }
-    safe
 }
 
-/// `install_module_load_observer`: rescan producers after each module load.
-unsafe fn install_loader(st: &mut State, lib: SceKernelModule) -> bool {
-    let ok = if st.loader.installed {
-        true
-    } else {
+/// `install_module_load_observer`: the two loaders, which route module paths
+/// through the index and install save data hooks after each module load.
+unsafe fn install_loader(st: &mut State, lib: SceKernelModule) {
+    if !st.loader.installed {
         let target = unsafe { resolve(lib, c"sceKernelLoadStartModule".as_ptr()) };
-        !target.is_null()
-            && unsafe {
+        if !target.is_null() {
+            unsafe {
                 install(
                     &mut st.tramp,
                     ORIGINAL_LOAD_START_MODULE.as_ptr(),
                     &mut st.loader,
                     target,
-                    sceKernelLoadStartModule_equeue_observer as *mut c_void,
+                    sceKernelLoadStartModule_observer as *mut c_void,
                 )
-            }
-    };
+            };
+        }
+    }
     if !st.loader_sys.installed {
         let target = unsafe { resolve(lib, c"sceKernelLoadStartModuleForSysmodule".as_ptr()) };
         if !target.is_null() {
@@ -1887,10 +1845,9 @@ unsafe fn install_loader(st: &mut State, lib: SceKernelModule) -> bool {
             };
         }
     }
-    ok
 }
 
-pub unsafe extern "C" fn sceKernelLoadStartModule_equeue_observer(
+pub unsafe extern "C" fn sceKernelLoadStartModule_observer(
     name: *const c_char,
     args: usize,
     argp: *const c_void,
@@ -1935,6 +1892,19 @@ pub unsafe extern "C" fn sceKernelLoadStartModuleForSysmodule_observer(
     }
 }
 
+type LoadStartModuleFn = unsafe extern "C" fn(
+    *const c_char,
+    usize,
+    *const c_void,
+    u32,
+    *const c_void,
+    *mut c_int,
+) -> SceKernelModule;
+
+/// Both loader hooks run on the game thread that loads the module. The load
+/// (with its 1 KiB path buffer) and the hook install after it are two
+/// out-of-line calls, so their frames do not stack (tools/check_stack_frames.py
+/// `LOADER_CHAIN`).
 unsafe fn load_observe(
     orig_slot: &AtomicPtr<c_void>,
     name: *const c_char,
@@ -1944,30 +1914,44 @@ unsafe fn load_observe(
     opt: *const c_void,
     result: *mut c_int,
 ) -> SceKernelModule {
-    type F = unsafe extern "C" fn(
-        *const c_char,
-        usize,
-        *const c_void,
-        u32,
-        *const c_void,
-        *mut c_int,
-    ) -> SceKernelModule;
-    let Some(orig) = (unsafe { sys::fn_from_ptr::<F>(orig_slot.load(Acquire)) }) else {
+    let Some(orig) = (unsafe { sys::fn_from_ptr::<LoadStartModuleFn>(orig_slot.load(Acquire)) })
+    else {
         return sys::SCE_KERNEL_ERROR_ENOSYS;
     };
-    // The loader opens the file itself, past the path hooks. Games load
-    // modules by names that differ in case from the dump (Wwise plugins as
-    // /app0/prx/AkSineTone.prx, stored aksinetone.prx): retail pfs and exFAT
-    // fold case, a folder install on the internal SSD does not and the load
-    // fails with ENOENT. An indexed /app0 path goes in as its stored path.
-    // The index can disagree in case with the disk too (indexed
-    // Il2cppUserAssemblies.prx, on disk and asked for as
-    // Il2CppUserAssemblies.prx), so an ENOENT on the stored path
-    // retries the name the game asked for. Only ENOENT, the error of a
-    // missing file; other failures may come after the loader mapped or
-    // started the module. An ENOENT for another reason (a missing import)
-    // costs one more failed load with the same result. An index hit is a
-    // copy in `pbuf` even when the bytes match; those do not retry.
+    let module = unsafe { load_resolved(orig, name, args, argp, flags, opt, result) };
+    #[cfg(feature = "mem_report")]
+    if module >= 0 {
+        unsafe { super::blackbox::module(b"load", module) };
+    }
+    if module >= 0 {
+        unsafe { observe_loaded(module) };
+    }
+    module
+}
+
+/// The loader opens the file itself, past the path hooks. Games load
+/// modules by names that differ in case from the dump (Wwise plugins as
+/// /app0/prx/AkSineTone.prx, stored aksinetone.prx): retail pfs and exFAT
+/// fold case, a folder install on the internal SSD does not and the load
+/// fails with ENOENT. An indexed /app0 path goes in as its stored path.
+/// The index can disagree in case with the disk too (indexed
+/// Il2cppUserAssemblies.prx, on disk and asked for as
+/// Il2CppUserAssemblies.prx), so an ENOENT on the stored path
+/// retries the name the game asked for. Only ENOENT, the error of a
+/// missing file; other failures may come after the loader mapped or
+/// started the module. An ENOENT for another reason (a missing import)
+/// costs one more failed load with the same result. An index hit is a
+/// copy in `pbuf` even when the bytes match; those do not retry.
+#[inline(never)]
+unsafe fn load_resolved(
+    orig: LoadStartModuleFn,
+    name: *const c_char,
+    args: usize,
+    argp: *const c_void,
+    flags: u32,
+    opt: *const c_void,
+    result: *mut c_int,
+) -> SceKernelModule {
     let mut pbuf: super::fd_cache::EntryPath = [0; ampr_format::source::PATH_BUF];
     let path = unsafe { super::index::maybe_resolve_path(name, &mut pbuf) };
     let mut module = unsafe { orig(path, args, argp, flags, opt, result) };
@@ -1979,13 +1963,12 @@ unsafe fn load_observe(
         module = unsafe { orig(name, args, argp, flags, opt, result) };
     }
     super::stats::fs_event(b'K', b'-', module as i64, name);
-    #[cfg(feature = "mem_report")]
-    if module >= 0 {
-        unsafe { super::blackbox::module(b"load", module) };
-    }
-    if module < 0 {
-        return module;
-    }
+    module
+}
+
+/// Installs the save data hooks a new module brings, after its load.
+#[inline(never)]
+unsafe fn observe_loaded(module: SceKernelModule) {
     let _g = HOOK_LOCK.lock();
     if hooks_installed() {
         let st = unsafe { state() };
@@ -1993,10 +1976,9 @@ unsafe fn load_observe(
         // (libSceSaveData.native); its returned handle still resolves its
         // exports.
         unsafe { install_save(st, module) };
-        st.ext_coverage_safe = st.ext_coverage_safe && unsafe { install_external(st, LIBKERNEL) };
+        unsafe { install_save_listed(st, LIBKERNEL) };
         unsafe { refresh(st) };
     }
-    module
 }
 
 /// `ampr_install_libkernel_hooks_for_module`.
@@ -2004,13 +1986,11 @@ unsafe fn install_all(lib: SceKernelModule) -> c_int {
     let _g = HOOK_LOCK.lock();
     let st = unsafe { state() };
     if hooks_installed() {
-        let loader = unsafe { install_loader(st, lib) };
-        st.ext_coverage_safe =
-            st.ext_coverage_safe && loader && unsafe { install_external(st, lib) };
+        unsafe { install_loader(st, lib) };
+        unsafe { install_save_listed(st, lib) };
         unsafe { refresh(st) };
         return 0;
     }
-    st.ext_coverage_safe = false;
 
     let (mut installed, mut mandatory_unavailable) = (0usize, false);
     for i in 0..HOOK_COUNT {
@@ -2055,7 +2035,7 @@ unsafe fn install_all(lib: SceKernelModule) -> c_int {
     // Each entry is optional, so `install` alone would keep a partial set.
     // The submits go first, so no new synthetic id is handed out while the
     // completion calls come off; each slot gets its fallback at once, since
-    // the loader and equeue hooks below may reuse the freed trampolines
+    // the loader and save data hooks below may reuse the freed trampolines
     // before `refresh`.
     let aio = id::sceKernelAioSubmitReadCommands..=id::sceKernelAioCancelRequests;
     if !aio.clone().all(|i| st.hooks[i].installed) {
@@ -2081,8 +2061,8 @@ unsafe fn install_all(lib: SceKernelModule) -> c_int {
         return -1;
     }
 
-    let loader = unsafe { install_loader(st, lib) };
-    st.ext_coverage_safe = loader && unsafe { install_external(st, lib) };
+    unsafe { install_loader(st, lib) };
+    unsafe { install_save_listed(st, lib) };
     unsafe { refresh(st) };
     0
 }
@@ -2097,7 +2077,6 @@ pub unsafe fn amprUninstallLibkernelHooks() -> c_int {
     let _g = HOOK_LOCK.lock();
     unsafe { apr_equeue_overlay_shutdown() };
     let st = unsafe { state() };
-    st.ext_coverage_safe = false;
     let mut ok = true;
     let was = st.loader.installed;
     let r = unsafe { uninstall(&mut st.tramp, &mut st.loader) };
@@ -2110,14 +2089,6 @@ pub unsafe fn amprUninstallLibkernelHooks() -> c_int {
     ok &= r;
     if was && r {
         ORIGINAL_LOAD_FOR_SYSMODULE.store(null_mut(), Release);
-    }
-    for i in (0..EXT_COUNT).rev() {
-        let was = st.ext[i].installed;
-        let r = unsafe { uninstall(&mut st.tramp, &mut st.ext[i]) };
-        ok &= r;
-        if was && r {
-            unsafe { store_slot(ext_slot(i), null_mut()) };
-        }
     }
     for i in (0..SAVE_COUNT).rev() {
         let was = st.save[i].installed;
@@ -2199,5 +2170,25 @@ mod tests {
             assert!(routing_enabled(i) && !observed_only(i));
             assert!(!HOOK_SYMBOLS[i].1);
         }
+    }
+
+    /// The removed equeue classification ids never install and keep their
+    /// numbers; the equeue's own ids 50..=54, which turn tracking on, do.
+    #[test]
+    fn classification_ids_never_install() {
+        use super::super::equeue::slot as eq;
+        assert_eq!(HOOK_SYMBOLS[55].0, c"sceKernelAddTimerEvent");
+        assert_eq!(HOOK_SYMBOLS[eq::sceKernelAddUserEventEdge].0, c"sceKernelAddUserEventEdge");
+        assert_eq!(HOOK_SYMBOLS[63].0, c"sceKernelDeleteAmprSystemEvent");
+        assert_eq!(HOOK_SYMBOLS[id::sceKernelClose].0, c"sceKernelClose");
+        for i in UNUSED_EQUEUE_IDS {
+            assert!(!hook_enabled(i), "hook id {i}");
+            assert!(!HOOK_SYMBOLS[i].1);
+        }
+        for i in eq::sceKernelCreateEqueue..=eq::sceKernelDeleteAmprEvent {
+            assert!(hook_enabled(i), "hook id {i}");
+        }
+        assert_eq!(HOOK_SYMBOLS[eq::sceKernelCreateEqueue].0, c"sceKernelCreateEqueue");
+        assert_eq!(HOOK_SYMBOLS[eq::sceKernelDeleteAmprEvent].0, c"sceKernelDeleteAmprEvent");
     }
 }

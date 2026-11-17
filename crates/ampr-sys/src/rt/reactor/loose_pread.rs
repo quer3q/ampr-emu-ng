@@ -19,12 +19,14 @@
 //! A read longer than `loose_pread_part_kib` (64 KiB release) is queued as
 //! parallel part tasks into the same destination, all or none; their results
 //! fold (`LoosePartResult`) into what one pread of the range returns, and
-//! the read finishes when the last part is in. On a console, 64 KiB parts
-//! took 1.10 ms per read against 2.51 ms unsplit (debug /metrics,
+//! the read finishes when the last part is in (only that part's thread
+//! wakes the reactor). On a console, 64 KiB parts took 1.10 ms per read
+//! against 2.51 ms unsplit (debug /metrics,
 //! `AMPR_EMU_APR_LOOSE_PREAD_PART_KIB` in mod.rs). The loose task cap
 //! (threads minus `loose_pread_pack_reserve`, 4 with packs and 0 without)
-//! is 2 at 6 threads in a title with packs, so only reads of up to two
-//! parts split there, and 6 in a title without.
+//! is 2 at 6 threads in a title with packs and 6 in a title without; a
+//! read with more parts than free tasks gets larger parts, one per free
+//! task (`loose_pread_split`).
 
 use super::*;
 use crate::rt::stats::{self, Stat};
@@ -163,24 +165,34 @@ pub(crate) const fn loose_pread_part_bytes(kib: u32) -> u64 {
     }
 }
 
-/// Number of pool tasks for a read of `length` bytes with part size `part`
-/// (0 = no split) when `room` loose tasks are free: ceil(length / part),
-/// or 1 (unsplit) when that does not fit `room` or one pool group, or the
-/// read is not longer than one part. Never a partial split.
-pub(crate) fn loose_pread_part_count(length: u64, part: u64, room: u32) -> u32 {
-    if part == 0 || length <= part {
-        return 1;
+/// Pool tasks and part size for a read of `length` bytes with knob part
+/// size `part` (0 = no split) when `room` loose tasks are free:
+/// ceil(length / part) parts of `part` bytes when they fit `room` (and one
+/// queue call); otherwise `room` parts, the size ceil(length / room)
+/// rounded up to 4 KiB (the count is then recomputed and may be one less).
+/// (1, length) unsplit when the read is not longer than one part, or room
+/// is below 2. Larger parts still beat an unsplit read: on a console,
+/// 128 KiB parts took 1.50 ms per read, 256 KiB 2.09 ms, unsplit 2.51 ms
+/// (`AMPR_EMU_APR_LOOSE_PREAD_PART_KIB` in mod.rs). Before, a 508 KB read
+/// (8 parts of 64 KiB) at the cap of 6 tasks went unsplit.
+pub(crate) fn loose_pread_split(length: u64, part: u64, room: u32) -> (u32, u64) {
+    let room = (room as u64).min(kAprExternalAioGroupMaxRequests as u64);
+    if part == 0 || length <= part || room < 2 {
+        return (1, length);
     }
-    let parts = length.div_ceil(part);
-    if parts > room as u64 || parts > kAprExternalAioGroupMaxRequests as u64 {
-        1
-    } else {
-        parts as u32
+    let mut size = part;
+    if length.div_ceil(size) > room {
+        size = length.div_ceil(room).div_ceil(LOOSE_PREAD_PART_ALIGN_BYTES) * LOOSE_PREAD_PART_ALIGN_BYTES;
     }
+    let parts = length.div_ceil(size);
+    if parts < 2 {
+        return (1, length);
+    }
+    (parts as u32, size)
 }
 
 /// Byte offset (relative to the read's start) and length of part `index`
-/// of `parts` (from loose_pread_part_count) for a read of `length` bytes:
+/// of `parts` (from loose_pread_split) for a read of `length` bytes:
 /// `index * part`, the last part takes the rest; one part is the whole read.
 pub(crate) fn loose_pread_part_range(length: u64, part: u64, parts: u32, index: u32) -> (u64, u64) {
     if parts <= 1 {
@@ -361,36 +373,47 @@ impl AprAioReactor {
         // <= AMPR_EMU_APR_LOOSE_PREAD_PACK_RESERVE threads (only the debug
         // `pread_threads` knob allows it) the reserve cannot be kept: the
         // cap floors at 1 loose task.
-        if !self.ensure_pread_workers() {
-            return false;
+        // One preadMutex section decides the cap, the split and the queue
+        // (it was four: two pool starts, the thread count, the queue). Only
+        // a pool with no thread yet is started first, outside the lock.
+        let mut guard = unsafe { (&*addr_of!(self.preadMutex)).lock() };
+        if self.started() == 0 {
+            drop(guard);
+            if !self.ensure_pread_workers() {
+                return false;
+            }
+            guard = unsafe { (&*addr_of!(self.preadMutex)).lock() };
+            // No accepted read without a thread (queue_pread_requests).
+            if self.started() == 0 {
+                return false;
+            }
         }
         // Threads the pool has or may still start (its ceiling and the thread
         // budget's room, rt/thread_hooks.rs): the pool grows from
         // PREAD_MIN_THREADS when tasks queue, so the live count alone would
         // keep it at 1; after a budget cut it is the live count.
-        let reachable = {
-            let _g = self.preadMutex.lock();
-            (self.preadThreadCount + crate::rt::thread_hooks::budget_room() as usize)
-                .min(self.preadCeiling as usize)
-        };
+        let reachable = (self.preadThreadCount + crate::rt::thread_hooks::budget_room() as usize)
+            .min(self.preadCeiling as usize);
         let looseCap = (reachable.saturating_sub(loose_pread_pack_reserve()))
-        .max(1)
-        .min(AMPR_EMU_APR_LOOSE_PREAD_TASKS_MAX as usize) as u32;
+            .max(1)
+            .min(AMPR_EMU_APR_LOOSE_PREAD_TASKS_MAX as usize) as u32;
         if self.preadLooseCount >= looseCap {
             return false;
         }
-        // Split into parts when every part fits the cap and the free tasks;
-        // otherwise one unsplit task, never a partial split.
+        // Split into parts that fit the free loose tasks (larger parts when
+        // the knob's do not); a full task table queues it unsplit.
         let length = active.desc.length;
-        let part = loose_pread_part_bytes(crate::rt::tune::loose_pread_part_kib());
-        let mut parts = loose_pread_part_count(length, part, looseCap - self.preadLooseCount);
-        let mut rc = self.queue_loose_parts(active, item, priority, part, parts);
-        if rc == SCE_KERNEL_ERROR_EAGAIN && parts > 1 {
+        let knobPart = loose_pread_part_bytes(crate::rt::tune::loose_pread_part_kib());
+        let (mut parts, part) = loose_pread_split(length, knobPart, looseCap - self.preadLooseCount);
+        let mut queued = self.queue_loose_parts(active, item, priority, part, parts);
+        if queued == Err(SCE_KERNEL_ERROR_EAGAIN) && parts > 1 {
             parts = 1;
-            rc = self.queue_loose_parts(active, item, priority, part, parts);
+            queued = self.queue_loose_parts(active, item, priority, length, parts);
         }
-        if rc != 0 {
-            return false;
+        drop(guard);
+        match queued {
+            Ok(grow) => self.grow_pread_threads(grow),
+            Err(_) => return false,
         }
         if parts > 1 {
             stats::add(Stat::LoosePreadSplitReads, 1);
@@ -417,7 +440,8 @@ impl AprAioReactor {
     /// Queues `parts` tasks for the read, part k at `offset + k * part` into
     /// `buf + k * part`, all into the same game destination. The tasks get
     /// a null `request.result` and report through PreadTask.returnValue, so
-    /// no pool thread writes the ActiveRead.
+    /// no pool thread writes the ActiveRead. Under preadMutex
+    /// (queue_tasks_locked); Ok: threads to start.
     fn queue_loose_parts(
         &mut self,
         active: &ActiveRead,
@@ -425,7 +449,7 @@ impl AprAioReactor {
         priority: c_int,
         part: u64,
         parts: u32,
-    ) -> c_int {
+    ) -> Result<usize, c_int> {
         let mut requests = [SceKernelAioRWRequest::default(); kAprExternalAioGroupMaxRequests];
         let length = active.desc.length;
         for index in 0..parts {
@@ -437,7 +461,7 @@ impl AprAioReactor {
             request.buf = unsafe { active.request.buf.cast::<u8>().add(start as usize).cast() };
             request.result = null_mut();
         }
-        self.queue_pread_tasks(
+        self.queue_tasks_locked(
             &requests[..parts as usize],
             item.slot,
             item.generation,
@@ -449,8 +473,9 @@ impl AprAioReactor {
     /// One part task of a loose read is done (drain_pread_completions). Its
     /// result is folded in; once all parts are in, a full read completes as
     /// a kernel COMPLETED result would (poll path in progress.rs) and
-    /// anything else goes back to kernel AIO as a whole.
-    pub(crate) fn finish_loose_pread(&mut self, target: ActiveReadRef, part: LoosePartDone) {
+    /// anything else goes back to kernel AIO as a whole. True when the read
+    /// finished (all parts in), the only case the reactor pass acts on.
+    pub(crate) fn finish_loose_pread(&mut self, target: ActiveReadRef, part: LoosePartDone) -> bool {
         let it = self.activeReads.iterator_from_slot(target.slot);
         if it.index_ == kInvalid {
             abort();
@@ -483,7 +508,7 @@ impl AprAioReactor {
             .loosePart
             .add(part.index, start, part.len, part.value);
         if !active.loosePart.done() {
-            return;
+            return false;
         }
         if self.preadLooseReadCount == 0 {
             abort();
@@ -529,6 +554,7 @@ impl AprAioReactor {
                 self.defer_loose_pread_to_aio(active);
             }
         }
+        true
     }
 
     /// Same deferred state as kernel AIO's EFAULT retry (capacity.rs), with no
@@ -689,13 +715,17 @@ mod tests {
             assert_eq!(loose_pread_part_bytes(kib), bytes, "{kib} KiB");
         }
         assert_eq!(loose_pread_part_bytes(4096), 4 << 20);
-        assert_eq!(loose_pread_part_count(READ, PART, 8), 8);
-        assert_eq!(loose_pread_part_count(READ, PART, 7), 1, "no partial split");
-        assert_eq!(loose_pread_part_count(READ, 0, 32), 1, "knob 0");
-        assert_eq!(loose_pread_part_count(PART, PART, 32), 1);
-        assert_eq!(loose_pread_part_count(PART + 1, PART, 32), 2);
+        assert_eq!(loose_pread_split(READ, PART, 8), (8, PART));
+        assert_eq!(loose_pread_split(READ, 0, 32), (1, READ), "knob 0");
+        assert_eq!(loose_pread_split(PART, PART, 32), (1, PART));
+        assert_eq!(loose_pread_split(PART + 1, PART, 32), (2, PART));
+        assert_eq!(loose_pread_split(READ, PART, 1), (1, READ), "no room");
+        assert_eq!(loose_pread_split(READ, PART, 0), (1, READ));
         let tooMany = (kAprExternalAioGroupMaxRequests as u64 + 1) * 16 * 1024;
-        assert_eq!(loose_pread_part_count(tooMany, 16 * 1024, 64), 1);
+        let (parts, size) = loose_pread_split(tooMany, 16 * 1024, 64);
+        // 33 parts of 16 KiB at room 64: capped at one queue call (32), the
+        // 4 KiB rounding then leaves 27 parts of 20 KiB.
+        assert_eq!((parts, size), (27, 20 << 10), "one queue call");
         assert_eq!(loose_pread_part_range(READ, PART, 1, 0), (0, READ));
         // Parts are contiguous from 0, the last one takes the rest.
         let mut next = 0;
@@ -706,6 +736,33 @@ mod tests {
         }
         assert_eq!(next, READ);
         assert_eq!(loose_pread_part_range(PART + 1, PART, 2, 1), (PART, 1));
+    }
+
+    #[test]
+    fn parts_grow_to_fit_the_room() {
+        // 508 KB at the 6-task cap without packs: 6 parts of 88 KiB, not
+        // unsplit; at 2 tasks (with packs) 2 of 256 KiB; at 7 tasks, 7 of
+        // 76 KiB (ceil(508 KB / 7) rounded up to 4 KiB).
+        assert_eq!(loose_pread_split(READ, PART, 6), (6, 88 << 10));
+        assert_eq!(loose_pread_split(READ, PART, 2), (2, 256 << 10));
+        assert_eq!(loose_pread_split(READ, PART, 7), (7, 76 << 10));
+        // Every length and room: the parts fit the room, are 4 KiB
+        // multiples no smaller than the knob's, and cover the read exactly.
+        for length in [PART + 1, 3 * PART - 7, READ, 2 << 20, (2 << 20) + 5] {
+            for room in 2..=40u32 {
+                let (parts, size) = loose_pread_split(length, PART, room);
+                let fits = length.div_ceil(PART) <= room.min(kAprExternalAioGroupMaxRequests as u32) as u64;
+                assert!(parts >= 2 && parts <= room.min(kAprExternalAioGroupMaxRequests as u32), "{length} {room}");
+                assert!(size >= PART && (fits || size % LOOSE_PREAD_PART_ALIGN_BYTES == 0));
+                let mut next = 0;
+                for k in 0..parts {
+                    let (start, len) = loose_pread_part_range(length, size, parts, k);
+                    assert!(start == next && len > 0 && len <= size, "{length} {room} {k}");
+                    next = start + len;
+                }
+                assert_eq!(next, length, "{length} {room}");
+            }
+        }
     }
 
     #[test]

@@ -40,9 +40,9 @@ const MIB: usize = 1 << 20;
 /// (`files_the_index_cap_covers`).
 /// The compiled index view is one block of the cap (rt/index_view.rs
 /// `layout`): at 300,000 files and the first directory capacity it is
-/// 12.6 MiB with no packs, 14.9 MiB for zstd packs and 16.0 MiB for LZ4
-/// (computed: 24 B of columns, 8 B of `path_at` and `dir_of` and 7 B of
-/// hash slots per file, plus 32 B per directory).
+/// 13.7 MiB with no packs, 14.9 MiB for zstd packs and 16.0 MiB for LZ4
+/// (computed: a 32 B row and 4 B of `dir_of` and 7 B of hash slots per
+/// file, plus 32 B per directory).
 /// An AMPRPAK4 mount keeps 48 B per file and 12 B per chunk (its record
 /// sections), 32 B per pack and its name plus a 16 B span,
 /// and the 128 B header; the paths are read once, at the mount, through
@@ -60,8 +60,8 @@ pub(crate) const INDEX_MEMORY_MAX: usize = 80 * MIB;
 /// a 16 KiB cache page. The cache is the only part whose size changes
 /// behaviour (more I/O windows, 12 vs 16, and more decode workers, 4 vs 8,
 /// measured flat: 312 vs 315 us game wait per read), so the PRX total is a
-/// round number and the cache takes the rest: 133.64 MiB in the debug pool,
-/// 134.98 MiB in the release one at the 256 MiB layout (pools fitted from
+/// round number and the cache takes the rest: 135.77 MiB in the debug pool,
+/// 137.11 MiB in the release one at the 256 MiB layout (pools fitted from
 /// a `dist` build, Makefile).
 /// The decoded cache default is this whole cap (rt/pack/mod.rs
 /// `AMPR_EMU_PACK_DECODED_CACHE_BYTES`); a runtime profile or debug knob
@@ -101,7 +101,7 @@ const BUFFER_DECODERS: usize = BUFFER_WORKERS;
 // A workspace is whole pages, so the ledger counts it at its size.
 const _: () = assert!(ampr_codec::ZSTD_DECODER_WORKSPACE % SCE_KERNEL_PAGE_SIZE == 0);
 
-/// The three caps together; with the 2 MiB fixed sites budget
+/// The three caps together; with the 1.75 MiB fixed sites budget
 /// (rt/runtime_memory.rs `POOL_SITES_BUDGET`) and the 2 MiB stack block
 /// they fill the pool to its last 16 KiB page. A knob that grows a cap past
 /// the pool fails the build in `CACHE_MEMORY_MAX` or here instead of
@@ -372,6 +372,11 @@ static INDEX_NOTICED: AtomicBool = AtomicBool::new(false);
 /// process for each class: the index cap (with the size it needed), any
 /// other refusal. A transient buffer (`index_scratch_alloc`) is only
 /// counted: its caller degrades on its own and the packs stay served.
+/// Out of line and cold: the allocation paths that call it keep a small
+/// frame (it was 0xcc8 B with the notice request inlined, rt/exports.rs
+/// `notify`).
+#[inline(never)]
+#[cold]
 unsafe fn refused(kind: Kind, reason: Refusal, needed: usize, mapped: usize, notice: bool) {
     LEDGER_ALLOC_REFUSED.fetch_add(1, Relaxed);
     if !notice {
@@ -537,14 +542,16 @@ pub(crate) fn cache_room() -> usize {
 }
 
 /// Index room kept when the rest moves to the cache: for any later Index
-/// allocation (debug /bench) and the holes the build left in the pool.
+/// allocation (debug /bench, the 64 KiB getdents listing window taken on
+/// the first packed listing) and the holes the build left in the pool.
 pub(crate) const INDEX_KEPT_ROOM: usize = 4 * MIB;
 
 /// Once the index is finished (rt/pack/manifest.rs `grow_cache_from_index`):
 /// moves the Index cap's unused room above INDEX_KEPT_ROOM to the Cache cap,
 /// in whole `page`s, and returns the bytes moved. The caps' sum stays the
 /// same, so the pool still holds every ledger. Nothing allocates from the
-/// Index ledger after startup but the debug /bench buffer.
+/// Index ledger after startup but the debug /bench buffer and the
+/// listing window, both inside the kept room.
 pub(crate) fn move_index_room_to_cache(page: usize) -> usize {
     with_all(|l| l.move_index_room(page))
 }
@@ -708,11 +715,12 @@ mod tests {
         let fixed = INDEX_MEMORY_MAX + BUFFER_MEMORY_MAX + POOL_SITES_BUDGET + STACK_MEMORY_MAX;
         assert_eq!(CACHE_MEMORY_MAX, (STATIC_POOL_SIZE - fixed) / PAGE * PAGE);
         assert_eq!(CACHE_MEMORY_MAX % PAGE, 0);
-        // The debug pool of the 256 MiB layout, 0xf614000 (246.07 MiB):
-        // 80 + 28.44 + 2 + 2 MiB fixed, the cache 133.64 MiB.
-        assert_eq!(STATIC_POOL_SIZE, 0xf61_4000);
-        assert_eq!(CACHE_MEMORY_MAX, 0xf61_4000 - fixed);
-        assert_eq!(CACHE_MEMORY_MAX, 140_132_352);
+        // The debug pool of the 256 MiB layout, 0xf7f4000 (247.95 MiB):
+        // 80 + 28.44 + 1.75 + 2 MiB fixed, the cache 135.77 MiB.
+        assert_eq!(STATIC_POOL_SIZE, 0xf7f_4000);
+        assert_eq!(POOL_SITES_BUDGET, 0x1c_0000);
+        assert_eq!(CACHE_MEMORY_MAX, 0xf7f_4000 - fixed);
+        assert_eq!(CACHE_MEMORY_MAX, 142_360_576);
     }
 
     #[test]

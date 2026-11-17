@@ -62,21 +62,23 @@ pub fn src_bytes<'b>(
 }
 
 /// CRC-32 of `[from, to)`, streamed in 4 KiB steps (no_std threads have
-/// small stacks), seeded like `crc32_seeded`.
+/// small stacks) through one hasher, seeded like `crc32_seeded`.
 pub fn src_crc32(s: &(impl Source + ?Sized), from: u64, to: u64, seed: u32) -> Result<u32> {
     let mut buf = [0u8; 4096];
-    let (mut at, mut crc) = (from, seed);
+    let mut crc = crc32fast::Hasher::new_with_initial(seed);
+    let mut at = from;
     while at < to {
         let n = (to - at).min(buf.len() as u64) as usize;
         s.read_at(at, &mut buf[..n])?;
-        crc = crate::crc32_seeded(&buf[..n], crc);
+        crc.update(&buf[..n]);
         at += n as u64;
     }
-    Ok(crc)
+    Ok(crc.finalize())
 }
 
 #[cfg(test)]
 mod tests {
+    extern crate std;
     use super::*;
 
     #[test]
@@ -88,5 +90,11 @@ mod tests {
         let mut buf = [0u8; 2];
         assert_eq!(src_bytes(b, 5, 3, &mut buf), Err(Error::Invalid));
         assert_eq!(src_crc32(b, 0, 7, 0), Ok(crate::crc32_seeded(b, 0)));
+        let big: std::vec::Vec<u8> = (0..10_000u32).map(|i| (i * 7 + i / 13) as u8).collect();
+        let seed = crate::crc32(b"seed");
+        assert_eq!(
+            src_crc32(&big[..], 3, 9_999, seed),
+            Ok(crate::crc32_seeded(&big[3..9_999], seed))
+        );
     }
 }

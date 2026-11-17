@@ -306,37 +306,48 @@ pub(crate) unsafe fn release_pack_fd_after_read(
 ) -> c_int {
     let state = pack_state();
     let mut result = error;
-    if read_ran {
+    // One PACK_M section for the reopen rule and the unpin (two before).
+    let wake_workers = {
         let _lock = PACK_M.lock();
-        if (pack_id as u32) < pack_volume_count(state) {
+        if read_ran && (pack_id as u32) < pack_volume_count(state) {
             let handle = &mut (*state).pack_handles[pack_id as usize];
             if handle.fd == fd && handle.pins != 0 {
                 (result, handle.reopen) = handle.reopen.after_read(error);
             }
         }
+        unsafe { release_pack_fd_locked(state, pack_id) }
+    };
+    if wake_workers {
+        QUEUE_CV.notify_all();
     }
-    release_pack_fd(pack_id);
     result
 }
 
-pub(crate) unsafe fn acquire_pack_fd(pack_id: u16) -> c_int {
+/// Pins volume `pack_id`'s fd, opening it when needed, and returns it with
+/// its payload range `[payload_begin, payload_end)` read under the same
+/// PACK_M section as the pin, or an error with an empty range. An fd
+/// already open and not stale is pinned in the first section, one PACK_M
+/// round trip (three per disk read before, with the range check).
+pub(crate) unsafe fn acquire_pack_fd(pack_id: u16) -> (c_int, (u64, u64)) {
     let state = pack_state();
-    let mut path = [0 as c_char; SCE_KERNEL_PATH_MAX];
     let (Some(open_fn), Some(_), Some(fstat_fn)) = (real_open(), real_close(), real_fstat()) else {
-        return SCE_KERNEL_ERROR_EIO;
+        return (SCE_KERNEL_ERROR_EIO, (0, 0));
     };
     let id = pack_id as usize;
     let stale_fd = {
         let _lock = PACK_M.lock();
         if pack_id as u32 >= pack_volume_count(state) {
-            return SCE_KERNEL_ERROR_EINVAL;
+            return (SCE_KERNEL_ERROR_EINVAL, (0, 0));
+        }
+        if let Some(pinned) = unsafe { pin_open_pack_fd_locked(state, id) } {
+            return pinned;
         }
         let handle = &mut (*state).pack_handles[id];
         if handle.fd >= 0 && handle.reopen.is_stale() {
             // No new pins on a stale fd; the last unpin bumps
             // PACK_FD_PROGRESS_EPOCH and wakes this job to reopen it.
             if handle.pins != 0 {
-                return SCE_KERNEL_ERROR_EAGAIN;
+                return (SCE_KERNEL_ERROR_EAGAIN, (0, 0));
             }
             let fd = handle.fd;
             *handle = PackHandle {
@@ -355,33 +366,29 @@ pub(crate) unsafe fn acquire_pack_fd(pack_id: u16) -> c_int {
     };
     // Closed outside PACK_M: a close on a released USB device may block.
     close_physical_pack_fd(stale_fd);
+    // Zeroed only past the pin fast path above.
+    let mut path = [0 as c_char; SCE_KERNEL_PATH_MAX];
     let mut victim_fd = -1;
     {
         let _lock = PACK_M.lock();
         // AMPRPAK4 pack count, or the zstd volume count.
         let pack_count = pack_volume_count(state);
         if pack_id as u32 >= pack_count {
-            return SCE_KERNEL_ERROR_EINVAL;
+            return (SCE_KERNEL_ERROR_EINVAL, (0, 0));
         }
-        if (*state).pack_handles[id].fd >= 0 {
-            // Marked stale since the check above: no new pin, so the last
-            // unpin can close it; the next attempt reopens (see above).
-            if (*state).pack_handles[id].reopen.is_stale() {
-                return SCE_KERNEL_ERROR_EAGAIN;
-            }
-            if (*state).pack_handles[id].pins == u32::MAX {
-                return SCE_KERNEL_ERROR_EBUSY;
-            }
-            (*state).pack_handles[id].pins += 1;
-            (*state).pack_handles[id].last_use = (*state).tick;
-            (*state).tick += 1;
-            return (*state).pack_handles[id].fd;
+        // Marked stale since the check above: no new pin, so the last unpin
+        // can close it; the next attempt reopens (see above).
+        if (*state).pack_handles[id].fd >= 0 && (*state).pack_handles[id].reopen.is_stale() {
+            return (SCE_KERNEL_ERROR_EAGAIN, (0, 0));
+        }
+        if let Some(pinned) = unsafe { pin_open_pack_fd_locked(state, id) } {
+            return pinned;
         }
         if (*state).pack_handles[id].opening {
-            return SCE_KERNEL_ERROR_EAGAIN;
+            return (SCE_KERNEL_ERROR_EAGAIN, (0, 0));
         }
         if !build_pack_path(state, pack_id, path.as_mut_ptr(), path.len()) {
-            return SCE_KERNEL_ERROR_ENAMETOOLONG;
+            return (SCE_KERNEL_ERROR_ENAMETOOLONG, (0, 0));
         }
         if (*state).open_pack_count + (*state).opening_pack_count >= AMPR_EMU_PACK_OPEN_PACK_FD_CAP
         {
@@ -395,7 +402,7 @@ pub(crate) unsafe fn acquire_pack_fd(pack_id: u16) -> c_int {
                 }
             }
             if victim == INVALID_INDEX {
-                return SCE_KERNEL_ERROR_EAGAIN;
+                return (SCE_KERNEL_ERROR_EAGAIN, (0, 0));
             }
             let evicted = &mut (*state).pack_handles[victim as usize];
             stats::add(stats::Stat::PackFdEvictions, 1);
@@ -423,7 +430,7 @@ pub(crate) unsafe fn acquire_pack_fd(pack_id: u16) -> c_int {
         }
         (*state).pack_handles[id].opening = false;
         (*state).opening_pack_count -= 1;
-        return SCE_KERNEL_ERROR_EAGAIN;
+        return (SCE_KERNEL_ERROR_EAGAIN, (0, 0));
     }
     let open_start = stats::now();
     let mut fd = open_fn(path.as_ptr(), SCE_KERNEL_O_RDONLY | O_NONBLOCK, 0 as c_int);
@@ -515,7 +522,28 @@ pub(crate) unsafe fn acquire_pack_fd(pack_id: u16) -> c_int {
     if wake_workers {
         QUEUE_CV.notify_all();
     }
-    result
+    if fd >= 0 {
+        (result, (payload_begin, payload_end))
+    } else {
+        (result, (0, 0))
+    }
+}
+
+/// Pins the open, not stale fd of volume `id`: Some((fd, payload range)),
+/// Some(EBUSY) at the pin cap, None when there is no such fd. PACK_M held.
+unsafe fn pin_open_pack_fd_locked(state: *mut PackState, id: usize) -> Option<(c_int, (u64, u64))> {
+    let tick = (*state).tick;
+    let handle = &mut (*state).pack_handles[id];
+    if handle.fd < 0 || handle.reopen.is_stale() {
+        return None;
+    }
+    if handle.pins == u32::MAX {
+        return Some((SCE_KERNEL_ERROR_EBUSY, (0, 0)));
+    }
+    handle.pins += 1;
+    handle.last_use = tick;
+    (*state).tick += 1;
+    Some((handle.fd, (handle.payload_begin, handle.payload_end)))
 }
 
 #[cfg(test)]

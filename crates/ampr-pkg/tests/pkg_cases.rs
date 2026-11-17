@@ -176,6 +176,20 @@ fn open_pkg_accepts_unaligned_raw_on_pack_0_only() {
     assert_eq!(open_pkg(&b[..]).err(), Some(Error::Invalid));
 }
 
+/// A RAW chunk is copied out of the read window as is, so its stored size
+/// must be its raw size: pack 0's loosened layout rules keep that check, and
+/// the runtime's raw copy (rt/pack/virtual_read.rs) relies on it.
+#[test]
+fn open_pkg_rejects_raw_chunk_shorter_than_its_block() {
+    let at = u64::from(PAGE) + 4;
+    let b = build(
+        16384,
+        FILE_PACKED | FILE_STORE_ONLY,
+        &[(loc(at, 0), desc(16000, CHUNK_RAW))],
+    );
+    assert_eq!(open_pkg(&b[..]).err(), Some(Error::Invalid));
+}
+
 /// `open_pkg` keeps upstream's header checks: a flipped payload byte fails
 /// the CRC, a wrong version fails the fields, as with strict `open`.
 #[test]

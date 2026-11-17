@@ -16,24 +16,37 @@ unsafe fn set_error_out(error_out: *mut c_int, error: c_int) {
 
 pub(crate) unsafe fn release_pack_fd(pack_id: u16) {
     let state = pack_state();
-    let mut wake_workers = false;
-    {
+    let wake_workers = {
         let _lock = PACK_M.lock();
-        if pack_id as u32 >= pack_volume_count(state) {
-            return;
-        }
-        let handle = &mut (*state).pack_handles[pack_id as usize];
-        if handle.pins != 0 {
-            handle.pins -= 1;
-            PACK_FD_PROGRESS_EPOCH.fetch_add(1, Ordering::Release);
-            wake_workers = wake_fd_waiters_locked(state);
-        }
-        (*state).pack_handles[pack_id as usize].last_use = (*state).tick;
-        (*state).tick += 1;
-    }
+        unsafe { release_pack_fd_locked(state, pack_id) }
+    };
     if wake_workers {
         QUEUE_CV.notify_all();
     }
+}
+
+/// The unpin of `release_pack_fd`; returns whether fd waiters need a
+/// QUEUE_CV wake (sent by the caller after PACK_M). PACK_M held.
+pub(crate) unsafe fn release_pack_fd_locked(state: *mut PackState, pack_id: u16) -> bool {
+    if pack_id as u32 >= pack_volume_count(state) {
+        return false;
+    }
+    let mut wake_workers = false;
+    let handle = &mut (*state).pack_handles[pack_id as usize];
+    if handle.pins != 0 {
+        handle.pins -= 1;
+        // Only the last unpin can unblock an open (a stale fd closes, an
+        // fd becomes an eviction victim, leases.rs `acquire_pack_fd`).
+        // Bumping on every unpin ended an idle worker's spin
+        // (worker.rs `idle_spin`) once per disk read for nothing.
+        if handle.pins == 0 || (*state).fd_waiter_count != 0 {
+            PACK_FD_PROGRESS_EPOCH.fetch_add(1, Ordering::Release);
+        }
+        wake_workers = wake_fd_waiters_locked(state);
+    }
+    (*state).pack_handles[pack_id as usize].last_use = (*state).tick;
+    (*state).tick += 1;
+    wake_workers
 }
 
 pub(crate) unsafe fn pipeline_window_contains(
@@ -82,7 +95,8 @@ pub(crate) unsafe fn ensure_pipeline_io_scratch(pipeline: &mut ReadPipelineConte
 
 /// One native read of exactly `range` (any byte offset and length, no page
 /// alignment; the pack fd has no direct I/O) into the pipeline io scratch:
-/// pins the pack fd and sets up the request for the reactor (worker.rs).
+/// pins the pack fd and sets up the request the worker queues to the pread
+/// pool, or to the reactor when the pool refuses it (worker.rs).
 /// finish_pipeline_window_aio binds the scratch as the window
 /// [range.offset, + range.length).
 pub(crate) unsafe fn prepare_exact_window_aio(
@@ -106,7 +120,9 @@ pub(crate) unsafe fn prepare_exact_window_aio(
         }
         pipeline.fd_wait_epoch = PACK_FD_PROGRESS_EPOCH.load(Ordering::Acquire);
         pipeline.fd_budget_wait_epoch = ampr_index_fd_open_budget_progress_generation();
-        let fd = acquire_pack_fd(range.pack_id);
+        // The payload range comes back from the pin's own PACK_M section:
+        // a pinned handle is never closed or reset, so it stays valid.
+        let (fd, payload) = acquire_pack_fd(range.pack_id);
         if fd < 0 {
             pipeline.io_range = PipelineIoRange::EMPTY;
             if fd == SCE_KERNEL_ERROR_EAGAIN {
@@ -115,20 +131,11 @@ pub(crate) unsafe fn prepare_exact_window_aio(
             set_error_out(error_out, fd);
             return PipelineStep::Failed;
         }
-        let state = pack_state();
-        let mut in_range = false;
-        {
-            let _lock = PACK_M.lock();
-            // zstd: [payload_begin, payload_end) is [0, volume size).
-            if (range.pack_id as u32) < pack_volume_count(state) {
-                let handle = &(*state).pack_handles[range.pack_id as usize];
-                let mut end = 0u64;
-                in_range = handle.fd == fd
-                    && checked_add_u64(range.offset, range.length as u64, &mut end)
-                    && range.offset >= handle.payload_begin
-                    && end <= handle.payload_end;
-            }
-        }
+        // zstd: [payload_begin, payload_end) is [0, volume size).
+        let mut end = 0u64;
+        let in_range = checked_add_u64(range.offset, range.length as u64, &mut end)
+            && range.offset >= payload.0
+            && end <= payload.1;
         if !in_range {
             release_pack_fd(range.pack_id);
             pipeline.io_range = PipelineIoRange::EMPTY;

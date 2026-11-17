@@ -39,6 +39,8 @@ pub(crate) unsafe fn pack_state_create() -> *mut PackState {
             let st = &mut *s;
             st.queue_head = [[INVALID_INDEX; PACK_WORK_CLASS_COUNT]; 3];
             st.queue_tail = [[INVALID_INDEX; PACK_WORK_CLASS_COUNT]; 3];
+            st.retained_head = [[INVALID_INDEX; PACK_WORK_CLASS_COUNT]; 3];
+            st.retained_tail = [[INVALID_INDEX; PACK_WORK_CLASS_COUNT]; 3];
             st.decoded_cache_target_bytes = super::super::tune::decoded_bytes();
             st.requested_workers = super::super::tune::workers();
             st.latency_reserve_workers = AMPR_EMU_PACK_LATENCY_RESERVE_WORKERS;
@@ -204,10 +206,6 @@ pub(crate) fn pack_monotonic_usecs() -> u64 {
         .wrapping_add(ts.tv_nsec as u64 / 1000)
 }
 
-pub(crate) fn pack_telemetry_usecs() -> u64 {
-    0
-}
-
 pub(crate) fn elapsed_usecs(start: u64, end: u64) -> u64 {
     if start != 0 && end >= start {
         end - start
@@ -303,19 +301,6 @@ pub(crate) unsafe fn manifest_string<'b>(
 
 pub(crate) fn overlay_bytes(value: *const c_char) -> *const u8 {
     value as *const u8
-}
-
-fn fold(c: c_char) -> u8 {
-    (c as u8).to_ascii_lowercase()
-}
-
-pub(crate) unsafe fn folded_equal(
-    a: *const c_char,
-    a_length: usize,
-    b: *const c_char,
-    b_length: usize,
-) -> bool {
-    a_length == b_length && (0..a_length).all(|i| unsafe { fold(*a.add(i)) == fold(*b.add(i)) })
 }
 
 pub(crate) unsafe fn folded_hash(value: *const c_char, length: usize) -> u64 {
@@ -424,35 +409,10 @@ pub(crate) unsafe fn fill_synthetic_stat(
     st.st_ino = ((inode_seed & 0x7fff_ffff) | 1) as u32;
 }
 
-pub(crate) unsafe fn joined_entry_matches_path(
-    directory: *const c_char,
-    directory_length: u16,
-    name: *const c_char,
-    name_length: usize,
-    target: *const c_char,
-) -> bool {
-    if directory.is_null() || name.is_null() || target.is_null() {
-        return false;
-    }
-    let dir_len = directory_length as usize;
-    let target_length = unsafe { CStr::from_ptr(target) }.count_bytes();
-    let slash = dir_len == 0 || unsafe { *directory.add(dir_len - 1) } != b'/' as c_char;
-    if dir_len + slash as usize + name_length != target_length {
-        return false;
-    }
-    if !unsafe { folded_equal(directory, dir_len, target, dir_len) } {
-        return false;
-    }
-    let mut target_cursor = dir_len;
-    if slash {
-        if unsafe { *target.add(target_cursor) } != b'/' as c_char {
-            return false;
-        }
-        target_cursor += 1;
-    }
-    unsafe { folded_equal(name, name_length, target.add(target_cursor), name_length) }
-}
-
+/// Emulator files, manifest pack volumes, stale default-named volumes and,
+/// with zstd packs, the mounted volumes never appear in a listing. One
+/// implementation, `ampr_lz4::overlay::service_name_hidden` behind the FFI
+/// shim, over the mounted manifest (none in zstd mode or without packs).
 pub(crate) unsafe fn service_name_hidden(
     state: *const PackState,
     directory: *const c_char,
@@ -460,117 +420,15 @@ pub(crate) unsafe fn service_name_hidden(
     name: *const c_char,
     name_length: usize,
 ) -> bool {
-    // AMPR_EMU_PACK_INDEX_PATH is /app0/ampr_assets.index.
-    const FIXED_PATHS: [&CStr; 4] = [
-        c"/app0/ampr_emu.index",
-        c"/app0/ampr_commands.bin",
-        c"/app0/ampr_emu.log",
-        AMPR_EMU_PACK_INDEX_PATH,
-    ];
-    // zstd: ampr_zstd.index and the mounted ampr_zstd-NNN.pak volumes.
-    if zstd_mode()
-        && !directory.is_null()
-        && !name.is_null()
-        && unsafe {
-            ampr_rust_overlay_service_name_hidden(
-                null(),
-                directory as *const u8,
-                directory_length,
-                name as *const u8,
-                name_length,
-            )
-        }
-    {
-        return true;
-    }
-    for path in FIXED_PATHS {
-        if unsafe {
-            joined_entry_matches_path(
-                directory,
-                directory_length,
-                name,
-                name_length,
-                path.as_ptr(),
-            )
-        } {
-            return true;
-        }
-    }
-
-    // Hide the exact physical volumes named by the loaded manifest; pack
-    // names are deployment-relative to the logical /app0 namespace.
-    let root = AMPR_EMU_PACK_LOGICAL_ROOT_PATH.to_bytes();
-    if !(*state).header.is_null() {
-        let root_slash = root.last() != Some(&b'/');
-        for pack_id in 0..unsafe { (*(*state).header).pack_count } {
-            let Some(record) = (unsafe { lz4_pack(state, pack_id) }) else {
-                continue;
-            };
-            let mut pack_name = [0u8; SCE_KERNEL_PATH_MAX];
-            let Some(pack_name) = (unsafe {
-                manifest_string(
-                    state,
-                    record.name_offset,
-                    record.name_length,
-                    &mut pack_name,
-                )
-            }) else {
-                continue;
-            };
-            let name_len = pack_name.len();
-            let target_length = root.len() + root_slash as usize + name_len;
-            if target_length >= SCE_KERNEL_PATH_MAX {
-                continue;
-            }
-            let mut target = [0 as c_char; SCE_KERNEL_PATH_MAX];
-            let t = target.as_mut_ptr();
-            unsafe {
-                core::ptr::copy_nonoverlapping(root.as_ptr() as *const c_char, t, root.len());
-                let mut cursor = root.len();
-                if root_slash {
-                    *t.add(cursor) = b'/' as c_char;
-                    cursor += 1;
-                }
-                core::ptr::copy_nonoverlapping(
-                    pack_name.as_ptr() as *const c_char,
-                    t.add(cursor),
-                    name_len,
-                );
-                if joined_entry_matches_path(directory, directory_length, name, name_length, t) {
-                    return true;
-                }
-            }
-        }
-    }
-
-    // Also hide stale/default-named volumes in /app0.
-    if !unsafe {
-        folded_equal(
-            directory,
-            directory_length as usize,
-            root.as_ptr() as *const c_char,
-            root.len(),
+    unsafe {
+        ampr_rust_overlay_service_name_hidden(
+            core::ptr::addr_of!((*state).core_view),
+            directory as *const u8,
+            directory_length,
+            name as *const u8,
+            name_length,
         )
-    } {
-        return false;
     }
-    const PACK_PREFIX: &[u8] = b"ampr_assets-";
-    const SUFFIX: &[u8] = b".pak";
-    name_length > PACK_PREFIX.len()
-        && name_length >= SUFFIX.len()
-        && unsafe {
-            folded_equal(
-                name,
-                PACK_PREFIX.len(),
-                PACK_PREFIX.as_ptr() as *const c_char,
-                PACK_PREFIX.len(),
-            ) && folded_equal(
-                name.add(name_length - SUFFIX.len()),
-                SUFFIX.len(),
-                SUFFIX.as_ptr() as *const c_char,
-                SUFFIX.len(),
-            )
-        }
 }
 
 pub(crate) unsafe fn join_directory_child(

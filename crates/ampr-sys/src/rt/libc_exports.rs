@@ -131,8 +131,7 @@ fn fabs(x: f64) -> f64 {
 fn exp_small(t: f64) -> f64 {
     const LN2_HI: f64 = 6.931_471_803_691_238_164_90e-1;
     const LN2_LO: f64 = 1.908_214_929_270_587_700_02e-10;
-    const INV_LN2: f64 = 1.442_695_040_888_963_387_00;
-    let k = (t * INV_LN2 + 0.5) as i64;
+    let k = (t * core::f64::consts::LOG2_E + 0.5) as i64;
     let kf = k as f64;
     let r = (t - kf * LN2_HI) - kf * LN2_LO;
     let mut p = 1.0;

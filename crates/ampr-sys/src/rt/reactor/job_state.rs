@@ -2,11 +2,6 @@
 
 use super::*;
 
-/// Detaches the guard lifetime from `self` so `&mut self` helpers can run under `m`.
-fn unbound_mutex<'a>(m: &Mutex) -> &'a Mutex {
-    unsafe { &*(m as *const Mutex) }
-}
-
 /// `PackedOpLayout::bytes` (field is private in command_buffer.rs; repr(C), first u32).
 fn packed_layout_bytes(l: &PackedOpLayout) -> u32 {
     unsafe { *(l as *const PackedOpLayout as *const u32) }
@@ -50,15 +45,15 @@ impl AprAioReactor {
         job.syntheticWaitSlot = u32::MAX;
     }
 
-    pub(crate) fn publish_synthetic_wait_completion(&mut self, job: &mut JobState) {
+    /// Under `m`: publishes a released job's synthetic wait result. Returns
+    /// whether the lane's waiters must be woken; the caller notifies after
+    /// dropping `m` (`notify_synthetic_waiters`).
+    pub(crate) fn publish_synthetic_wait_completion_locked(&mut self, job: &mut JobState) -> bool {
         if !job.syntheticWaitPublished || job.syntheticWaitSlot >= kSyntheticRequestCapacity {
-            return;
+            return false;
         }
         let mut notifyWaiter = false;
-        let mut notifyRequestAvailable = false;
-        let laneIndex = job.prioIndex as usize;
         {
-            let _lk = unbound_mutex(&self.m).lock();
             let slot = job.syntheticWaitSlot as usize;
             let request = self.syntheticWaitSlots[slot];
             if request.active && request.submitId == job.syntheticSubmitId {
@@ -80,17 +75,21 @@ impl AprAioReactor {
                         self.retain_synthetic_done_result_locked(request.submitId, result);
                     self.syntheticWaitSlots[slot] = SyntheticWaitSlot::default();
                     job.syntheticWaitSlot = u32::MAX;
-                    notifyRequestAvailable = true;
+                    self.syntheticRequestAvailableCv.notify_one();
                 }
             }
             // Completion always releases the lower descriptor immediately.
             self.release_synthetic_lower_slot_locked(job);
         }
-        if notifyWaiter && laneIndex < PRIO_N {
+        notifyWaiter
+    }
+
+    /// Wakes the APR waiters of `laneIndex` after a synthetic wait result was
+    /// published. All of them: they share the lane's condvar and wait on
+    /// different submit ids.
+    pub(crate) fn notify_synthetic_waiters(&self, laneIndex: usize) {
+        if laneIndex < PRIO_N {
             self.syntheticWaitCvs[laneIndex].notify_all();
-        }
-        if notifyRequestAvailable {
-            self.syntheticRequestAvailableCv.notify_one();
         }
     }
 

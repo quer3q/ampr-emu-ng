@@ -18,17 +18,15 @@ use core::ptr::{null, null_mut};
 ///
 /// Layout: the Index, Cache and Buffer ledgers (rt/index_memory.rs,
 /// 80 + remainder + 28.44 MiB caps), the 2 MiB thread stack block
-/// (rt/thread_stack.rs) and `POOL_SITES_BUDGET` (2 MiB) for these fixed
+/// (rt/thread_stack.rs) and `POOL_SITES_BUDGET` (1.75 MiB) for these fixed
 /// sites with their largest live size:
 /// - small slab (`sdk_alloc` up to a page): at most 64 blocks of 16 KiB,
 ///   1 MiB; its user is the getdents buffer up to 16 KiB;
 /// - the index writer's buffer, 256 KiB, one (rt/index.rs `BufWriter`);
 /// - a getdents buffer over 16 KiB, at most 64 KiB, one (rt/index.rs
 ///   `DENTS_POOL_MAX`; a larger st_blksize takes index memory);
-/// - the disk cache copy piece, 256 KiB, one under CACHE_M
-///   (pack/mmap.rs `PIECE`);
 /// - the iced-x86 heap, 384 KiB, one (rt/heap.rs `HEAP_BYTES`).
-/// Sites sum: 1.94 MiB (`POOL_SITES_MAX`). The cache cap is what is left
+/// Sites sum: 1.69 MiB (`POOL_SITES_MAX`). The cache cap is what is left
 /// after the other caps, the stack block and the budget, so the pool is
 /// full to its last 16 KiB page (index_memory.rs `CACHE_MEMORY_MAX`).
 pub(crate) const STATIC_POOL_SIZE: usize = {
@@ -41,7 +39,7 @@ pub(crate) const STATIC_POOL_SIZE: usize = {
 
 /// The Makefile's `AMPR_DEBUG_POOL_SIZE`, the smaller of the two pools, so
 /// host tests check the tighter fit (and the smaller cache).
-pub(crate) const DEFAULT_POOL_SIZE: usize = 0xf61_4000;
+pub(crate) const DEFAULT_POOL_SIZE: usize = 0xf7f_4000;
 
 /// Compile-time number parser (Makefile knobs); a malformed value fails the build.
 pub(crate) const fn parse_size(s: &[u8]) -> usize {
@@ -74,11 +72,10 @@ pub(crate) const fn parse_size(s: &[u8]) -> usize {
 const _: () = assert!(STATIC_POOL_SIZE % SCE_KERNEL_PAGE_SIZE == 0);
 
 /// The fixed pool sites above, largest live bytes each.
-pub(crate) const POOL_SITES: [(&str, usize); 5] = [
+pub(crate) const POOL_SITES: [(&str, usize); 4] = [
     ("small slab", SMALL_SLAB_BLOCKS * SCE_KERNEL_PAGE_SIZE),
     ("index writer", super::index::BUF_WRITER_SIZE),
     ("getdents", super::index::DENTS_POOL_MAX),
-    ("disk cache piece", super::pack::mmap::PIECE),
     ("iced-x86 heap", super::heap::HEAP_BYTES),
 ];
 pub(crate) const POOL_SITES_MAX: usize = {
@@ -90,9 +87,11 @@ pub(crate) const POOL_SITES_MAX: usize = {
     }
     sum
 };
-/// Pool room set aside for the fixed sites: 2 MiB, 1.94 MiB used, the rest
-/// for page rounding and fragmentation between them.
-pub(crate) const POOL_SITES_BUDGET: usize = 2 << 20;
+/// Pool room set aside for the fixed sites: 1.75 MiB, 1.69 MiB used, the
+/// rest for page rounding and fragmentation between them. It was 2 MiB
+/// with the removed mmap disk cache's 256 KiB piece; that 256 KiB went to
+/// the cache through the remainder rule.
+pub(crate) const POOL_SITES_BUDGET: usize = 7 << 18;
 const _: () = assert!(POOL_SITES_MAX <= POOL_SITES_BUDGET);
 const MAX_CHUNKS: usize = 512;
 const NIL: i32 = -1;
@@ -650,26 +649,28 @@ impl<const N: usize> ExactSlab<N> {
         }
     }
 
-    /// Caller holds `self.lock`.
-    unsafe fn blocks(&self) -> &mut [SlabBlock; N] {
-        unsafe { &mut *self.blocks.get() }
+    /// The block table; the caller holds `self.lock` while it uses it. A
+    /// raw pointer, not `&mut` from `&self` (clippy `mut_from_ref`).
+    fn blocks(&self) -> *mut [SlabBlock; N] {
+        self.blocks.get()
     }
 
     unsafe fn take_locked(&self, slot: usize) -> Option<(*mut u8, usize)> {
-        let b = unsafe { self.blocks() }
+        let b = unsafe { &mut *self.blocks() }
             .iter_mut()
             .find(|b| b.active && b.slot_size == slot && b.free_head != SLAB_NIL)?;
         unsafe { b.take() }
     }
 
-    /// Carves a fresh block into slots; None if the table is full.
+    /// Carves a fresh block into slots of `blocks` (the table, under
+    /// `self.lock`); None if the table is full.
     unsafe fn publish_locked(
-        &self,
+        blocks: &mut [SlabBlock; N],
         slot: usize,
         base: *mut u8,
         bytes: usize,
     ) -> Option<&mut SlabBlock> {
-        let b = unsafe { self.blocks() }
+        let b = blocks
             .iter_mut()
             .find(|b| !b.active && b.base.is_null())?;
         let count = bytes / slot;
@@ -723,7 +724,9 @@ impl<const N: usize> ExactSlab<N> {
             // Another thread may have published a block for this size meanwhile.
             match unsafe { self.take_locked(slot) } {
                 Some(r) => (Some(r), block),
-                None => match unsafe { self.publish_locked(slot, block, bytes) } {
+                None => match unsafe {
+                    Self::publish_locked(&mut *self.blocks(), slot, block, bytes)
+                } {
                     Some(b) => (unsafe { b.take() }, null_mut()),
                     None => (None, block),
                 },
@@ -745,7 +748,7 @@ impl<const N: usize> ExactSlab<N> {
         let addr = ptr as usize;
         let (slot, release) = {
             let _g = self.lock.lock();
-            let blocks = unsafe { self.blocks() };
+            let blocks = unsafe { &mut *self.blocks() };
             let i = blocks.iter().position(|b| {
                 let base = b.base as usize;
                 b.active
@@ -870,7 +873,7 @@ pub unsafe fn ampr_small_slab_free(
 mod pool_site_tests {
     /// Every pool allocation call in the runtime, with why it is fixed in
     /// size or held under a ledger cap.
-    const ALLOWED: [(&str, &str); 11] = [
+    const ALLOWED: [(&str, &str); 10] = [
         // The thread stack block, STACK_MEMORY_MAX, and the iced-x86 heap,
         // HEAP_BYTES: one block each.
         (
@@ -899,7 +902,6 @@ mod pool_site_tests {
             "ampr_internal_amm_pool_try_alloc(size, out_size",
         ),
         ("rt/runtime_memory.rs", "ampr_internal_amm_pool_alloc("),
-        ("rt/pack/mmap.rs", "sdk_alloc(PIECE"),
     ];
     const CALLS: [&str; 5] = [
         "sdk_alloc(",

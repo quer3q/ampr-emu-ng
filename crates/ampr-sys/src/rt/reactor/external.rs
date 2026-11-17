@@ -17,36 +17,13 @@ impl AprAioReactor {
         context: *mut c_void,
         callback: AprExternalAioCallback,
     ) -> c_int {
-        self.submit_external_aio_read_impl(request, 1, false, priority, ioClass, context, callback)
-    }
-
-    pub(crate) fn submit_external_aio_read_impl(
-        &mut self,
-        requests: *const SceKernelAioRWRequest,
-        requestCount: usize,
-        grouped: bool,
-        priority: c_int,
-        ioClass: AprExternalAioClass,
-        context: *mut c_void,
-        callback: AprExternalAioCallback,
-    ) -> c_int {
-        if requests.is_null()
-            || callback.is_none()
-            || requestCount == 0
-            || requestCount > kAprExternalAioGroupMaxRequests
-            || (grouped && requestCount < 2)
+        if callback.is_none()
+            || request.result.is_null()
+            || request.fd < 0
+            || request.nbyte == 0
             || !(SCE_KERNEL_AIO_PRIORITY_LOW..=SCE_KERNEL_AIO_PRIORITY_HIGH).contains(&priority)
         {
             return SCE_KERNEL_ERROR_EINVAL;
-        }
-        let reqs = unsafe { core::slice::from_raw_parts(requests, requestCount) };
-        let mut totalBytes: u64 = 0;
-        for r in reqs {
-            let n = r.nbyte as u64;
-            if r.result.is_null() || r.fd < 0 || n == 0 || totalBytes > u64::MAX - n {
-                return SCE_KERNEL_ERROR_EINVAL;
-            }
-            totalBytes += n;
         }
         if !self.start_worker() {
             return SCE_KERNEL_ERROR_ENOMEM;
@@ -65,18 +42,15 @@ impl AprAioReactor {
             if generation == 0 {
                 generation = 1;
             }
-            slot.requests = [SceKernelAioRWRequest::default(); kAprExternalAioGroupMaxRequests];
-            slot.aioIds = [-1; kAprExternalAioGroupMaxRequests];
+            slot.request = *request;
+            slot.aioId = -1;
             slot.submitTimeNs = 0;
             slot.retryNotBeforeNs = 0;
             slot.nextPollTimeNs = 0;
             slot.pollBackoffNs = 0;
-            slot.requests[..requestCount].copy_from_slice(reqs);
-            slot.requestCount = requestCount as u32;
+            slot.requestCount = 1;
             slot.remainingCount = 0;
-            slot.totalBytes = totalBytes;
             slot.completionState = SCE_KERNEL_AIO_STATE_COMPLETED;
-            slot.grouped = grouped;
             // Only the pack submits externals, into pool memory: pread-safe (pread_pool.rs).
             slot.preadBacked = crate::rt::tune::pread();
             slot.context = context;

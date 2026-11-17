@@ -9,6 +9,9 @@ pub unsafe fn sceKernelClose(fd: c_int) -> c_int {
     if handled {
         return rc;
     }
+    if crate::rt::index::is_kept_index_fd(fd) {
+        return SCE_KERNEL_ERROR_EBADF;
+    }
     match unsafe { real_sce_close() } {
         Some(f) => unsafe { f(fd) },
         None => SCE_KERNEL_ERROR_EIO,
@@ -42,6 +45,12 @@ pub unsafe extern "C" fn posix_close_emul(fd: c_int) -> c_int {
     let rc = unsafe { ampr_pack_try_close_fd(fd, &mut handled) };
     if handled {
         return posix_result_from_pack(rc);
+    }
+    // The runtime's kept index fd is not the game's to close (rt/index.rs
+    // `KEPT_FD`): EBADF, as for a number the game never opened.
+    if crate::rt::index::is_kept_index_fd(fd) {
+        set_errno(crate::rt::sys::EBADF);
+        return -1;
     }
     match unsafe { real_close() } {
         Some(f) => unsafe { f(fd) },
@@ -530,7 +539,6 @@ unsafe fn publish_virtual_jobs(
 ) {
     unsafe {
         let virtual_count = virtual_indexes.len();
-        let queued_at_usec = pack_telemetry_usecs();
         let mut queued = 0usize;
         let notify_one;
         {
@@ -540,7 +548,7 @@ unsafe fn publish_virtual_jobs(
                 let id = encode_virtual_aio(index, (*state).virtual_aio[index as usize].generation);
                 let id = split_caller_id(state, split_groups[virtual_positions[i]], id);
                 *ids.add(virtual_positions[i]) = id;
-                queue_push_locked(state, index, queued_at_usec);
+                queue_push_locked(state, index);
                 queued += 1;
             }
             notify_one = queued == 1 && effective_latency_reserve_locked(state) == 0;
@@ -673,32 +681,7 @@ pub unsafe fn sceKernelAioPollRequests(
                     continue;
                 }
                 let aio = lookup_virtual_aio_locked(state, id, null_mut());
-                *states.add(i) = if aio.is_null() {
-                    SCE_KERNEL_ERROR_ESRCH
-                } else {
-                    match (*aio).phase {
-                        VirtualAioPhase::Reserved
-                        | VirtualAioPhase::Queued
-                        | VirtualAioPhase::WaitingCache
-                        | VirtualAioPhase::WaitingFd => SCE_KERNEL_AIO_STATE_SUBMITTED,
-                        VirtualAioPhase::IoQueued => {
-                            let p = (*aio).pipeline_index;
-                            if p < (*state).pipeline_capacity
-                                && AtomicBool::from_ptr(
-                                    &raw mut (*state).pipelines[p as usize].native_submitted,
-                                )
-                                .load(Ordering::Acquire)
-                            {
-                                SCE_KERNEL_AIO_STATE_PROCESSING
-                            } else {
-                                SCE_KERNEL_AIO_STATE_SUBMITTED
-                            }
-                        }
-                        VirtualAioPhase::Running => SCE_KERNEL_AIO_STATE_PROCESSING,
-                        VirtualAioPhase::Done => (*aio).completion_state,
-                        _ => SCE_KERNEL_ERROR_ESRCH,
-                    }
-                };
+                *states.add(i) = virtual_job_poll_state_locked(state, aio);
             }
         }
         if real_count != 0 {
@@ -718,6 +701,39 @@ pub unsafe fn sceKernelAioPollRequests(
             }
         }
         0
+    }
+}
+
+/// The AIO state a poll reports for virtual job `aio` (null: ESRCH).
+/// PACK_M held.
+pub(crate) unsafe fn virtual_job_poll_state_locked(
+    state: *mut PackState,
+    aio: *const VirtualAioSlot,
+) -> c_int {
+    if aio.is_null() {
+        return SCE_KERNEL_ERROR_ESRCH;
+    }
+    match (*aio).phase {
+        VirtualAioPhase::Reserved
+        | VirtualAioPhase::Queued
+        | VirtualAioPhase::WaitingCache
+        | VirtualAioPhase::WaitingFd => SCE_KERNEL_AIO_STATE_SUBMITTED,
+        VirtualAioPhase::IoQueued => {
+            let p = (*aio).pipeline_index;
+            if p < (*state).pipeline_capacity
+                && unsafe {
+                    AtomicBool::from_ptr(&raw mut (*state).pipelines[p as usize].native_submitted)
+                }
+                .load(Ordering::Acquire)
+            {
+                SCE_KERNEL_AIO_STATE_PROCESSING
+            } else {
+                SCE_KERNEL_AIO_STATE_SUBMITTED
+            }
+        }
+        VirtualAioPhase::Running => SCE_KERNEL_AIO_STATE_PROCESSING,
+        VirtualAioPhase::Done => (*aio).completion_state,
+        _ => SCE_KERNEL_ERROR_ESRCH,
     }
 }
 
@@ -828,13 +844,13 @@ pub unsafe fn sceKernelAioCancelRequests(
                     }
                     VirtualAioPhase::WaitingCache => {
                         (*aio).cancel_requested.store(true, Ordering::Release);
-                        queue_cache_waiter_locked(state, index, pack_telemetry_usecs());
+                        queue_cache_waiter_locked(state, index);
                         *out = SCE_KERNEL_AIO_STATE_PROCESSING;
                         completed_queued_job = true;
                     }
                     VirtualAioPhase::WaitingFd => {
                         (*aio).cancel_requested.store(true, Ordering::Release);
-                        queue_fd_waiter_locked(state, index, pack_telemetry_usecs());
+                        queue_fd_waiter_locked(state, index);
                         *out = SCE_KERNEL_AIO_STATE_PROCESSING;
                         completed_queued_job = true;
                     }

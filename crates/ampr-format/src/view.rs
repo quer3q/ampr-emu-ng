@@ -1,4 +1,5 @@
-//! The compiled index view: per-file columns, two hash slot arrays (files,
+//! The compiled index view: one 32-byte `Row` per file, a zstd chunk
+//! column, two hash slot arrays (files,
 //! then directories) and one record per folded directory key, built once
 //! from an AMPRIDX3 index into caller slices and read-only afterwards.
 //!
@@ -8,7 +9,7 @@
 //! yielding ids of that hash) and `View::collides`.
 use crate::index::Index;
 use crate::source::{Source, PATH_BUF};
-use crate::{folded, idx_path_hash, pak_path_hash, Error, Result};
+use crate::{folded, view_hash, pak_path_hash, Error, Result};
 
 /// Ids are one-based; 0 is no file or directory.
 pub const NONE: u32 = 0;
@@ -25,7 +26,7 @@ const ROOT_LEN: usize = 5;
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Dir {
-    /// `idx_path_hash` of the folded key.
+    /// `view_hash` of the folded key.
     pub hash: u64,
     /// Parent directory id, `NONE` for `/app0`.
     pub parent: u32,
@@ -40,6 +41,29 @@ pub struct Dir {
 }
 
 const _: () = assert!(core::mem::size_of::<Dir>() == 32);
+
+/// One file's row. A stat hit reads the slot, then `hash` (the probe),
+/// `size` and `mtime`; as four columns that was four cache lines, in one
+/// 32-byte row aligned to 32 it is the slot's line and the row's. A hash
+/// tag in the slot (4 B more per slot) skips the hash read only for the
+/// other ids of a chain: a hit still compares all 64 bits, since a 32-bit
+/// tag alone would answer a miss with a file about once per 4 billion
+/// probes. The row costs 4 B per file on a title without packs (28 B of
+/// columns before), none with packs, where `next` was its own column.
+#[repr(C, align(32))]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Row {
+    /// `view_hash` of the folded path.
+    hash: u64,
+    size: u64,
+    mtime: i64,
+    /// Absolute offset of the path in the index file.
+    path_at: u32,
+    /// Next packed file of the directory; `UNLINKED` when not linked.
+    next: u32,
+}
+
+const _: () = assert!(core::mem::size_of::<Row>() == 32);
 
 /// Which pack columns a view carries. `Lz4` also covers pkg.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -60,13 +84,13 @@ pub struct Sizes {
 }
 
 impl Sizes {
-    /// (`next`, `chunk`, `lz4_hash`) lengths for `packs`.
-    pub fn pack_columns(&self, packs: Packs) -> (usize, usize, usize) {
+    /// (`chunk`, `lz4_hash`) lengths for `packs`.
+    pub fn pack_columns(&self, packs: Packs) -> (usize, usize) {
         let n = self.files as usize;
         match packs {
-            Packs::None => (0, 0, 0),
-            Packs::Lz4 => (n, 0, n),
-            Packs::Zstd => (n, n, 0),
+            Packs::None => (0, 0),
+            Packs::Lz4 => (0, n),
+            Packs::Zstd => (n, 0),
         }
     }
 }
@@ -93,12 +117,8 @@ pub fn sizes(files: u32, dir_cap: u32) -> Option<Sizes> {
 /// Caller memory for a view; lengths as `sizes` and `Sizes::pack_columns`
 /// give them, `dirs.len()` being the directory capacity.
 pub struct Buffers<'a> {
-    pub hash: &'a mut [u64],
-    pub size: &'a mut [u64],
-    pub mtime: &'a mut [i64],
-    /// Absolute offset of the path in the index file.
-    pub path_at: &'a mut [u32],
-    pub next: &'a mut [u32],
+    /// One per file.
+    pub rows: &'a mut [Row],
     pub chunk: &'a mut [u32],
     pub slots: &'a mut [u32],
     pub dirs: &'a mut [Dir],
@@ -162,6 +182,44 @@ fn folded_eq(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).all(|(&x, &y)| folded(x) == folded(y))
 }
 
+/// Length of `path`'s directory key: up to its last `/`.
+fn dir_len(path: &[u8]) -> Result<usize> {
+    path.iter().rposition(|&c| c == b'/').ok_or(Error::Invalid)
+}
+
+/// Length of the longest directory key `path` (directory key length
+/// `dir_len`) shares with `prev`, folded: the key of their deepest common
+/// directory, at least `/app0`.
+fn shared_dir(path: &[u8], prev: &[u8], dir_len: usize) -> Result<usize> {
+    let common = path
+        .iter()
+        .zip(prev)
+        .take_while(|(&x, &y)| folded(x) == folded(y))
+        .count();
+    (ROOT_LEN..=dir_len)
+        .rev()
+        .find(|&c| path[c] == b'/' && (c < common || (c == common && prev.get(c) == Some(&b'/'))))
+        .ok_or(Error::Invalid)
+}
+
+/// Directories `path` can add that `prev` (the path before it) did not:
+/// those below their shared key, and every one with no `prev`. Summed
+/// over files this bounds the directory count from above, as each
+/// directory is counted at least at its first file; it is exact for a
+/// sorted index.
+fn new_dirs(path: &[u8], prev: Option<&[u8]>) -> Result<u32> {
+    let dir_len = dir_len(path)?;
+    if dir_len < ROOT_LEN {
+        return Err(Error::Invalid);
+    }
+    let known = match prev {
+        Some(prev) => shared_dir(path, prev, dir_len)?,
+        None => ROOT_LEN,
+    };
+    let below = path[known + 1..=dir_len].iter().filter(|&&c| c == b'/').count();
+    Ok(below as u32 + u32::from(prev.is_none()))
+}
+
 /// Adds `id` to the collision list once; `Invalid` when the list is full.
 fn push_collide(collide: &mut [u32], len: &mut usize, id: u32) -> Result<()> {
     if collide[..*len].contains(&id) {
@@ -177,35 +235,38 @@ fn push_collide(collide: &mut [u32], len: &mut usize, id: u32) -> Result<()> {
 /// are `Invalid`; more directories than `bufs.dirs` holds is `OutOfRange`
 /// (the caller grows it and builds again).
 pub fn build<'a, S: Source + ?Sized>(idx: &Index<'_, S>, bufs: Buffers<'a>) -> Result<Builder<'a>> {
+    build_sized(idx, bufs, &mut 0)
+}
+
+/// `build`, and on `OutOfRange` for the directories, `dirs_needed` set to
+/// a capacity that holds them (`new_dirs`; exact for a sorted index), so
+/// the caller builds again once instead of doubling. The pass goes on
+/// after the table fills, reading paths only to count, so a title of one
+/// file per directory takes two passes where doubling from `files / 8`
+/// took four.
+pub fn build_sized<'a, S: Source + ?Sized>(
+    idx: &Index<'_, S>,
+    bufs: Buffers<'a>,
+    dirs_needed: &mut u32,
+) -> Result<Builder<'a>> {
     let files = idx.len();
     let dir_cap = u32::try_from(bufs.dirs.len()).map_err(|_| Error::Invalid)?;
     let sz = sizes(files, dir_cap).ok_or(Error::Invalid)?;
     let n = files as usize;
-    let (next, chunk, lz4) = (bufs.next.len(), bufs.chunk.len(), bufs.lz4_hash.len());
+    let (chunk, lz4) = (bufs.chunk.len(), bufs.lz4_hash.len());
     let packs = [Packs::None, Packs::Lz4, Packs::Zstd]
         .into_iter()
-        .any(|p| sz.pack_columns(p) == (next, chunk, lz4));
+        .any(|p| sz.pack_columns(p) == (chunk, lz4));
     if !packs
-        || [
-            bufs.hash.len(),
-            bufs.size.len(),
-            bufs.mtime.len(),
-            bufs.path_at.len(),
-            bufs.dir_of.len(),
-        ]
-        .iter()
-        .any(|&l| l != n)
+        || bufs.rows.len() != n
+        || bufs.dir_of.len() != n
         || bufs.slots.len() != sz.file_slots as usize
         || bufs.dir_slots.len() != sz.dir_slots as usize
     {
         return Err(Error::Invalid);
     }
     let mut b = Builder {
-        hash: bufs.hash,
-        size: bufs.size,
-        mtime: bufs.mtime,
-        path_at: bufs.path_at,
-        next: bufs.next,
+        rows: bufs.rows,
         chunk: bufs.chunk,
         slots: bufs.slots,
         dirs: bufs.dirs,
@@ -215,33 +276,59 @@ pub fn build<'a, S: Source + ?Sized>(idx: &Index<'_, S>, bufs: Buffers<'a>) -> R
         lz4_hash: bufs.lz4_hash,
         dir_count: 0,
         collide_len: 0,
+        packs: (chunk, lz4) != (0, 0),
     };
     b.slots.fill(NONE);
     b.dir_slots.fill(NONE);
-    b.next.fill(UNLINKED);
     b.chunk.fill(NO_CHUNK);
     let mut bufs = [[0u8; PATH_BUF]; 3];
     let (mut prev_len, mut prev_dir) = (None, NONE);
+    let mut over = None;
     for id in 1..=files {
         let [a, z, scratch] = &mut bufs;
         let (cur, prev) = if id & 1 == 0 { (a, &*z) } else { (z, &*a) };
         let rec = idx.record(id)?;
         let path = idx.checked_path(&rec, cur)?;
         let i = (id - 1) as usize;
-        let h = idx_path_hash(path);
-        b.hash[i] = h;
-        b.size[i] = rec.size;
-        b.mtime[i] = rec.mtime;
-        b.path_at[i] = u32::try_from(rec.path_at).map_err(|_| Error::OutOfRange)?;
+        let h = view_hash(path);
+        b.rows[i] = Row {
+            hash: h,
+            size: rec.size,
+            mtime: rec.mtime,
+            path_at: u32::try_from(rec.path_at).map_err(|_| Error::OutOfRange)?,
+            next: UNLINKED,
+        };
         if let Some(l) = b.lz4_hash.get_mut(i) {
             *l = pak_path_hash(path);
         }
         b.add_file(idx, id, h, path, scratch)?;
         let prev = prev_len.map(|l: usize| &prev[..l]);
-        let d = b.add_dirs(idx, id, path, prev, prev_dir, scratch)?;
+        // The count before this file: its own new directories, some added
+        // before the table filled, are counted again by `new_dirs`.
+        let before = b.dir_count;
+        let d = match b.add_dirs(idx, id, path, prev, prev_dir, scratch) {
+            Err(Error::OutOfRange) if b.dir_count as usize == b.dirs.len() => {
+                over = Some((id, before.saturating_add(new_dirs(path, prev)?)));
+                prev_len = Some(path.len());
+                break;
+            }
+            r => r?,
+        };
         b.dir_of[i] = d;
         prev_dir = d;
         prev_len = Some(path.len());
+    }
+    if let Some((full_at, mut need)) = over {
+        // The rest only counts; the buffers alternate as above.
+        for id in full_at + 1..=files {
+            let [a, z, _] = &mut bufs;
+            let (cur, prev) = if id & 1 == 0 { (a, &*z) } else { (z, &*a) };
+            let path = idx.checked_path(&idx.record(id)?, cur)?;
+            need = need.saturating_add(new_dirs(path, prev_len.map(|l: usize| &prev[..l]))?);
+            prev_len = Some(path.len());
+        }
+        *dirs_needed = need;
+        return Err(Error::OutOfRange);
     }
     b.collide[..b.collide_len].sort_unstable();
     Ok(b)
@@ -252,11 +339,7 @@ pub fn build<'a, S: Source + ?Sized>(idx: &Index<'_, S>, bufs: Buffers<'a>) -> R
 /// A view being built: `build` filled the AMPRIDX3 columns, a pack join
 /// sets chunks and links packed files, `finish` makes it read-only.
 pub struct Builder<'a> {
-    hash: &'a mut [u64],
-    size: &'a mut [u64],
-    mtime: &'a mut [i64],
-    path_at: &'a mut [u32],
-    next: &'a mut [u32],
+    rows: &'a mut [Row],
     chunk: &'a mut [u32],
     slots: &'a mut [u32],
     dirs: &'a mut [Dir],
@@ -266,6 +349,8 @@ pub struct Builder<'a> {
     lz4_hash: &'a mut [u64],
     dir_count: u32,
     collide_len: usize,
+    /// The view has pack columns, so `link_packed` may link.
+    packs: bool,
 }
 
 impl<'a> Builder<'a> {
@@ -279,8 +364,8 @@ impl<'a> Builder<'a> {
         path: &[u8],
         scratch: &mut [u8; PATH_BUF],
     ) -> Result<()> {
-        let hashes = &*self.hash;
-        for other in probe(self.slots, hash, |v| hashes[v as usize - 1]) {
+        let rows = &*self.rows;
+        for other in probe(self.slots, hash, |v| rows[v as usize - 1].hash) {
             let other_path = idx.path(&idx.record(other)?, scratch)?;
             if folded_eq(other_path, path) {
                 return Err(Error::Invalid);
@@ -303,24 +388,10 @@ impl<'a> Builder<'a> {
         prev_dir: u32,
         scratch: &mut [u8; PATH_BUF],
     ) -> Result<u32> {
-        let dir_len = path
-            .iter()
-            .rposition(|&c| c == b'/')
-            .ok_or(Error::Invalid)?;
+        let dir_len = dir_len(path)?;
         let (mut d, known) = match prev {
             Some(prev) if prev_dir != NONE => {
-                let common = path
-                    .iter()
-                    .zip(prev)
-                    .take_while(|(&x, &y)| folded(x) == folded(y))
-                    .count();
-                let shared = (ROOT_LEN..=dir_len)
-                    .rev()
-                    .find(|&c| {
-                        path[c] == b'/'
-                            && (c < common || (c == common && prev.get(c) == Some(&b'/')))
-                    })
-                    .ok_or(Error::Invalid)?;
+                let shared = shared_dir(path, prev, dir_len)?;
                 let mut d = prev_dir;
                 while d != NONE && usize::from(self.dirs[d as usize - 1].key_len) > shared {
                     d = self.dirs[d as usize - 1].parent;
@@ -355,7 +426,7 @@ impl<'a> Builder<'a> {
         scratch: &mut [u8; PATH_BUF],
     ) -> Result<u32> {
         let key = &path[..k];
-        let hash = idx_path_hash(key);
+        let hash = view_hash(key);
         let dirs = &*self.dirs;
         for d in probe(self.dir_slots, hash, |v| dirs[v as usize - 1].hash) {
             let dir = dirs[d as usize - 1];
@@ -387,18 +458,18 @@ impl<'a> Builder<'a> {
     }
 
     pub fn files(&self) -> u32 {
-        self.hash.len() as u32
+        self.rows.len() as u32
     }
 
     pub fn size(&self, id: u32) -> u64 {
-        at(self.size, id).unwrap_or(0)
+        at(self.rows, id).map_or(0, |r| r.size)
     }
 
     /// The file id of `hash`, `None` for no file or a hash on the collision
     /// list (the join then has no row for it).
     pub fn find_hash(&self, hash: u64) -> Option<u32> {
-        let hashes = &*self.hash;
-        let id = probe(self.slots, hash, |v| hashes[v as usize - 1]).next()?;
+        let rows = &*self.rows;
+        let id = probe(self.slots, hash, |v| rows[v as usize - 1].hash).next()?;
         (self.collide[..self.collide_len].binary_search(&id).is_err()).then_some(id)
     }
 
@@ -411,17 +482,17 @@ impl<'a> Builder<'a> {
 
     /// Puts file `id` on its directory's packed chain and flags the
     /// directory and its ancestors `DIR_PACKED`. Once per file: a second
-    /// call, or one without a `next` column, does nothing and answers
+    /// call, or one in a view without packs, does nothing and answers
     /// false, so a join counts each row once.
     pub fn link_packed(&mut self, id: u32) -> bool {
-        let Some(i) = index_of(id).filter(|&i| i < self.next.len()) else {
+        let Some(i) = index_of(id).filter(|&i| self.packs && i < self.rows.len()) else {
             return false;
         };
         let d = self.dir_of[i];
-        if self.next[i] != UNLINKED || d == NONE {
+        if self.rows[i].next != UNLINKED || d == NONE {
             return false;
         }
-        self.next[i] = core::mem::replace(&mut self.dirs[d as usize - 1].first_file, id);
+        self.rows[i].next = core::mem::replace(&mut self.dirs[d as usize - 1].first_file, id);
         let mut d = d;
         while d != NONE && self.dirs[d as usize - 1].flags & DIR_PACKED == 0 {
             self.dirs[d as usize - 1].flags |= DIR_PACKED;
@@ -445,7 +516,7 @@ impl<'a> Builder<'a> {
     /// directory `DIR_PACKED`. For a pack mount that failed after linking
     /// some rows.
     pub fn unlink_all(&mut self) {
-        self.next.fill(UNLINKED);
+        self.rows.iter_mut().for_each(|r| r.next = UNLINKED);
         self.chunk.fill(NO_CHUNK);
         for d in self.dirs[..self.dir_count as usize].iter_mut() {
             d.first_file = NONE;
@@ -457,11 +528,7 @@ impl<'a> Builder<'a> {
     pub fn finish(self) -> View<'a> {
         let (dirs, collide): (&'a [Dir], &'a [u32]) = (self.dirs, self.collide);
         View {
-            hash: self.hash,
-            size: self.size,
-            mtime: self.mtime,
-            path_at: self.path_at,
-            next: self.next,
+            rows: self.rows,
             chunk: self.chunk,
             slots: self.slots,
             dirs: &dirs[..self.dir_count as usize],
@@ -485,11 +552,7 @@ fn at<T: Copy>(column: &[T], id: u32) -> Option<T> {
 /// default `Dir` for an id out of range.
 #[derive(Clone, Copy)]
 pub struct View<'a> {
-    hash: &'a [u64],
-    size: &'a [u64],
-    mtime: &'a [i64],
-    path_at: &'a [u32],
-    next: &'a [u32],
+    rows: &'a [Row],
     chunk: &'a [u32],
     slots: &'a [u32],
     dirs: &'a [Dir],
@@ -499,7 +562,7 @@ pub struct View<'a> {
 
 impl<'a> View<'a> {
     pub fn files(&self) -> u32 {
-        self.hash.len() as u32
+        self.rows.len() as u32
     }
 
     pub fn dir_count(&self) -> u32 {
@@ -507,11 +570,11 @@ impl<'a> View<'a> {
     }
 
     pub fn size(&self, id: u32) -> u64 {
-        at(self.size, id).unwrap_or(0)
+        at(self.rows, id).map_or(0, |r| r.size)
     }
 
     pub fn mtime(&self, id: u32) -> i64 {
-        at(self.mtime, id).unwrap_or(0)
+        at(self.rows, id).map_or(0, |r| r.mtime)
     }
 
     /// First zstd chunk of file `id`; `NO_CHUNK` when loose or not zstd.
@@ -521,7 +584,7 @@ impl<'a> View<'a> {
 
     /// Whether a join linked file `id` with `Builder::link_packed`.
     pub fn packed(&self, id: u32) -> bool {
-        at(self.next, id).is_some_and(|n| n != UNLINKED)
+        at(self.rows, id).is_some_and(|r| r.next != UNLINKED)
     }
 
     pub fn dir(&self, id: u32) -> Dir {
@@ -530,7 +593,7 @@ impl<'a> View<'a> {
 
     /// The next packed file of file `id`'s directory, `NONE` at the end.
     pub(crate) fn next_file(&self, id: u32) -> u32 {
-        at(self.next, id).filter(|&n| n != UNLINKED).unwrap_or(NONE)
+        at(self.rows, id).map(|r| r.next).filter(|&n| n != UNLINKED).unwrap_or(NONE)
     }
 
     /// Every directory record, id `i + 1` at `i`.
@@ -540,18 +603,18 @@ impl<'a> View<'a> {
 
     /// Absolute offset of file `id`'s path in the index file.
     pub(crate) fn path_at(&self, id: u32) -> Option<u32> {
-        at(self.path_at, id)
+        at(self.rows, id).map(|r| r.path_at)
     }
 
     /// File `id`'s path hash, 0 for no file.
     pub(crate) fn hash(&self, id: u32) -> u64 {
-        at(self.hash, id).unwrap_or(0)
+        at(self.rows, id).map_or(0, |r| r.hash)
     }
 
     /// File ids whose path hash is `hash`, in probe order.
     pub(crate) fn files_by_hash(&self, hash: u64) -> impl Iterator<Item = u32> + 'a {
-        let hashes = self.hash;
-        probe(self.slots, hash, move |v| hashes[v as usize - 1])
+        let rows = self.rows;
+        probe(self.slots, hash, move |v| rows[v as usize - 1].hash)
     }
 
     /// Directory ids whose key hash is `hash`, in probe order.
@@ -577,14 +640,25 @@ impl<'a> View<'a> {
     /// directories of the key's length share its hash; any other hash
     /// match is the answer.
     pub fn lookup<S: Source + ?Sized>(&self, src: &S, key: &[u8]) -> Result<Hit> {
-        let hash = idx_path_hash(key);
-        let mut buf = [0u8; PATH_BUF];
+        // One hash for both probes.
+        let hash = view_hash(key);
         for id in self.files_by_hash(hash) {
-            if !self.collides(id) || folded_eq(self.path(src, id, &mut buf)?, key) {
+            if !self.collides(id) || self.path_is(src, id, key)? {
                 return Ok(Hit::File(id));
             }
         }
-        Ok(self.lookup_dir(src, key)?.map_or(Hit::Miss, Hit::Dir))
+        Ok(self
+            .lookup_dir_hashed(src, key, hash)?
+            .map_or(Hit::Miss, Hit::Dir))
+    }
+
+    /// Whether file `id`'s stored path folds to `key`. Out of line, so the
+    /// 1 KiB buffer is taken (and zeroed) only for a collision-listed id,
+    /// not on every lookup.
+    #[inline(never)]
+    fn path_is<S: Source + ?Sized>(&self, src: &S, id: u32, key: &[u8]) -> Result<bool> {
+        let mut buf = [0u8; PATH_BUF];
+        Ok(folded_eq(self.path(src, id, &mut buf)?, key))
     }
 
     /// The directory the normalized `key` names, files not probed: a file
@@ -592,7 +666,16 @@ impl<'a> View<'a> {
     /// `A/`), and `lookup` answers the file there. The source is read only
     /// when two directories of the key's length share its hash.
     pub fn lookup_dir<S: Source + ?Sized>(&self, src: &S, key: &[u8]) -> Result<Option<u32>> {
-        let hash = idx_path_hash(key);
+        self.lookup_dir_hashed(src, key, view_hash(key))
+    }
+
+    /// `lookup_dir` with the key's `view_hash` already taken.
+    fn lookup_dir_hashed<S: Source + ?Sized>(
+        &self,
+        src: &S,
+        key: &[u8],
+        hash: u64,
+    ) -> Result<Option<u32>> {
         let len_ok = |d: &u32| usize::from(self.dir(*d).key_len) == key.len();
         let mut dirs = self.dirs_by_hash(hash).filter(len_ok);
         let Some(first) = dirs.next() else {
@@ -601,6 +684,15 @@ impl<'a> View<'a> {
         if dirs.next().is_none() {
             return Ok(Some(first));
         }
+        self.dir_named(src, key, hash)
+    }
+
+    /// The directory of `hash` and `key`'s length whose spelling folds to
+    /// `key`, read from `src`. Out of line, as `path_is`: only two
+    /// directories of one hash and length take the buffer.
+    #[inline(never)]
+    fn dir_named<S: Source + ?Sized>(&self, src: &S, key: &[u8], hash: u64) -> Result<Option<u32>> {
+        let len_ok = |d: &u32| usize::from(self.dir(*d).key_len) == key.len();
         let mut buf = [0u8; PATH_BUF];
         for d in self.dirs_by_hash(hash).filter(len_ok) {
             if folded_eq(self.dir_path(src, d, &mut buf)?, key) {
@@ -663,7 +755,7 @@ impl<'a> View<'a> {
 mod tests {
     extern crate std;
     use super::*;
-    use crate::idx_path_hash_parts;
+    use crate::view_hash_parts;
     use crate::index::{
         read_layout,
         tests::{image, Counting},
@@ -675,11 +767,7 @@ mod tests {
 
     /// Owned memory for every `Buffers` slice.
     struct Mem {
-        hash: Vec<u64>,
-        size: Vec<u64>,
-        mtime: Vec<i64>,
-        path_at: Vec<u32>,
-        next: Vec<u32>,
+        rows: Vec<Row>,
         chunk: Vec<u32>,
         slots: Vec<u32>,
         dirs: Vec<Dir>,
@@ -693,13 +781,9 @@ mod tests {
         fn new(files: u32, dir_cap: u32, packs: Packs) -> Self {
             let sz = sizes(files, dir_cap).unwrap();
             let n = files as usize;
-            let (next, chunk, lz4) = sz.pack_columns(packs);
+            let (chunk, lz4) = sz.pack_columns(packs);
             Mem {
-                hash: vec![0; n],
-                size: vec![0; n],
-                mtime: vec![0; n],
-                path_at: vec![0; n],
-                next: vec![0; next],
+                rows: vec![Row::default(); n],
                 chunk: vec![0; chunk],
                 slots: vec![7; sz.file_slots as usize],
                 dirs: vec![Dir::default(); dir_cap as usize],
@@ -712,11 +796,7 @@ mod tests {
 
         fn bufs(&mut self) -> Buffers<'_> {
             Buffers {
-                hash: &mut self.hash,
-                size: &mut self.size,
-                mtime: &mut self.mtime,
-                path_at: &mut self.path_at,
-                next: &mut self.next,
+                rows: &mut self.rows,
                 chunk: &mut self.chunk,
                 slots: &mut self.slots,
                 dirs: &mut self.dirs,
@@ -745,13 +825,13 @@ mod tests {
         let path: &[u8] = b"/app0/Data/Sub\\File.BIN";
         for cut in 0..=path.len() {
             let (a, b) = path.split_at(cut);
-            assert_eq!(idx_path_hash_parts(&[a, b]), idx_path_hash(path));
+            assert_eq!(view_hash_parts(&[a, b]), view_hash(path));
         }
         assert_eq!(
-            idx_path_hash_parts(&[b"/app0/", b"x/", b"", b"y.bin"]),
-            idx_path_hash(b"/app0/x/y.bin")
+            view_hash_parts(&[b"/app0/", b"x/", b"", b"y.bin"]),
+            view_hash(b"/app0/x/y.bin")
         );
-        assert_eq!(idx_path_hash_parts(&[]), idx_path_hash(b""));
+        assert_eq!(view_hash_parts(&[]), view_hash(b""));
     }
 
     /// 500 paths in mixed case under nested directories, out of order.
@@ -776,6 +856,40 @@ mod tests {
             .collect()
     }
 
+    /// A full directory table answers `OutOfRange` with a count that
+    /// holds every directory: exact on a sorted index, at least the real
+    /// count on an unsorted one, and a build at that count succeeds.
+    #[test]
+    fn a_full_directory_table_counts_what_the_build_needs() {
+        let unsorted = unsorted_paths();
+        let mut sorted = unsorted.clone();
+        sorted.sort_by_key(|p| p.to_ascii_lowercase());
+        for (paths, exact) in [(sorted, true), (unsorted, false)] {
+            let refs: Vec<&[u8]> = paths.iter().map(|p| &p[..]).collect();
+            let img = image(&refs);
+            let idx = Index::open(&img[..]).unwrap();
+            let files = idx.len();
+            let mut keys = HashSet::new();
+            for p in &paths {
+                for k in dir_lens(p) {
+                    keys.insert(p[..k].to_ascii_lowercase());
+                }
+            }
+            let real = keys.len() as u32;
+            for cap in [1, 2, real / 2, real - 1] {
+                let mut mem = Mem::new(files, cap, Packs::None);
+                let mut need = 0;
+                let r = build_sized(&idx, mem.bufs(), &mut need);
+                assert_eq!(r.err(), Some(Error::OutOfRange), "cap {cap}");
+                assert!(need >= real, "cap {cap}: {need} < {real}");
+                assert!(!exact || need == real, "cap {cap}: {need} != {real}");
+                let mut mem = Mem::new(files, need, Packs::None);
+                let v = build_sized(&idx, mem.bufs(), &mut 0).unwrap().finish();
+                assert_eq!(v.dir_count(), real);
+            }
+        }
+    }
+
     #[test]
     fn build_fills_columns_and_directory_chains() {
         let paths = unsorted_paths();
@@ -788,7 +902,7 @@ mod tests {
         let b = build(&idx, mem.bufs()).unwrap();
         assert_eq!(b.files(), 500);
         let dir_of: Vec<u32> = (1..=files).map(|id| b.dir_of(id)).collect();
-        assert_eq!(b.find_hash(idx_path_hash(b"/APP0/f0.BIN")), Some(1));
+        assert_eq!(b.find_hash(view_hash(b"/APP0/f0.BIN")), Some(1));
         let v = b.finish();
         assert_eq!(v.files(), 500);
         let mut keys = HashSet::new();
@@ -803,7 +917,7 @@ mod tests {
             for &k in dir_lens(path).iter().rev() {
                 let dir = v.dir(d);
                 assert_eq!(usize::from(dir.key_len), k);
-                assert_eq!(dir.hash, idx_path_hash(&path[..k]));
+                assert_eq!(dir.hash, view_hash(&path[..k]));
                 let rep = &paths[dir.rep_file as usize - 1];
                 assert!(folded_eq(&rep[..k], &path[..k]));
                 keys.insert(path[..k].to_ascii_lowercase());
@@ -813,7 +927,7 @@ mod tests {
         }
         assert_eq!(v.dir_count() as usize, keys.len());
         assert!(v.collide_list().is_empty());
-        let root = v.dirs_by_hash(idx_path_hash(b"/app0")).next().unwrap();
+        let root = v.dirs_by_hash(view_hash(b"/app0")).next().unwrap();
         let mut children = 0;
         let mut c = v.dir(root).first_dir;
         while c != NONE {
@@ -862,7 +976,7 @@ mod tests {
             assert_eq!(v.dir(d).flags & DIR_PACKED, DIR_PACKED);
             d = v.dir(d).parent;
         }
-        let q = v.dirs_by_hash(idx_path_hash(b"/app0/q")).next().unwrap();
+        let q = v.dirs_by_hash(view_hash(b"/app0/q")).next().unwrap();
         assert_eq!(v.dir(q).flags, 0);
         assert_eq!(v.dir(q).first_file, NONE);
     }
@@ -886,8 +1000,44 @@ mod tests {
             assert_eq!(v.chunk(id), NO_CHUNK);
         }
         assert!(v.packed(3));
-        let a = v.dirs_by_hash(idx_path_hash(b"/app0/a")).next().unwrap();
+        let a = v.dirs_by_hash(view_hash(b"/app0/a")).next().unwrap();
         assert_eq!((v.dir(a).flags, v.dir(a).first_file), (0, NONE));
+    }
+
+    /// A stat hit reads one row: the lookup's id carries the record's
+    /// size, mtime and path offset and its own hash, all in the 32-byte
+    /// row of that id. Without packs no row links, as the `next` column's
+    /// absence made it before.
+    #[test]
+    fn a_stat_hit_reads_its_row() {
+        assert_eq!((core::mem::size_of::<Row>(), core::mem::align_of::<Row>()), (32, 32));
+        let paths = mixed_paths(300);
+        let refs: Vec<&[u8]> = paths.iter().map(|p| &p[..]).collect();
+        let img = image(&refs);
+        let idx = Index::open(&img[..]).unwrap();
+        let files = idx.len();
+        let mut mem = Mem::new(files, files / 8 + 1024, Packs::None);
+        let mut b = build(&idx, mem.bufs()).unwrap();
+        assert!(!b.link_packed(1));
+        let v = b.finish();
+        let mut ids = Vec::new();
+        for p in &paths {
+            let Hit::File(id) = v.lookup(&img[..], p).unwrap() else {
+                panic!("no file for {p:?}");
+            };
+            let rec = idx.record(id).unwrap();
+            assert_eq!((v.size(id), v.mtime(id), v.packed(id)), (rec.size, rec.mtime, false));
+            ids.push(id);
+        }
+        for (p, id) in paths.iter().zip(ids) {
+            let rec = idx.record(id).unwrap();
+            assert_eq!(idx.path(&rec, &mut [0; PATH_BUF]).unwrap(), &p[..]);
+            let row = mem.rows[id as usize - 1];
+            assert_eq!(
+                (row.size, row.mtime, row.path_at, row.hash, row.next),
+                (rec.size, rec.mtime, rec.path_at as u32, view_hash(p), UNLINKED)
+            );
+        }
     }
 
     // ---- lookups ----
@@ -904,10 +1054,10 @@ mod tests {
     /// Gives file `to` file `from`'s hash, as a real collision would, by
     /// rewriting the hash column, the file slots and the collision list.
     fn share_hash(b: &mut Builder<'_>, from: u32, to: u32) {
-        b.hash[to as usize - 1] = b.hash[from as usize - 1];
+        b.rows[to as usize - 1].hash = b.rows[from as usize - 1].hash;
         b.slots.fill(NONE);
         for id in 1..=b.files() {
-            insert(b.slots, b.hash[id as usize - 1], id).unwrap();
+            insert(b.slots, b.rows[id as usize - 1].hash, id).unwrap();
         }
         push_collide(b.collide, &mut b.collide_len, from).unwrap();
         push_collide(b.collide, &mut b.collide_len, to).unwrap();

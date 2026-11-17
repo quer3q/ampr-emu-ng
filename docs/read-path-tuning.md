@@ -16,7 +16,7 @@ job (`apr_read_ns` / `job_count`) and last read to notify
 |---|---|---|
 | Loose APR reads through the pread pool | on | `AMPR_EMU_APR_LOOSE_PREAD`, reactor/loose_pread.rs |
 | Loose read split into parallel parts | 64 KiB | `AMPR_EMU_APR_LOOSE_PREAD_PART_KIB` |
-| pread pool threads | at most 6, grown by backlog, kept until pressure mode gives them back (`retire_load=1` restores load retirement) | `tune::RELEASE_PREAD_THREADS` |
+| pread pool threads | at most 6, grown by backlog, kept until pressure mode gives them back | `tune::RELEASE_PREAD_THREADS` |
 | Threads kept for pack reads | 4 in a title with packs, 0 without (loose tasks: threads minus that, at least 1) | `AMPR_EMU_APR_LOOSE_PREAD_PACK_RESERVE`, `loose_pread_pack_reserve` |
 | Read pass / per-read active limits | 512 KiB / 4 chunks, 2 MiB | reactor/mod.rs |
 

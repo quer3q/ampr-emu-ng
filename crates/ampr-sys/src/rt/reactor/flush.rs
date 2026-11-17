@@ -100,45 +100,24 @@ impl AprAioReactor {
         self.maybe_release_reactor_job(&mut job);
     }
 
-    fn flush_group_external(&mut self, item: &AioItemRef) -> &'static mut ExternalAioRead {
-        let external = self.external_aio_at(&item.external);
-        if external.is_null() {
-            abort();
-        }
-        let external = unsafe { &mut *external };
-        if !external.grouped || external.state != ExternalAioState::AwaitingBatchSubmit {
-            abort();
-        }
-        external
-    }
-
     pub(crate) fn flush_aio_priority_submits(
         &mut self,
         batch: &mut AioSubmitBatch,
-        grouped: &mut ExternalAioGroupBatch,
         admission: *mut AioAdmissionContext,
     ) -> bool {
         let stagedItemCount = batch.count;
-        let stagedGroupCount = grouped.count;
         batch.count = 0;
-        grouped.count = 0;
-        if stagedItemCount == 0 && stagedGroupCount == 0 {
+        if stagedItemCount == 0 {
             return false;
         }
-        if batch.aioPriority != grouped.aioPriority
-            || stagedItemCount > SCE_KERNEL_AIO_REQUEST_NUM_MAX
-            || stagedGroupCount > kExternalAioCapacity as usize
-        {
+        if stagedItemCount > SCE_KERNEL_AIO_REQUEST_NUM_MAX {
             abort();
         }
 
-        let mut groupRequestOffsets = [0u32; kExternalAioCapacity as usize];
         let mut progressedAny = false;
         let mut stagedItem = 0usize;
-        let mut stagedGroup = 0usize;
-        while stagedItem < stagedItemCount || stagedGroup < stagedGroupCount {
+        while stagedItem < stagedItemCount {
             let firstItem = stagedItem;
-            let firstGroup = stagedGroup;
             let mut requestCount = 0usize;
             while stagedItem < stagedItemCount && requestCount < kAioCombinedSubmitRequestLimit {
                 batch.requests[requestCount] = batch.requests[stagedItem];
@@ -147,25 +126,6 @@ impl AprAioReactor {
                 stagedItem += 1;
             }
 
-            let mut groupCount = 0usize;
-            while stagedGroup < stagedGroupCount {
-                let external = self.flush_group_external(&grouped.items[stagedGroup]);
-                let n = external.requestCount as usize;
-                if n < 2 || n > kAioCombinedSubmitRequestLimit {
-                    abort();
-                }
-                if n > kAioCombinedSubmitRequestLimit - requestCount {
-                    break;
-                }
-                groupRequestOffsets[groupCount] = requestCount as u32;
-                for r in 0..n {
-                    batch.requests[requestCount] = external.requests[r];
-                    batch.ids[requestCount] = -1;
-                    requestCount += 1;
-                }
-                groupCount += 1;
-                stagedGroup += 1;
-            }
             if requestCount == 0 {
                 abort();
             }
@@ -243,32 +203,6 @@ impl AprAioReactor {
                 }
             }
 
-            for groupIndex in 0..groupCount {
-                let item = grouped.items[firstGroup + groupIndex];
-                let external = self.flush_group_external(&item);
-                let requestOffset = groupRequestOffsets[groupIndex] as usize;
-                let requestEnd = if groupIndex + 1 < groupCount {
-                    groupRequestOffsets[groupIndex + 1] as usize
-                } else {
-                    requestCount
-                };
-                if requestEnd < requestOffset
-                    || external.requestCount as usize != requestEnd - requestOffset
-                {
-                    abort();
-                }
-                if submitRc == 0 {
-                    let n = external.requestCount as usize;
-                    external.aioIds[..n].copy_from_slice(&batch.ids[requestOffset..requestEnd]);
-                    self.accept_external_aio_group(&item, submitTimeNs, !acceptedExternalInBatch);
-                    acceptedExternalInBatch = true;
-                    progressedAny = true;
-                    Self::stat_arm_external_requests(external, statSubmitNs);
-                } else {
-                    self.reject_external_aio_submit(&item, submitSceRc, submitTimeNs, admission);
-                    progressedAny |= !deferred;
-                }
-            }
             if submitRc == 0 && statSubmitNs != 0 {
                 stats::max(
                     Stat::AprInflightMax,
@@ -283,7 +217,7 @@ impl AprAioReactor {
 
     pub(crate) fn flush_aio_submit_round(&mut self, admission: *mut AioAdmissionContext) -> bool {
         let r = &self.aioSubmitRound;
-        if !(0..3).any(|i| r.batches[i].count != 0 || r.groupedExternal[i].count != 0) {
+        if !r.batches.iter().any(|b| b.count != 0) {
             return false;
         }
         self.ensure_aio_initialized();
@@ -291,10 +225,9 @@ impl AprAioReactor {
         for i in 0..3 {
             // Batches live in `self`; the flush callees never touch `aioSubmitRound`.
             let batch = unsafe { &mut *addr_of_mut!(self.aioSubmitRound.batches[i]) };
-            let grouped = unsafe { &mut *addr_of_mut!(self.aioSubmitRound.groupedExternal[i]) };
             // Loose first submits leave for the pread pool (loose_pread.rs).
             progressedAny |= self.route_loose_reads_to_pread(batch);
-            progressedAny |= self.flush_aio_priority_submits(batch, grouped, admission);
+            progressedAny |= self.flush_aio_priority_submits(batch, admission);
         }
         progressedAny
     }
@@ -338,20 +271,17 @@ impl AprAioReactor {
             chain.retryNotBeforeNs = 0;
         }
         self.prepare_aio_admission_context(admission, nowNs);
-        let readClass = self.effective_read_class(*job, &chain.ownerDesc);
-        let readWindow = self.adaptive_read_window(jobRef.prioIndex, readClass, admission);
+        let readWindow = self.adaptive_read_window(jobRef.prioIndex, admission);
         // Count and charged bytes are separate adaptive credits; I/O length is unchanged.
         if chain.activeCount >= readWindow.chunks
             || sliceCreditBytes > readWindow.bytes
             || chain.activeBytes > readWindow.bytes - sliceCreditBytes
         {
-            self.note_adaptive_read_window_blocked(readWindow.mode);
             stats::add(Stat::ReadActiveHeld, 1);
             return PENDING;
         }
         if !self.direct_read_admission_available(
             jobRef.prioIndex,
-            readClass,
             &chain.ownerDesc,
             &sliceDesc,
             nowNs,
@@ -374,9 +304,6 @@ impl AprAioReactor {
             if !acquired {
                 if apr_fd_acquire_sce_rc_is_deferred(acquireRc) {
                     let failureNowNs = time_counter_now();
-                    if acquireRc == SCE_KERNEL_ERROR_EMFILE {
-                        self.note_emfile_event();
-                    }
                     // Only a real open EAGAIN/EMFILE/ENFILE publishes fd pressure.
                     if self.fd_pressure_active(failureNowNs) {
                         admission.current = false;
@@ -409,7 +336,6 @@ impl AprAioReactor {
             jobRef.nextReadSeq
         };
         let activeIt = self.activeReads.push_back(ActiveRead::default());
-        self.note_active_read_peak(self.activeReads.size());
         let active = unsafe { activeIt.get() };
         let chainPtr: *mut ReadChain = chain;
         active.job = *job;
@@ -436,7 +362,6 @@ impl AprAioReactor {
         // Park the chain until the end-of-pass multiple-submit accepts this
         // exact slice, so no duplicate request is staged from the same range.
         chain.retryNotBeforeNs = kReadChainAwaitingInitialSubmit;
-        self.note_adaptive_read_window_staged(readWindow.mode);
         // Reserve in the pass-local admission snapshot with the real lane time.
         self.reserve_staged_aio_admission(admission, active, nowNs);
         outcome(DirectReadSubmitResult::Staged, null(), 0, 0, 0)
@@ -465,17 +390,9 @@ impl AprAioReactor {
             return;
         }
         if let Some(e) = unsafe { self.external_aio_at(&item.external).as_mut() } {
-            Self::stat_arm_external_requests(e, ns);
+            e.statSubmitNs = ns;
+            e.statLastPollNs = 0;
+            e.statPolls = 0;
         }
-    }
-
-    fn stat_arm_external_requests(external: &mut ExternalAioRead, ns: u64) {
-        if ns == 0 {
-            return;
-        }
-        let n = (external.requestCount as usize).min(kAprExternalAioGroupMaxRequests);
-        external.statSubmitNs[..n].fill(ns);
-        external.statLastPollNs[..n].fill(0);
-        external.statPolls[..n].fill(0);
     }
 }

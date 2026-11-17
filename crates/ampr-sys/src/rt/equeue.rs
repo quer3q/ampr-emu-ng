@@ -2,23 +2,30 @@
 //!
 //! Layout:
 //! 1. constants, fn types, slot ids, `SceKernelEvent`, records, state statics
-//! 2. locks (`overlay_lock`, `ControlLock`, `amm_cb_lock`), originals, deadlines
-//! 3. init + hashes (queue, AMM queue, AMM command buffer, registration)
-//! 4. classification, queue control, allocation, pending, private wake
+//! 2. locks (`overlay_lock`, `ControlLock`), originals, deadlines
+//! 3. init + hashes (queue, registration)
+//! 4. queue control, allocation, pending, private wake
 //! 5. native wait / forwarding helpers
 //! 6. `apr_equeue_*` helpers and `*_emul` detour targets
 //!
 //! State: `OV` (`SyncCell<Overlay>`) holds the lock-protected overlay state;
-//! take `overlay_lock()` and use `ov()`. Lock-free overlay fields are separate atomic statics (`HOOKS_AVAILABLE`,
-//! `WAKE_TRIGGER_STATE`, `AMM_QUEUE_HASH`, ...). The
-//! `AmmCommandBufferRegistry` is `AMM_CB_*`. Queue control uses the recursive
-//! pthread mutex behind `ControlLock`. Every tracked wait is a native kernel
-//! wait, which the overlay wakes privately to hand over its own events.
+//! take `overlay_lock()` and use `ov()`. Lock-free overlay fields are separate
+//! atomic statics (`HOOKS_AVAILABLE`, `WAKE_TRIGGER_STATE`). Queue control
+//! uses the recursive pthread mutex behind `ControlLock`. Every tracked wait
+//! is a native kernel wait, which the overlay wakes privately to hand over
+//! its own events.
+//!
+//! Every queue the game creates is tracked; its non-AMPR sources (timers,
+//! fds, user events, the AGC and VideoOut producers, AMM command buffers)
+//! are not observed. The queue classification that marked them (hooks
+//! 55..=63, five external producer hooks, the AMM queue hash and
+//! command-buffer registry) fed only the debug /queues flags and was
+//! removed; a failed install of one of those hooks had turned tracking off.
 #![allow(non_snake_case, non_upper_case_globals)]
 
 use core::ffi::{c_char, c_int, c_void};
 use core::sync::atomic::{
-    AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering,
+    AtomicBool, AtomicI32, AtomicU64, AtomicU8, Ordering,
 };
 
 use super::sync::{spin_pause_or_yield, Once, SpinGuard, SpinLock, SyncCell};
@@ -26,25 +33,28 @@ use super::sys::*;
 
 // ---- constants -------------------------------------------------------------
 
-const COMMAND_BUFFER_LIVE_MAX: u32 = 4096;
+/// Upstream sized the tables to its 4096 live command buffers (4096 queues,
+/// 16384 registrations, 4096 extras, 1,507,392 B of `OV` on the host); they
+/// are a quarter of that, 376,896 B, with no live peak measured yet (debug `/queues`
+/// `eqpeak`). A full table degrades: a queue past it stays native only, a
+/// registration past it is not mirrored (its publish posts a native
+/// packet), and a second unread event past the extras is backpressured.
+const TABLE_BASE: u32 = 1024;
 pub(crate) const INVALID_INDEX: u32 = u32::MAX;
 const HASH_TOMBSTONE: u32 = u32::MAX;
-const QUEUE_CAPACITY: u32 = COMMAND_BUFFER_LIVE_MAX;
-const REGISTRATION_CAPACITY: u32 = 16384;
+const QUEUE_CAPACITY: u32 = TABLE_BASE;
+const REGISTRATION_CAPACITY: u32 = TABLE_BASE * 4;
 /// Pending nodes past the first one of a registration: a second event on one
 /// id before the game reads the first (kept, never merged).
-const PENDING_EXTRA_CAPACITY: u32 = COMMAND_BUFFER_LIVE_MAX;
+const PENDING_EXTRA_CAPACITY: u32 = TABLE_BASE;
 /// One node per registration, as a kernel knote, plus the extras: the first
 /// event of a live registration is never refused, whatever other queues hold.
 const PENDING_CAPACITY: u32 = REGISTRATION_CAPACITY + PENDING_EXTRA_CAPACITY;
 const QUEUE_HASH_CAPACITY: u32 = QUEUE_CAPACITY * 2;
-const AMM_BUFFER_HASH_CAPACITY: u32 = QUEUE_HASH_CAPACITY;
 const REGISTRATION_HASH_CAPACITY: u32 = REGISTRATION_CAPACITY * 2;
 const WAKE_ID_BASE: u32 = 0x5a4d_5000;
 const WAKE_ATTACH_ATTEMPTS: u32 = 64;
 const REGISTRATION_HASH_TOMBSTONE: u16 = u16::MAX;
-/// `AMM_QUEUE_HASH` tombstone; never a valid handle (fd -1, unaligned address).
-const AMM_QUEUE_HASH_TOMBSTONE: usize = usize::MAX;
 const USECONDS_PER_SECOND: u64 = 1_000_000;
 const MAX_SCALED_COUNTER_FREQUENCY: u64 = u64::MAX / USECONDS_PER_SECOND;
 /// `EVFILT_AMPR`, the filter `sceKernelAddAmprEvent` registers.
@@ -59,7 +69,6 @@ const AMPR_SYSTEM_EVENT_FILTER: i16 = SCE_KERNEL_EVFILT_AMPR_SYSTEM;
 const _: () = {
     assert!(AMPR_EVENT_FILTER != AMPR_SYSTEM_EVENT_FILTER);
     assert!(QUEUE_HASH_CAPACITY.is_power_of_two());
-    assert!(AMM_BUFFER_HASH_CAPACITY.is_power_of_two());
     assert!(REGISTRATION_HASH_CAPACITY.is_power_of_two());
     assert!(QUEUE_CAPACITY <= u16::MAX as u32 - 1);
     assert!(REGISTRATION_CAPACITY <= u16::MAX as u32 - 1);
@@ -74,15 +83,9 @@ pub(crate) mod slot {
     pub const sceKernelDeleteEqueue: usize = 52;
     pub const sceKernelAddAmprEvent: usize = 53;
     pub const sceKernelDeleteAmprEvent: usize = 54;
-    pub const sceKernelAddTimerEvent: usize = 55;
-    pub const sceKernelAddReadEvent: usize = 56;
-    pub const sceKernelAddWriteEvent: usize = 57;
-    pub const sceKernelAddFileEvent: usize = 58;
-    pub const sceKernelAddUserEvent: usize = 59;
+    /// Never installed (rt/hook.rs `hook_enabled`); its SDK fallback adds
+    /// the hidden wake (`attach_hidden_wake_unlocked`).
     pub const sceKernelAddUserEventEdge: usize = 60;
-    pub const sceKernelAddHRTimerEvent: usize = 61;
-    pub const sceKernelAddAmprSystemEvent: usize = 62;
-    pub const sceKernelDeleteAmprSystemEvent: usize = 63;
     const _: () = assert!(super::hook::sceKernelClose == 64);
 }
 
@@ -114,17 +117,7 @@ type CreateEqueueFn = unsafe extern "C" fn(*mut SceKernelEqueue, *const c_char) 
 type DeleteEqueueFn = unsafe extern "C" fn(SceKernelEqueue) -> c_int;
 type AddAmprEventFn = unsafe extern "C" fn(SceKernelEqueue, c_int, *mut c_void) -> c_int;
 type DeleteAmprEventFn = unsafe extern "C" fn(SceKernelEqueue, c_int) -> c_int;
-type AddAmprSystemEventFn =
-    unsafe extern "C" fn(SceKernelEqueue, c_int, c_int, *mut c_void) -> c_int;
-type AddTimerEventFn =
-    unsafe extern "C" fn(SceKernelEqueue, c_int, SceKernelUseconds, *mut c_void) -> c_int;
-type AddFdEventFn = unsafe extern "C" fn(SceKernelEqueue, c_int, usize, *mut c_void) -> c_int;
-type AddFileEventFn = unsafe extern "C" fn(SceKernelEqueue, c_int, c_int, *mut c_void) -> c_int;
 type AddUserEventFn = unsafe extern "C" fn(SceKernelEqueue, c_int) -> c_int;
-type AddHRTimerEventFn =
-    unsafe extern "C" fn(SceKernelEqueue, c_int, *mut SceKernelTimespec, *mut c_void) -> c_int;
-/// `ExternalAddEventFn<Value>`.
-type ExternalAddEventFn<V> = unsafe extern "C" fn(SceKernelEqueue, V, *mut c_void) -> c_int;
 
 // ---- records ---------------------------------------------------------------
 
@@ -226,9 +219,6 @@ struct TrackedEqueue {
     wake_ready: bool,
     wake_armed: bool,
     wake_triggering: bool,
-    ampr_source_seen: bool,
-    mixed_source_seen: bool,
-    amm_source_seen: bool,
 }
 impl TrackedEqueue {
     const ZERO: Self = Self {
@@ -248,9 +238,6 @@ impl TrackedEqueue {
         wake_ready: false,
         wake_armed: false,
         wake_triggering: false,
-        ampr_source_seen: false,
-        mixed_source_seen: false,
-        amm_source_seen: false,
     };
 }
 
@@ -323,13 +310,34 @@ struct NativeWaitDeadline {
     counter_frequency: u64,
 }
 
+/// Debug: live peaks of the fixed tables, each the highest count seen at
+/// once since module_start. The sizes (1024 queues, 4096 registrations,
+/// 5120 pending nodes) are not measured; these say whether they fit.
+#[cfg(feature = "mem_report")]
+#[derive(Clone, Copy, Default)]
+pub(crate) struct Peaks {
+    pub(crate) queues: u32,
+    pub(crate) registrations: u32,
+    pub(crate) pending: u32,
+    /// Pending nodes past a registration's first (`PENDING_EXTRA_CAPACITY`).
+    pub(crate) extras: u32,
+}
+#[cfg(feature = "mem_report")]
+impl Peaks {
+    const ZERO: Self = Self {
+        queues: 0,
+        registrations: 0,
+        pending: 0,
+        extras: 0,
+    };
+}
+
 // ---- global state ----------------------------------------------------------
 
 const QCAP: usize = QUEUE_CAPACITY as usize;
 const RCAP: usize = REGISTRATION_CAPACITY as usize;
 const PCAP: usize = PENDING_CAPACITY as usize;
 const QHASH: usize = QUEUE_HASH_CAPACITY as usize;
-const AHASH: usize = AMM_BUFFER_HASH_CAPACITY as usize;
 const RHASH: usize = REGISTRATION_HASH_CAPACITY as usize;
 
 /// Lock-protected overlay state (guarded by `OVERLAY_LOCK`).
@@ -350,8 +358,11 @@ struct Overlay {
     registrations_with_pending: u32,
     queue_hash_tombstones: u32,
     registration_hash_tombstones: u32,
-    amm_queue_hash_tombstones: u32,
     pending_pool_backpressured: bool,
+    /// Debug: the most queues, registrations and pending nodes live at
+    /// once, so the table sizes can be cut to a measured peak (/queues).
+    #[cfg(feature = "mem_report")]
+    peaks: Peaks,
     controls: [QueueControlState; QCAP],
     queues: [TrackedEqueue; QCAP],
     registrations: [MirroredRegistration; RCAP],
@@ -377,8 +388,9 @@ static OV: SyncCell<Overlay> = SyncCell::new(Overlay {
     registrations_with_pending: 0,
     queue_hash_tombstones: 0,
     registration_hash_tombstones: 0,
-    amm_queue_hash_tombstones: 0,
     pending_pool_backpressured: false,
+    #[cfg(feature = "mem_report")]
+    peaks: Peaks::ZERO,
     controls: [QueueControlState::ZERO; QCAP],
     queues: [TrackedEqueue::ZERO; QCAP],
     registrations: [MirroredRegistration::ZERO; RCAP],
@@ -401,27 +413,16 @@ struct Align64<T>(T);
 
 static OVERLAY_LOCK: SpinLock = SpinLock::new();
 static HOOKS_AVAILABLE: AtomicBool = AtomicBool::new(false);
-static CLASSIFICATION_HOOKS_AVAILABLE: AtomicBool = AtomicBool::new(false);
 /// Set once by `initialize_control_once` (0 = use CLOCK_MONOTONIC).
 static PROCESS_TIME_COUNTER_FREQUENCY: AtomicU64 = AtomicU64::new(0);
 /// Slot-local wake trigger state, for waiting after the overlay lock drops
 /// (the bit in `TrackedEqueue` is the lock-protected hot-path predicate).
 static WAKE_TRIGGER_STATE: Align64<[AtomicU8; QCAP]> = Align64([const { AtomicU8::new(0) }; QCAP]);
-/// AMM-classified queue set: 0 empty, `AMM_QUEUE_HASH_TOMBSTONE`, else the equeue address.
-static AMM_QUEUE_HASH: Align64<[AtomicUsize; QHASH]> =
-    Align64([const { AtomicUsize::new(0) }; QHASH]);
 
 static CONTROL_ONCE: Once = Once::new();
 static CONTROL_MUTEX: SyncCell<ScePthreadMutex> = SyncCell::new(core::ptr::null_mut());
 static CONTROL_INIT_RC: AtomicI32 = AtomicI32::new(SCE_KERNEL_ERROR_EAGAIN);
 
-/// `AmmCommandBufferRegistry`: address 0 is empty and 1 a tombstone (retail
-/// command-buffer objects are aligned, so neither names a live object).
-static AMM_CB_LOCK: SpinLock = SpinLock::new();
-static AMM_CB_TRACKING_LOST: AtomicBool = AtomicBool::new(false);
-static AMM_CB_SLOTS: SyncCell<[usize; AHASH]> = SyncCell::new([0; AHASH]);
-/// Live entries in `AMM_CB_SLOTS`; changed only under `AMM_CB_LOCK`.
-static AMM_CB_LIVE: AtomicU32 = AtomicU32::new(0);
 
 // ---- locks -----------------------------------------------------------------
 
@@ -429,12 +430,6 @@ static AMM_CB_LIVE: AtomicU32 = AtomicU32::new(0);
 #[inline]
 fn overlay_lock() -> SpinGuard<'static> {
     OVERLAY_LOCK.lock()
-}
-
-/// Takes the AMM command-buffer registry spin lock.
-#[inline]
-fn amm_cb_lock() -> SpinGuard<'static> {
-    AMM_CB_LOCK.lock()
 }
 
 fn initialize_control_once() {
@@ -511,8 +506,8 @@ fn original_delete_ampr_event() -> Option<DeleteAmprEventFn> {
     unsafe { kernel_slot(slot::sceKernelDeleteAmprEvent) }
 }
 #[inline]
-fn original_event_hook<F: Copy>(id: usize) -> Option<F> {
-    unsafe { kernel_slot(id) }
+fn original_add_user_event_edge() -> Option<AddUserEventFn> {
+    unsafe { kernel_slot(slot::sceKernelAddUserEventEdge) }
 }
 
 // ---- deadlines -------------------------------------------------------------
@@ -566,7 +561,7 @@ fn next_generation64(value: &mut u64) -> u64 {
     out
 }
 
-// ---- init + queue / AMM hashes ---------------------------------------------
+// ---- init + queue hash -----------------------------------------------------
 
 unsafe fn initialize_locked() {
     let o = unsafe { ov() };
@@ -604,9 +599,6 @@ unsafe fn initialize_locked() {
         o.pending[i].registration_index = INVALID_INDEX;
     }
     o.queue_hash.fill(0);
-    for s in AMM_QUEUE_HASH.0.iter() {
-        s.store(0, Ordering::Relaxed);
-    }
     o.registration_hash.fill(0);
     o.queue_free_head = 0;
     o.registration_free_head = 0;
@@ -620,7 +612,6 @@ unsafe fn initialize_locked() {
     o.registrations_with_pending = 0;
     o.queue_hash_tombstones = 0;
     o.registration_hash_tombstones = 0;
-    o.amm_queue_hash_tombstones = 0;
     o.pending_pool_backpressured = false;
     o.initialized = true;
 }
@@ -634,133 +625,7 @@ fn hash_queue(eq: SceKernelEqueue) -> u32 {
     ((v >> 32) as u32) & (QUEUE_HASH_CAPACITY - 1)
 }
 
-/// Lock-free AMM classification probe.
-fn amm_queue_classified_fast(eq: SceKernelEqueue) -> bool {
-    if eq.is_null() {
-        return false;
-    }
-    let key = eq as usize;
-    let mut slot = hash_queue(eq);
-    for _ in 0..QUEUE_HASH_CAPACITY {
-        let v = AMM_QUEUE_HASH.0[slot as usize].load(Ordering::Acquire);
-        if v == 0 {
-            return false;
-        }
-        if v == key {
-            return true;
-        }
-        slot = (slot + 1) & (QUEUE_HASH_CAPACITY - 1);
-    }
-    false
-}
-
-unsafe fn insert_amm_queue_hash_raw_locked(eq: SceKernelEqueue) -> bool {
-    let o = unsafe { ov() };
-    let key = eq as usize;
-    let mut slot = hash_queue(eq);
-    let mut tomb = INVALID_INDEX;
-    for _ in 0..QUEUE_HASH_CAPACITY {
-        let v = AMM_QUEUE_HASH.0[slot as usize].load(Ordering::Relaxed);
-        if v == key {
-            return true;
-        }
-        if v == AMM_QUEUE_HASH_TOMBSTONE && tomb == INVALID_INDEX {
-            tomb = slot;
-        } else if v == 0 {
-            let target = if tomb != INVALID_INDEX { tomb } else { slot };
-            AMM_QUEUE_HASH.0[target as usize].store(key, Ordering::Release);
-            if tomb != INVALID_INDEX && o.amm_queue_hash_tombstones != 0 {
-                o.amm_queue_hash_tombstones -= 1;
-            }
-            return true;
-        }
-        slot = (slot + 1) & (QUEUE_HASH_CAPACITY - 1);
-    }
-    if tomb != INVALID_INDEX {
-        AMM_QUEUE_HASH.0[tomb as usize].store(key, Ordering::Release);
-        if o.amm_queue_hash_tombstones != 0 {
-            o.amm_queue_hash_tombstones -= 1;
-        }
-        return true;
-    }
-    false
-}
-
-unsafe fn rebuild_amm_queue_hash_locked() -> bool {
-    for s in AMM_QUEUE_HASH.0.iter() {
-        s.store(0, Ordering::Release);
-    }
-    let o = unsafe { ov() };
-    o.amm_queue_hash_tombstones = 0;
-    for i in 0..QCAP {
-        let q = o.queues[i];
-        if q.used && q.amm_source_seen && !unsafe { insert_amm_queue_hash_raw_locked(q.eq) } {
-            return false;
-        }
-    }
-    true
-}
-
-unsafe fn insert_amm_queue_hash_locked(eq: SceKernelEqueue) -> bool {
-    if unsafe { ov() }.amm_queue_hash_tombstones >= QUEUE_CAPACITY / 2
-        && !unsafe { rebuild_amm_queue_hash_locked() }
-    {
-        return false;
-    }
-    unsafe { insert_amm_queue_hash_raw_locked(eq) }
-}
-
-unsafe fn erase_amm_queue_hash_locked(eq: SceKernelEqueue) {
-    let key = eq as usize;
-    let mut slot = hash_queue(eq);
-    for _ in 0..QUEUE_HASH_CAPACITY {
-        let v = AMM_QUEUE_HASH.0[slot as usize].load(Ordering::Relaxed);
-        if v == 0 {
-            return;
-        }
-        if v == key {
-            AMM_QUEUE_HASH.0[slot as usize].store(AMM_QUEUE_HASH_TOMBSTONE, Ordering::Release);
-            unsafe { ov() }.amm_queue_hash_tombstones += 1;
-            return;
-        }
-        slot = (slot + 1) & (QUEUE_HASH_CAPACITY - 1);
-    }
-}
-
-// ---- AMM command-buffer registry -------------------------------------------
-
-fn hash_amm_command_buffer(mut v: usize) -> u32 {
-    v >>= 3;
-    v ^= v >> 17;
-    v = v.wrapping_mul(0x9e37_79b9_7f4a_7c15);
-    (v as u32) & (AMM_BUFFER_HASH_CAPACITY - 1)
-}
-
-fn is_registered_amm_command_buffer(cb: *const c_void) -> bool {
-    if cb.is_null()
-        || AMM_CB_TRACKING_LOST.load(Ordering::Acquire)
-        || AMM_CB_LIVE.load(Ordering::Acquire) == 0
-    {
-        return false;
-    }
-    let key = cb as usize;
-    let _g = amm_cb_lock();
-    let slots = unsafe { &*AMM_CB_SLOTS.get() };
-    let mut slot = hash_amm_command_buffer(key);
-    for _ in 0..AMM_BUFFER_HASH_CAPACITY {
-        let v = slots[slot as usize];
-        if v == 0 {
-            return false;
-        }
-        if v == key {
-            return true;
-        }
-        slot = (slot + 1) & (AMM_BUFFER_HASH_CAPACITY - 1);
-    }
-    false
-}
-
-// ---- queue lookup + classification -----------------------------------------
+// ---- queue lookup ----------------------------------------------------------
 
 unsafe fn find_queue_index_locked(eq: SceKernelEqueue) -> u32 {
     let o = unsafe { ov() };
@@ -782,10 +647,6 @@ unsafe fn find_queue_index_locked(eq: SceKernelEqueue) -> u32 {
         slot = (slot + 1) & (QUEUE_HASH_CAPACITY - 1);
     }
     INVALID_INDEX
-}
-
-const fn queue_has_meaningful_classification(ampr: bool, mixed: bool, amm: bool) -> bool {
-    ampr || mixed || amm
 }
 
 const _: () = {
@@ -812,17 +673,9 @@ const _: () = {
         scope: QueueControlScope::WholeQueue,
     };
     assert!(registration_control_conflicts(whole, AMPR_EVENT_FILTER, 1));
-    assert!(!queue_has_meaningful_classification(false, false, false));
-    assert!(queue_has_meaningful_classification(true, false, false));
 };
 
-// ---- queue control + mixed promotion --------------------------------------
-
-/// Records that the queue has a source other than mirrored AMPR
-/// registrations (shown in the debug /queues flags).
-unsafe fn mark_queue_mixed_locked(queue_index: u32) {
-    unsafe { ov() }.queues[queue_index as usize].mixed_source_seen = true;
-}
+// ---- queue control ---------------------------------------------------------
 
 fn begin_queue_control(eq: SceKernelEqueue, filter: i16, id: c_int) -> QueueControlTransaction {
     let mut t = QueueControlTransaction::DEFAULT;
@@ -893,35 +746,23 @@ unsafe fn queue_control_conflicts_with_registration_locked(
     matches!(c.scope, QueueControlScope::None) || registration_control_conflicts(c, filter, id)
 }
 
-/// The AMM command-buffer registry overflowed: no queue can be shown free
-/// of AMM sources any more, so every tracked queue is marked mixed.
-fn mark_all_queues_mixed_for_amm_tracking_loss() {
-    let _g = overlay_lock();
-    if unsafe { ov() }.initialized {
-        for i in 0..QUEUE_CAPACITY {
-            if unsafe { ov() }.queues[i as usize].used {
-                unsafe { mark_queue_mixed_locked(i) };
-            }
-        }
-    }
-}
-
-/// Forwards a non-AMPR add natively; a tracked queue becomes mixed.
-fn forward_non_ampr_add(eq: SceKernelEqueue, call: impl FnOnce() -> c_int) -> c_int {
-    if !HOOKS_AVAILABLE.load(Ordering::Acquire) {
-        return call();
-    }
-    {
-        let _g = overlay_lock();
-        let i = unsafe { find_queue_index_locked(eq) };
-        if i < QUEUE_CAPACITY {
-            unsafe { mark_queue_mixed_locked(i) };
-        }
-    }
-    call()
-}
-
 // ---- queue hash + allocation -----------------------------------------------
+
+/// Debug: raises the live peaks after an allocation; empty in release.
+#[inline(always)]
+unsafe fn note_peaks_locked() {
+    #[cfg(feature = "mem_report")]
+    {
+        let o = unsafe { ov() };
+        let p = &mut o.peaks;
+        p.queues = p.queues.max(o.live_queues);
+        p.registrations = p.registrations.max(o.live_registrations);
+        p.pending = p.pending.max(o.live_pending);
+        p.extras = p
+            .extras
+            .max(o.live_pending.saturating_sub(o.registrations_with_pending));
+    }
+}
 
 unsafe fn insert_queue_hash_raw_locked(eq: SceKernelEqueue, queue_index: u32) -> bool {
     let o = unsafe { ov() };
@@ -1026,6 +867,7 @@ unsafe fn allocate_queue_locked(eq: SceKernelEqueue) -> u32 {
         return INVALID_INDEX;
     }
     unsafe { ov() }.live_queues += 1;
+    unsafe { note_peaks_locked() };
     index
 }
 
@@ -1224,6 +1066,7 @@ unsafe fn allocate_registration_locked(
     o.queues[qi].registration_head = index;
     o.queues[qi].registration_cache = index;
     o.live_registrations += 1;
+    unsafe { note_peaks_locked() };
     index
 }
 
@@ -1313,6 +1156,7 @@ unsafe fn allocate_pending_locked(registration_index: u32) -> u32 {
     if first {
         o.registrations_with_pending += 1;
     }
+    unsafe { note_peaks_locked() };
     index
 }
 
@@ -1541,7 +1385,6 @@ fn execute_private_wake(req: &PrivateWakeRequest) -> PrivateWakeCompletion {
                 // Trigger failures are permanent for this (equeue, id): keep
                 // FIFO nodes drainable, route later publications natively.
                 unsafe { ov() }.queues[req.queue_index as usize].wake_ready = false;
-                unsafe { mark_queue_mixed_locked(req.queue_index) };
             }
             let q = &mut unsafe { ov() }.queues[req.queue_index as usize];
             q.wake_triggering = false;
@@ -1602,8 +1445,7 @@ fn execute_replacement_wake(req: &PrivateWakeRequest) {
 }
 
 fn attach_hidden_wake_unlocked(queue_index: u32, queue_generation: u64) -> bool {
-    let Some(add_edge) = original_event_hook::<AddUserEventFn>(slot::sceKernelAddUserEventEdge)
-    else {
+    let Some(add_edge) = original_add_user_event_edge() else {
         return false;
     };
     let qi = queue_index as usize;
@@ -1699,9 +1541,6 @@ unsafe fn release_queue_locked(queue_index: u32) -> bool {
     }
     let notify_reactor = unsafe { take_pending_backpressure_progress_locked() };
     let eq = o.queues[qi].eq;
-    if o.queues[qi].amm_source_seen {
-        unsafe { erase_amm_queue_hash_locked(eq) };
-    }
     unsafe { erase_queue_hash_locked(eq) };
     o.controls[qi] = QueueControlState::ZERO;
     o.queues[qi] = TrackedEqueue {
@@ -1715,15 +1554,8 @@ unsafe fn release_queue_locked(queue_index: u32) -> bool {
     if o.live_queues == 0 {
         o.queue_hash.fill(0);
         o.queue_hash_tombstones = 0;
-        for s in AMM_QUEUE_HASH.0.iter() {
-            s.store(0, Ordering::Release);
-        }
-        o.amm_queue_hash_tombstones = 0;
     } else if o.queue_hash_tombstones >= QUEUE_CAPACITY / 2 {
         unsafe { rebuild_queue_hash_locked() };
-    }
-    if o.live_queues != 0 && o.amm_queue_hash_tombstones >= QUEUE_CAPACITY / 2 {
-        unsafe { rebuild_amm_queue_hash_locked() };
     }
     notify_reactor
 }
@@ -1821,8 +1653,9 @@ fn notify_reactor_progress() {
     unsafe { apr_reactor_notify_external_progress() };
 }
 
-/// Forwards the native add, then mirrors
-/// the registration (and attaches the hidden wake) or marks the queue mixed.
+/// Forwards the native add, then attaches the hidden wake and mirrors the
+/// registration. With no wake or a full registration table the id stays
+/// native only: a publish to it falls back to a native packet.
 fn forward_ampr_registration_add(
     eq: SceKernelEqueue,
     filter: i16,
@@ -1857,20 +1690,10 @@ fn forward_ampr_registration_add(
             return rc;
         };
         let qi = qidx as usize;
-        if rc == 0 {
-            if !wake_available || !unsafe { ov() }.queues[qi].wake_registered {
-                unsafe { mark_queue_mixed_locked(qidx) };
-            } else if unsafe {
+        if rc == 0 && wake_available && unsafe { ov() }.queues[qi].wake_registered {
+            unsafe {
                 allocate_registration_locked(qidx, filter, id, udata, Some(&mut notify_reactor))
-            } >= REGISTRATION_CAPACITY
-            {
-                unsafe { mark_queue_mixed_locked(qidx) };
-            } else if filter == AMPR_SYSTEM_EVENT_FILTER {
-                // Only the kernel posts system events: waits must stay native.
-                unsafe { mark_queue_mixed_locked(qidx) };
-            } else {
-                unsafe { ov() }.queues[qi].ampr_source_seen = true;
-            }
+            };
         }
         unsafe { finish_queue_control_locked(qidx) };
     }
@@ -1902,8 +1725,6 @@ fn forward_ampr_registration_delete(
         if let Some(qidx) = unsafe { find_queue_control_locked(&t) } {
             if rc == 0 {
                 unsafe { remove_registration_locked(qidx, filter, id, Some(&mut notify_reactor)) };
-                let q = &mut unsafe { ov() }.queues[qidx as usize];
-                q.ampr_source_seen = q.registration_head < REGISTRATION_CAPACITY;
             }
             unsafe { finish_queue_control_locked(qidx) };
         }
@@ -1932,7 +1753,6 @@ pub unsafe fn apr_equeue_try_publish(
     {
         let mut wake_request = PrivateWakeRequest::DEFAULT;
         let mut execute_wake = false;
-        let mut control_fallback = false;
         {
             let _g = overlay_lock();
             if !HOOKS_AVAILABLE.load(Ordering::Relaxed) {
@@ -1952,8 +1772,7 @@ pub unsafe fn apr_equeue_try_publish(
                     id,
                 )
             } {
-                unsafe { mark_queue_mixed_locked(qidx) };
-                control_fallback = true;
+                return NativeFallback;
             } else if private_wake_in_flight_locked(&o.queues[qi]) {
                 return Backpressure;
             } else {
@@ -1993,9 +1812,6 @@ pub unsafe fn apr_equeue_try_publish(
                 }
             }
         }
-        if control_fallback {
-            return NativeFallback;
-        }
         if execute_wake && !execute_private_wake(&wake_request).publication_handled {
             return NativeFallback;
         }
@@ -2003,96 +1819,17 @@ pub unsafe fn apr_equeue_try_publish(
     Published
 }
 
-pub unsafe fn apr_equeue_overlay_set_hook_availability(
-    hooks_available: bool,
-    classification_available: bool,
-) {
+/// Turns queue tracking on or off. On needs ids 50..=54 (create, wait,
+/// delete, AMPR add and delete; rt/hook.rs `refresh`): an untracked queue
+/// gets AMPR events from the kernel, which merges two of one id before the
+/// game reads them (a save load hung that way).
+pub unsafe fn apr_equeue_overlay_set_hook_availability(hooks_available: bool) {
     let _g = overlay_lock();
-    CLASSIFICATION_HOOKS_AVAILABLE.store(classification_available, Ordering::Relaxed);
     HOOKS_AVAILABLE.store(hooks_available, Ordering::Release);
 }
 
-pub unsafe fn apr_equeue_register_amm_command_buffer(cb: *const c_void) {
-    if cb.is_null() || AMM_CB_TRACKING_LOST.load(Ordering::Acquire) {
-        return;
-    }
-    let key = cb as usize;
-    let mut inserted = false;
-    let mut tracking_lost = false;
-    {
-        let _g = amm_cb_lock();
-        let slots = unsafe { &mut *AMM_CB_SLOTS.get() };
-        let mut slot = hash_amm_command_buffer(key);
-        let mut tomb = INVALID_INDEX;
-        for _ in 0..AMM_BUFFER_HASH_CAPACITY {
-            let v = slots[slot as usize];
-            if v == key {
-                return;
-            }
-            if v == 1 && tomb == INVALID_INDEX {
-                tomb = slot;
-            } else if v == 0 {
-                slots[if tomb != INVALID_INDEX { tomb } else { slot } as usize] = key;
-                inserted = true;
-                break;
-            }
-            slot = (slot + 1) & (AMM_BUFFER_HASH_CAPACITY - 1);
-        }
-        if !inserted && tomb != INVALID_INDEX {
-            slots[tomb as usize] = key;
-            inserted = true;
-        }
-        if inserted {
-            AMM_CB_LIVE.fetch_add(1, Ordering::Release);
-        } else {
-            tracking_lost = !AMM_CB_TRACKING_LOST.swap(true, Ordering::AcqRel);
-        }
-    }
-    if !inserted && tracking_lost {
-        mark_all_queues_mixed_for_amm_tracking_loss();
-    }
-}
-
-pub unsafe fn apr_equeue_unregister_amm_command_buffer(cb: *const c_void) {
-    if cb.is_null() || AMM_CB_TRACKING_LOST.load(Ordering::Acquire) {
-        return;
-    }
-    let key = cb as usize;
-    let _g = amm_cb_lock();
-    let slots = unsafe { &mut *AMM_CB_SLOTS.get() };
-    let mut slot = hash_amm_command_buffer(key);
-    for _ in 0..AMM_BUFFER_HASH_CAPACITY {
-        let v = slots[slot as usize];
-        if v == 0 {
-            return;
-        }
-        if v == key {
-            slots[slot as usize] = 1;
-            AMM_CB_LIVE.fetch_sub(1, Ordering::Release);
-            return;
-        }
-        slot = (slot + 1) & (AMM_BUFFER_HASH_CAPACITY - 1);
-    }
-}
-
-/// An event recorded by a registered AMM command buffer makes the queue mixed.
-pub unsafe fn apr_equeue_note_command_buffer_event(cb: *const c_void, eq: SceKernelEqueue) {
-    if eq.is_null() || amm_queue_classified_fast(eq) || !is_registered_amm_command_buffer(cb) {
-        return;
-    }
-    let _g = overlay_lock();
-    let qidx = unsafe { find_queue_index_locked(eq) };
-    if qidx >= QUEUE_CAPACITY {
-        return;
-    }
-    unsafe { ov() }.queues[qidx as usize].amm_source_seen = true;
-    unsafe { mark_queue_mixed_locked(qidx) };
-    // Publish the lock-free fast-path key only after mixed is committed.
-    unsafe { insert_amm_queue_hash_locked(eq) };
-}
-
 pub unsafe fn apr_equeue_overlay_shutdown() {
-    unsafe { apr_equeue_overlay_set_hook_availability(false, false) };
+    unsafe { apr_equeue_overlay_set_hook_availability(false) };
     let _control = ControlLock::new();
     {
         let _g = overlay_lock();
@@ -2174,9 +1911,7 @@ pub unsafe extern "C" fn sceKernelCreateEqueue_emul(
                             notify_reactor |= unsafe { release_queue_locked(stale) };
                         }
                     }
-                    if wait_qi >= QUEUE_CAPACITY
-                        && CLASSIFICATION_HOOKS_AVAILABLE.load(Ordering::Relaxed)
-                    {
+                    if wait_qi >= QUEUE_CAPACITY {
                         unsafe { allocate_queue_locked(e) };
                     }
                 }
@@ -2198,86 +1933,6 @@ pub unsafe extern "C" fn sceKernelCreateEqueue_emul(
     rc
 }
 
-/// Forwards a non-AMPR registration through the libkernel hook slot `id`.
-macro_rules! non_ampr_add {
-    ($name:ident, $slot:ident, $fty:ty, ($($a:ident: $t:ty),*)) => {
-        pub unsafe extern "C" fn $name(eq: SceKernelEqueue, $($a: $t),*) -> c_int {
-            match original_event_hook::<$fty>(slot::$slot) {
-                Some(f) => forward_non_ampr_add(eq, || unsafe { f(eq, $($a),*) }),
-                None => SCE_KERNEL_ERROR_ENOSYS,
-            }
-        }
-    };
-}
-non_ampr_add!(sceKernelAddTimerEvent_emul, sceKernelAddTimerEvent, AddTimerEventFn,
-    (id: c_int, usec: SceKernelUseconds, udata: *mut c_void));
-non_ampr_add!(sceKernelAddReadEvent_emul, sceKernelAddReadEvent, AddFdEventFn,
-    (fd: c_int, size: usize, udata: *mut c_void));
-non_ampr_add!(sceKernelAddWriteEvent_emul, sceKernelAddWriteEvent, AddFdEventFn,
-    (fd: c_int, size: usize, udata: *mut c_void));
-non_ampr_add!(sceKernelAddFileEvent_emul, sceKernelAddFileEvent, AddFileEventFn,
-    (fd: c_int, watch: c_int, udata: *mut c_void));
-non_ampr_add!(sceKernelAddUserEvent_emul, sceKernelAddUserEvent, AddUserEventFn, (id: c_int));
-non_ampr_add!(sceKernelAddUserEventEdge_emul, sceKernelAddUserEventEdge, AddUserEventFn, (id: c_int));
-non_ampr_add!(sceKernelAddHRTimerEvent_emul, sceKernelAddHRTimerEvent, AddHRTimerEventFn,
-    (id: c_int, ts: *mut SceKernelTimespec, udata: *mut c_void));
-
-/// `forward_external_event_add`: `hook_id` is the `AmprExternalEqueueHookId`.
-fn forward_external_event_add<V: Copy>(
-    hook_id: usize,
-    eq: SceKernelEqueue,
-    value: V,
-    udata: *mut c_void,
-) -> c_int {
-    use core::sync::atomic::AtomicPtr;
-    let p = unsafe {
-        AtomicPtr::from_ptr(core::ptr::addr_of_mut!(
-            super::hook::g_amprOriginalExternalEqueueById[hook_id]
-        ))
-    }
-    .load(Ordering::Acquire);
-    match unsafe { fn_from_ptr::<ExternalAddEventFn<V>>(p) } {
-        Some(f) => forward_non_ampr_add(eq, || unsafe { f(eq, value, udata) }),
-        None => SCE_KERNEL_ERROR_ENOSYS,
-    }
-}
-
-pub unsafe extern "C" fn sceAgcDriverAddEqEvent_emul(
-    eq: SceKernelEqueue,
-    ty: u32,
-    udata: *mut c_void,
-) -> c_int {
-    forward_external_event_add(0, eq, ty, udata)
-}
-pub unsafe extern "C" fn sceVideoOutAddFlipEvent_emul(
-    eq: SceKernelEqueue,
-    h: i32,
-    udata: *mut c_void,
-) -> c_int {
-    forward_external_event_add(1, eq, h, udata)
-}
-pub unsafe extern "C" fn sceVideoOutAddVblankEvent_emul(
-    eq: SceKernelEqueue,
-    h: i32,
-    udata: *mut c_void,
-) -> c_int {
-    forward_external_event_add(2, eq, h, udata)
-}
-pub unsafe extern "C" fn sceVideoOutAddPreVblankStartEvent_emul(
-    eq: SceKernelEqueue,
-    h: i32,
-    udata: *mut c_void,
-) -> c_int {
-    forward_external_event_add(3, eq, h, udata)
-}
-pub unsafe extern "C" fn sceVideoOutAddOutputModeEvent_emul(
-    eq: SceKernelEqueue,
-    h: i32,
-    udata: *mut c_void,
-) -> c_int {
-    forward_external_event_add(4, eq, h, udata)
-}
-
 pub unsafe extern "C" fn sceKernelAddAmprEvent_emul(
     eq: SceKernelEqueue,
     id: c_int,
@@ -2296,34 +1951,6 @@ pub unsafe extern "C" fn sceKernelAddAmprEvent_emul(
 pub unsafe extern "C" fn sceKernelDeleteAmprEvent_emul(eq: SceKernelEqueue, id: c_int) -> c_int {
     match original_delete_ampr_event() {
         Some(f) => forward_ampr_registration_delete(eq, SCE_KERNEL_EVFILT_AMPR, id, || unsafe {
-            f(eq, id)
-        }),
-        None => SCE_KERNEL_ERROR_ENOSYS,
-    }
-}
-
-pub unsafe extern "C" fn sceKernelAddAmprSystemEvent_emul(
-    eq: SceKernelEqueue,
-    id: c_int,
-    watch: c_int,
-    udata: *mut c_void,
-) -> c_int {
-    match original_event_hook::<AddAmprSystemEventFn>(slot::sceKernelAddAmprSystemEvent) {
-        Some(f) => {
-            forward_ampr_registration_add(eq, AMPR_SYSTEM_EVENT_FILTER, id, udata, || unsafe {
-                f(eq, id, watch, udata)
-            })
-        }
-        None => SCE_KERNEL_ERROR_ENOSYS,
-    }
-}
-
-pub unsafe extern "C" fn sceKernelDeleteAmprSystemEvent_emul(
-    eq: SceKernelEqueue,
-    id: c_int,
-) -> c_int {
-    match original_event_hook::<DeleteAmprEventFn>(slot::sceKernelDeleteAmprSystemEvent) {
-        Some(f) => forward_ampr_registration_delete(eq, AMPR_SYSTEM_EVENT_FILTER, id, || unsafe {
             f(eq, id)
         }),
         None => SCE_KERNEL_ERROR_ENOSYS,
@@ -2422,6 +2049,8 @@ pub unsafe extern "C" fn sceKernelWaitEqueue_emul(
 #[cfg(feature = "mem_report")]
 const WAIT_TABLE: usize = 32;
 #[cfg(feature = "mem_report")]
+use core::sync::atomic::AtomicUsize;
+#[cfg(feature = "mem_report")]
 static WAIT_EQ: [AtomicUsize; WAIT_TABLE] = [const { AtomicUsize::new(0) }; WAIT_TABLE];
 #[cfg(feature = "mem_report")]
 static WAIT_START_NS: [AtomicU64; WAIT_TABLE] = [const { AtomicU64::new(0) }; WAIT_TABLE];
@@ -2475,8 +2104,9 @@ pub(crate) struct EqueueView {
     pub(crate) registrations: u32,
     pub(crate) native_intent: u32,
     pub(crate) trigger: u8,
-    /// Bits: 1 ampr source, 2 mixed, 4 amm, 8 wake ready, 16 wake armed,
-    /// 32 wake triggering, 64 wake registered.
+    /// Bits: 8 wake ready, 16 wake armed, 32 wake triggering, 64 wake
+    /// registered. 1, 2 and 4 held the removed queue classification and stay
+    /// unused, so readings from older builds compare.
     pub(crate) flags: u32,
 }
 
@@ -2488,10 +2118,7 @@ unsafe fn fill_queue_view(v: &mut EqueueView, qidx: u32) {
     v.pending = q.pending_count;
     v.native_intent = q.native_wait_intent;
     v.trigger = WAKE_TRIGGER_STATE.0[qidx as usize].load(Ordering::Relaxed);
-    v.flags = q.ampr_source_seen as u32
-        | (q.mixed_source_seen as u32) << 1
-        | (q.amm_source_seen as u32) << 2
-        | (q.wake_ready as u32) << 3
+    v.flags = (q.wake_ready as u32) << 3
         | (q.wake_armed as u32) << 4
         | (q.wake_triggering as u32) << 5
         | (q.wake_registered as u32) << 6;
@@ -2502,6 +2129,19 @@ unsafe fn fill_queue_view(v: &mut EqueueView, qidx: u32) {
         r = o.registrations[r as usize].next;
     }
     v.registrations = n;
+}
+
+/// Debug: the live peaks and, in the same order, the table capacities.
+#[cfg(feature = "mem_report")]
+pub(crate) fn equeue_peaks() -> (Peaks, Peaks) {
+    let _g = overlay_lock();
+    let caps = Peaks {
+        queues: QUEUE_CAPACITY,
+        registrations: REGISTRATION_CAPACITY,
+        pending: PENDING_CAPACITY,
+        extras: PENDING_EXTRA_CAPACITY,
+    };
+    (unsafe { ov() }.peaks, caps)
 }
 
 /// Waits in progress, then tracked queues with pending events and no

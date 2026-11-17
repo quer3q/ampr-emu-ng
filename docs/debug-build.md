@@ -8,12 +8,12 @@ with it, then ship the release build.
 
 `./ps5/build-docker.sh` (`make dist`) builds both files. The debug one is
 `make AMPR_MEM_REPORT=1` (Cargo feature `mem_report`) with the pool set to
-`AMPR_DEBUG_POOL_SIZE` (`0xf614000`, 246.07 MiB); the release pool is
-`0xf76c000` (247.42 MiB). The smaller pool offsets the larger debug code, so
+`AMPR_DEBUG_POOL_SIZE` (`0xf7f4000`, 247.95 MiB); the release pool is
+`0xf94c000` (249.30 MiB). The smaller pool offsets the larger debug code, so
 both PRX files load to 256 MiB (within a 16 KiB page) with the same Index
 and Buffer caps and thread limits. The decoded cache is the rest of the
-pool, so the debug cache is 1.34 MiB (about 1%) smaller: 133.64 vs
-134.98 MiB; debug cache numbers are that much conservative. Those are the
+pool, so the debug cache is 1.34 MiB (about 1%) smaller: 135.77 vs
+137.11 MiB; debug cache numbers are that much conservative. Those are the
 sizes carved at the pack mount: once the index is built the cache grows
 into the Index ledger's idle room above 4 MiB (`cache_grown_bytes`; 204 MiB
 on a zstd title using 5.6 MiB of Index, 208 MiB on a pkg title using
@@ -50,7 +50,7 @@ answer. The pages are listed in `serve` in `crates/ampr-sys/src/rt/exports.rs`.
 | `/bench?path=/app0/<file>[&backing=/abs/file]` | Read speed of a loose file through `/app0` and, with `backing=`, through its backing path. |
 | `/fsfail` | Every distinct failed call since load. |
 | `/modules` | Loaded modules. |
-| `/queues` | Event queue waits in progress and queues with pending events. |
+| `/queues` | Event queue waits in progress and queues with pending events. The first line, `eqpeak queues=N/1024 regs=N/4096 pending=N/5120 extras=N/1024`, is the overlay tables' live peaks against their caps (`equeue_peaks` in `rt/equeue.rs`); a queue line's `flags=` keeps bits 8, 16, 32 and 64. |
 | `/threads` | Thread counts; `?hold=N`, `?release=1`, `?yield=N` and `?yield_workers=N` test the game's thread limit. |
 
 ```sh
@@ -116,7 +116,7 @@ Pack chunks are read with exact-size reads, the only read path: one disk
 read covers a chunk's stored bytes, adjacent chunks coalesced.
 `pack_disk_reads` counts those reads and `pack_disk_bytes` their bytes.
 Read bytes are not cached; decoded chunks go to the decoded cache, the
-Cache ledger (133.64 MiB in the debug build).
+Cache ledger (135.77 MiB in the debug build).
 
 Most runs compare three numbers:
 
@@ -164,7 +164,7 @@ those that got libkernel's stack instead (no `scePthreadAttrSetstack`, block
 full, a stack over 128 KiB, or the attribute refused), and
 `thread_stack_bytes` / `thread_stack_bytes_max` the block bytes in use,
 guards included. Held threads (`/threads?hold=N`) keep libkernel stacks.
-The iced-x86 heap (rt/heap.rs) is a 256 KiB pool block: `heap_bytes` and
+The iced-x86 heap (rt/heap.rs) is a 384 KiB pool block: `heap_bytes` and
 `heap_bytes_max` are live bytes, `heap_bump_top` how far the block is
 used, and `heap_libc_bytes` what went to libc malloc past it (0 expected;
 the host measured 246,688 B for the decoder tables). Compare
@@ -178,6 +178,19 @@ as its caller sees it: the queue wait, the pack job and the wake-up.
 `posix_read_ns / posix_reads` is the time per read; `posix_read_ns_max`
 resets on every scrape. Compare it with `pack_job_ns / pack_jobs`, and with
 a v0.4.1 run, whose reads went through a read thread (two more hops).
+`posix_read_cancel_on` counts packed POSIX reads that ran with thread
+cancellation still on (it could not be turned off); the read proceeds.
+
+`path_calls_<id>` and `path_ns_<id>` count and time the path lookup hooks
+by hook id (0 to 4, 78, 79, 84 `_open`, 85 `_openat`, 91 `access`, 92
+`lstat`: open, stat, the sceKernel open and stat, reachability, unlink and
+rename; `PATH_HOOKS` in `rt/stats.rs`). `path_ns_<id> / path_calls_<id>`
+is the time per call.
+
+`reactor_passes` counts reactor loop passes; per job or per read it is
+the fixed pass cost. `thread_join_failed` counts a failed `scePthreadJoin`
+of an exited pool thread or decode worker: the slot is freed (a retry
+could join a reused handle) and its pool stack stays reserved.
 
 `libc_hits_84` to `libc_hits_95` count calls into the libc entry hooks by
 hook id: 84 `_open`, 85 `_openat`, 86 `_read`, 87 `_readv`, 88 `_close`,
@@ -220,7 +233,9 @@ cannot change), per 10 minutes of play. A read of part of a chunk is
 cached on its first touch; a read of a whole chunk decodes into the game
 buffer and is cached on its second touch, so `cache_miss_repeat /
 cache_misses` and `pack_disk_bytes` per game byte show the admission
-change.
+change. `cache_cap_evictions` counts evictions forced by the entry cap
+(16384 entries) while free page room was left; a high count says the cap,
+not the cache size, limits the hit rate.
 
 ## Tune file
 
@@ -231,34 +246,29 @@ so titles without packs read it too.
 ```sh
 curl http://<ps5-ip>:9090/set                       # list knobs, ranges, live or next launch
 curl 'http://<ps5-ip>:9090/set?read_chunk_quantum=8&pread_threads=4'
-curl 'http://<ps5-ip>:9090/set?profile=low'         # low, medium or high
 ```
 
 `/set` applies the pairs in order and stops at the first bad one, then
 rewrites the file and lists every knob. Live knobs (pread pool switches,
 reactor issue limits, thread budget,
 `spin_us`, `regrow_s`, `pread_wake_all`, `cache_protect_hits`,
-`cache_protect_pct`, `retire_load`) apply from the next read or reactor
+`cache_protect_pct`) apply from the next read or reactor
 pass. `spin_us` (0..=200, release 0) is read at each idle wait of a pack
 worker and pread pool thread, so `/set?spin_us=50` or `100`
 takes effect at once; compare game wait per read and `pread_wakeups_idle`
-before and after. `retire_load` (default 0) keeps grown runtime threads
-until a failed game thread creation (pressure mode) gives them back;
-`retire_load=1` brings back load retirement. Compare `decode_retired_load` and
-`pread_retired_load` against `pack_workers_started` and
-`pread_threads_started` per minute, and watch `/fsfail` op `P` and the
-pressure counters. Each group's `_busy_peak` is the highest busy count in
-its last 8192 samples, which is also its load target. Startup knobs (`decoded_mib`, workers, pipelines, `pread_threads`,
+before and after. Grown runtime threads stay until a failed game thread
+creation (pressure mode) gives them back; watch `/fsfail` op `P` and the
+pressure counters (`<group>_threads_live`, `_threads_peak`,
+`_retired_pressure`; `_target` is written only under pressure, 0 or 1,
+and reads 0 before the first pressure check). Startup knobs (`decoded_mib`, workers, pipelines, `pread_threads`,
 `zstd_verify`, `worker_stack_kib`) apply at the next launch. The tune file
 skips knobs that no longer exist (`ra`, `ra_gate`, `lane_eop_overlap`,
-`equeue_local`).
-A profile sets `decoded_mib`, `workers` and `pipelines` (low 24 MiB, 4, 8;
-medium 80 MiB, 8, 16; high 160 MiB, 8, 32, `PROFILES` in `rt/tune.rs`); a
-decoded cache past the Cache ledger (`decoded_mib` default 134, the cap
-rounded up) is cut to fit. The I/O windows
+`equeue_local`, `retire_load`, `profile`); `/set` refuses them. A decoded
+cache past the Cache ledger (`decoded_mib` default 136, the cap rounded up)
+is cut to fit. The I/O windows
 are taken at the worker start and the pipelines are the windows the Buffer
 ledger grants after the worker buffers; workers are cut until each has a
-pipeline (medium and high run 8 workers with 9 pipelines,
+pipeline (8 workers run with 9 pipelines,
 `buffer_split` in `rt/pack/worker.rs`).
 
 The file stores every knob, defaults included, so a file from an older build
@@ -287,7 +297,7 @@ of `/metrics` and in the black box; the full list is at `FsEvents` in
 | `D W T F C N` | Probes: dup, poll, openat, fstatat, faccessat, readlink reached a packed file (`p`), indexed directory (`d`) or virtual fd (`v`). |
 | `O A a l` with lookup `p` or `d` | A libc hook with its `AMPR_PACK_LIBC_HOOKS` bit clear saw a packed file or directory and did not route it. |
 | `I` | The game's own AIO submit on a packed fd, served by the runtime (logged whatever the result). |
-| `X Y` | mmap, `sceKernelMmap` of a virtual fd: lookup `k` disk cache file, `v` failure. `/fsfail` keeps failures only. |
+| `X Y` | mmap, `sceKernelMmap` of a virtual fd, lookup `v`: the map failed (a packed file has no physical copy to map; the mmap disk cache was removed). Debug only, ids 96 and 97 are probes; `mmap_virtual` counts them. |
 | `Z` | A pack chunk failed to decode, or a zstd checksum mismatched. |
 | `U` | A failed `getdents` or `getdirentries` on a virtual directory fd, lookup `d`: path `read <directory> rc=0x<8 hex>`. Each distinct result of a directory is kept once, `/fsfail` counts the repeats. Lookup `x`: path `realfail <directory> errno=<n>`, the physical `getdents` behind the directory failed with `n`, so the listing goes on with the packed entries only. |
 | `P` | A failed game thread creation: lookup `s` scePthreadCreate, `p` pthread_create, `r` its retry, `h` the `/threads` probe (black box only). |
@@ -337,4 +347,4 @@ Folder installs on the internal SSD are case-sensitive; retail pfs and exFAT
 are not, and games rely on that. A path that skips the index (an unhooked
 libc call) fails only on such an install. The system module loader opens
 files itself, so module loads go through the index
-(`sceKernelLoadStartModule_equeue_observer` in `rt/hook.rs`).
+(`sceKernelLoadStartModule_observer` in `rt/hook.rs`).

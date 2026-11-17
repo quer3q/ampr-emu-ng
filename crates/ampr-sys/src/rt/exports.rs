@@ -28,7 +28,7 @@ use super::sys::{
     off_t, SceAmmResultBuffer, SceAmmSubmitId, SceAprFileId, SceKernelEqueue,
     SCE_KERNEL_ERROR_EINVAL as EINVAL, SCE_KERNEL_ERROR_EPERM as EPERM,
 };
-use super::{amm, command_buffer as cb, equeue, hook};
+use super::{amm, command_buffer as cb, hook};
 
 use super::pack::ampr_pack_shutdown;
 use super::reactor::apr_reactor_shutdown;
@@ -109,19 +109,33 @@ extern "C" {
     ) -> c_int;
 }
 
-/// Best effort system notification; errors are ignored.
-pub(crate) unsafe fn notify(text: &[u8]) {
-    let mut req = NotifyRequest {
+/// The one request `notify` fills, under `NOTIFY_LOCK`. Static because the
+/// 3120 B request on the stack made `index_memory::refused`, which inlined
+/// `notify`, take a 0xcc8 frame on every allocation path that can refuse.
+static NOTIFY_REQ: super::sync::SyncCell<NotifyRequest> =
+    super::sync::SyncCell::new(NotifyRequest {
         head: [0; 45],
         message: [0; 3075],
-    };
+    });
+static NOTIFY_LOCK: super::sync::SpinLock = super::sync::SpinLock::new();
+
+/// Best effort system notification; errors are ignored. Out of line so a
+/// caller's frame does not hold the request: notices are rare and cold.
+#[inline(never)]
+#[cold]
+pub(crate) unsafe fn notify(text: &[u8]) {
+    let _g = NOTIFY_LOCK.lock();
+    // SAFETY: NOTIFY_LOCK serializes every user of the request.
+    let req = unsafe { &mut *NOTIFY_REQ.get() };
+    req.head = [0; 45];
     let len = text.len().min(req.message.len() - 1);
     req.message[..len].copy_from_slice(&text[..len]);
+    req.message[len..].fill(0);
     // Host tests reach this through the ledgers and have no libkernel.
     if cfg!(test) {
         return;
     }
-    let _ = unsafe { sceKernelSendNotificationRequest(0, &mut req, size_of::<NotifyRequest>(), 0) };
+    let _ = unsafe { sceKernelSendNotificationRequest(0, req, size_of::<NotifyRequest>(), 0) };
 }
 
 /// Git revision the PRX was built from: short hash, "-dirty" when tracked
@@ -1019,11 +1033,31 @@ mod mem_report {
         }
     }
 
-    /// `GET /queues`: event queue waits in progress, queues with pending
-    /// events and the queues AMPR jobs signal.
+    /// `GET /queues`: the overlay's live table peaks, event queue waits in
+    /// progress, queues with pending events and the queues AMPR jobs signal.
     /// Its own page, so a busy title cannot crowd `/metrics` out of its
     /// 16 KiB buffer.
     fn queues(out: &mut Text) {
+        // Live peaks against capacity (rt/equeue.rs `equeue_peaks`), to size
+        // the overlay's fixed tables from a measurement.
+        let (peak, cap) = super::super::equeue::equeue_peaks();
+        out.s(b"eqpeak queues=")
+            .u(peak.queues.into())
+            .s(b"/")
+            .u(cap.queues.into())
+            .s(b" regs=")
+            .u(peak.registrations.into())
+            .s(b"/")
+            .u(cap.registrations.into());
+        out.s(b" pending=")
+            .u(peak.pending.into())
+            .s(b"/")
+            .u(cap.pending.into())
+            .s(b" extras=")
+            .u(peak.extras.into())
+            .s(b"/")
+            .u(cap.extras.into())
+            .s(b"\n");
         // Event queue waits in progress and queues with pending events
         // (rt/equeue.rs `equeue_views`).
         let mut views = [super::super::equeue::EqueueView::default(); 48];
@@ -1299,7 +1333,7 @@ mod mem_report {
             let (workers, worker_ceiling) = super::super::pack::pack_workers_state();
             out.kv("pack_workers_ceiling", worker_ceiling as u64);
             // Per group (rt/thread_hooks.rs LoadGroup): live, peak, target,
-            // peak busy over the window, retired by load, under pressure.
+            // retired under pressure.
             let groups = [
                 (
                     &b"decode"[..],
@@ -1308,16 +1342,14 @@ mod mem_report {
                 ),
                 (b"pread", live, super::super::reactor::pread_pool_load()),
             ];
-            const KEYS: [&[u8]; 6] = [
+            const KEYS: [&[u8]; 4] = [
                 b"_threads_live ",
                 b"_threads_peak ",
                 b"_target ",
-                b"_busy_peak ",
-                b"_retired_load ",
                 b"_retired_pressure ",
             ];
             for (name, live, load) in groups {
-                let values = [live, load[0], load[1], load[2], load[3], load[4]];
+                let values = [live, load[0], load[1], load[2]];
                 for (key, v) in KEYS.iter().zip(values) {
                     out.s(name).s(key).u(v).s(b"\n");
                 }
@@ -1517,9 +1549,15 @@ pub unsafe extern "C" fn module_start(_args: usize, _argp: *const c_void) -> c_i
     // load AMPRIDX3 and the pack manifest here, before the game runs (zstd
     // also mounts ampr_zstd.index and joins it to the view). Without a
     // shipped index this fails at once: ensure_ready(false) never builds one.
-    // A title with no packs skips it and loads its index on the first AMPR
-    // call.
-    if super::pack::packs_present() && rc == 0 && unsafe { super::index::ensure_ready(false) } {
+    // A title with no packs loads its shipped index here too, so the load
+    // (frames of 0x1068 B for `load_compact_index` and 0x1008 B for the
+    // CRC, more than the chain that overflowed a game stack in v0.4.0)
+    // never runs on a game thread. With no shipped index it still
+    // walk-builds on the first AMPR call.
+    if rc == 0
+        && unsafe { super::index::ensure_ready(false) }
+        && super::pack::packs_present()
+    {
         unsafe { super::pack::ampr_pack_ensure_manifest_ready_safe() };
     }
     // Only after hooks install: a failed module_start may be unloaded.
@@ -1549,15 +1587,15 @@ pub unsafe extern "C" fn module_stop(_args: usize, _argp: *const c_void) -> c_in
 
 // ---- sceAmprAmm* ---------------------------------------------------------
 
+// The constructor and destructor did only the equeue queue classification's
+// command-buffer registry, which was removed; they stay exported, as retail.
 #[no_mangle]
-pub unsafe extern "C" fn sceAmprAmmCommandBufferConstructor(this: *mut Cb) -> i64 {
-    unsafe { equeue::apr_equeue_register_amm_command_buffer(this.cast()) };
+pub unsafe extern "C" fn sceAmprAmmCommandBufferConstructor(_this: *mut Cb) -> i64 {
     0
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn sceAmprAmmCommandBufferDestructor(this: *mut Cb) -> i64 {
-    unsafe { equeue::apr_equeue_unregister_amm_command_buffer(this.cast()) };
+pub unsafe extern "C" fn sceAmprAmmCommandBufferDestructor(_this: *mut Cb) -> i64 {
     0
 }
 

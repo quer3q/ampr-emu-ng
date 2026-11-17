@@ -11,8 +11,8 @@
 //! (rt/pack/aio.rs) log their served packed requests through
 //! `note_aio_submit`, and rt/index.rs
 //! calls `probe_path` from the libc path hooks it installs as observers.
-//! rt/pack/mmap.rs logs its b'X'/b'Y' events through `fd_path` and
-//! `event_text`.
+//! Slots 96 and 97 (mmap, sceKernelMmap) are probes too, debug only: a
+//! packed file has no physical copy, so a map of one fails.
 
 use super::index::{probe_file_path, probe_packed_path};
 use super::pack::{
@@ -102,8 +102,8 @@ pub(crate) fn note_text(op: u8, how: u8, rc: i64, call: &[u8], t: &Text) {
 }
 
 /// As `note_text`, through `stats::fs_event`: only a failure (rc < 0) enters
-/// `/fsfail` (rt/pack/mmap.rs, whose served maps are counted instead).
-pub(crate) fn event_text(op: u8, how: u8, rc: i64, call: &[u8], t: &Text) {
+/// `/fsfail` (the mmap probes; every map is counted in `mmap_virtual`).
+fn event_text(op: u8, how: u8, rc: i64, call: &[u8], t: &Text) {
     stats::fs_event(op, how, rc, t.prefixed(call).ptr());
 }
 
@@ -242,6 +242,89 @@ fn select_text(nfds: c_int) -> Text {
     digits[..n].reverse();
     t.push(&digits[..n]);
     t
+}
+
+// ---- mmap ---------------------------------------------------------------------
+
+const MAP_FAILED: *mut c_void = usize::MAX as *mut c_void;
+/// FreeBSD MAP_ANON: the fd is not mapped (it is -1 by convention, but the
+/// kernel ignores it), so the map is never a packed file's.
+const MAP_ANON: c_int = 0x1000;
+
+type MmapFn = unsafe extern "C" fn(*mut c_void, usize, c_int, c_int, c_int, sys::off_t) -> *mut c_void;
+type SceMmapFn = unsafe extern "C" fn(
+    *mut c_void,
+    usize,
+    c_int,
+    c_int,
+    c_int,
+    sys::off_t,
+    *mut *mut c_void,
+) -> c_int;
+
+/// The path of a mapped virtual pack fd or directory, a packed file's map
+/// counted in `mmap_virtual`; None for MAP_ANON and any other fd, which
+/// pass through unlogged.
+unsafe fn map_path(flags: c_int, fd: c_int) -> Option<Text> {
+    if flags & MAP_ANON != 0 {
+        return None;
+    }
+    let t = unsafe { fd_path(fd) }?;
+    if unsafe { virtual_fd_file_id(fd) }.is_some() {
+        stats::add(stats::Stat::MmapVirtual, 1);
+    }
+    Some(t)
+}
+
+/// mmap: the original call, its result unchanged. A map of a virtual pack
+/// fd fails there and shows in `/fsfail` as op b'X'.
+pub(crate) unsafe extern "C" fn mmap_probe(
+    addr: *mut c_void,
+    len: usize,
+    prot: c_int,
+    flags: c_int,
+    fd: c_int,
+    off: sys::off_t,
+) -> *mut c_void {
+    let seen = unsafe { map_path(flags, fd) };
+    let p = match unsafe { kernel_slot::<MmapFn>(sys::hook::mmap) } {
+        Some(f) => unsafe { f(addr, len, prot, flags, fd, off) },
+        None => {
+            sys::set_errno(sys::EIO);
+            MAP_FAILED
+        }
+    };
+    if let Some(t) = seen {
+        let rc = if p == MAP_FAILED {
+            -i64::from(sys::errno())
+        } else {
+            0
+        };
+        event_text(b'X', HOW_VIRTUAL, rc, b"mmap", &t);
+    }
+    p
+}
+
+/// sceKernelMmap: as `mmap_probe`, op b'Y'.
+#[allow(non_snake_case)]
+pub(crate) unsafe extern "C" fn sceKernelMmap_probe(
+    addr: *mut c_void,
+    len: usize,
+    prot: c_int,
+    flags: c_int,
+    fd: c_int,
+    off: sys::off_t,
+    res: *mut *mut c_void,
+) -> c_int {
+    let seen = unsafe { map_path(flags, fd) };
+    let rc = unsafe { kernel_slot::<SceMmapFn>(sys::hook::sceKernelMmap) }
+        .map_or(sys::SCE_KERNEL_ERROR_EIO, |f| unsafe {
+            f(addr, len, prot, flags, fd, off, res)
+        });
+    if let Some(t) = seen {
+        event_text(b'Y', HOW_VIRTUAL, rc.into(), b"sceKernelMmap", &t);
+    }
+    rc
 }
 
 // ---- path calls ---------------------------------------------------------------

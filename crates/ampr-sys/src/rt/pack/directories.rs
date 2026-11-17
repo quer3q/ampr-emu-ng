@@ -122,27 +122,157 @@ pub(crate) fn list_next_in<S: Source + ?Sized>(
     Ok(Some(ViewChild { len, kind, next }))
 }
 
-/// `list_next_in` over the published view; None before the mount is ready.
-pub(crate) fn list_next(c: Cursor, name: &mut [u8; 256]) -> ampr_format::Result<Option<ViewChild>> {
-    match listing_view() {
-        Some((view, paths)) => list_next_in(&view, paths, c, name),
-        None => Ok(None),
+// ---- listing window ---------------------------------------------------------
+//
+// A listed name is read from the stored path (`list_next_in`), one
+// PATH_BUF read per entry: on the kept index fd that was one 1 KiB pread
+// per entry. A getdents call reads its names through one 64 KiB window
+// instead, so the entries of one directory, whose paths sit together in
+// the blob of a sorted index, cost about one pread per 64 KiB of paths.
+// The window is one buffer for the module, taken by one getdents at a
+// time; a call that finds it busy, or a title whose index has no room
+// for it, reads per entry as before.
+
+/// Bytes of the listing window, as the index build windows.
+const LISTING_WINDOW: usize = crate::rt::index_file::WINDOW;
+
+/// The window buffer once taken from the Index ledger, null before.
+static LISTING_BUF: AtomicPtr<u8> = AtomicPtr::new(core::ptr::null_mut());
+/// 0 untried, 1 taken (in `LISTING_BUF`), 2 refused for good.
+static LISTING_STATE: AtomicU8 = AtomicU8::new(0);
+/// Held by the getdents call reading through the window.
+static LISTING_BUSY: AtomicBool = AtomicBool::new(false);
+
+/// `src` read through `win` when there is one: a read inside the window
+/// copies from it, any other refills it with up to `win.len()` bytes
+/// around the read, placed after it when the reads move forward and
+/// before it when they move back (a packed chain lists ids downward).
+/// The window is valid for one getdents call: the index file does not
+/// change under it.
+pub(crate) struct Windowed<'a, S: Source + ?Sized> {
+    src: &'a S,
+    win: Option<core::cell::RefCell<&'a mut [u8]>>,
+    base: core::cell::Cell<u64>,
+    filled: core::cell::Cell<usize>,
+    last: core::cell::Cell<u64>,
+}
+
+impl<'a, S: Source + ?Sized> Windowed<'a, S> {
+    pub(crate) fn new(src: &'a S, win: Option<&'a mut [u8]>) -> Self {
+        Self {
+            src,
+            win: win.map(core::cell::RefCell::new),
+            base: core::cell::Cell::new(0),
+            filled: core::cell::Cell::new(0),
+            last: core::cell::Cell::new(0),
+        }
     }
 }
 
-/// The child at the slot's view cursor (`list_next`) and the cursor after it in `next`.
-/// `Ok(false)` at the end of the listing (`next` is `Done`) or for an
-/// entry whose name cannot be listed (skipped); `Err(IndexIo)` when its
-/// path could not be read (the cursor stays).
-fn next_view_child(
+impl<S: Source + ?Sized> Source for Windowed<'_, S> {
+    fn len(&self) -> u64 {
+        self.src.len()
+    }
+
+    fn read_at(&self, at: u64, out: &mut [u8]) -> ampr_format::Result<()> {
+        let Some(win) = &self.win else {
+            return self.src.read_at(at, out);
+        };
+        let mut win = win.borrow_mut();
+        let len = self.src.len();
+        let end = at
+            .checked_add(out.len() as u64)
+            .filter(|&e| e <= len)
+            .ok_or(ampr_format::Error::Truncated)?;
+        if out.len() > win.len() {
+            return self.src.read_at(at, out);
+        }
+        let (base, filled) = (self.base.get(), self.filled.get() as u64);
+        if !(base <= at && end <= base + filled) {
+            let size = win.len() as u64;
+            let back = at < self.last.get();
+            let start = if back { end.saturating_sub(size) } else { at };
+            // Keep a full window where the file allows it.
+            let start = start.min(len.saturating_sub(size));
+            let n = (len - start).min(size) as usize;
+            self.filled.set(0);
+            self.src.read_at(start, &mut win[..n])?;
+            self.base.set(start);
+            self.filled.set(n);
+        }
+        let off = (at - self.base.get()) as usize;
+        out.copy_from_slice(&win[off..off + out.len()]);
+        self.last.set(at);
+        Ok(())
+    }
+}
+
+/// The listing window for this call, None when another call holds it or
+/// it could not be taken. Given back by `ListingGuard`.
+fn take_listing_window() -> Option<&'static mut [u8]> {
+    if LISTING_BUSY
+        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        return None;
+    }
+    if LISTING_STATE.load(Ordering::Acquire) == 0 {
+        // Only from the kept room: a refusal here must not raise the
+        // index notice (`index_alloc` does on a cap refusal).
+        let p = if crate::rt::index_memory::index_room() >= LISTING_WINDOW {
+            unsafe {
+                crate::rt::index_memory::index_alloc(
+                    LISTING_WINDOW,
+                    SCE_KERNEL_PAGE_SIZE,
+                    c"apr.list.window".as_ptr(),
+                )
+            }
+        } else {
+            core::ptr::null_mut()
+        };
+        LISTING_BUF.store(p, Ordering::Release);
+        LISTING_STATE.store(if p.is_null() { 2 } else { 1 }, Ordering::Release);
+    }
+    let p = LISTING_BUF.load(Ordering::Acquire);
+    if p.is_null() {
+        LISTING_BUSY.store(false, Ordering::Release);
+        return None;
+    }
+    // SAFETY: `LISTING_BUSY` gives one caller the buffer at a time, and it
+    // is never freed.
+    Some(unsafe { core::slice::from_raw_parts_mut(p, LISTING_WINDOW) })
+}
+
+/// Gives the window back when the getdents call returns, on every path.
+struct ListingGuard(bool);
+
+impl Drop for ListingGuard {
+    fn drop(&mut self) {
+        if self.0 {
+            LISTING_BUSY.store(false, Ordering::Release);
+        }
+    }
+}
+
+/// The child at the slot's view cursor (`list_next_in` over `listing`,
+/// the published view and its path source) and the cursor after it in
+/// `next`. `Ok(false)` at the end of the listing (`next` is `Done`), with
+/// no view, or for an entry whose name cannot be listed (skipped);
+/// `Err(IndexIo)` when its path could not be read (the cursor stays).
+fn next_view_child<S: Source + ?Sized>(
     slot: &VirtualDirectorySlot,
+    listing: Option<(&View<'_>, &S)>,
     name: &mut [u8; 256],
     name_length: &mut u8,
     type_: &mut u8,
     next: &mut Cursor,
 ) -> Result<bool, IndexIo> {
     *next = slot.listing;
-    let child = match list_next(slot.listing, name) {
+    let read = match listing {
+        Some((view, src)) => list_next_in(view, src, slot.listing, name),
+        None => Ok(None),
+    };
+    let child = match read {
         Ok(Some(child)) => child,
         Err(ampr_format::Error::Io) => return Err(IndexIo),
         Ok(None) | Err(_) => {
@@ -973,6 +1103,17 @@ unsafe fn directory_read_fd(
 
         // The slot path is fixed while the slot is open: hash it once.
         let path_hash = folded_hash(slot.path.as_ptr(), slot.path_length as usize);
+        // One view and one path source for the call; names on the kept
+        // index fd go through the listing window (a resident blob needs none).
+        let view = listing_view();
+        let window = match view {
+            Some((_, crate::rt::index::Paths::File(_))) if slot.listing != Cursor::Done => {
+                take_listing_window()
+            }
+            _ => None,
+        };
+        let _guard = ListingGuard(window.is_some());
+        let src = view.map(|(v, paths)| (v, Windowed::new(paths, window)));
         while slot.listing != Cursor::Done {
             let mut name = [0u8; 256];
             let mut name_length = 0u8;
@@ -980,6 +1121,7 @@ unsafe fn directory_read_fd(
             let mut next_listing = slot.listing;
             let child = next_view_child(
                 slot,
+                src.as_ref().map(|(v, w)| (v, w)),
                 &mut name,
                 &mut name_length,
                 &mut type_,
@@ -1073,6 +1215,55 @@ mod tests {
         assert_eq!(physical_dirent_bounds(&record(16, 8, 16)), None);
         assert_eq!(physical_dirent_bounds(&record(24, 3, 16)), None);
         assert_eq!(physical_dirent_bounds(&record(8, 0, 16)), None);
+    }
+
+    /// A slice source counting its reads, as the kept fd's preads.
+    struct Counting(Vec<u8>, core::cell::Cell<u32>);
+
+    impl Source for Counting {
+        fn len(&self) -> u64 {
+            self.0.len() as u64
+        }
+        fn read_at(&self, at: u64, out: &mut [u8]) -> ampr_format::Result<()> {
+            self.1.set(self.1.get() + 1);
+            self.0[..].read_at(at, out)
+        }
+    }
+
+    /// The window answers what the source would, with one source read per
+    /// window of bytes in either direction; a read longer than the window
+    /// or with no window goes straight to the source.
+    #[test]
+    fn listing_window_reads_each_block_once_both_ways() {
+        let bytes: Vec<u8> = (0..1000u32).map(|i| (i * 31 + i / 7) as u8).collect();
+        let src = Counting(bytes.clone(), Default::default());
+        let mut win = [0u8; 100];
+        let w = Windowed::new(&src, Some(&mut win[..]));
+        let mut out = [0u8; 10];
+        for at in (0..990).step_by(10) {
+            w.read_at(at, &mut out).unwrap();
+            assert_eq!(out[..], bytes[at as usize..at as usize + 10]);
+        }
+        assert_eq!(src.1.get(), 10);
+        src.1.set(0);
+        let w = Windowed::new(&src, Some(&mut win[..]));
+        w.read_at(985, &mut out[..5]).unwrap();
+        for at in (0..98u64).rev().map(|i| i * 10) {
+            w.read_at(at, &mut out).unwrap();
+            assert_eq!(out[..], bytes[at as usize..at as usize + 10]);
+        }
+        assert_eq!(src.1.get(), 10);
+        // Past the end, longer than the window, and no window at all.
+        assert_eq!(w.read_at(995, &mut out), Err(ampr_format::Error::Truncated));
+        let mut long = [0u8; 150];
+        src.1.set(0);
+        w.read_at(800, &mut long).unwrap();
+        assert_eq!(long[..], bytes[800..950]);
+        let direct = Windowed::new(&src, None);
+        direct.read_at(3, &mut out).unwrap();
+        direct.read_at(4, &mut out).unwrap();
+        assert_eq!(src.1.get(), 3);
+        assert_eq!(out[..], bytes[4..14]);
     }
 
     /// A physical `getdents` that fails for good ends the physical

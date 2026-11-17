@@ -8,8 +8,8 @@
 //! runtime thread spin and regrow times)
 //! take effect on the next read, reactor pass or thread idle check.
 //! `GET /set?k=v&...` on the metrics port changes both and rewrites TUNE_PATH,
-//! so startup knobs apply on the next game launch; `profile=low|medium|high`
-//! sets all startup knobs. Release builds use the compile-time constants:
+//! so startup knobs apply on the next game launch. Release builds use the
+//! compile-time constants:
 //! `ON` is false and the atomics are never read.
 
 use super::pack::{
@@ -90,7 +90,6 @@ const REGROW_S: usize = 15;
 const WORKER_STACK_KIB: usize = 16;
 const CACHE_PROTECT_HITS: usize = 17;
 const CACHE_PROTECT_PCT: usize = 18;
-const RETIRE_LOAD: usize = 19;
 
 // ---- runtime thread lifetime (rt/thread_hooks.rs) ----
 // Release values; the debug knobs of the same names default to them.
@@ -98,10 +97,9 @@ const RETIRE_LOAD: usize = 19;
 /// Microseconds an idle runtime thread spins before it parks; 0 parks at once.
 pub(crate) const SPIN_US_DEFAULT: u32 = 0;
 /// Quiet seconds after a thread creation failure before the budget regrows
-/// by one and pressure mode ends (rt/thread_hooks.rs). With load retirement
-/// off a started thread stays, so pressure mode is the only way threads go
-/// back to the game: 5 s holds it after the last failure, against 10 s and
-/// 30 s before.
+/// by one and pressure mode ends (rt/thread_hooks.rs). A started thread
+/// stays, so pressure mode is the only way threads go back to the game: 5 s
+/// holds it after the last failure, against 10 s and 30 s before.
 pub(crate) const REGROW_S_DEFAULT: u32 = 5;
 /// Pack worker stack in KiB; 0 keeps the system default.
 pub(crate) const WORKER_STACK_KIB_DEFAULT: u32 = 0;
@@ -126,14 +124,14 @@ const READ_SLICE_KIB: u32 = (kSoftwareReadChunkMax / 1024) as u32;
 /// Largest pass budget and per-read active window, in KiB (16 MiB).
 const READ_LIMIT_MAX_KIB: u32 = 16 * 1024;
 
-/// `decoded_mib` default: the Cache cap in MiB rounded up (134 in the debug
+/// `decoded_mib` default: the Cache cap in MiB rounded up (136 in the debug
 /// pool), so the default cache is cut to the whole cap, as in release.
 const DECODED_MIB_DEFAULT: u32 = AMPR_EMU_PACK_DECODED_CACHE_BYTES.div_ceil(MIB) as u32;
 
 /// Cache size: 0 turns the decoded cache off (reads bypass it); otherwise it is
 /// cut to the room under the Cache cap, and off when that leaves less than the
 /// smaller of the knob and 16 MiB (pack/manifest.rs `cache_region`).
-pub(crate) static KNOBS: [Knob; 20] = [
+pub(crate) static KNOBS: [Knob; 19] = [
     knob("decoded_mib", false, 0, 512, DECODED_MIB_DEFAULT),
     knob(
         "workers",
@@ -201,18 +199,6 @@ pub(crate) static KNOBS: [Knob; 20] = [
     knob("worker_stack_kib", false, 0, 1024, WORKER_STACK_KIB_DEFAULT),
     knob("cache_protect_hits", true, 0, 255, CACHE_PROTECT_HITS_DEFAULT),
     knob("cache_protect_pct", true, 0, 100, CACHE_PROTECT_PCT_DEFAULT),
-    knob("retire_load", true, 0, 1, 0),
-];
-
-/// (name, [decoded_mib, workers, pipelines]). The decoded sizes are the
-/// earlier two-cache totals. `pipelines` is clamped to the build's slots
-/// (`apply`); a cache past the Cache cap is cut to what is left under
-/// it, and workers and windows past the Buffer cap are refused
-/// (rt/index_memory.rs).
-const PROFILES: [(&str, [u32; 3]); 3] = [
-    ("low", [24, 4, 8]),
-    ("medium", [80, 8, 16]),
-    ("high", [160, 8, 32]),
 ];
 
 fn get(i: usize) -> u32 {
@@ -320,15 +306,6 @@ pub(crate) fn cache_protect_pct() -> u32 {
     } else {
         CACHE_PROTECT_PCT_DEFAULT
     }
-}
-/// 0 (release, and the debug default): a runtime thread, once started,
-/// stays until pressure mode gives it back; 1: threads also retire by load
-/// in normal mode (rt/thread_hooks.rs `LoadGroup::retire_due`), as up to
-/// 0.4.1. Load retirement was retuned three times for churn and still
-/// recreated threads it had just retired; keeping them costs only their
-/// pool stacks. The debug build reads `retire_load` live.
-pub(crate) fn retire_load() -> bool {
-    ON && get(RETIRE_LOAD) != 0
 }
 /// Pack worker stack in bytes, 0 for the system default; the debug build
 /// reads `worker_stack_kib` (0..=1024) at startup.
@@ -457,17 +434,6 @@ pub(crate) fn apply(s: &[u8]) -> Result<(), &[u8]> {
             return Err(pair);
         };
         let (k, v) = (trim(&pair[..eq]), trim(&pair[eq + 1..]));
-        if k == b"profile" {
-            let Some((_, values)) = PROFILES.iter().find(|(name, _)| name.as_bytes() == v) else {
-                return Err(pair);
-            };
-            // Clamped to each knob's range: `high` asks for 32 pipelines,
-            // more than a build with fewer AMPR_PACK_PIPELINES slots has.
-            for (i, &value) in values.iter().enumerate() {
-                KNOBS[i].v.store(value.clamp(KNOBS[i].min, KNOBS[i].max), Relaxed);
-            }
-            continue;
-        }
         let Some(knob) = KNOBS.iter().find(|n| n.name.as_bytes() == k) else {
             return Err(pair);
         };
@@ -632,7 +598,8 @@ pub(crate) mod tests {
     fn tune_file_skips_unknown_lines_and_save_fits() {
         let _lock = knob_lock();
         let file = b"ra=8\napp0_direct=1\napp0_backing=/data/homebrew/%5BX%5D\r\n\
-            # comment\nnot a pair\nread_chunk_quantum=32\nlane_eop_overlap=0\nequeue_local=1\n";
+            # comment\nnot a pair\nread_chunk_quantum=32\nlane_eop_overlap=0\nequeue_local=1\n\
+            retire_load=1\nprofile=high\n";
         apply_file(file);
         assert_eq!(knob_value(READ_CHUNK_QUANTUM), 32);
         // /set queries still report the first bad pair.
@@ -648,8 +615,7 @@ pub(crate) mod tests {
     }
 
     /// `pipelines` defaults to AMPR_PACK_PIPELINES and never passes the
-    /// build's slots: the knob range ends there and a profile is clamped to
-    /// it (`high` asks for 32).
+    /// build's slots: the knob range ends there.
     #[test]
     fn pipelines_stay_within_build_slots() {
         let _lock = knob_lock();
@@ -663,15 +629,12 @@ pub(crate) mod tests {
         if ON {
             assert_eq!(pipelines(), RELEASE_PIPELINES as usize);
         }
-        let saved: Vec<u32> = (0..3).map(knob_value).collect();
-        assert_eq!(apply(b"profile=high"), Ok(()));
-        assert_eq!(knob_value(PIPELINES), slots.min(32));
-        assert!(pipelines() <= AMPR_EMU_PACK_PIPELINE_SLOTS);
         let over = format!("pipelines={}", slots + 1);
         assert_eq!(apply(over.as_bytes()), Err(over.as_bytes()));
-        for (i, v) in saved.into_iter().enumerate() {
-            KNOBS[i].v.store(v, Relaxed);
-        }
+        assert_eq!(knob_value(PIPELINES), RELEASE_PIPELINES);
+        // Profiles are gone: a /set with one is refused, nothing stored.
+        assert_eq!(apply(b"profile=high"), Err(&b"profile=high"[..]));
+        assert_eq!(knob_value(PIPELINES), RELEASE_PIPELINES);
     }
 
     /// The sizing knobs are plain numbers with the build defaults (workers

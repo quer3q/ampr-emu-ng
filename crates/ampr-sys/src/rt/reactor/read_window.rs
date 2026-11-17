@@ -121,53 +121,23 @@ impl AprAioReactor {
     pub(crate) fn adaptive_read_window(
         &self,
         priority: u8,
-        readClass: AmprLooseReadClass,
         context: &AioAdmissionContext,
     ) -> AdaptiveReadWindow {
         let pressure = context.fdPressure
             || self.aioAgeThrottleLevel != AioAgeThrottleLevel::Normal
             || self.slow_aio_cooldown_active(context.laneNowNs)
             || context.effectiveLimit < Self::aio_active_read_limit();
-        let latencyDemand = self.latency_read_waiting_at_equal_or_higher_priority(priority);
         let mut window = AdaptiveReadWindow::default();
-        let mut constrained = pressure || readClass == AmprLooseReadClass::Latency;
-        let mut shared = false;
-        if pressure {
-            window.mode = AdaptiveReadWindowMode::Pressure;
-        } else if readClass == AmprLooseReadClass::Latency || latencyDemand {
-            window.mode = AdaptiveReadWindowMode::Contended;
-        } else if self.another_priority_has_waiting_read(priority, context.laneDemandMask) {
-            window.mode = AdaptiveReadWindowMode::Contended;
-            constrained = true;
-        } else {
-            let mut otherLaneMask = context.laneDemandMask;
-            if priority < kPriorityCount {
-                otherLaneMask &= !(1u8 << priority);
-            }
-            let aged =
-                context.snapshot.oldestSubmittedAgeMs > AMPR_EMU_APR_AIO_THROTTLE_RECOVER_NORMAL_MS;
-            shared = otherLaneMask != 0 || aged || latencyDemand;
-            window.mode = if shared {
-                AdaptiveReadWindowMode::Shared
-            } else {
-                AdaptiveReadWindowMode::Exclusive
-            };
-        }
-        window.chunks = ampr_loose_chain_chunk_limit(
-            readClass,
-            latencyDemand,
-            constrained,
-            shared,
-            Self::adaptive_read_hard_chunk_limit(),
-        );
+        // The window's mode (pressure, contended, shared, exclusive) fed only
+        // empty note functions; the chunk count depends on constraint alone.
+        let constrained =
+            pressure || self.another_priority_has_waiting_read(priority, context.laneDemandMask);
+        window.chunks =
+            ampr_loose_chain_chunk_limit(constrained, Self::adaptive_read_hard_chunk_limit());
         window.bytes = (window.chunks as u64 * Self::read_credit_bytes(kSoftwareReadChunkMax))
             .min(crate::rt::tune::per_read_active_bytes());
         window
     }
-
-    pub(crate) fn note_adaptive_read_window_staged(&mut self, _mode: AdaptiveReadWindowMode) {}
-
-    pub(crate) fn note_adaptive_read_window_blocked(&mut self, _mode: AdaptiveReadWindowMode) {}
 }
 
 impl AprAioReactor {
@@ -184,10 +154,6 @@ impl AprAioReactor {
             return;
         }
         context.snapshot.activeCount += 1;
-        let classIndex = active.desc.readClass as usize;
-        if classIndex < AmprLooseReadClass::Count as usize {
-            context.snapshot.classActive[classIndex] += 1;
-        }
         if Self::aio_desc_is_small_for_boost(&active.desc) {
             context.snapshot.smallCount += 1;
         }
@@ -214,15 +180,13 @@ impl AprAioReactor {
     pub(crate) fn direct_read_admission_available(
         &mut self,
         priority: u8,
-        readClass: AmprLooseReadClass,
         ownerDesc: &AprAioReadDesc,
         sliceDesc: &AprAioReadDesc,
         nowNs: u64,
         context: &mut AioAdmissionContext,
     ) -> bool {
         self.prepare_aio_admission_context(context, nowNs);
-        let limit =
-            self.aio_direct_read_admission_limit(priority, readClass, sliceDesc, nowNs, context);
+        let limit = context.effectiveLimit;
         let activeCount = context.snapshot.activeCount;
         // Virtual pack parents still occupy ActiveRead storage; keep storage
         // admission independent from the native-capacity snapshot.
@@ -259,9 +223,7 @@ impl AprAioReactor {
 
     pub(crate) fn begin_aio_submit_round(&mut self) {
         let round = &mut self.aioSubmitRound;
-        if round.groupedExternal.iter().any(|b| b.count != 0)
-            || round.batches.iter().any(|b| b.count != 0)
-        {
+        if round.batches.iter().any(|b| b.count != 0) {
             abort();
         }
         let prios = [
@@ -271,7 +233,6 @@ impl AprAioReactor {
         ];
         for (i, p) in prios.into_iter().enumerate() {
             round.batches[i].aioPriority = p;
-            round.groupedExternal[i].aioPriority = p;
         }
     }
 
@@ -322,12 +283,10 @@ impl AprAioReactor {
 
     pub(crate) fn release_external_aio_slot(external: &mut ExternalAioRead) {
         let generation = external.generation;
-        for i in 0..kAprExternalAioGroupMaxRequests {
-            external.requests[i] = SceKernelAioRWRequest::default();
-            external.deleteRetries[i] = 0;
-            external.deleteFirstFailureNs[i] = 0;
-            external.aioIds[i] = -1;
-        }
+        external.request = SceKernelAioRWRequest::default();
+        external.deleteRetries = 0;
+        external.deleteFirstFailureNs = 0;
+        external.aioId = -1;
         external.context = null_mut();
         external.callback = None;
         external.submitTimeNs = 0;
@@ -336,13 +295,32 @@ impl AprAioReactor {
         external.pollBackoffNs = 0;
         external.requestCount = 0;
         external.remainingCount = 0;
-        external.totalBytes = 0;
         external.completionState = SCE_KERNEL_AIO_STATE_COMPLETED;
         external.aioPriority = SCE_KERNEL_AIO_PRIORITY_MID;
-        external.grouped = false;
         external.preadBacked = false;
         external.state = ExternalAioState::Free;
         external.generation = generation;
         external.published.store(false, Ordering::Release);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn loose_chain_chunk_limit_keeps_the_balanced_arms() {
+        assert_eq!(ampr_loose_chain_chunk_limit(false, 0), 0);
+        assert_eq!(ampr_loose_chain_chunk_limit(true, 0), 0);
+        assert_eq!(ampr_loose_chain_chunk_limit(true, 4), 1);
+        assert_eq!(ampr_loose_chain_chunk_limit(false, 1), 1);
+        assert_eq!(ampr_loose_chain_chunk_limit(false, 4), 2);
+    }
+
+    /// 144 B on the host (about 2512 B with upstream's 32-request arrays, 80 KiB
+    /// over the 32 slots).
+    #[test]
+    fn external_read_holds_one_request() {
+        assert!(size_of::<ExternalAioRead>() <= 160);
     }
 }

@@ -303,18 +303,6 @@ impl AprAioReactor {
         }
     }
 
-    pub(crate) fn effective_read_class(
-        &self,
-        _job: *const JobState,
-        desc: &AprAioReadDesc,
-    ) -> AmprLooseReadClass {
-        desc.readClass
-    }
-
-    pub(crate) fn latency_read_waiting_at_equal_or_higher_priority(&self, _priority: u8) -> bool {
-        false
-    }
-
     pub(crate) fn read_group_for_priority(priority: u8) -> A53ReadGroup {
         match priority {
             0 => A53ReadGroup::Urgent,

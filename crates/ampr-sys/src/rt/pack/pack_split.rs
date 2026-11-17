@@ -137,12 +137,10 @@ impl SplitGroup {
     };
 }
 
+/// Free virtual AIO slots, from the used count slots.rs keeps (no scan of
+/// the 256 slots under PACK_M per multi-chunk read). PACK_M held.
 unsafe fn free_virtual_aio_count_locked(state: *const PackState) -> usize {
-    (*state)
-        .virtual_aio
-        .iter()
-        .filter(|slot| slot.phase == VirtualAioPhase::Free)
-        .count()
+    AMPR_EMU_PACK_VIRTUAL_AIO_SLOTS.saturating_sub((*state).virtual_aio_used as usize)
 }
 
 /// Splits the just-prepared virtual job `first` (Reserved; request, file,
@@ -268,18 +266,25 @@ pub(crate) unsafe fn free_split_groups_locked(state: *mut PackState, groups: &[u
 }
 
 /// One child of split group `group_index` completed (its result is written):
-/// the last one writes the caller's result. PACK_M held.
-pub(crate) unsafe fn finish_split_child_locked(state: *mut PackState, group_index: u32) {
+/// the last one writes the caller's result. Returns false only while other
+/// children are still pending, so the caller skips the wakeups: nobody waits
+/// on a child alone (the caller holds the group id, a sync read needs every
+/// child), and a 4-child read woke the reactor and every AIO_CV waiter 3
+/// times for nothing. PACK_M held.
+pub(crate) unsafe fn finish_split_child_locked(state: *mut PackState, group_index: u32) -> bool {
     let Some(group) = (*state).virtual_aio_groups.get_mut(group_index as usize) else {
-        return;
+        return true;
     };
     let split = &mut group.split;
     if !group.active || split.count == 0 || split.pending == 0 {
-        return;
+        return true;
     }
     split.pending -= 1;
-    if split.pending != 0 || split.result.is_null() {
-        return;
+    if split.pending != 0 {
+        return false;
+    }
+    if split.result.is_null() {
+        return true;
     }
     // Children write their results under PACK_M too (complete_virtual_job).
     let n = split.count as usize;
@@ -290,6 +295,7 @@ pub(crate) unsafe fn finish_split_child_locked(state: *mut PackState, group_inde
         AtomicI64::from_ptr(&raw mut (*result).return_value).store(return_value, Ordering::Relaxed);
         AtomicU32::from_ptr(&raw mut (*result).state).store(completion as u32, Ordering::Release);
     }
+    true
 }
 
 // ---- tests --------------------------------------------------------------------
@@ -411,6 +417,71 @@ mod tests {
         assert_eq!(plan(3 * C, 0, 4).len(), 0);
         assert_eq!(split_chunk_span(C - 1, 2, SHIFT), 2);
         assert_eq!(split_chunk_span(C, C, SHIFT), 1);
+    }
+
+    /// A zeroed `PackState` (heap; several MB), as the .bss storage starts.
+    fn zeroed_state() -> *mut PackState {
+        let layout = std::alloc::Layout::new::<PackState>();
+        let state = unsafe { std::alloc::alloc_zeroed(layout) }.cast::<PackState>();
+        assert!(!state.is_null());
+        state
+    }
+
+    fn free_state(state: *mut PackState) {
+        unsafe { std::alloc::dealloc(state.cast(), std::alloc::Layout::new::<PackState>()) };
+    }
+
+    /// Only the last child of a split group reports the group finished (and
+    /// writes the caller's result), so earlier children wake nobody.
+    #[test]
+    fn only_the_last_split_child_finishes_the_group() {
+        let state = zeroed_state();
+        let mut caller = SceKernelAioResult::EMPTY;
+        unsafe {
+            let group = &mut (*state).virtual_aio_groups[5];
+            group.active = true;
+            group.split = SplitGroup {
+                result: &mut caller,
+                count: 3,
+                pending: 3,
+                ..SplitGroup::EMPTY
+            };
+            for k in 0..3 {
+                group.split.nbytes[k] = 100;
+                group.split.results[k] = res(100, OK);
+            }
+            assert!(!finish_split_child_locked(state, 5));
+            assert!(!finish_split_child_locked(state, 5));
+            assert_eq!(caller.state, 0, "no caller result before the last child");
+            assert!(finish_split_child_locked(state, 5));
+            assert_eq!((caller.return_value, caller.state), (300, OK as u32));
+            // A stray completion after the last, or a plain group, still wakes.
+            assert!(finish_split_child_locked(state, 5));
+            assert!(finish_split_child_locked(state, 6));
+        }
+        free_state(state);
+    }
+
+    /// The used count follows allocate and free, a double free included,
+    /// so the split room check needs no scan.
+    #[test]
+    fn free_slot_count_follows_allocate_and_free() {
+        let state = zeroed_state();
+        unsafe {
+            let total = AMPR_EMU_PACK_VIRTUAL_AIO_SLOTS;
+            assert_eq!(free_virtual_aio_count_locked(state), total);
+            let a = allocate_virtual_aio_locked(state);
+            let b = allocate_virtual_aio_locked(state);
+            assert_eq!(free_virtual_aio_count_locked(state), total - 2);
+            // free_virtual_aio_locked's count step (its pipeline release
+            // needs libkernel condvars, absent on the host).
+            mark_virtual_aio_free_locked(state, a);
+            mark_virtual_aio_free_locked(state, a);
+            assert_eq!(free_virtual_aio_count_locked(state), total - 1);
+            mark_virtual_aio_free_locked(state, b);
+            assert_eq!(free_virtual_aio_count_locked(state), total);
+        }
+        free_state(state);
     }
 
     fn res(return_value: i64, state: c_int) -> SceKernelAioResult {

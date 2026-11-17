@@ -13,6 +13,7 @@ pub(crate) unsafe fn allocate_virtual_aio_locked(state: *mut PackState) -> u32 {
             reset_virtual_aio_slot(slot, generation, VirtualAioPhase::Reserved);
             slot.submit_ns = stats::now();
             (*state).virtual_aio_cursor = (index + 1) % slots;
+            (*state).virtual_aio_used += 1;
             return index;
         }
     }
@@ -29,7 +30,16 @@ pub(crate) unsafe fn free_virtual_aio_locked(state: *mut PackState, index: u32) 
     if was_fd_waiter {
         PACK_FD_WAITER_COUNT.fetch_sub(1, Ordering::SeqCst);
     }
+    unsafe { mark_virtual_aio_free_locked(state, index) };
+}
+
+/// Resets slot `index` to Free and gives its count back once (a second free
+/// of the same slot counts nothing). PACK_M held.
+pub(crate) unsafe fn mark_virtual_aio_free_locked(state: *mut PackState, index: u32) {
     let slot = &mut (*state).virtual_aio[index as usize];
+    if slot.phase != VirtualAioPhase::Free {
+        (*state).virtual_aio_used -= 1;
+    }
     let generation = slot.generation;
     reset_virtual_aio_slot(slot, generation, VirtualAioPhase::Free);
 }

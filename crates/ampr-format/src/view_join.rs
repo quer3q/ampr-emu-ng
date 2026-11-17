@@ -8,7 +8,7 @@
 //! 1,000,000 files).
 use crate::source::{Source, PATH_BUF};
 use crate::view::Builder;
-use crate::{idx_path_hash_parts, zstd, Error, Result};
+use crate::{view_hash_parts, zstd, Error, Result};
 
 /// Joins every zstd file record, in id order, to its view row: the row is
 /// the one whose hash is `/app0/` plus the record's relative path, case
@@ -26,7 +26,7 @@ pub fn join_zstd<S: Source + ?Sized>(b: &mut Builder<'_>, z: &zstd::Index<'_, S>
         // A row whose 64-bit hash another AMPRIDX3 file shares has no
         // find_hash answer and stays loose: confirming it by path would need
         // the AMPRIDX3 source here, for a case no real index has shown.
-        let Some(id) = b.find_hash(idx_path_hash_parts(&[b"/app0/", path])) else {
+        let Some(id) = b.find_hash(view_hash_parts(&[b"/app0/", path])) else {
             continue;
         };
         if b.size(id) != rec.logical_size {
@@ -85,7 +85,7 @@ mod tests {
     extern crate std;
     use super::*;
     use crate::index::{tests::image, Index};
-    use crate::view::{build, sizes, Buffers, Dir, Hit, Packs, DIR_PACKED, NO_CHUNK};
+    use crate::view::{build, sizes, Buffers, Dir, Hit, Packs, Row, DIR_PACKED, NO_CHUNK};
     use crate::zstd::{path_hash, INDEX_HEADER_SIZE, INDEX_MAGIC, VOLUME_HEADER_SIZE};
     use crate::{crc32, pak_path_hash};
     use std::vec;
@@ -93,9 +93,9 @@ mod tests {
 
     /// Owned memory for every `Buffers` slice.
     struct Mem {
-        u64s: [Vec<u64>; 3],
-        mtime: Vec<i64>,
-        u32s: [Vec<u32>; 7],
+        rows: Vec<Row>,
+        lz4_hash: Vec<u64>,
+        u32s: [Vec<u32>; 5],
         dirs: Vec<Dir>,
     }
 
@@ -103,32 +103,27 @@ mod tests {
         fn new(files: u32, dir_cap: u32, packs: Packs) -> Self {
             let sz = sizes(files, dir_cap).unwrap();
             let n = files as usize;
-            let (next, chunk, lz4) = sz.pack_columns(packs);
+            let (chunk, lz4) = sz.pack_columns(packs);
             let (fs, ds) = (sz.file_slots as usize, sz.dir_slots as usize);
             Mem {
-                u64s: [vec![0; n], vec![0; n], vec![0; lz4]],
-                mtime: vec![0; n],
-                u32s: [n, next, chunk, fs, ds, 256, n].map(|l| vec![0; l]),
+                rows: vec![Row::default(); n],
+                lz4_hash: vec![0; lz4],
+                u32s: [chunk, fs, ds, 256, n].map(|l| vec![0; l]),
                 dirs: vec![Dir::default(); dir_cap as usize],
             }
         }
 
         fn bufs(&mut self) -> Buffers<'_> {
-            let [hash, size, lz4_hash] = &mut self.u64s;
-            let [path_at, next, chunk, slots, dir_slots, collide, dir_of] = &mut self.u32s;
+            let [chunk, slots, dir_slots, collide, dir_of] = &mut self.u32s;
             Buffers {
-                hash,
-                size,
-                mtime: &mut self.mtime,
-                path_at,
-                next,
+                rows: &mut self.rows,
                 chunk,
                 slots,
                 dirs: &mut self.dirs,
                 dir_slots,
                 collide,
                 dir_of,
-                lz4_hash,
+                lz4_hash: &mut self.lz4_hash,
             }
         }
     }

@@ -195,6 +195,9 @@ impl AprAioReactor {
             return;
         }
         let succ;
+        let notifyWaiters;
+        // One `m` section erases the job from its lane and publishes its
+        // result and synthetic wait (two or three sections before).
         {
             let _lk = lock_detached(&self.m);
             if jr.prioIndex >= kPriorityCount
@@ -209,22 +212,25 @@ impl AprAioReactor {
                 null_mut()
             };
             self.erase_active_job_locked(j);
+            jr.nativeCompletionAddress = null_mut();
+            jr.nativeCommandBuffer = null_mut();
+            self.publish_job_result(jr);
+            notifyWaiters = if jr.syntheticWaitPublished {
+                self.publish_synthetic_wait_completion_locked(jr)
+            } else {
+                self.release_unpublished_synthetic_wait_slot_locked(jr);
+                false
+            };
+        }
+        jr.stat_notified();
+        if notifyWaiters {
+            self.notify_synthetic_waiters(jr.prioIndex as usize);
         }
         // Reactor-owned like `j`; only the reactor releases lane jobs.
         if crate::rt::tune::ON && !succ.is_null() {
             Self::note_successor_order_wait(unsafe { &*succ });
         }
-        jr.nativeCompletionAddress = null_mut();
-        jr.nativeCommandBuffer = null_mut();
-        self.publish_job_result(jr);
-        jr.stat_notified();
         crate::rt::stats::add(crate::rt::stats::Stat::JobCount, 1);
-        if jr.syntheticWaitPublished {
-            self.publish_synthetic_wait_completion(jr);
-        } else {
-            let _lk = lock_detached(&self.m);
-            self.release_unpublished_synthetic_wait_slot_locked(jr);
-        }
         self.release_job_state(j);
         *job = null_mut();
     }
@@ -240,14 +246,10 @@ impl AprAioReactor {
                 && self.activeReads.empty()
                 && self.externalAioLiveCount.load(Ordering::Acquire) == 0;
             self.maybe_release_stale_fds(waitIfIdle);
-            self.drain_incoming(waitIfIdle);
-            self.workerObservedWakeEpoch = self.reactorWakeEpoch.load(Ordering::Acquire);
-            {
-                let _lk = lock_detached(&self.m);
-                if self.stop {
-                    return;
-                }
+            if self.drain_incoming(waitIfIdle) {
+                return;
             }
+            crate::rt::stats::add(crate::rt::stats::Stat::ReactorPasses, 1);
 
             // Pread pool completions (pread_pool.rs); a later completion bumps the
             // epoch observed above, so the wait below returns at once.
@@ -294,15 +296,15 @@ impl AprAioReactor {
 
             if progressed {
                 waitOnAddressBackoffNs = AMPR_EMU_APR_ACTIVE_LANE_IDLE_SLEEP_NS;
-                self.note_reactor_progress(true);
                 continue;
             }
-            self.note_reactor_progress(false);
 
             // Phase 3: one unified wait domain.
             let mut passNativeMicroPending = false;
             let mut nativeSubmitRetryAtNs = 0;
-            {
+            // No lane, nothing to walk: a submit adding one bumps the wake
+            // epoch, so the wait below returns at once.
+            if self.has_active_lanes_locked() {
                 let _lk = lock_detached(&self.m);
                 for lane in 0..PRIO_N {
                     let mut job = self.activePriorityHeads[lane];

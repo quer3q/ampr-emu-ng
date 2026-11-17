@@ -86,8 +86,7 @@ pub(crate) unsafe fn cleanup_pipeline_continuation(
 ) {
     unsafe {
         if pipeline.decoded_lease.entry != INVALID_INDEX {
-            cache_publish(&mut pipeline.decoded_lease, error);
-            cache_release(&mut pipeline.decoded_lease);
+            cache_publish_and_release(&mut pipeline.decoded_lease, error);
         }
         if pipeline.pack_fd >= 0 && !pipeline.native_accepted {
             release_pack_fd(pipeline.io_range.pack_id);
@@ -361,7 +360,7 @@ unsafe fn acquire_task_decoded_chunk(
     pipeline.decoded_wait_key = 0;
     prepare_cache_wait(pipeline, key_hash);
     let full_chunk = task.source_offset == 0 && task.copy_length == chunk.raw_size;
-    let mut cache = cache_acquire(chunk, file_flags, full_chunk, false, waiter);
+    let mut cache = cache_acquire(chunk, file_flags, full_chunk, waiter);
     // Pending retries the lookup after the loader publishes; count the final kind only.
     match cache.kind {
         CacheAcquireKind::Load | CacheAcquireKind::Bypass => {
@@ -542,15 +541,9 @@ unsafe fn decode_task_chunk(
         stats::add(stats::Stat::DecodeErrors, 1);
     }
     if cache_loader {
-        let waited = cache_publish(&mut pipeline.decoded_lease, decode_rc);
-        if waited {
-            // Requeue game reads parked on this chunk now, not after the whole run.
-            let g = PACK_M.lock();
-            if wake_cache_waiters_locked(state) {
-                drop(g);
-                QUEUE_CV.notify_all();
-            }
-        }
+        // Copy out before publishing: the publish drops the loader's pin in
+        // the same CACHE_MUTEX section, so the entry may be evicted after
+        // it. Readers parked on the chunk wait the copy longer.
         if decode_rc == 0 {
             timed_copy(
                 pipeline.decoded_lease.data.add(task.source_offset as usize),
@@ -558,7 +551,18 @@ unsafe fn decode_task_chunk(
                 task.copy_length as usize,
             );
         }
-        cache_release(&mut pipeline.decoded_lease);
+        let waited = cache_publish_and_release(&mut pipeline.decoded_lease, decode_rc);
+        if waited {
+            // Requeue game reads parked on this chunk now, not after the whole run.
+            // One requeued job needs one worker (`single_wake_locked`).
+            let g = PACK_M.lock();
+            let queued = unsafe { super::worker::requeue_cache_waiters_locked(state) };
+            if queued != 0 {
+                let single = unsafe { super::worker::single_wake_locked(state, queued) };
+                drop(g);
+                super::worker::wake_queue_workers(single);
+            }
+        }
     } else if decode_rc == 0 && decoded == worker.decoded_scratch {
         timed_copy(
             decoded.add(task.source_offset as usize),

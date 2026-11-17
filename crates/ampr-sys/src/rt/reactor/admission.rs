@@ -48,6 +48,11 @@ impl AprAioReactor {
         admission: &mut AioAdmissionContext,
         preserveLaneShare: bool,
     ) -> bool {
+        // No external read live: skip the 3 x 32 slot scan. The admission
+        // context is prepared lazily by the lane that needs it.
+        if self.externalAioLiveCount.load(Ordering::Acquire) == 0 {
+            return false;
+        }
         let mut staged = false;
         let nowNs = time_counter_now();
         self.prepare_aio_admission_context(admission, nowNs);
@@ -72,11 +77,8 @@ impl AprAioReactor {
                 }
                 // Pread pool (pread_pool.rs): no kernel AIO admission, ids or polling.
                 if external.preadBacked {
-                    let n = external.requestCount as usize;
-                    let requests =
-                        unsafe { core::slice::from_raw_parts(external.requests.as_ptr(), n) };
                     let rc = self.queue_pread_requests(
-                        requests,
+                        core::slice::from_ref(&external.request),
                         slotIndex,
                         external.generation,
                         priority,
@@ -113,15 +115,10 @@ impl AprAioReactor {
                     staged = true;
                     continue;
                 }
-                if (!external.grouped
-                    && self.aioSubmitRound.batches[bi].count >= SCE_KERNEL_AIO_REQUEST_NUM_MAX)
-                    || (external.grouped
-                        && self.aioSubmitRound.groupedExternal[bi].count
-                            >= kAprExternalAioCapacity as usize)
-                {
+                if self.aioSubmitRound.batches[bi].count >= SCE_KERNEL_AIO_REQUEST_NUM_MAX {
                     continue;
                 }
-                let n = external.requestCount as usize;
+                let n = 1usize;
                 if !deferred {
                     let mut admissionLimit = admission.effectiveLimit as usize;
                     if !Self::external_aio_is_small_for_boost(external)
@@ -149,18 +146,12 @@ impl AprAioReactor {
                     externalWasDeferred: deferred,
                     ..Default::default()
                 };
-                if external.grouped {
-                    let g = &mut self.aioSubmitRound.groupedExternal[bi];
-                    g.items[g.count] = itemRef;
-                    g.count += 1;
-                } else {
-                    let b = &mut self.aioSubmitRound.batches[bi];
-                    let item = b.count;
-                    b.count += 1;
-                    b.requests[item] = external.requests[0];
-                    b.ids[item] = -1;
-                    b.items[item] = itemRef;
-                }
+                let b = &mut self.aioSubmitRound.batches[bi];
+                let item = b.count;
+                b.count += 1;
+                b.requests[item] = external.request;
+                b.ids[item] = -1;
+                b.items[item] = itemRef;
                 external.state = ExternalAioState::AwaitingBatchSubmit;
                 if !deferred {
                     self.reserve_external_aio_admission(admission, external, nowNs);
@@ -187,13 +178,6 @@ impl AprAioReactor {
             abort();
         }
         s.activeCount -= 1;
-        let classIndex = active.desc.readClass as usize;
-        if classIndex < AmprLooseReadClass::Count as usize {
-            if s.classActive[classIndex] == 0 {
-                abort();
-            }
-            s.classActive[classIndex] -= 1;
-        }
         if Self::aio_desc_is_small_for_boost(&active.desc) {
             if s.smallCount == 0 {
                 abort();
@@ -229,7 +213,7 @@ impl AprAioReactor {
         for external in &self.externalAioReads {
             if external.published.load(Ordering::Acquire)
                 && external.state == ExternalAioState::Submitted
-                && external.aioIds[..external.requestCount as usize].contains(&id)
+                && external.aioId == id
             {
                 return false;
             }
@@ -296,19 +280,14 @@ impl AprAioReactor {
         }
     }
 
-    fn arm_external_submitted(
-        &self,
-        external: &mut ExternalAioRead,
-        submitTimeNs: u64,
-        submitted: u32,
-    ) {
+    fn arm_external_submitted(&self, external: &mut ExternalAioRead, submitTimeNs: u64) {
         external.submitTimeNs = submitTimeNs;
         external.retryNotBeforeNs = 0;
         external.pollBackoffNs = self.external_aio_initial_poll_delay_ns(external);
         external.nextPollTimeNs = submitTimeNs + external.pollBackoffNs as u64;
         external.state = ExternalAioState::Submitted;
         self.externalAioSubmittedCount
-            .fetch_add(submitted, Ordering::Release);
+            .fetch_add(1, Ordering::Release);
     }
 
     pub(crate) fn accept_external_aio_submit(
@@ -327,37 +306,9 @@ impl AprAioReactor {
         }
         let external = unsafe { &mut *external };
         self.take_external_deferred(item.externalWasDeferred);
-        external.aioIds[0] = aioId;
+        external.aioId = aioId;
         external.remainingCount = 1;
-        self.arm_external_submitted(external, submitTimeNs, 1);
-        self.notify_external_aio(
-            external,
-            AprExternalAioEvent::Submitted,
-            0,
-            firstExternalInSubmitBatch,
-        );
-    }
-
-    pub(crate) fn accept_external_aio_group(
-        &mut self,
-        item: &AioItemRef,
-        submitTimeNs: u64,
-        firstExternalInSubmitBatch: bool,
-    ) {
-        let external = self.external_aio_at(&item.external);
-        if external.is_null() {
-            abort();
-        }
-        let external = unsafe { &mut *external };
-        if !external.grouped
-            || external.state != ExternalAioState::AwaitingBatchSubmit
-            || external.requestCount < 2
-        {
-            abort();
-        }
-        self.take_external_deferred(item.externalWasDeferred);
-        external.remainingCount = external.requestCount;
-        self.arm_external_submitted(external, submitTimeNs, external.requestCount);
+        self.arm_external_submitted(external, submitTimeNs);
         self.notify_external_aio(
             external,
             AprExternalAioEvent::Submitted,

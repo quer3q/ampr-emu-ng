@@ -29,7 +29,6 @@ impl AprAioReactor {
             self.clear_cursor_read_wait_hint(lane);
             let mut priorReadFencePending = false;
             let mut priorNativeBatchPending = false;
-            let mut speculativeCommandUsed = false;
             let mut readIssueBudget = ReadIssueBudget {
                 requestsLeft: crate::rt::tune::read_chunk_quantum(),
                 bytesLeft: crate::rt::tune::read_pass_bytes(),
@@ -48,7 +47,6 @@ impl AprAioReactor {
                     &mut job,
                     priorReadFencePending,
                     priorNativeBatchPending,
-                    &mut speculativeCommandUsed,
                     &mut readIssueBudget,
                     &mut admission,
                 );
@@ -259,29 +257,26 @@ impl AprAioReactor {
         {
             abort();
         }
-        for requestIndex in 0..external.requestCount {
-            let id = external.aioIds[requestIndex as usize];
-            if id < 0 {
-                continue;
-            }
-            if batch.count >= kAioPollBatchLimit {
-                abort();
-            }
-            #[cfg(debug_assertions)]
-            if batch.ids[..batch.count].contains(&id) {
-                abort();
-            }
-            let item = batch.count;
-            batch.count += 1;
-            batch.items[item].external = ExternalAioRef {
-                slot: slotIndex,
-                generation: external.generation,
-            };
-            batch.items[item].isExternal = true;
-            batch.items[item].externalRequestIndex = requestIndex;
-            batch.ids[item] = id;
-            batch.states[item] = i32::MIN;
+        let id = external.aioId;
+        if id < 0 {
+            return;
         }
+        if batch.count >= kAioPollBatchLimit {
+            abort();
+        }
+        #[cfg(debug_assertions)]
+        if batch.ids[..batch.count].contains(&id) {
+            abort();
+        }
+        let item = batch.count;
+        batch.count += 1;
+        batch.items[item].external = ExternalAioRef {
+            slot: slotIndex,
+            generation: external.generation,
+        };
+        batch.items[item].isExternal = true;
+        batch.ids[item] = id;
+        batch.states[item] = i32::MIN;
     }
 
     pub(crate) fn record_aio_delete_failure(
@@ -303,16 +298,14 @@ impl AprAioReactor {
     pub(crate) fn handle_external_delete_failure(
         &self,
         external: &mut ExternalAioRead,
-        requestIndex: u32,
         nowNs: u64,
         _rc: c_int,
     ) {
-        let i = requestIndex as usize;
         // A failed delete does not retire the ID; the kernel may still own the
         // buffer, so a timed-out delete is fatal.
         if Self::record_aio_delete_failure(
-            &mut external.deleteRetries[i],
-            &mut external.deleteFirstFailureNs[i],
+            &mut external.deleteRetries,
+            &mut external.deleteFirstFailureNs,
             nowNs,
         ) {
             abort();
@@ -324,15 +317,11 @@ impl AprAioReactor {
     /// Live external slot for a batch item, or abort when stale.
     fn poll_batch_external(&mut self, batch: &AioPollBatch, item: usize) -> *mut ExternalAioRead {
         let external = self.external_aio_at(&batch.items[item].external);
-        let requestIndex = batch.items[item].externalRequestIndex;
         if external.is_null() {
             abort();
         }
         let e = unsafe { &*external };
-        if e.state != ExternalAioState::Submitted
-            || requestIndex >= e.requestCount
-            || e.aioIds[requestIndex as usize] != batch.ids[item]
-        {
+        if e.state != ExternalAioState::Submitted || e.aioId != batch.ids[item] {
             abort();
         }
         external
@@ -402,13 +391,7 @@ impl AprAioReactor {
             let terminal = finalState == SCE_KERNEL_AIO_STATE_COMPLETED
                 || finalState == SCE_KERNEL_AIO_STATE_ABORTED;
             if statPollNs != 0 {
-                Self::stat_observe_poll(
-                    external,
-                    active,
-                    batch.items[item].externalRequestIndex,
-                    terminal,
-                    statPollNs,
-                );
+                Self::stat_observe_poll(external, active, terminal, statPollNs);
             }
             if terminal {
                 terminalItems[terminalCount] = item;
@@ -463,10 +446,9 @@ impl AprAioReactor {
             let batchItem = batch.items[item];
             if batchItem.isExternal {
                 let e = unsafe { &mut *self.poll_batch_external(batch, item) };
-                let requestIndex = batchItem.externalRequestIndex;
                 let deleteSceRc = apr_aio_api_rc_to_sce(deleteResults[terminal]);
                 if deleteSceRc != 0 {
-                    self.handle_external_delete_failure(e, requestIndex, pollEndNs, deleteSceRc);
+                    self.handle_external_delete_failure(e, pollEndNs, deleteSceRc);
                     if e.nextPollTimeNs <= pollEndNs {
                         self.schedule_next_external_aio_poll(e, pollEndNs);
                     }
@@ -475,7 +457,7 @@ impl AprAioReactor {
                 if e.remainingCount == 0 {
                     abort();
                 }
-                e.aioIds[requestIndex as usize] = -1;
+                e.aioId = -1;
                 e.remainingCount -= 1;
                 if self.externalAioSubmittedCount.load(Ordering::Acquire) == 0 {
                     abort();
@@ -543,21 +525,16 @@ impl AprAioReactor {
     fn stat_observe_poll(
         external: *mut ExternalAioRead,
         active: *mut ActiveRead,
-        requestIndex: u32,
         terminal: bool,
         nowNs: u64,
     ) {
         let (submitNs, lastPollNs, polls, bytes, ext) =
             if let Some(e) = unsafe { external.as_mut() } {
-                let i = requestIndex as usize;
-                if i >= kAprExternalAioGroupMaxRequests {
-                    return;
-                }
-                let bytes = e.requests[i].nbyte as u64;
+                let bytes = e.request.nbyte as u64;
                 (
-                    &mut e.statSubmitNs[i],
-                    &mut e.statLastPollNs[i],
-                    &mut e.statPolls[i],
+                    &mut e.statSubmitNs,
+                    &mut e.statLastPollNs,
+                    &mut e.statPolls,
                     bytes,
                     true,
                 )

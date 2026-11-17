@@ -313,12 +313,19 @@ const CANCEL_DISABLE: c_int = 1;
 /// flight: the wait (`wait_sync`) is a cancellation point, and a thread
 /// cancelled there would leave workers writing into its dead stack
 /// (`results`, the iovec buffers) and its job slots never freed. Returns the
-/// state to restore, None when libkernel lacks the call or refuses.
+/// state to restore, None when libkernel lacks the call or refuses; the read
+/// then runs anyway, as it did before this guard, and the debug build counts
+/// it (`posix_read_cancel_on`) so a console shows whether that ever happens.
 #[inline(never)]
 fn no_cancel() -> Option<c_int> {
-    let set = cancel_state_fn()?;
-    let mut old: c_int = 0;
-    (unsafe { set(CANCEL_DISABLE, &mut old) } == 0).then_some(old)
+    let old = cancel_state_fn().and_then(|set| {
+        let mut old: c_int = 0;
+        (unsafe { set(CANCEL_DISABLE, &mut old) } == 0).then_some(old)
+    });
+    if old.is_none() {
+        stats::add(stats::Stat::PosixReadCancelOn, 1);
+    }
+    old
 }
 
 /// scePthreadSetcancelstate, else pthread_setcancelstate (same arguments;
@@ -353,7 +360,6 @@ unsafe fn submit_sync(
         return SCE_KERNEL_ERROR_EBADF;
     };
     let state = unsafe { pack_state() };
-    let queued_at_usec = pack_telemetry_usecs();
     let notify_one;
     {
         let _lock = PACK_M.lock();
@@ -364,7 +370,7 @@ unsafe fn submit_sync(
         let mut queued = 0usize;
         for &job in &jobs[..plan.len()] {
             queued += unsafe {
-                for_each_job_locked(state, job, |i| queue_push_locked(state, i, queued_at_usec))
+                for_each_job_locked(state, job, |i| queue_push_locked(state, i))
             };
         }
         notify_one = queued == 1 && unsafe { effective_latency_reserve_locked(state) } == 0;
@@ -409,7 +415,15 @@ unsafe fn submit_sync_locked(
                 &mut children,
             )
         } {
-            Ok((group, _)) => jobs[i] = (children[0], group),
+            Ok((group, _)) => {
+                jobs[i] = (children[0], group);
+                // Its completion wakes this thread on AIO_CV, not the reactor.
+                unsafe {
+                    for_each_job_locked(state, jobs[i], |j| {
+                        (*state).virtual_aio[j as usize].sync_read = true
+                    })
+                };
+            }
             Err(e) => {
                 rc = e;
                 break;
@@ -569,6 +583,30 @@ unsafe fn virtual_fd_snapshot(
     slot.holds(fd).then_some(slot)
 }
 
+/// Admits one submission (PackSubmission) and snapshots slot `index` while
+/// it still holds `fd`, in one PACK_M section: a sync pread took PACK_M five
+/// times (admission, snapshot, submit, wait, release), now four. None when
+/// shutdown closed submissions or the fd closed (EBADF either way).
+unsafe fn admit_fd_snapshot(
+    state: *mut PackState,
+    fd: c_int,
+    index: u32,
+) -> Option<(PackSubmission, VirtualFdSlot)> {
+    let _lock = PACK_M.lock();
+    let slot = (*state).virtual_fds[index as usize];
+    if (*state).submissions_closed || !slot.holds(fd) {
+        return None;
+    }
+    (*state).active_submissions += 1;
+    Some((
+        PackSubmission {
+            state,
+            admitted: true,
+        },
+        slot,
+    ))
+}
+
 /// Classifies `fd` for a read: Some(slot) for a virtual pack fd; None with
 /// `*handled` false for any physical fd (the caller runs the real function)
 /// or true with `*rc` set for a virtual directory fd.
@@ -645,11 +683,7 @@ unsafe fn virtual_pread(
         return rc;
     };
     let state = unsafe { pack_state() };
-    let submission = PackSubmission::new(state);
-    if !submission.admitted() {
-        return SCE_KERNEL_ERROR_EBADF as ssize_t;
-    }
-    let Some(slot) = (unsafe { virtual_fd_snapshot(state, fd, index) }) else {
+    let Some((_submission, slot)) = (unsafe { admit_fd_snapshot(state, fd, index) }) else {
         return SCE_KERNEL_ERROR_EBADF as ssize_t;
     };
     unsafe { read_slot_at(state, fd, &slot, iov, iovcnt, offset) }
@@ -676,13 +710,9 @@ unsafe fn virtual_read(
     if WORKER_STOP_REQUESTED.load(Ordering::Acquire) {
         return SCE_KERNEL_ERROR_EBADF as ssize_t;
     }
-    let submission = PackSubmission::new(state);
-    if !submission.admitted() {
-        return SCE_KERNEL_ERROR_EBADF as ssize_t;
-    }
     // Close needs the descriptor mutex, so this slot stays this fd's until
     // the guard drops; re-check in case it closed before we took it.
-    let Some(slot) = (unsafe { virtual_fd_snapshot(state, fd, index) }) else {
+    let Some((_submission, slot)) = (unsafe { admit_fd_snapshot(state, fd, index) }) else {
         return SCE_KERNEL_ERROR_EBADF as ssize_t;
     };
     let cursor = slot.cursor;
@@ -980,8 +1010,8 @@ pub unsafe fn ampr_pack_is_virtual_fd(fd: c_int) -> bool {
 }
 
 /// One-based AMPRIDX3 file id behind an open virtual pack fd; None for any
-/// other fd. rt/pack/mmap.rs keys its disk cache by it; debug probes
-/// (rt/probe.rs) map it to the file's path.
+/// other fd. The save icon read (rt/save.rs) tests a packed open with it;
+/// debug probes (rt/probe.rs) map it to the file's path.
 pub(crate) unsafe fn virtual_fd_file_id(fd: c_int) -> Option<u32> {
     let slot = decode_virtual_fd(fd)?;
     let state = unsafe { pack_state() };
@@ -1091,7 +1121,7 @@ pub(crate) unsafe extern "C" fn complete_pack_backing_aio(
                 p.native_accepted = false;
                 p.native_io_error = n.value;
                 p.native_completion_ready = true;
-                queue_push_locked(state, owner, pack_telemetry_usecs());
+                queue_push_locked(state, owner);
                 queue_worker = true;
             }
             AprExternalAioEvent::Completed => {
@@ -1113,7 +1143,7 @@ pub(crate) unsafe extern "C" fn complete_pack_backing_aio(
                     SCE_KERNEL_ERROR_ECANCELED
                 };
                 p.native_completion_ready = true;
-                queue_push_locked(state, owner, 0);
+                queue_push_locked(state, owner);
                 queue_worker = true;
             }
         }
@@ -1159,7 +1189,6 @@ pub unsafe fn ampr_pack_shutdown() -> c_int {
             || unsafe { core::ptr::read_volatile(addr_of_mut!((*sp).active_submissions)) } == 0,
         );
     }
-    unsafe { super::mmap::close_cache() };
     {
         let _g = MANIFEST_MUTEX.lock();
         WORKER_STOP_REQUESTED.store(true, Ordering::Release);
@@ -1220,7 +1249,6 @@ pub unsafe fn ampr_pack_shutdown() -> c_int {
         if (*state).workers_started != 0 {
             (*state).workers_started -= 1;
         }
-        PROFILE_STARTED_WORKERS.store((*state).workers_started, Ordering::Release);
     }
     if join_error != 0 {
         return join_error;
@@ -1278,15 +1306,12 @@ unsafe fn cancel_virtual_jobs(state: *mut PackState) {
                     SCE_KERNEL_AIO_STATE_ABORTED,
                 )
             },
-            VirtualAioPhase::WaitingCache => queue_cache_waiter_locked(state, index, 0),
-            VirtualAioPhase::WaitingFd => queue_fd_waiter_locked(state, index, 0),
+            VirtualAioPhase::WaitingCache => queue_cache_waiter_locked(state, index),
+            VirtualAioPhase::WaitingFd => queue_fd_waiter_locked(state, index),
             _ => {}
         }
     }
     QUEUE_CV.notify_all();
-    for cv in CACHE_CVS.iter() {
-        cv.notify_all();
-    }
 }
 
 /// Shutdown: resets the pack handles, virtual jobs, virtual fds and virtual

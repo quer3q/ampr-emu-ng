@@ -442,7 +442,6 @@ impl AprAioReactor {
         job: &mut JobPtr,
         priorReadFencePending: bool,
         priorNativeBatchPending: bool,
-        _speculativeCommandUsed: &mut bool,
         readIssueBudget: &mut ReadIssueBudget,
         admission: &mut AioAdmissionContext,
     ) -> bool {
@@ -735,23 +734,14 @@ impl AprAioReactor {
         }
         let coalesced = Self::coalesce_adjacent_reads(jb, gs, op, opBytes, &read);
         let commandIndex = jb.sourceCommandIndex as usize;
-        let mut logicalIssued = false;
         if !self.issue_software_read(
             job,
             gs,
-            &coalesced.read,
-            coalesced.sourceBytes,
+            &coalesced,
             op.buf_offset_bytes,
             commandIndex,
             admission,
-            true,
-            false,
-            &mut logicalIssued,
             readIssueBudget,
-            coalesced.commandCount,
-            &coalesced.finalGs,
-            coalesced.gatherScatterCommandCount,
-            null_mut(),
         ) {
             let jb = j!(job);
             if !Self::job_failed(jb) {
@@ -761,7 +751,7 @@ impl AprAioReactor {
         }
         *progressed = true;
         // Consecutive APR reads share the remaining request/byte quantum.
-        if logicalIssued && read_budget_open(readIssueBudget) {
+        if read_budget_open(readIssueBudget) {
             return CommandFlow::GroupReads;
         }
         CommandFlow::Stop

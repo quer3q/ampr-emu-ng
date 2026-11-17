@@ -86,7 +86,6 @@ pub(crate) const AMPR_EMU_APR_AIO_DELETE_RETRY_LIMIT: u32 = 4096;
 pub(crate) const AMPR_EMU_APR_AIO_DELETE_TIMEOUT_NS: u64 = 5_000_000_000;
 pub(crate) const AMPR_EMU_APR_AIO_DISPATCH_QUANTUM_BYTES: u32 = 0x80000;
 pub(crate) const AMPR_EMU_APR_AIO_INFLIGHT: u32 = 32;
-pub(crate) const AMPR_EMU_APR_AIO_LATENCY_ESCAPE_SLOTS: u32 = 4;
 pub(crate) const AMPR_EMU_APR_AIO_POLL_BACKGROUND_INITIAL_MIN_NS: u32 = 250_000;
 pub(crate) const AMPR_EMU_APR_AIO_POLL_BACKOFF_MAX_NS: u32 = 1_000_000;
 pub(crate) const AMPR_EMU_APR_AIO_POLL_CRITICAL_INITIAL_NS: u32 = 10_000;
@@ -138,7 +137,8 @@ pub(crate) const AMPR_EMU_APR_READ_PASS_MAX_BYTES: u64 = 0x80000;
 /// Blocking pread pool for the pack's physical reads (pread_pool.rs). Kernel AIO on BFS
 /// serves 1-2 requests at a time; 32 parallel preads reached 1.6-2.0 GB/s on
 /// a console (bench). At most 6 threads in both builds, grown by backlog and
-/// retired by load (`LoadGroup` in rt/thread_hooks.rs;
+/// kept once started; pressure mode after a failed game thread creation
+/// gives idle ones back (`LoadGroup` in rt/thread_hooks.rs;
 /// tune::RELEASE_PREAD_THREADS has the measurements), shared by pack groups
 /// and split loose reads. Their 64 KiB stacks come from the pool's stack
 /// block (rt/thread_stack.rs).
@@ -198,11 +198,6 @@ pub(crate) const AMPR_EMU_FD_CACHE_OPEN_PRESSURE_IDLE_CLOSE_PERCENT: c_uint = 10
 pub(crate) const AMPR_EMU_FD_DIRECT_CAP_PRESSURE_PERCENT: usize = 60;
 pub(crate) const AMPR_EMU_FD_DIRECT_CAP_RESERVE: usize = 12;
 pub(crate) const AMPR_EMU_FD_DIRECT_OPEN_SAFETY_RESERVE: usize = 6;
-pub(crate) const AMPR_EMU_LOOSE_COALESCE_MAX_BYTES: u64 = 0x80000;
-pub(crate) const AMPR_EMU_LOOSE_COALESCE_MAX_COMMANDS: u32 = 8;
-pub(crate) const AMPR_EMU_LOOSE_GS_COALESCE_MAX_BYTES: u64 = AMPR_EMU_LOOSE_COALESCE_MAX_BYTES;
-pub(crate) const AMPR_EMU_LOOSE_GS_COALESCE_MAX_COMMANDS: u32 =
-    AMPR_EMU_LOOSE_COALESCE_MAX_COMMANDS;
 /// Base cap of the fd open budget.
 pub(crate) const kFdOpenBudgetBaseCap: usize = AMPR_EMU_FD_OPEN_BUDGET_CAP;
 /// Maximum number of live APR command buffers.
@@ -441,6 +436,9 @@ const _: () = assert!(
 // ---- external AIO broker -------------------------------------------------------
 
 pub(crate) const kAprExternalAioCapacity: u32 = 32;
+/// Most requests one pread pool queue call takes: the parts of one split
+/// loose read (loose_pread.rs). The name is upstream's grouped external
+/// submit, which is gone; an external read is one request.
 pub(crate) const kAprExternalAioGroupMaxRequests: usize = 32;
 
 #[repr(u8)]
@@ -594,16 +592,6 @@ pub(crate) const SCE_AMPR_APR_FILEID_INVALID: u32 = u32::MAX;
 // ---- loose adaptive reads -----------------------------------------------------
 
 #[repr(u8)]
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
-pub(crate) enum AmprLooseReadClass {
-    Latency = 0,
-    #[default]
-    Balanced = 1,
-    Bulk = 2,
-    Count = 3,
-}
-
-#[repr(u8)]
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum AmprLooseGsReadKind {
     #[default]
@@ -638,21 +626,16 @@ pub(crate) struct AmprLooseGsResolvedRead {
     pub(crate) valid: bool,
 }
 
-pub(crate) fn ampr_loose_chain_chunk_limit(
-    readClass: AmprLooseReadClass,
-    waitingLatency: bool,
-    constrained: bool,
-    shared: bool,
-    hardLimit: u32,
-) -> u32 {
+/// Chunks one loose chain may have in flight: 1 when constrained, else at
+/// most 2. Upstream's latency and bulk read classes were never ported (every
+/// read was the balanced class), so only the balanced arms remain.
+pub(crate) fn ampr_loose_chain_chunk_limit(constrained: bool, hardLimit: u32) -> u32 {
     if hardLimit == 0 {
         0
-    } else if waitingLatency || constrained || readClass == AmprLooseReadClass::Latency {
+    } else if constrained {
         1
-    } else if shared || readClass != AmprLooseReadClass::Bulk {
-        hardLimit.min(2)
     } else {
-        hardLimit
+        hardLimit.min(2)
     }
 }
 
@@ -802,8 +785,6 @@ pub(crate) struct AprAioReadDesc {
     pub(crate) offset: u64,
     pub(crate) fileSize: usize,
     pub(crate) errorOff: u32,
-    pub(crate) readClass: AmprLooseReadClass,
-    pub(crate) coalescedCommandCount: u8,
     pub(crate) bypassFdCache: bool,
     pub(crate) closeAfter: bool,
     pub(crate) closeAfterPhysical: bool,
@@ -815,8 +796,6 @@ impl Default for AprAioReadDesc {
     fn default() -> Self {
         Self {
             fd: -1,
-            readClass: AmprLooseReadClass::Balanced,
-            coalescedCommandCount: 1,
             ..unsafe { core::mem::zeroed() }
         }
     }
@@ -905,8 +884,9 @@ pub(crate) const kInvalid: u32 = u32::MAX;
 const _: () = {
     assert!(kMaxActiveReads == 64 && kBaseActiveReads == 32 && kReadChainPoolCapacity == 79);
     assert!(kMaxActiveReads as usize + kExternalAioCapacity as usize <= SCE_KERNEL_AIO_ID_NUM_MAX);
-    assert!(kAprExternalAioGroupMaxRequests <= kAioCombinedSubmitRequestLimit);
     assert!(kReadCompletionRingBits > kMaxActiveReads as u64);
+    // The idle reactor wait is bounded by it (idle.rs drain_incoming).
+    assert!(kFdCacheMaintenanceIntervalNs != 0);
     assert!(kSyntheticLowerSlotCapacity <= kSyntheticSubmitIdSlotMask + 1);
 };
 
@@ -970,21 +950,10 @@ pub(crate) struct ReadIssueBudget {
     pub(crate) held: bool,
 }
 
-#[repr(u8)]
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
-pub(crate) enum AdaptiveReadWindowMode {
-    #[default]
-    Pressure = 0,
-    Contended = 1,
-    Shared = 2,
-    Exclusive = 3,
-}
-
 #[derive(Clone, Copy, Default)]
 pub(crate) struct AdaptiveReadWindow {
     pub(crate) chunks: u32,
     pub(crate) bytes: u64,
-    pub(crate) mode: AdaptiveReadWindowMode,
 }
 
 #[derive(Clone, Copy)]
@@ -1149,7 +1118,6 @@ pub(crate) struct JobState {
     pub(crate) syntheticLowerSlot: u32,
     pub(crate) syntheticLowerGeneration: u32,
     pub(crate) syntheticWaitPublished: bool,
-    pub(crate) schedulingWaiterClaimed: AtomicBool,
     pub(crate) nativeSubmitBytes: u32,
     pub(crate) nativeSubmitFirstType: OpType,
     pub(crate) nativeSubmitType: c_int,
@@ -1287,11 +1255,14 @@ pub(crate) enum ExternalAioState {
     Submitted = 4,
 }
 
+/// One external read: one request. Upstream's grouped submit (up to 32
+/// requests per slot, submitted together) had no caller in ampr-emu-ng, so
+/// the slot holds a single request.
 pub(crate) struct ExternalAioRead {
-    pub(crate) requests: [SceKernelAioRWRequest; kAprExternalAioGroupMaxRequests],
-    pub(crate) aioIds: [SceKernelAioSubmitId; kAprExternalAioGroupMaxRequests],
-    pub(crate) deleteRetries: [u32; kAprExternalAioGroupMaxRequests],
-    pub(crate) deleteFirstFailureNs: [u64; kAprExternalAioGroupMaxRequests],
+    pub(crate) request: SceKernelAioRWRequest,
+    pub(crate) aioId: SceKernelAioSubmitId,
+    pub(crate) deleteRetries: u32,
+    pub(crate) deleteFirstFailureNs: u64,
     pub(crate) context: *mut c_void,
     pub(crate) callback: AprExternalAioCallback,
     pub(crate) submitTimeNs: u64,
@@ -1299,21 +1270,21 @@ pub(crate) struct ExternalAioRead {
     pub(crate) nextPollTimeNs: u64,
     pub(crate) pollBackoffNs: u32,
     pub(crate) generation: u32,
+    /// Always 1; the pread pool checks a task's part index against it.
     pub(crate) requestCount: u32,
+    /// 1 while the request is submitted and not yet finished, else 0.
     pub(crate) remainingCount: u32,
-    pub(crate) totalBytes: u64,
     pub(crate) completionState: c_int,
     pub(crate) aioPriority: c_int,
     pub(crate) ioClass: AprExternalAioClass,
     pub(crate) state: ExternalAioState,
-    pub(crate) grouped: bool,
     /// Served by the pread pool (pread_pool.rs) instead of kernel AIO; set at submit.
     pub(crate) preadBacked: bool,
     pub(crate) published: AtomicBool,
-    /// mem_report counters per request (see `ActiveRead::statSubmitNs`).
-    pub(crate) statSubmitNs: [u64; kAprExternalAioGroupMaxRequests],
-    pub(crate) statLastPollNs: [u64; kAprExternalAioGroupMaxRequests],
-    pub(crate) statPolls: [u32; kAprExternalAioGroupMaxRequests],
+    /// mem_report counters (see `ActiveRead::statSubmitNs`).
+    pub(crate) statSubmitNs: u64,
+    pub(crate) statLastPollNs: u64,
+    pub(crate) statPolls: u32,
 }
 impl ExternalAioRead {
     /// Applies the non-zero member initializers to zeroed storage.
@@ -1344,7 +1315,6 @@ pub(crate) struct AioItemRef {
     pub(crate) external: ExternalAioRef,
     pub(crate) isExternal: bool,
     pub(crate) externalWasDeferred: bool,
-    pub(crate) externalRequestIndex: u32,
 }
 
 pub(crate) struct AioSubmitBatch {
@@ -1355,15 +1325,8 @@ pub(crate) struct AioSubmitBatch {
     pub(crate) aioPriority: c_int,
 }
 
-pub(crate) struct ExternalAioGroupBatch {
-    pub(crate) items: [AioItemRef; kAprExternalAioCapacity as usize],
-    pub(crate) count: usize,
-    pub(crate) aioPriority: c_int,
-}
-
 pub(crate) struct AioSubmitRound {
     pub(crate) batches: [AioSubmitBatch; 3],
-    pub(crate) groupedExternal: [ExternalAioGroupBatch; 3],
 }
 impl AioSubmitRound {
     /// Resets in place to the empty state (no large stack temporaries).
@@ -1374,11 +1337,6 @@ impl AioSubmitRound {
             b.items = [AioItemRef::default(); SCE_KERNEL_AIO_REQUEST_NUM_MAX];
             b.count = 0;
             b.aioPriority = SCE_KERNEL_AIO_PRIORITY_MID;
-        }
-        for g in &mut self.groupedExternal {
-            g.items = [AioItemRef::default(); kAprExternalAioCapacity as usize];
-            g.count = 0;
-            g.aioPriority = SCE_KERNEL_AIO_PRIORITY_MID;
         }
     }
 }
@@ -1461,7 +1419,6 @@ impl ActiveReadIt {
 pub(crate) struct AioAdmissionSnapshot {
     pub(crate) activeCount: usize,
     pub(crate) smallCount: usize,
-    pub(crate) classActive: [usize; AmprLooseReadClass::Count as usize],
     pub(crate) oldestSubmittedTimeNs: u64,
     pub(crate) oldestSubmittedAgeMs: u64,
     /// U, H, N
@@ -1554,16 +1511,7 @@ pub(crate) struct CoalescedSoftwareRead {
     pub(crate) read: SoftwareRead,
     pub(crate) finalGs: GatherScatterState,
     pub(crate) sourceBytes: u32,
-    pub(crate) commandCount: u32,
     pub(crate) gatherScatterCommandCount: u32,
-}
-impl Default for CoalescedSoftwareRead {
-    fn default() -> Self {
-        Self {
-            commandCount: 1,
-            ..unsafe { core::mem::zeroed() }
-        }
-    }
 }
 
 #[derive(Clone, Copy, Default)]
@@ -1700,6 +1648,16 @@ pub(crate) struct AprAioReactor {
     pub(crate) preadReapPending: AtomicBool,
     pub(crate) preadStop: bool,
     pub(crate) preadPendingCount: u32,
+    /// Tasks in PREAD_QUEUED (not yet taken by a thread), changed under
+    /// preadMutex; spin_for_task reads it without the lock.
+    pub(crate) preadQueuedCount: AtomicU32,
+    /// Where the next free-task scan starts, under preadMutex: one past the
+    /// last task queued (pread_pool.rs `take_free_tasks`).
+    pub(crate) preadFreeHint: u32,
+    /// Per ActiveRead slot: its listGeneration (high 32 bits) and the loose
+    /// part tasks not yet DONE (low 32), so only the last part's thread wakes
+    /// the reactor (pread_pool.rs `loose_part_finished`).
+    pub(crate) preadLoosePartsLeft: [AtomicU64; kMaxActiveReads as usize],
     pub(crate) preadNextSequence: u64,
     pub(crate) preadTasks: [PreadTask; AMPR_EMU_PACK_PREAD_TASKS],
     /// Tasks held by loose reads (loose_pread.rs, part tasks of a split read

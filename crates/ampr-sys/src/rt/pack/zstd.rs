@@ -251,7 +251,7 @@ unsafe fn mount_from_file(b: &mut Builder<'_>) -> bool {
 
 /// The chunk and volume tables, in one Index allocation filled by one
 /// pass over them: chunk records and volume sizes then read memory only,
-/// which the read jobs and the fault handler need. None when the
+/// which the read jobs need. None when the
 /// allocation is refused or on a read error.
 unsafe fn attach_chunks(index: ZstdIndex, mount: &mut ZstdMount) -> Option<ZstdIndex> {
     let (c, v) = index.chunk_lens();

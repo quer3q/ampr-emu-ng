@@ -86,7 +86,7 @@ fn apr_read_desc_entry_error(rd: &AprAioReadDesc, rc: c_int) -> c_int {
 }
 
 pub(crate) fn apr_acquire_aio_read_desc(
-    jobId: u64,
+    _jobId: u64,
     rd: &mut AprAioReadDesc,
     allowNewFd: bool,
     directOpenCap: usize,
@@ -211,8 +211,7 @@ pub(crate) fn apr_acquire_aio_read_desc(
         lookupFailed = rc != 0 && rc != -EIO;
         rc
     };
-    let fd =
-        unsafe { ampr_index_acquire_cached_fd(jobId, rd.fileId, entry, kAprAioOpenFlags, 0, true) };
+    let fd = unsafe { ampr_index_acquire_cached_fd(rd.fileId, entry, kAprAioOpenFlags, 0, true) };
     if lookupFailed {
         set_rc(apr_file_id_lookup_error(rd.fileId));
         return false;
@@ -412,13 +411,6 @@ impl AprAioReactor {
             return SCE_KERNEL_ERROR_EBUSY;
         }
         waitSlot.waiterClaimed = true;
-        if !waitSlot.ownerJob.is_null() {
-            unsafe {
-                (*waitSlot.ownerJob)
-                    .schedulingWaiterClaimed
-                    .store(true, Ordering::Release)
-            };
-        }
         let laneIndex = waitSlot.prioIndex as usize;
         self.reactorWakeEpoch.fetch_add(1, Ordering::Release);
         self.reactorCv.notify_one();

@@ -3,16 +3,6 @@
 use super::*;
 
 impl AprAioReactor {
-    pub(crate) fn idle_wait_timeout_ns() -> u64 {
-        if AMPR_EMU_FD_CACHE_IDLE_CLOSE_NS == 0 {
-            0
-        } else if AMPR_EMU_FD_CACHE_IDLE_SCAN_NS != 0 {
-            AMPR_EMU_FD_CACHE_IDLE_SCAN_NS
-        } else {
-            AMPR_EMU_FD_CACHE_IDLE_CLOSE_NS
-        }
-    }
-
     pub(crate) fn maybe_release_stale_fds(&mut self, beforeIdleWait: bool) {
         if AMPR_EMU_FD_CACHE_IDLE_CLOSE_NS == 0 {
             return;
@@ -40,29 +30,29 @@ impl AprAioReactor {
         self.nextFdCacheMaintenanceNs = deadline;
     }
 
-    pub(crate) fn drain_incoming(&mut self, waitIfIdle: bool) {
-        let mut lk = self.m.lock();
-        if waitIfIdle
-            && !self.stop
-            && !self.shutdownRequested.load(Ordering::Acquire)
-            && !self.has_active_lanes_locked()
-            && self.activeReads.empty()
-            // Re-check under `m`: an external submit may have landed after worker() looked.
-            && self.externalAioLiveCount.load(Ordering::Acquire) == 0
-        {
-            let idleWaitNs = Self::idle_wait_timeout_ns();
-            if idleWaitNs != 0 {
-                self.reactorCv.wait_for_us(&mut lk, idleWaitNs / 1000);
-            } else {
-                self.reactorCv.wait_until(&mut lk, || {
-                    self.stop
-                        || self.shutdownRequested.load(Ordering::Acquire)
-                        || self.has_active_lanes_locked()
-                        || !self.activeReads.empty()
-                        || self.externalAioLiveCount.load(Ordering::Acquire) != 0
-                });
+    /// One `m` section per reactor pass: the idle wait when `waitIfIdle`,
+    /// then the stop check and the wake epoch the pass observes. True when
+    /// the reactor must stop.
+    pub(crate) fn drain_incoming(&mut self, waitIfIdle: bool) -> bool {
+        let (stop, epoch) = {
+            let mut lk = self.m.lock();
+            if waitIfIdle
+                && !self.stop
+                && !self.shutdownRequested.load(Ordering::Acquire)
+                && !self.has_active_lanes_locked()
+                && self.activeReads.empty()
+                // Re-check under `m`: an external submit may have landed after worker() looked.
+                && self.externalAioLiveCount.load(Ordering::Acquire) == 0
+            {
+                // Bounded by the fd cache scan interval, so an idle reactor
+                // still closes stale fds (maybe_release_stale_fds).
+                self.reactorCv
+                    .wait_for_us(&mut lk, kFdCacheMaintenanceIntervalNs / 1000);
             }
-        }
+            (self.stop, self.reactorWakeEpoch.load(Ordering::Acquire))
+        };
+        self.workerObservedWakeEpoch = epoch;
+        stop
     }
 
     pub(crate) fn active_read_age_ms(active: &ActiveRead, now: u64) -> u64 {
@@ -72,12 +62,6 @@ impl AprAioReactor {
             0
         }
     }
-
-    pub(crate) fn note_active_read_peak(&mut self, _total: usize) {}
-    pub(crate) fn note_aio_age_ms(&mut self, _ageMs: u64) {}
-    pub(crate) fn note_emfile_event(&mut self) {}
-    pub(crate) fn note_efault_retry_event(&mut self) {}
-    pub(crate) fn note_efault_retry_limit_event(&mut self) {}
 
     pub(crate) fn refresh_aio_snapshot_age(snapshot: &mut AioAdmissionSnapshot, now: u64) {
         snapshot.oldestSubmittedAgeMs =
@@ -91,15 +75,10 @@ impl AprAioReactor {
 
 impl AprAioReactor {
     pub(crate) fn external_aio_is_small_for_boost(external: &ExternalAioRead) -> bool {
-        if AMPR_EMU_APR_AIO_SMALL_READ_MAX_BYTES == 0 || external.requestCount == 0 {
-            return false;
-        }
-        external.requests[..external.requestCount as usize]
-            .iter()
-            .all(|r| {
-                let bytes = r.nbyte as u64;
-                bytes != 0 && bytes <= AMPR_EMU_APR_AIO_SMALL_READ_MAX_BYTES
-            })
+        let bytes = external.request.nbyte as u64;
+        AMPR_EMU_APR_AIO_SMALL_READ_MAX_BYTES != 0
+            && bytes != 0
+            && bytes <= AMPR_EMU_APR_AIO_SMALL_READ_MAX_BYTES
     }
 
     pub(crate) fn external_aio_admission_count(external: &ExternalAioRead) -> u32 {
@@ -121,10 +100,6 @@ impl AprAioReactor {
                 continue;
             }
             snapshot.activeCount += 1;
-            let classIndex = active.desc.readClass as usize;
-            if classIndex < AmprLooseReadClass::Count as usize {
-                snapshot.classActive[classIndex] += 1;
-            }
             if Self::aio_desc_is_small_for_boost(&active.desc) {
                 snapshot.smallCount += 1;
             }
@@ -243,35 +218,6 @@ impl AprAioReactor {
         }
         snapshot.smallCount * 100
             >= snapshot.activeCount * AMPR_EMU_APR_AIO_SMALL_READ_MIN_PERCENT as usize
-    }
-
-    pub(crate) fn aio_direct_read_admission_limit(
-        &self,
-        priority: u8,
-        readClass: AmprLooseReadClass,
-        sliceDesc: &AprAioReadDesc,
-        now: u64,
-        context: &AioAdmissionContext,
-    ) -> u32 {
-        let currentLimit = context.effectiveLimit;
-        if AMPR_EMU_APR_AIO_LATENCY_ESCAPE_SLOTS == 0 {
-            return currentLimit;
-        }
-        let baseLimit = Self::aio_active_read_limit();
-        if currentLimit != baseLimit
-            || priority > 3
-            || readClass != AmprLooseReadClass::Latency
-            || !Self::aio_desc_is_small_for_boost(sliceDesc)
-            || context.fdPressure
-            || self.aioAgeThrottleLevel != AioAgeThrottleLevel::Normal
-            || self.slow_aio_cooldown_active(now)
-            || self.aio_small_read_boost_recovery_cooldown_active(now)
-            || context.snapshot.oldestSubmittedAgeMs > AMPR_EMU_APR_AIO_SMALL_READ_MAX_OLDEST_MS
-        {
-            return currentLimit;
-        }
-        let availableExtra = Self::aio_small_read_limit().saturating_sub(baseLimit);
-        baseLimit + AMPR_EMU_APR_AIO_LATENCY_ESCAPE_SLOTS.min(availableExtra)
     }
 
     pub(crate) fn update_aio_age_throttle(&mut self, now: u64, snapshot: &AioAdmissionSnapshot) {

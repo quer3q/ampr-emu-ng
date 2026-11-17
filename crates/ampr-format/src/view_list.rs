@@ -92,7 +92,7 @@ mod tests {
     use super::*;
     use crate::index::{tests::image, Index};
     use crate::source::PATH_BUF;
-    use crate::view::{build, sizes, Buffers, Dir, Packs};
+    use crate::view::{build, sizes, Buffers, Dir, Packs, Row};
     use std::collections::HashMap;
     use std::vec::Vec;
     use std::{format, vec};
@@ -106,21 +106,16 @@ mod tests {
         let files = idx.len();
         let dir_cap = files / 8 + 1024;
         let sz = sizes(files, dir_cap).unwrap();
-        let (next, chunk, lz4) = sz.pack_columns(Packs::Lz4);
+        let (chunk, lz4) = sz.pack_columns(Packs::Lz4);
         let n = files as usize;
-        let (mut hash, mut size, mut mtime, mut path_at) =
-            (vec![0; n], vec![0; n], vec![0; n], vec![0; n]);
-        let (mut next, mut chunk, mut lz4_hash) = (vec![0; next], vec![0; chunk], vec![0; lz4]);
+        let mut rows = vec![Row::default(); n];
+        let (mut chunk, mut lz4_hash) = (vec![0; chunk], vec![0; lz4]);
         let mut slots = vec![0; sz.file_slots as usize];
         let mut dirs = vec![Dir::default(); dir_cap as usize];
         let mut dir_slots = vec![0; sz.dir_slots as usize];
         let (mut collide, mut dir_of) = (vec![0; 256], vec![0; n]);
         let bufs = Buffers {
-            hash: &mut hash,
-            size: &mut size,
-            mtime: &mut mtime,
-            path_at: &mut path_at,
-            next: &mut next,
+            rows: &mut rows,
             chunk: &mut chunk,
             slots: &mut slots,
             dirs: &mut dirs,
@@ -249,11 +244,11 @@ mod tests {
         let packed = packed_ids(&paths);
         with_view(&paths, &packed, |v, img| {
             for (key, name) in [(&b"/app0/data"[..], &b"s1"[..]), (b"/app0/data/s2", b"d1")] {
-                let dir = v.dirs_by_hash(crate::idx_path_hash(key)).next().unwrap();
+                let dir = v.dirs_by_hash(crate::view_hash(key)).next().unwrap();
                 assert_eq!(listed(&v, img, dir, v.first(dir)).get(name), Some(&true));
             }
             let only = v
-                .dirs_by_hash(crate::idx_path_hash(b"/app0/only"))
+                .dirs_by_hash(crate::view_hash(b"/app0/only"))
                 .next()
                 .unwrap();
             let got = listed(&v, img, only, v.first(only));
@@ -282,7 +277,7 @@ mod tests {
         let packed = packed_ids(&paths);
         with_view(&paths, &packed, |v, img| {
             let root = v
-                .dirs_by_hash(crate::idx_path_hash(b"/app0"))
+                .dirs_by_hash(crate::view_hash(b"/app0"))
                 .next()
                 .unwrap();
             let all = listed(&v, img, root, v.first(root));

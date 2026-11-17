@@ -2,8 +2,8 @@
 //! not replace. The save service runs outside the game's mount namespace and
 //! opens the icon path itself, so a packed icon (no physical copy) fails
 //! with 0x809f000e and the game never finishes saving. A packed icon's
-//! decoded bytes go to sceSaveDataSaveIcon instead (rt/pack/mmap.rs
-//! `read_packed`, in game heap memory freed right after the call). A loose or
+//! decoded bytes go to sceSaveDataSaveIcon instead (`read_packed` below, in
+//! game heap memory freed right after the call). A loose or
 //! missing icon goes to the original call unchanged.
 //!
 //! Removing the hook made a title's save fail again; handing the service a
@@ -17,10 +17,14 @@
 //! through; it is hooked only for its original entry.
 
 use super::hook::{save_original, SAVE_ICON, SAVE_ICON_PATH, SAVE_MOUNT3, SAVE_UMOUNT2};
-use super::pack::mmap::read_packed;
+use super::heap::{libc_free, libc_malloc};
+use super::index::posix_open_emul;
+use super::pack::{
+    ampr_pack_try_pread_fd, posix_close_emul, posix_fstat_emul, virtual_fd_file_id, SceKernelStat,
+};
 use super::stats::{self, Stat};
 use super::sync::{SpinLock, SyncCell};
-use super::sys::SCE_KERNEL_ERROR_ENOSYS;
+use super::sys::{errno, off_t, EMFILE, ENFILE, ENOMEM, SCE_KERNEL_ERROR_ENOSYS};
 use core::ffi::{c_char, c_int, c_void};
 
 /// `SceSaveDataIcon` as sceSaveDataSaveIcon reads it (live 13.00 native
@@ -106,6 +110,78 @@ unsafe fn forward(orig: SaveIconByPathFn, mount_point: *const c_void, path: *con
     rc
 }
 
+// ---- packed icon bytes --------------------------------------------------------
+
+/// The save service opens the icon path itself, past the path hooks: when
+/// `path` opens as a packed file, `use_bytes` gets its decoded bytes in a
+/// buffer of its size from the game's libc heap, freed as soon as
+/// `use_bytes` returns: the icon is held only for the one call, outside the
+/// pool, at any size (a title's /app0/images/icon0.png is 551,096 B). A
+/// failed malloc or read is Some(Err) and the caller skips the icon, as is
+/// an open that failed for lack of fds or memory. None for a loose or
+/// missing file, or another failed open. A path handed to the save service
+/// instead (a decoded copy under /data/ampr_cache) hung a title's save
+/// inside the service call.
+unsafe fn read_packed<R>(
+    path: *const c_char,
+    use_bytes: impl FnOnce(&[u8]) -> R,
+) -> Option<Result<R, ()>> {
+    let vfd = unsafe { posix_open_emul(path, 0, 0) };
+    if vfd < 0 {
+        // Out of fds or memory: the icon may be packed, where the service
+        // cannot open it (0x809f000e there stalled a title's save), so it
+        // is skipped. Any other failure (missing, refused) goes to the
+        // service, which opens a loose icon itself and answers the rest.
+        return matches!(errno(), EMFILE | ENFILE | ENOMEM).then_some(Err(()));
+    }
+    let out = if unsafe { virtual_fd_file_id(vfd) }.is_some() {
+        Some(unsafe { read_to_heap(vfd, use_bytes) })
+    } else {
+        None
+    };
+    unsafe { posix_close_emul(vfd) };
+    out
+}
+
+/// The whole decoded file behind `vfd`, in game heap memory, to `use_bytes`.
+unsafe fn read_to_heap<R>(vfd: c_int, use_bytes: impl FnOnce(&[u8]) -> R) -> Result<R, ()> {
+    let mut st: SceKernelStat = unsafe { core::mem::zeroed() };
+    if unsafe { posix_fstat_emul(vfd, &mut st) } != 0 {
+        return Err(());
+    }
+    let len = usize::try_from(st.st_size).ok().filter(|&n| n > 0).ok_or(())?;
+    let buf = unsafe { libc_malloc(len) };
+    if buf.is_null() {
+        return Err(());
+    }
+    let out = unsafe { read_into(vfd, buf, len, use_bytes) };
+    unsafe { libc_free(buf) };
+    out
+}
+
+unsafe fn read_into<R>(
+    vfd: c_int,
+    buf: *mut u8,
+    len: usize,
+    use_bytes: impl FnOnce(&[u8]) -> R,
+) -> Result<R, ()> {
+    let mut off = 0usize;
+    let mut rc = Ok(());
+    while off < len {
+        let mut handled = false;
+        let want = len - off;
+        let n = unsafe {
+            ampr_pack_try_pread_fd(vfd, buf.add(off).cast(), want, off as off_t, &mut handled)
+        };
+        if n <= 0 || n as usize > want {
+            rc = Err(());
+            break;
+        }
+        off += n as usize;
+    }
+    rc.map(|()| use_bytes(unsafe { core::slice::from_raw_parts(buf, len) }))
+}
+
 // ---- shared mounts ------------------------------------------------------------
 
 // A title can mount a save directory it already has mounted: one kept
@@ -162,6 +238,12 @@ struct Mounted {
     /// string, so the bytes past the NUL of a game's copy do not count.
     point: [u8; POINT_BYTES],
     result: [u8; RESULT_BYTES],
+    /// Pass-through unmounts of this point still in the service when the
+    /// mount was recorded. Counted in `unmounting`, so not shared until all
+    /// have answered: a success drops the entry, a failure counts one
+    /// down. No later one can pass through while the entry holds the point
+    /// (umount2_emul finds it).
+    pending: u32,
 }
 const MOUNTED0: Mounted = Mounted {
     owners: 0,
@@ -172,11 +254,98 @@ const MOUNTED0: Mounted = Mounted {
     req: [0; 2],
     point: [0; POINT_BYTES],
     result: [0; RESULT_BYTES],
+    pending: 0,
 };
 static MOUNTED: SyncCell<[Mounted; MOUNTS]> = SyncCell::new([MOUNTED0; MOUNTS]);
 static MOUNT_LOCK: SpinLock = SpinLock::new();
 /// The last `gen` handed out, under MOUNT_LOCK.
 static MOUNT_GEN: SyncCell<u64> = SyncCell::new(0);
+
+/// Unmounts that passed through with no table entry, newest last, under
+/// MOUNT_LOCK. A mount is recorded only after its service call returns, so
+/// another thread can unmount that point in between; `remember` then must
+/// not record a point the service already removed, or a later BUSY mount
+/// would be answered with it. Each entry is (sequence number, point, state):
+/// logged before the service call as in flight, then marked done on
+/// success or dropped on failure, so a failed unmount never hides a live
+/// mount.
+const PASSED: usize = 16;
+static PASSED_UMOUNTS: SyncCell<[(u64, [u8; POINT_BYTES], Passed); PASSED]> =
+    SyncCell::new([(0, [0; POINT_BYTES], Passed::Failed); PASSED]);
+
+#[derive(Clone, Copy, PartialEq)]
+enum Passed {
+    InFlight,
+    Done,
+    Failed,
+}
+/// Sequence number of the last pass-through unmount, under MOUNT_LOCK.
+static PASSED_SEQ: SyncCell<u64> = SyncCell::new(0);
+
+/// The pass-through unmount sequence now: taken right before each service
+/// mount call and handed to `remember`.
+fn passed_seq() -> u64 {
+    let _g = MOUNT_LOCK.lock();
+    unsafe { *PASSED_SEQ.get() }
+}
+
+/// Logs a pass-through unmount of `point` as in flight, before its service
+/// call, so a mount that races it sees it in `remember`; returns its
+/// sequence for `passed_umount_done`. Caller holds MOUNT_LOCK.
+unsafe fn note_passed_umount(point: [u8; POINT_BYTES]) -> u64 {
+    let seq = unsafe { &mut *PASSED_SEQ.get() };
+    *seq += 1;
+    let ring = unsafe { &mut *PASSED_UMOUNTS.get() };
+    ring[(*seq % PASSED as u64) as usize] = (*seq, point, Passed::InFlight);
+    *seq
+}
+
+/// The service answered pass-through unmount `seq` of `point`: on success
+/// the point is gone, so a mount recorded while it was in flight is
+/// dropped; on failure the log entry goes and such a mount waits for one
+/// answer less. Caller holds MOUNT_LOCK.
+unsafe fn passed_umount_done(seq: u64, point: &[u8; POINT_BYTES], gone: bool) {
+    let ring = unsafe { &mut *PASSED_UMOUNTS.get() };
+    let e = &mut ring[(seq % PASSED as u64) as usize];
+    if e.0 == seq {
+        e.2 = if gone { Passed::Done } else { Passed::Failed };
+    }
+    for m in unsafe { &mut *MOUNTED.get() }.iter_mut() {
+        if m.owners != 0 && m.pending != 0 && m.point == *point {
+            if gone {
+                *m = MOUNTED0;
+            } else {
+                m.pending -= 1;
+                m.unmounting -= 1;
+            }
+        }
+    }
+}
+
+/// What the pass-through unmounts of `point` mean for a mount whose call
+/// started at sequence `since` and is recorded now: None when one that
+/// started since removed the point (or more than PASSED started, so the
+/// ring no longer shows them all and the mount is not recorded, as when
+/// the table is full), else how many are still in the service, whenever
+/// they started. Caller holds MOUNT_LOCK.
+unsafe fn umount_since(since: u64, point: &[u8; POINT_BYTES]) -> Option<u32> {
+    let now = unsafe { *PASSED_SEQ.get() };
+    if now - since > PASSED as u64 {
+        return None;
+    }
+    let ring = unsafe { &*PASSED_UMOUNTS.get() };
+    let mut in_flight = 0;
+    for (seq, p, state) in ring.iter() {
+        if p == point {
+            match state {
+                Passed::Done if *seq > since => return None,
+                Passed::InFlight => in_flight += 1,
+                _ => {}
+            }
+        }
+    }
+    Some(in_flight)
+}
 
 type MountFn = unsafe extern "C" fn(*const c_void, *mut c_void) -> c_int;
 type Umount2Fn = unsafe extern "C" fn(u32, *const c_void) -> c_int;
@@ -252,6 +421,7 @@ pub unsafe extern "C" fn mount3_emul(mount: *const c_void, result: *mut c_void) 
     let Some(orig) = (unsafe { save_original::<MountFn>(SAVE_MOUNT3) }) else {
         return SCE_KERNEL_ERROR_ENOSYS;
     };
+    let mut since = passed_seq();
     let mut rc = unsafe { orig(mount, result) };
     // Debug: the request's words, only once the service took the struct
     // (0 or BUSY), as the release path reads it.
@@ -284,10 +454,11 @@ pub unsafe extern "C" fn mount3_emul(mount: *const c_void, result: *mut c_void) 
                 }
                 tries += 1;
                 unsafe { super::sys::sceKernelUsleep(BUSY_WAIT_US) };
+                since = passed_seq();
                 rc = unsafe { orig(mount, result) };
             }
             if rc == 0 && !shared {
-                unsafe { remember(user, dir, req, result) };
+                unsafe { remember(user, dir, req, result, since) };
             }
         }
     }
@@ -304,13 +475,34 @@ pub unsafe extern "C" fn mount3_emul(mount: *const c_void, result: *mut c_void) 
 /// A new mount of `dir`: its point gets one owner, replacing any entry for
 /// the same point (one the service gave back without an unmount seen). With
 /// 16 entries for 16 points the table fills only if unmounts were missed;
-/// a mount it cannot record is then not shared, as before.
-unsafe fn remember(user: u32, dir: [u8; DIR_BYTES], req: [u64; 2], result: *const c_void) {
+/// a mount it cannot record is then not shared, as before. Not recorded
+/// either when an unmount of that point passed through since `since`
+/// (`passed_seq` before the service mount): the point may already be gone.
+/// Other entries of the same user and directory go: the service mounts a
+/// directory once (a second mount is BUSY), so a new mount means the old one
+/// was unmounted by a call this runtime does not hook, and `share`, which
+/// takes the first match, must not hand out its point.
+unsafe fn remember(
+    user: u32,
+    dir: [u8; DIR_BYTES],
+    req: [u64; 2],
+    result: *const c_void,
+    since: u64,
+) {
     let mut res = [0u8; RESULT_BYTES];
     unsafe { core::ptr::copy_nonoverlapping(result.cast::<u8>(), res.as_mut_ptr(), RESULT_BYTES) };
     let point = unsafe { c_name::<POINT_BYTES>(res.as_ptr()) };
     let _g = MOUNT_LOCK.lock();
+    // None: the point is gone; else the unmounts of it still in flight.
+    let Some(pending) = (unsafe { umount_since(since, &point) }) else {
+        return;
+    };
     let t = unsafe { &mut *MOUNTED.get() };
+    for m in t.iter_mut() {
+        if m.owners != 0 && m.user == user && m.dir == dir && m.point != point {
+            *m = MOUNTED0;
+        }
+    }
     let slot = t
         .iter()
         .position(|m| m.owners != 0 && m.point == point)
@@ -321,12 +513,13 @@ unsafe fn remember(user: u32, dir: [u8; DIR_BYTES], req: [u64; 2], result: *cons
         t[i] = Mounted {
             owners: 1,
             gen: *gen,
-            unmounting: 0,
+            unmounting: pending,
             user,
             dir,
             req,
             point,
             result: res,
+            pending,
         };
     }
 }
@@ -365,6 +558,9 @@ pub unsafe extern "C" fn umount2_emul(mode: u32, point: *const c_void) -> c_int 
     };
     // The last owner's mount this call saw (slot, gen).
     let mut seen: Option<(usize, u64)> = None;
+    // Sequence of this call in the pass-through log (0: not logged).
+    let mut passed = 0;
+    let mut passed_point = [0u8; POINT_BYTES];
     if readable(point as usize, POINT_BYTES) {
         let name = unsafe { c_name::<POINT_BYTES>(point.cast()) };
         let _g = MOUNT_LOCK.lock();
@@ -380,9 +576,17 @@ pub unsafe extern "C" fn umount2_emul(mode: u32, point: *const c_void) -> c_int 
             }
             seen = Some((i, m.gen));
             m.unmounting += 1;
+        } else {
+            passed = unsafe { note_passed_umount(name) };
+            passed_point = name;
         }
     }
     let rc = unsafe { orig(mode, point) };
+    if passed != 0 {
+        let _g = MOUNT_LOCK.lock();
+        let gone = rc == 0 || rc == SAVE_DATA_ERROR_NOT_MOUNTED;
+        unsafe { passed_umount_done(passed, &passed_point, gone) };
+    }
     if let Some((i, gen)) = seen {
         // Whichever unmount the service answered with success forgets the
         // mount; a failed one only leaves the in-flight count.
@@ -605,7 +809,7 @@ mod tests {
         first[..10].copy_from_slice(b"/savedata0");
         first[16] = 7; // required blocks, handed on with the point
         let req = [0x100, 0];
-        unsafe { remember(7, slot2, req, first.as_ptr().cast()) };
+        unsafe { remember(7, slot2, req, first.as_ptr().cast(), passed_seq()) };
         // Another directory is not shared: its BUSY goes back to the game.
         let mut out = [0xaau8; 64];
         assert!(!unsafe { share(7, &name(b"slot1"), req, out.as_mut_ptr().cast()) });
@@ -622,9 +826,101 @@ mod tests {
         let m = t.iter().find(|m| m.dir == slot2).unwrap();
         assert_eq!(m.owners, 2);
         // A new mount at the same point replaces the entry.
-        unsafe { remember(7, name(b"slot3"), req, first.as_ptr().cast()) };
+        unsafe { remember(7, name(b"slot3"), req, first.as_ptr().cast(), passed_seq()) };
         let t = unsafe { &*MOUNTED.get() };
         assert!(t.iter().all(|m| m.dir != slot2));
         assert_eq!(t.iter().filter(|m| m.owners != 0).count(), 1);
+
+        // A new mount of a held directory at another point drops the old
+        // entry (unmounted through a call that is not hooked).
+        let mut second = first;
+        second[..10].copy_from_slice(b"/savedata1");
+        unsafe { remember(7, name(b"slot3"), req, second.as_ptr().cast(), passed_seq()) };
+        let t = unsafe { &*MOUNTED.get() };
+        let held: Vec<_> = t.iter().filter(|m| m.owners != 0).collect();
+        assert_eq!(held.len(), 1);
+        assert_eq!(&held[0].point[..10], b"/savedata1");
+
+        // An unmount of the point that passed through after the mount call
+        // started: the point may be gone, so the mount is not recorded.
+        // One of another point does not stop it.
+        let since = passed_seq();
+        {
+            let _g = MOUNT_LOCK.lock();
+            let a = unsafe { note_passed_umount(name(b"/savedata2")) };
+            let b = unsafe { note_passed_umount(name(b"/savedata0")) };
+            unsafe { passed_umount_done(a, &name(b"/savedata2"), true) };
+            unsafe { passed_umount_done(b, &name(b"/savedata0"), true) };
+        }
+        unsafe { remember(7, name(b"slot4"), req, first.as_ptr().cast(), since) };
+        let t = unsafe { &*MOUNTED.get() };
+        assert!(t.iter().all(|m| m.dir != name::<DIR_BYTES>(b"slot4")));
+        let mut third = first;
+        third[..10].copy_from_slice(b"/savedata3");
+        unsafe { remember(7, name(b"slot4"), req, third.as_ptr().cast(), since) };
+        let t = unsafe { &*MOUNTED.get() };
+        assert!(t.iter().any(|m| m.dir == name::<DIR_BYTES>(b"slot4")));
+        // More pass-through unmounts than the ring holds: not recorded.
+        let since = passed_seq();
+        {
+            let _g = MOUNT_LOCK.lock();
+            for _ in 0..=PASSED {
+                unsafe { note_passed_umount(name(b"/savedata9")) };
+            }
+        }
+        unsafe { remember(7, name(b"slot5"), req, third.as_ptr().cast(), since) };
+        let t = unsafe { &*MOUNTED.get() };
+        assert!(t.iter().all(|m| m.dir != name::<DIR_BYTES>(b"slot5")));
+        // An unmount of the point still in the service: recorded, not shared,
+        // until its answer. A failure keeps the mount; a success drops it.
+        let mut fourth = first;
+        fourth[..10].copy_from_slice(b"/savedata4");
+        let point4: [u8; POINT_BYTES] = name(b"/savedata4");
+        let slot6: [u8; DIR_BYTES] = name(b"slot6");
+        for gone in [false, true] {
+            let since = passed_seq();
+            let seq = {
+                let _g = MOUNT_LOCK.lock();
+                unsafe { note_passed_umount(point4) }
+            };
+            unsafe { remember(7, slot6, req, fourth.as_ptr().cast(), since) };
+            assert!(!unsafe { share(7, &slot6, req, out.as_mut_ptr().cast()) });
+            {
+                let _g = MOUNT_LOCK.lock();
+                unsafe { passed_umount_done(seq, &point4, gone) };
+            }
+            let t = unsafe { &*MOUNTED.get() };
+            let held = t.iter().any(|m| m.owners != 0 && m.dir == slot6);
+            assert_eq!(held, !gone);
+            if !gone {
+                assert!(unsafe { share(7, &slot6, req, out.as_mut_ptr().cast()) });
+                let t = unsafe { &mut *MOUNTED.get() };
+                t.iter_mut().filter(|m| m.dir == slot6).for_each(|m| *m = MOUNTED0);
+            }
+        }
+        // Two unmounts in flight, one started before the mount call: both
+        // count, a failure of one leaves it unshared, a success of the
+        // other drops it.
+        let (old, since) = {
+            let _g = MOUNT_LOCK.lock();
+            (unsafe { note_passed_umount(point4) }, unsafe { *PASSED_SEQ.get() })
+        };
+        let new = {
+            let _g = MOUNT_LOCK.lock();
+            unsafe { note_passed_umount(point4) }
+        };
+        unsafe { remember(7, slot6, req, fourth.as_ptr().cast(), since) };
+        let held = |t: &[Mounted; MOUNTS]| t.iter().any(|m| m.owners != 0 && m.dir == slot6);
+        {
+            let _g = MOUNT_LOCK.lock();
+            unsafe { passed_umount_done(new, &point4, false) };
+        }
+        assert!(held(unsafe { &*MOUNTED.get() }));
+        assert!(!unsafe { share(7, &slot6, req, out.as_mut_ptr().cast()) });
+        {
+            let _g = MOUNT_LOCK.lock();
+            unsafe { passed_umount_done(old, &point4, true) };
+        }
+        assert!(!held(unsafe { &*MOUNTED.get() }));
     }
 }

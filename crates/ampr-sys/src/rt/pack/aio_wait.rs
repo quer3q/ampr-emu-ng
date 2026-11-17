@@ -332,6 +332,10 @@ pub unsafe fn sceKernelAioPollRequest(id: SceKernelAioSubmitId, state_out: *mut 
                 None => SCE_KERNEL_ERROR_EIO,
             };
         }
+        if let Some(answer) = poll_split_group(id) {
+            *state_out = answer;
+            return 0;
+        }
         let mut children = [0 as SceKernelAioSubmitId; SCE_KERNEL_AIO_REQUEST_NUM_MAX];
         let child_count = match copy_group_children(id, &mut children) {
             Err(rc) => return rc,
@@ -350,38 +354,70 @@ pub unsafe fn sceKernelAioPollRequest(id: SceKernelAioSubmitId, state_out: *mut 
         if poll_rc != 0 {
             return poll_rc;
         }
-        let mut terminal = true;
-        let mut aborted = false;
-        let mut processing = false;
-        for &cs in &child_states[..child_count] {
-            if cs < 0 {
-                *state_out = cs;
-                return 0;
-            }
-            let base = cs & !SCE_KERNEL_AIO_STATE_NOTIFIED;
-            if base == SCE_KERNEL_AIO_STATE_ABORTED {
-                aborted = true;
-            } else if base != SCE_KERNEL_AIO_STATE_COMPLETED {
-                terminal = false;
-                processing |= base == SCE_KERNEL_AIO_STATE_PROCESSING;
-            }
-        }
-        *state_out = if !terminal {
-            // A group reports like one job: a split read like the job it
-            // replaces, a plain group the same way, since 0 is not an AIO
-            // state (what the kernel reports for a pending single-id
-            // submit is not measured).
-            if processing {
-                SCE_KERNEL_AIO_STATE_PROCESSING
-            } else {
-                SCE_KERNEL_AIO_STATE_SUBMITTED
-            }
-        } else if aborted {
-            SCE_KERNEL_AIO_STATE_ABORTED
-        } else {
-            SCE_KERNEL_AIO_STATE_COMPLETED
-        };
+        *state_out = group_poll_state(child_states[..child_count].iter().copied());
         0
+    }
+}
+
+/// A split group's poll answer from its children under one PACK_M section,
+/// with no copy of the children and no second poll (two PACK_M sections and
+/// about 3 KiB of zeroed stack per group before). None for a plain group,
+/// whose native children need the kernel poll outside PACK_M; ESRCH for an
+/// unknown group.
+#[inline(never)]
+unsafe fn poll_split_group(id: SceKernelAioSubmitId) -> Option<c_int> {
+    let state = unsafe { pack_state() };
+    let _lock = PACK_M.lock();
+    let group = unsafe { lookup_virtual_aio_group_locked(state, id, null_mut()) };
+    if group.is_null() {
+        return Some(SCE_KERNEL_ERROR_ESRCH);
+    }
+    let child_count = unsafe { (*group).child_count } as usize;
+    if unsafe { (*group).split.count } == 0
+        || child_count == 0
+        || child_count > SCE_KERNEL_AIO_REQUEST_NUM_MAX
+    {
+        return None;
+    }
+    let children = unsafe { &(*group).children };
+    Some(group_poll_state(children[..child_count].iter().map(|&child| unsafe {
+        virtual_job_poll_state_locked(state, lookup_virtual_aio_locked(state, child, null_mut()))
+    })))
+}
+
+/// One state for a group from its children's states: a child's error
+/// first; else SUBMITTED or PROCESSING while any child is not terminal,
+/// then ABORTED when one aborted, else COMPLETED.
+pub(crate) fn group_poll_state(child_states: impl Iterator<Item = c_int>) -> c_int {
+    let mut terminal = true;
+    let mut aborted = false;
+    let mut processing = false;
+    for cs in child_states {
+        if cs < 0 {
+            return cs;
+        }
+        let base = cs & !SCE_KERNEL_AIO_STATE_NOTIFIED;
+        if base == SCE_KERNEL_AIO_STATE_ABORTED {
+            aborted = true;
+        } else if base != SCE_KERNEL_AIO_STATE_COMPLETED {
+            terminal = false;
+            processing |= base == SCE_KERNEL_AIO_STATE_PROCESSING;
+        }
+    }
+    if !terminal {
+        // A group reports like one job: a split read like the job it
+        // replaces, a plain group the same way, since 0 is not an AIO
+        // state (what the kernel reports for a pending single-id submit is
+        // not measured).
+        if processing {
+            SCE_KERNEL_AIO_STATE_PROCESSING
+        } else {
+            SCE_KERNEL_AIO_STATE_SUBMITTED
+        }
+    } else if aborted {
+        SCE_KERNEL_AIO_STATE_ABORTED
+    } else {
+        SCE_KERNEL_AIO_STATE_COMPLETED
     }
 }
 
@@ -591,6 +627,26 @@ pub(crate) fn cancel_group_state(child_states: &[c_int]) -> c_int {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A group polls as one job: pending while a child is, an error first,
+    /// abort over completion, NOTIFIED bits ignored.
+    #[test]
+    fn group_poll_state_reads_like_one_job() {
+        let (a, p, s, c) = (
+            SCE_KERNEL_AIO_STATE_ABORTED,
+            SCE_KERNEL_AIO_STATE_PROCESSING,
+            SCE_KERNEL_AIO_STATE_SUBMITTED,
+            SCE_KERNEL_AIO_STATE_COMPLETED,
+        );
+        let n = SCE_KERNEL_AIO_STATE_NOTIFIED;
+        let poll = |states: &[c_int]| group_poll_state(states.iter().copied());
+        assert_eq!(poll(&[c, c | n]), c);
+        assert_eq!(poll(&[c, s]), s);
+        assert_eq!(poll(&[s, p, c]), p);
+        assert_eq!(poll(&[a, c]), a);
+        assert_eq!(poll(&[a, s]), s, "pending wins over abort");
+        assert_eq!(poll(&[c, SCE_KERNEL_ERROR_ESRCH, p]), SCE_KERNEL_ERROR_ESRCH);
+    }
 
     #[test]
     fn canceled_group_stays_open_while_a_child_runs() {

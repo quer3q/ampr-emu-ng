@@ -22,6 +22,10 @@ pub enum KeyError {
 pub struct Key {
     pub len: usize,
     pub had_trailing_separator: bool,
+    /// The input has no byte >= 0x80 and no tab, LF or CR: the runtime
+    /// walk can list such a path, so its miss may be authoritative. Taken
+    /// in the same pass, so a miss scans the path no more.
+    pub plain: bool,
 }
 
 fn is_sep(b: u8) -> bool {
@@ -35,18 +39,19 @@ fn push(out: &mut [u8], len: &mut usize, b: u8) -> Result<(), KeyError> {
     }
     out[*len] = b;
     *len += 1;
-    out[*len] = 0;
     Ok(())
 }
 
 /// Normalizes an `/app0` path into a lookup key. `path` is the input without its NUL
-/// terminator. Collapses separators, drops `.`, resolves `..`, lowercases
-/// ASCII and writes a NUL-terminated key to `out`.
+/// terminator (a NUL in it is a name byte; the runtime cuts at the NUL it
+/// finds when it measures the path). Collapses separators, drops `.`,
+/// resolves `..`, lowercases ASCII and writes a NUL-terminated key to
+/// `out`, in one pass: the NUL is written once at the end, and `plain` is
+/// taken on the way.
 pub fn normalize(path: &[u8], out: &mut [u8]) -> Result<Key, KeyError> {
     if let Some(first) = out.first_mut() {
         *first = 0;
     }
-    let path = &path[..path.iter().position(|&b| b == 0).unwrap_or(path.len())];
     match path.first() {
         Some(&b) if is_sep(b) => {}
         _ => return Err(KeyError::Invalid),
@@ -55,6 +60,7 @@ pub fn normalize(path: &[u8], out: &mut [u8]) -> Result<Key, KeyError> {
         return Err(KeyError::NameTooLong);
     }
     let had_trailing_separator = path.last().is_some_and(|&b| is_sep(b));
+    let mut plain = true;
     let mut len = 0usize;
     push(out, &mut len, b'/')?;
     for component in path.split(|&b| is_sep(b)) {
@@ -74,19 +80,22 @@ pub fn normalize(path: &[u8], out: &mut [u8]) -> Result<Key, KeyError> {
             if len > 1 {
                 len -= 1;
             }
-            out[len] = 0;
             continue;
         }
         if len > 1 {
             push(out, &mut len, b'/')?;
         }
         for &b in component {
+            plain &= b < 0x80 && !matches!(b, b'\t' | b'\n' | b'\r');
             push(out, &mut len, b.to_ascii_lowercase())?;
         }
     }
+    // `push` kept room for the NUL.
+    out[len] = 0;
     Ok(Key {
         len,
         had_trailing_separator,
+        plain,
     })
 }
 
@@ -141,6 +150,29 @@ mod tests {
         let k = normalize(path, &mut out)?;
         assert_eq!(out[k.len], 0);
         Ok((out[..k.len].to_vec(), k.had_trailing_separator))
+    }
+
+    /// `plain` flags what the runtime walk cannot list: bytes >= 0x80 and
+    /// tab, LF, CR; the key is the same as before the one-pass change.
+    #[test]
+    fn one_pass_key_and_flags() {
+        let mut out = [0xffu8; RUNTIME_KEY_CAPACITY];
+        let k = normalize(b"/APP0//Data/./x/../F.bin/", &mut out).unwrap();
+        assert_eq!(&out[..k.len + 1], b"/app0/data/f.bin\0");
+        assert!(k.had_trailing_separator && k.plain);
+        for bad in [
+            &b"/app0/a\tb"[..],
+            b"/app0/\xc3\x84",
+            b"/app0/a\rb",
+            b"/app0/x\n",
+        ] {
+            assert!(!normalize(bad, &mut out).unwrap().plain, "{bad:?}");
+        }
+        let mut out = [0u8; 8];
+        assert_eq!(
+            normalize(b"/app0/abcdef", &mut out),
+            Err(KeyError::NameTooLong)
+        );
     }
 
     #[test]

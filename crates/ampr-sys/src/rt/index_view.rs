@@ -1,6 +1,7 @@
 //! Memory for the compiled index view: two `index_alloc` blocks from the
 //! Index ledger (rt/index_memory.rs), carved into the column slices of
-//! `ampr_format::view::Buffers`, each column at its type's alignment. The
+//! `ampr_format::view::Buffers`, each column at its type's alignment (the
+//! 32-byte file rows at 32, so a row is in one cache line). The
 //! resident block holds the columns `View` reads; the transient block holds
 //! the ones only the `Builder` and the pack join read (`dir_of`, 4 B per
 //! file, and `lz4_hash`, 8 B per file with LZ4 packs), and is given back
@@ -14,7 +15,7 @@ use super::index_memory::{index_alloc, index_free};
 use super::stats;
 use ampr_format::index::Index;
 use ampr_format::source::Source;
-use ampr_format::view::{self, Buffers, Builder, Dir, Packs, Sizes};
+use ampr_format::view::{self, Buffers, Builder, Dir, Packs, Row, Sizes};
 use ampr_format::Error;
 use core::ffi::c_void;
 use core::mem::{align_of, size_of};
@@ -31,19 +32,16 @@ const SCRATCH_TAG: &core::ffi::CStr = c"index.view.build";
 
 /// Byte offset of each column in its block and the two block sizes:
 /// `bytes` for the resident block, `scratch` for the transient one
-/// (`lz4_hash` and `dir_of`). The 8-byte columns come first, so the 4-byte
-/// ones need no padding; `place` aligns each anyway.
+/// (`lz4_hash` and `dir_of`). The rows come first, at the block's page
+/// start, then the 8-byte columns, so the 4-byte ones need no padding;
+/// `place` aligns each anyway.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Layout {
     pub sizes: Sizes,
     pub packs: Packs,
-    hash: usize,
-    size: usize,
-    mtime: usize,
+    rows: usize,
     lz4_hash: usize,
     dirs: usize,
-    path_at: usize,
-    next: usize,
     chunk: usize,
     slots: usize,
     dir_slots: usize,
@@ -66,18 +64,14 @@ fn place<T>(end: &mut usize, count: usize) -> Option<usize> {
 pub(crate) fn layout(files: u32, dir_cap: u32, packs: Packs) -> Option<Layout> {
     let sizes = view::sizes(files, dir_cap)?;
     let n = files as usize;
-    let (next, chunk, lz4) = sizes.pack_columns(packs);
+    let (chunk, lz4) = sizes.pack_columns(packs);
     let (mut end, mut tmp) = (0, 0);
     Some(Layout {
         sizes,
         packs,
-        hash: place::<u64>(&mut end, n)?,
-        size: place::<u64>(&mut end, n)?,
-        mtime: place::<i64>(&mut end, n)?,
+        rows: place::<Row>(&mut end, n)?,
         lz4_hash: place::<u64>(&mut tmp, lz4)?,
         dirs: place::<Dir>(&mut end, dir_cap as usize)?,
-        path_at: place::<u32>(&mut end, n)?,
-        next: place::<u32>(&mut end, next)?,
         chunk: place::<u32>(&mut end, chunk)?,
         slots: place::<u32>(&mut end, sizes.file_slots as usize)?,
         dir_slots: place::<u32>(&mut end, sizes.dir_slots as usize)?,
@@ -113,7 +107,7 @@ unsafe impl Send for ViewMem {}
 fn alloc_zeroed(bytes: usize, tag: &core::ffi::CStr) -> *mut u8 {
     // SAFETY: `tag` is a C string; the size and alignment are checked by
     // `index_alloc`.
-    let ptr = unsafe { index_alloc(bytes, align_of::<u64>(), tag.as_ptr()) };
+    let ptr = unsafe { index_alloc(bytes, align_of::<Row>(), tag.as_ptr()) };
     if !ptr.is_null() {
         // SAFETY: `index_alloc` gave `bytes` writable bytes at `ptr`.
         unsafe { core::ptr::write_bytes(ptr, 0, bytes) };
@@ -193,15 +187,11 @@ impl ViewMem {
         let l = self.layout;
         let (p, t) = (self.ptr, self.scratch);
         let n = l.sizes.files as usize;
-        let (next, chunk, lz4) = l.sizes.pack_columns(l.packs);
+        let (chunk, lz4) = l.sizes.pack_columns(l.packs);
         // SAFETY: the caller's promise; the columns do not overlap.
         unsafe {
             Buffers {
-                hash: Self::column(p, l.hash, n),
-                size: Self::column(p, l.size, n),
-                mtime: Self::column(p, l.mtime, n),
-                path_at: Self::column(p, l.path_at, n),
-                next: Self::column(p, l.next, next),
+                rows: Self::column(p, l.rows, n),
                 chunk: Self::column(p, l.chunk, chunk),
                 slots: Self::column(p, l.slots, l.sizes.file_slots as usize),
                 dirs: Self::column(p, l.dirs, l.sizes.dir_cap as usize),
@@ -259,8 +249,12 @@ fn dir_ceiling(path_bytes: u64) -> u32 {
 }
 
 /// Builds the view of `idx` into a `ViewMem`, starting at `first_dir_cap`
-/// directories and doubling, up to `dir_ceiling`, on `Error::OutOfRange`;
-/// the blocks of a failed try are freed before the next are asked. On
+/// directories. On `Error::OutOfRange` it builds again at the count the
+/// failed pass took (`view::build_sized`), so a title with more
+/// directories reads its index twice, not once per doubling (four times
+/// for one file per directory); it doubles only when no count came back
+/// or the count did not hold, up to `dir_ceiling`. The blocks of a failed
+/// try are freed before the next are asked. On
 /// success the caller owns the blocks: it joins the packs into the
 /// `Builder`, finishes it, calls `free_scratch`, and frees the `ViewMem`
 /// after the last use of the view.
@@ -284,12 +278,24 @@ pub(crate) unsafe fn build<'a, S: Source + ?Sized>(
     }
     let ceiling = dir_ceiling(idx.layout().path_bytes);
     let mut dir_cap = first_dir_cap(files).min(ceiling);
+    // The capacity before a jump to the failed pass's count: that count is
+    // exact for a sorted index but only an upper bound for an unsorted one,
+    // so a jump that does not fit falls back to doubling from here.
+    let mut before_jump: Option<u32> = None;
     loop {
-        let l = layout(files, dir_cap, packs).ok_or(BuildError::Memory)?;
-        let mut mem = ViewMem::alloc(l).ok_or(BuildError::Memory)?;
+        let Some(mut mem) = layout(files, dir_cap, packs).and_then(ViewMem::alloc) else {
+            match before_jump.take() {
+                Some(prev) if prev < dir_cap => {
+                    dir_cap = prev.saturating_mul(2).min(ceiling);
+                    continue;
+                }
+                _ => return Err(BuildError::Memory),
+            }
+        };
         // SAFETY: the blocks live until the caller frees `mem`, and these
         // are their only buffers.
-        match view::build(idx, unsafe { mem.buffers() }) {
+        let mut needed = 0;
+        match view::build_sized(idx, unsafe { mem.buffers() }, &mut needed) {
             Ok(b) => return Ok((mem, b)),
             Err(e) => {
                 // SAFETY: the failed build's buffers are gone with it.
@@ -299,7 +305,9 @@ pub(crate) unsafe fn build<'a, S: Source + ?Sized>(
                 }
             }
         }
-        dir_cap = dir_cap.saturating_mul(2).min(ceiling);
+        let doubled = dir_cap.saturating_mul(2);
+        before_jump = (needed > doubled).then_some(dir_cap);
+        dir_cap = if needed > dir_cap { needed } else { doubled }.min(ceiling);
     }
 }
 
@@ -339,15 +347,11 @@ mod tests {
     fn columns_are_aligned_and_apart() {
         for packs in [Packs::None, Packs::Lz4, Packs::Zstd] {
             let l = layout(1000, 300, packs).unwrap();
-            let (next, chunk, lz4) = l.sizes.pack_columns(packs);
+            let (chunk, lz4) = l.sizes.pack_columns(packs);
             let n = 1000;
             let resident = [
-                (l.hash, n * 8, 8),
-                (l.size, n * 8, 8),
-                (l.mtime, n * 8, 8),
+                (l.rows, n * 32, 32),
                 (l.dirs, 300 * size_of::<Dir>(), align_of::<Dir>()),
-                (l.path_at, n * 4, 4),
-                (l.next, next * 4, 4),
                 (l.chunk, chunk * 4, 4),
                 (l.slots, l.sizes.file_slots as usize * 4, 4),
                 (l.dir_slots, l.sizes.dir_slots as usize * 4, 4),
@@ -369,20 +373,22 @@ mod tests {
 
     /// The sizes rt/index_memory.rs `INDEX_MEMORY_MAX` quotes for 300,000
     /// files at the first directory capacity, in KiB: the build's peak
-    /// (both blocks), then the resident block alone after `finish`.
+    /// (both blocks), then the resident block alone after `finish`. The
+    /// 32-byte file rows added 1,171 KiB (4 B per file) without packs and
+    /// nothing with them.
     #[test]
     fn view_bytes_at_300k_files() {
         let kib = |packs| {
             let l = layout(300_000, first_dir_cap(300_000), packs).unwrap();
             ((l.bytes + l.scratch) >> 10, l.bytes >> 10)
         };
-        assert_eq!(kib(Packs::None), (12_883, 11_712));
+        assert_eq!(kib(Packs::None), (14_055, 12_883));
         assert_eq!(kib(Packs::Zstd), (15_227, 14_055));
         assert_eq!(kib(Packs::Lz4), (16_399, 12_883));
     }
 
-    /// 3000 directories outgrow the first 1399: the build doubles twice,
-    /// every path, directory and miss answers from the view in pool
+    /// 3000 directories outgrow the first 1399: the failed pass counts
+    /// 3001 (with `/app0`) and the second builds at exactly that, every path, directory and miss answers from the view in pool
     /// memory, and the free gives every byte back.
     #[test]
     fn a_view_builds_in_the_ledger_and_frees_to_zero() {
@@ -393,7 +399,7 @@ mod tests {
         let used = im::test_index_used();
         for packs in [Packs::None, Packs::Zstd] {
             let (mem, b) = unsafe { build(&idx, packs) }.unwrap();
-            assert_eq!(mem.layout().sizes.dir_cap, 4 * first_dir_cap(n as u32));
+            assert_eq!(mem.layout().sizes.dir_cap, n as u32 + 1);
             let scratch = mem.scratch_bytes().next_multiple_of(16 << 10);
             assert!(scratch > 0);
             assert!(im::test_index_used() >= used + mem.bytes() + scratch);
@@ -404,10 +410,13 @@ mod tests {
             assert_eq!(im::test_index_used(), before - scratch);
             assert_eq!(v.files(), n as u32);
             assert_eq!(v.dir_count(), n as u32 + 1);
+            // The rows start the block, so each is in one 64-byte line.
+            assert_eq!((mem.ptr as usize + mem.layout().rows) % align_of::<Row>(), 0);
             for (i, p) in paths.iter().enumerate() {
                 let id = i as u32 + 1;
                 assert_eq!(v.lookup(&img[..], p).unwrap(), Hit::File(id));
-                assert_eq!(v.size(id), i as u64);
+                assert_eq!((v.size(id), v.mtime(id)), (i as u64, 0));
+                assert!(!v.packed(id));
                 let Hit::Dir(d) = v.lookup(&img[..], &p[..12]).unwrap() else {
                     panic!("no directory for {:?}", &p[..12]);
                 };

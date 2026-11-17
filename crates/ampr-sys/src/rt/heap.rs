@@ -8,9 +8,11 @@
 //! counting allocator around `Decoder::new` and `decode`). So the heap is a
 //! 384 KiB bump block in the pool, a fixed site (rt/runtime_memory.rs
 //! `POOL_SITES`), taken at the first allocation, instead of the game's libc
-//! heap. A free gives back only the last block; nothing else is ever
-//! reused. Past the block, or without it, allocations go to libc malloc as
-//! before (debug /metrics `heap_libc_bytes`).
+//! heap. A free gives back only the last block, and a realloc of the last
+//! block grows or shrinks it in place (a Vec's regrowth otherwise left its
+//! old block behind); nothing else is ever reused. Past the block, or
+//! without it, allocations go to libc malloc as before (debug /metrics
+//! `heap_libc_bytes`).
 
 use super::runtime_memory::ampr_internal_amm_pool_alloc;
 use super::stats::{self, Stat};
@@ -53,6 +55,22 @@ impl Bump {
         self.top += size;
         self.last = at;
         Some(at)
+    }
+
+    /// Resizes the block at `at` to `size` bytes in place: only the last
+    /// block, and only when the new size fits. False leaves it as it was.
+    fn resize(&mut self, at: usize, size: usize) -> bool {
+        if at != self.last {
+            return false;
+        }
+        let Some(size) = size.checked_add(HEAP_ALIGN - 1).map(|s| s & !(HEAP_ALIGN - 1)) else {
+            return false;
+        };
+        if size > self.cap - at {
+            return false;
+        }
+        self.top = at + size;
+        true
     }
 
     /// Frees the block at `at`: only the last block moves the top back.
@@ -145,6 +163,29 @@ pub(crate) unsafe fn dealloc(ptr: *mut u8, size: usize) {
     unsafe { libc_free(ptr) }
 }
 
+/// Resizes a block from `alloc` from `old` to `new` bytes: the last pool
+/// block in place when it fits, else a new block, the bytes copied and the
+/// old block freed. Null (the old block kept) when no new block is had.
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) unsafe fn realloc(ptr: *mut u8, old: usize, new: usize) -> *mut u8 {
+    {
+        let _g = LOCK.lock();
+        let h = unsafe { &mut *HEAP.get() };
+        let at = (ptr as usize).wrapping_sub(h.base);
+        if h.base != 0 && at < HEAP_BYTES && h.bump.resize(at, new) {
+            count(h, false, old);
+            count(h, true, new);
+            return ptr;
+        }
+    }
+    let p = unsafe { alloc(new) };
+    if !p.is_null() {
+        unsafe { core::ptr::copy_nonoverlapping(ptr, p, old.min(new)) };
+        unsafe { dealloc(ptr, old) };
+    }
+    p
+}
+
 // libc only in the PRX (rt/sys.rs); host tests use std's allocator and
 // never call these.
 #[cfg(not(test))]
@@ -192,6 +233,26 @@ mod tests {
         assert_eq!(b.top, 16);
         assert_eq!(b.take(48), Some(16));
         assert_eq!(b.take(1), None);
+    }
+
+    /// Only the last block resizes in place, up to the cap; an older one,
+    /// or one too large, stays as it was.
+    #[test]
+    fn the_last_block_resizes_in_place() {
+        let mut b = Bump::new(64);
+        let a = b.take(16).unwrap();
+        let c = b.take(16).unwrap();
+        assert!(!b.resize(a, 32)); // not the last
+        assert!(b.resize(c, 33)); // grows to 48
+        assert_eq!(b.top, 64);
+        assert!(!b.resize(c, 49)); // past the cap
+        assert_eq!(b.top, 64);
+        assert!(b.resize(c, 1)); // shrinks
+        assert_eq!(b.top, 32);
+        assert!(!b.resize(c, usize::MAX));
+        b.give(c);
+        assert_eq!(b.top, 16);
+        assert!(!b.resize(c, 16)); // freed: no longer the last
     }
 
     #[test]

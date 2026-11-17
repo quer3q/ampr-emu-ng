@@ -46,9 +46,8 @@ pub const SCE_KERNEL_PROT_CPU_READ: c_int = 0x01;
 pub const SCE_KERNEL_PROT_CPU_RW: c_int = 0x02;
 pub const SCE_KERNEL_PROT_CPU_EXEC: c_int = 0x04;
 pub const SCE_KERNEL_PROT_CPU_ALL: c_int = 0x07;
-/// GPU and AMPR write bits of mmap/sceKernelMmap prot, the PS4 SDK values (the
-/// ps5-payload-sdk headers do not define them).
-pub const SCE_KERNEL_PROT_GPU_WRITE: c_int = 0x20;
+/// AMPR prot bits, the PS4 SDK values (the ps5-payload-sdk headers do not
+/// define them).
 pub const SCE_KERNEL_PROT_AMPR_WRITE: c_int = 0x80;
 pub const SCE_KERNEL_PROT_AMPR_ALL: c_int = 0xc0;
 
@@ -433,9 +432,9 @@ pub mod hook {
     pub const fcntl: usize = 93;
     pub const _fcntl: usize = 94;
     pub const sceKernelFcntl: usize = 95;
-    // Both formats, Makefile `AMPR_PACK_MMAP` != 0: mmap of a virtual pack fd
-    // maps a disk cache copy of the packed file (rt/pack/mmap.rs). Both
-    // builds.
+    // Debug builds only: pass-through probes of a map of a packed file,
+    // which fails (rt/probe.rs). Release never installs them; they held the
+    // removed mmap disk cache. Kept so the later ids keep their numbers.
     pub const mmap: usize = 96;
     pub const sceKernelMmap: usize = 97;
     // Unused, never installed: they held the munmap hooks of decode on
@@ -791,13 +790,8 @@ unsafe extern "C" {
     pub fn sceKernelDeleteEqueue();
     pub fn sceKernelAddAmprEvent();
     pub fn sceKernelDeleteAmprEvent();
-    pub fn sceKernelAddTimerEvent();
-    pub fn sceKernelAddReadEvent();
-    pub fn sceKernelAddWriteEvent();
-    pub fn sceKernelAddFileEvent();
-    pub fn sceKernelAddUserEvent();
+    /// The equeue's hidden wake (rt/equeue.rs).
     pub fn sceKernelAddUserEventEdge();
-    pub fn sceKernelAddHRTimerEvent();
 }
 
 // ---- libkernel imports for rt/index.rs --------------------------------------

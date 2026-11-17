@@ -336,6 +336,11 @@ impl AprAioReactor {
 }
 
 impl AprAioReactor {
+    /// The read to issue for the APR read op at the cursor. A retained cursor
+    /// chain owns the descriptor and GS result chosen on the first attempt;
+    /// never rebuild it from `initialGs`. Upstream's coalescing of adjacent
+    /// read commands into one chain was never enabled (one command a chain),
+    /// so only that retry path remains.
     pub(crate) fn coalesce_adjacent_reads(
         job: &JobState,
         initialGs: &GatherScatterState,
@@ -346,129 +351,59 @@ impl AprAioReactor {
         let mut result = CoalescedSoftwareRead {
             read: *firstRead,
             finalGs: *initialGs,
-            ..Default::default()
+            sourceBytes: firstOpBytes,
+            gatherScatterCommandCount: Self::software_read_op_is_stateful(firstOp) as u32,
         };
         Self::update_software_gs_cursor(&mut result.finalGs, firstRead);
-        result.sourceBytes = firstOpBytes;
-        result.commandCount = 1;
-        result.gatherScatterCommandCount = Self::software_read_op_is_stateful(firstOp) as u32;
-
-        // A retained cursor chain owns the descriptor and GS result chosen on
-        // the first attempt; never rebuild it from `initialGs`.
         let chain = job.cursorReadChain;
-        if chain.is_null() {
+        if chain.is_null() || firstOpBytes == 0 {
             return result;
         }
         let chain = unsafe { &*chain };
         if chain.commandIndex != job.sourceCommandIndex as usize
             || chain.ownerDesc.errorOff != firstOp.buf_offset_bytes
-            || chain.ownerDesc.coalescedCommandCount == 0
             || !chain.hasPendingFinalGs
         {
             return result;
         }
-        let retainedCommandCount = chain.ownerDesc.coalescedCommandCount as u32;
-        let mut retainedSourceBytes = firstOpBytes;
-        let mut cursor = job.sourceOffset.wrapping_add(firstOpBytes);
-        let mut valid = firstOpBytes != 0;
-        let mut index = 1u32;
-        while valid && index < retainedCommandCount {
-            let mut op = Op::default();
-            let mut opBytes = 0u32;
-            let mut errorOffset = cursor;
-            let rc = unsafe {
-                ampr_decode_apr_packed_op(
-                    job.sourceBuffer.cast(),
-                    job.sourceBytes,
-                    cursor,
-                    &mut op,
-                    &mut opBytes,
-                    &mut errorOffset,
-                )
-            };
-            valid = rc == 0
-                && opBytes != 0
-                && opBytes <= job.sourceBytes.wrapping_sub(cursor)
-                && cb_op_is_apr_read(op.op_type)
-                && retainedSourceBytes <= u32::MAX - opBytes;
-            if valid {
-                retainedSourceBytes += opBytes;
-                cursor = cursor.wrapping_add(opBytes);
-            }
-            index += 1;
-        }
-        if valid {
-            let d = &chain.ownerDesc;
-            result.read = SoftwareRead {
-                fileId: d.fileId,
-                buffer: d.buffer,
-                length: d.length,
-                offset: d.offset,
-            };
-            result.finalGs = chain.pendingFinalGs;
-            result.sourceBytes = retainedSourceBytes;
-            result.commandCount = retainedCommandCount;
-            result.gatherScatterCommandCount = chain.gatherScatterCommandCount as u32;
-        }
+        let d = &chain.ownerDesc;
+        result.read = SoftwareRead {
+            fileId: d.fileId,
+            buffer: d.buffer,
+            length: d.length,
+            offset: d.offset,
+        };
+        result.finalGs = chain.pendingFinalGs;
+        result.gatherScatterCommandCount = chain.gatherScatterCommandCount as u32;
         result
     }
 }
 
 impl AprAioReactor {
-    /// Defaults: advanceSource=true, deferValidationError=false,
-    /// outLogicalIssued/issueBudget/finalGs/outSubmitResult=null,
-    /// sourceCommandCount=1, sourceGatherScatterCount=0.
+    /// Issues the next slice of the read at the job's cursor. True when the
+    /// read's last slice was staged, so the cursor advanced past the command.
     pub(crate) fn issue_software_read(
         &mut self,
         job: &mut JobPtr,
         gs: &mut GatherScatterState,
-        read: &SoftwareRead,
-        opBytes: u32,
+        coalesced: &CoalescedSoftwareRead,
         opOffset: u32,
         commandIndex: usize,
         admission: &mut AioAdmissionContext,
-        advanceSource: bool,
-        deferValidationError: bool,
-        outLogicalIssued: *mut bool,
-        issueBudget: *mut ReadIssueBudget,
-        sourceCommandCount: u32,
-        finalGs: *const GatherScatterState,
-        sourceGatherScatterCount: u32,
-        outSubmitResult: *mut DirectReadSubmitResult,
+        issueBudget: &mut ReadIssueBudget,
     ) -> bool {
-        unsafe {
-            if !outLogicalIssued.is_null() {
-                *outLogicalIssued = false;
-            }
-            if !outSubmitResult.is_null() {
-                *outSubmitResult = DirectReadSubmitResult::Failed;
-            }
-        }
         let j: *mut JobState = *job;
-        if j.is_null()
-            || sourceCommandCount == 0
-            || sourceCommandCount > u8::MAX as u32
-            || sourceGatherScatterCount > sourceCommandCount
-            || sourceGatherScatterCount > u8::MAX as u32
-        {
+        let gsCount = coalesced.gatherScatterCommandCount;
+        if j.is_null() || gsCount > 1 {
             return false;
         }
-        if !issueBudget.is_null()
-            && unsafe { (*issueBudget).requestsLeft == 0 || (*issueBudget).bytesLeft == 0 }
-        {
-            unsafe { (*issueBudget).held = true };
+        if issueBudget.requestsLeft == 0 || issueBudget.bytesLeft == 0 {
+            issueBudget.held = true;
             return false;
         }
-        let effectiveRead = *read;
-        if !self.validate_software_read(j, &effectiveRead, opOffset, deferValidationError) {
+        let effectiveRead = coalesced.read;
+        if !self.validate_software_read(j, &effectiveRead, opOffset) {
             return false;
-        }
-
-        let mut requestedFinalGs = *gs;
-        if !finalGs.is_null() {
-            requestedFinalGs = unsafe { *finalGs };
-        } else {
-            Self::update_software_gs_cursor(&mut requestedFinalGs, &effectiveRead);
         }
 
         let chainSlot: *mut *mut ReadChain = unsafe { addr_of_mut!((*j).cursorReadChain) };
@@ -479,10 +414,8 @@ impl AprAioReactor {
                 &effectiveRead,
                 opOffset,
                 commandIndex,
-                sourceCommandCount,
-                sourceGatherScatterCount,
-                &requestedFinalGs,
-                deferValidationError,
+                gsCount,
+                &coalesced.finalGs,
             );
             if chain.is_null() {
                 return false;
@@ -495,8 +428,7 @@ impl AprAioReactor {
                 || c.job != j
                 || c.commandIndex != commandIndex
                 || c.ownerDesc.errorOff != opOffset
-                || c.ownerDesc.coalescedCommandCount as u32 != sourceCommandCount
-                || c.gatherScatterCommandCount as u32 != sourceGatherScatterCount
+                || c.gatherScatterCommandCount as u32 != gsCount
                 || !c.hasPendingFinalGs
             {
                 abort();
@@ -504,43 +436,17 @@ impl AprAioReactor {
             // GS drift on a Pending retry: keep the retained transactional GS.
         }
 
-        if advanceSource {
-            self.set_cursor_read_wait_hint(unsafe { (*j).prioIndex } as usize);
-        }
-
-        let mut singleRequestBudget = ReadIssueBudget {
-            requestsLeft: 1,
-            bytesLeft: kSoftwareReadChunkMax,
-            held: false,
-        };
-        let budget: &mut ReadIssueBudget = if issueBudget.is_null() {
-            &mut singleRequestBudget
-        } else {
-            unsafe { &mut *issueBudget }
-        };
-        let outcome = self.submit_read_chain_slice(job, unsafe { &mut *chain }, budget, admission);
-        if !outSubmitResult.is_null() {
-            unsafe { *outSubmitResult = outcome.result };
-        }
+        self.set_cursor_read_wait_hint(unsafe { (*j).prioIndex } as usize);
+        let outcome =
+            self.submit_read_chain_slice(job, unsafe { &mut *chain }, issueBudget, admission);
         if outcome.result == DirectReadSubmitResult::Staged {
-            return self.finish_staged_read_chain(
-                j,
-                gs,
-                chain,
-                chainSlot,
-                opBytes,
-                sourceCommandCount,
-                advanceSource,
-                outLogicalIssued,
-            );
+            return self.finish_staged_read_chain(j, gs, chain, chainSlot, coalesced.sourceBytes);
         }
         if outcome.result == DirectReadSubmitResult::Pending {
             return false;
         }
 
-        if advanceSource {
-            self.clear_cursor_read_wait_hint(unsafe { (*j).prioIndex } as usize);
-        }
+        self.clear_cursor_read_wait_hint(unsafe { (*j).prioIndex } as usize);
         // Detach cursor ownership before publishing an error (set_fail may
         // return the chain to the pool); do not touch `chain` after finish.
         unsafe { (*chain).allIssued = true };
@@ -562,25 +468,22 @@ impl AprAioReactor {
 
 impl AprAioReactor {
     /// Rejects an empty or oversized read and one outside the user VA or
-    /// file offset range, recording the error unless it is deferred.
+    /// file offset range, recording the error.
     #[inline]
     fn validate_software_read(
         &mut self,
         j: *mut JobState,
         effectiveRead: &SoftwareRead,
         opOffset: u32,
-        deferValidationError: bool,
     ) -> bool {
         if effectiveRead.length == 0 || effectiveRead.length > kSoftwareReadLengthMax {
-            if !deferValidationError {
-                self.set_command_error(
-                    unsafe { &mut *j },
-                    c"software-read-length".as_ptr(),
-                    SCE_KERNEL_ERROR_EINVAL,
-                    opOffset,
-                    0,
-                );
-            }
+            self.set_command_error(
+                unsafe { &mut *j },
+                c"software-read-length".as_ptr(),
+                SCE_KERNEL_ERROR_EINVAL,
+                opOffset,
+                0,
+            );
             return false;
         }
         let readBuffer = effectiveRead.buffer as u64;
@@ -588,15 +491,13 @@ impl AprAioReactor {
             || effectiveRead.length > kSoftwareReadUserVaMax - readBuffer
             || effectiveRead.offset >= kSoftwareReadOffsetMaxExclusive
         {
-            if !deferValidationError {
-                self.set_command_error(
-                    unsafe { &mut *j },
-                    c"software-read-range".as_ptr(),
-                    SCE_KERNEL_ERROR_EINVAL,
-                    opOffset,
-                    0,
-                );
-            }
+            self.set_command_error(
+                unsafe { &mut *j },
+                c"software-read-range".as_ptr(),
+                SCE_KERNEL_ERROR_EINVAL,
+                opOffset,
+                0,
+            );
             return false;
         }
         true
@@ -604,7 +505,7 @@ impl AprAioReactor {
 
     /// A new read chain owning the logical read at the job's cursor. Null
     /// when the completion window is full, the descriptor cannot be prepared
-    /// (error recorded unless deferred) or no chain is free.
+    /// (error recorded) or no chain is free.
     #[allow(clippy::too_many_arguments)]
     fn open_cursor_read_chain(
         &mut self,
@@ -612,10 +513,8 @@ impl AprAioReactor {
         effectiveRead: &SoftwareRead,
         opOffset: u32,
         commandIndex: usize,
-        sourceCommandCount: u32,
         sourceGatherScatterCount: u32,
         requestedFinalGs: &GatherScatterState,
-        deferValidationError: bool,
     ) -> *mut ReadChain {
         if unsafe {
             apr_read_completion_window_exhausted(
@@ -638,18 +537,15 @@ impl AprAioReactor {
             &mut logicalRead,
             &mut prepareRc,
         ) {
-            if !deferValidationError {
-                self.set_command_error(
-                    unsafe { &mut *j },
-                    c"software-read-prepare".as_ptr(),
-                    prepareRc,
-                    opOffset,
-                    0,
-                );
-            }
+            self.set_command_error(
+                unsafe { &mut *j },
+                c"software-read-prepare".as_ptr(),
+                prepareRc,
+                opOffset,
+                0,
+            );
             return null_mut();
         }
-        logicalRead.coalescedCommandCount = sourceCommandCount as u8;
         apr_update_read_desc_fd_policy(&mut logicalRead);
 
         let chain = self.allocate_read_chain();
@@ -680,9 +576,6 @@ impl AprAioReactor {
         chain: *mut ReadChain,
         chainSlot: *mut *mut ReadChain,
         opBytes: u32,
-        sourceCommandCount: u32,
-        advanceSource: bool,
-        outLogicalIssued: *mut bool,
     ) -> bool {
         let c = unsafe { &mut *chain };
         if c.remaining > kSoftwareReadChunkMax {
@@ -700,13 +593,8 @@ impl AprAioReactor {
             abort();
         }
         *gs = c.pendingFinalGs;
-        if advanceSource {
-            self.clear_cursor_read_wait_hint(unsafe { (*j).prioIndex } as usize);
-            Self::advance_job_source_commands(unsafe { &mut *j }, opBytes, sourceCommandCount);
-        }
-        if !outLogicalIssued.is_null() {
-            unsafe { *outLogicalIssued = true };
-        }
+        self.clear_cursor_read_wait_hint(unsafe { (*j).prioIndex } as usize);
+        Self::advance_job_source(unsafe { &mut *j }, opBytes);
         self.maybe_finish_read_chain(chain);
         true
     }

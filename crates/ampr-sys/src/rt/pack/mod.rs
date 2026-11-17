@@ -6,10 +6,10 @@
 //! - Functions keep their upstream names (snake_case or camelCase as they
 //!   are). Methods live in `impl` blocks that may be split across parts; a
 //!   constructor is `new`, a destructor is `impl Drop`.
-//! - Signatures keep a fixed parameter order, telemetry timestamps included
-//!   (pass 0). Out-parameters are `&mut T`, read-only ones `&T`, raw buffers
-//!   `*mut T` / `*const T`; `pack_state()` returns `*mut PackState`
-//!   (access fields as `(*state).x`; never form `&PackState`).
+//! - Signatures keep a fixed parameter order. Out-parameters are `&mut T`,
+//!   read-only ones `&T`, raw buffers `*mut T` / `*const T`; `pack_state()`
+//!   returns `*mut PackState` (access fields as `(*state).x`; never form
+//!   `&PackState`).
 //!   C scalars use `c_int`, `usize`, `c_long` and the `sys` aliases
 //!   `off_t`/`ssize_t`. Struct fields are snake_case (`io_window_pack_id`).
 //! - Build-time knobs keep their macro-style names (`AMPR_EMU_PACK_WORKERS`).
@@ -17,11 +17,11 @@
 //!   `AMPR_PACK_FILE_PACKED`, `INVALID_INDEX`).
 //! - The PackState mutexes, condvars and atomics live in separate statics
 //!   (see "sync state"), so lock guards never borrow PackState:
-//!   `PACK_M`, `CACHE_CVS[i]`, etc.
+//!   `PACK_M`, `QUEUE_CV`, etc.
 //! - Detour targets (`*_emul`) keep the C ABI; runtime helpers use Rust calls.
-//! - Telemetry timestamps are not implemented: `pack_telemetry_usecs()`
-//!   returns 0. Debug counters go through `stats::*` (no-ops unless
-//!   `mem_report`).
+//! - Upstream's telemetry timestamps were never ported and their parameters
+//!   are gone (they were always 0). Debug counters go through `stats::*`
+//!   (no-ops unless `mem_report`).
 //! - Shared helpers: `sce_errno_from_posix`, `posix_errno_from_sce`,
 //!   `errno()`, `kernel_slot::<F>`, hook ids `sys::hook::x`,
 //!   `spin_pause_or_yield(&mut spins)`, and `ampr_lz4::decode_chunk`
@@ -126,9 +126,6 @@ mod aio;
 pub(crate) use aio::*;
 mod aio_wait;
 pub(crate) use aio_wait::*;
-/// mmap of a packed file (both formats) through a disk cache copy (hook ids
-/// 96, 97).
-pub(crate) mod mmap;
 /// zstd mount state and accessors (reached as `zstd::x`).
 pub(crate) mod zstd;
 pub(crate) mod pack_libc;
@@ -357,13 +354,115 @@ pub(crate) unsafe fn select_pack_format() {
         PackFormat::Plain
     };
     PACK_FORMAT.store(format as u8, Ordering::Relaxed);
-    // A crash between a cache file's create and unlink leaves it named, and
-    // the next title may be one that never maps (no packs, or mapping off).
-    // Sweep and remove the folder in every title, so it does not keep
-    // showing in a file explorer; with no folder both are one failed open
-    // and one failed rmdir.
-    unsafe { mmap::sweep_cache_dir() };
-    unsafe { mmap::remove_cache_dir() };
+    unsafe { remove_old_cache_dir() };
+}
+
+// ---- folder left by older builds ----
+
+// Builds up to 0.4.1 kept an mmap disk cache under /data/ampr_cache (removed:
+// no measured game mapped a packed file, `mmap_virtual` 0 on three fully
+// packed games). A crash between a cache file's create and unlink left it
+// named, so the folder could stay on /data and show in a file explorer.
+// This build only removes what an older one left, in every title; with no
+// folder it costs one failed open.
+
+/// Folder of the removed mmap disk cache.
+const OLD_CACHE_DIR: &CStr = c"/data/ampr_cache";
+static RMDIR: LazySym = LazySym::new(c"rmdir");
+
+// Real libkernel entries: the pre-detour slot once hooks install, else the
+// dynamic symbol (this runs at module_start, before any hook), so no call
+// here goes through the index path hooks. The open is the `_open` original
+// (`real_open`): libkernel `open` calls `_open`, which routes through the
+// index by default (AMPR_PACK_LIBC_HOOKS=0xfff). Before any hook installs,
+// dynamic `open` reaches the undetoured `_open`.
+unsafe fn real_open_path(path: *const c_char, flags: c_int, mode: c_int) -> c_int {
+    unsafe { real_open() }.map_or_else(eio, |f| unsafe { f(path, flags, mode) })
+}
+
+unsafe fn real_unlink(path: *const c_char) -> c_int {
+    type F = unsafe extern "C" fn(*const c_char) -> c_int;
+    unsafe { slot_or_dynamic::<F>(hook::unlink, c"unlink") }
+        .map_or_else(eio, |f| unsafe { f(path) })
+}
+
+type RmdirFn = unsafe extern "C" fn(*const c_char) -> c_int;
+
+/// rmdir of `dir`, every error ignored (ENOENT: already gone; ENOTEMPTY: a
+/// named file is left) and errno kept.
+unsafe fn remove_dir_keeping_errno(dir: &CStr, rmdir: RmdirFn) {
+    let saved = errno();
+    unsafe { rmdir(dir.as_ptr()) };
+    set_errno(saved);
+}
+
+/// At module_start (`select_pack_format`): unlinks every entry of
+/// OLD_CACHE_DIR (files only: the old code made no subfolders), then
+/// removes it. A pass that unlinks while it lists may skip entries, so
+/// passes repeat until one unlinks nothing (at most 8). When the folder
+/// does not open there is nothing to remove, so no rmdir either.
+unsafe fn remove_old_cache_dir() {
+    for _ in 0..8 {
+        match unsafe { sweep_pass() } {
+            None => return,
+            Some(0) => break,
+            Some(_) => {}
+        }
+    }
+    // rmdir has no hook id: the dynamic symbol is the real call.
+    if let Some(rmdir) = unsafe { RMDIR.get::<RmdirFn>() } {
+        unsafe { remove_dir_keeping_errno(OLD_CACHE_DIR, rmdir) };
+    }
+}
+
+/// One listing of OLD_CACHE_DIR; the entries unlinked, None when the folder
+/// does not open.
+unsafe fn sweep_pass() -> Option<usize> {
+    let dir = unsafe { real_open_path(OLD_CACHE_DIR.as_ptr(), O_RDONLY | O_DIRECTORY, 0) };
+    if dir < 0 {
+        return None;
+    }
+    // getdents wants room for at least one 264-byte record; u64 aligns it.
+    let mut buf = [0u64; 512];
+    let mut removed = 0;
+    loop {
+        let base = buf.as_mut_ptr().cast::<u8>();
+        let n = unsafe { real_physical_getdents(dir, base.cast(), size_of_val(&buf) as c_int) };
+        if n <= 0 {
+            break;
+        }
+        let mut at = 0usize;
+        while at + DIRENT_NAME_OFFSET <= n as usize {
+            // Field reads, not a &Dirent: the last record may end before
+            // the 264 bytes of a full struct.
+            let rec = unsafe { base.add(at) };
+            let fileno = unsafe { rec.cast::<u32>().read_unaligned() };
+            let reclen = unsafe {
+                rec.add(offset_of!(Dirent, d_reclen))
+                    .cast::<u16>()
+                    .read_unaligned()
+            };
+            let namlen = unsafe { *rec.add(offset_of!(Dirent, d_namlen)) } as usize;
+            let reclen = reclen as usize;
+            if reclen == 0 || at + reclen > n as usize || DIRENT_NAME_OFFSET + namlen > reclen {
+                break;
+            }
+            let name = unsafe { core::slice::from_raw_parts(rec.add(DIRENT_NAME_OFFSET), namlen) };
+            if fileno != 0 && name != b"." && name != b".." {
+                let mut path = [0u8; 300];
+                let dir_bytes = OLD_CACHE_DIR.to_bytes();
+                path[..dir_bytes.len()].copy_from_slice(dir_bytes);
+                path[dir_bytes.len()] = b'/';
+                path[dir_bytes.len() + 1..][..name.len()].copy_from_slice(name);
+                if unsafe { real_unlink(path.as_ptr().cast()) } == 0 {
+                    removed += 1;
+                }
+            }
+            at += reclen;
+        }
+    }
+    unsafe { real_physical_close(dir) };
+    Some(removed)
 }
 
 // ---- SDK AIO types ------------------------------------------------------------
@@ -632,7 +731,6 @@ pub(crate) const AMPR_EMU_PACK_INDEX_PATH: &CStr = c"/app0/ampr_assets.index";
 /// `AMPR_EMU_PACK_INDEX_PATH ".runtime"` (AMPRPAK4 only; zstd keeps the defaults).
 pub(crate) const AMPR_EMU_PACK_RUNTIME_PROFILE_PATH: &CStr = c"/app0/ampr_assets.index.runtime";
 pub(crate) const AMPR_EMU_PACK_ROOT_PATH: &CStr = c"/app0";
-pub(crate) const AMPR_EMU_PACK_LOGICAL_ROOT_PATH: &CStr = c"/app0";
 
 /// Directories open at once through the index (a directory missing on disk,
 /// or opened with O_DIRECTORY). The numbers are plain, `DIRECTORY_BASE + slot`
@@ -734,7 +832,7 @@ pub(crate) const AMPR_EMU_PACK_MAX_PACKS: usize = 1024;
 /// all 18 of the old cap busy (debug /metrics).
 pub(crate) const AMPR_EMU_PACK_OPEN_PACK_FD_CAP: u32 = 32;
 /// The whole Cache ledger, the pool's remainder (rt/index_memory.rs
-/// `CACHE_MEMORY_MAX`: 133.64 MiB debug, 134.98 MiB release at the 256 MiB
+/// `CACHE_MEMORY_MAX`: 135.77 MiB debug, 137.11 MiB release at the 256 MiB
 /// layout; debug knob `decoded_mib`): the only pack cache, so the release
 /// cache is about 1% larger than the debug one. Exact reads with 64 MiB
 /// decoded gave 11-14% lower game wait per read than 32 + 32 MiB page reads
@@ -745,7 +843,14 @@ pub(crate) const AMPR_EMU_PACK_OPEN_PACK_FD_CAP: u32 = 32;
 pub(crate) const AMPR_EMU_PACK_DECODED_CACHE_BYTES: u64 =
     super::index_memory::CACHE_MEMORY_MAX as u64;
 pub(crate) const AMPR_EMU_PACK_DECODED_CACHE_MIN_BYTES: u64 = 16 * 1024 * 1024;
-pub(crate) const AMPR_EMU_PACK_CACHE_ENTRY_CAP: usize = 8192;
+/// Decoded cache entries. 8192 entries of 16 KiB blocks held 128 MiB,
+/// less than the 135 MiB cache before it grows from the Index ledger, so a
+/// title of small blocks evicted with pages free (debug
+/// `cache_cap_evictions`). 16384 covers 256 MiB of 16 KiB blocks. The
+/// entries live in `PackState`, in .bss outside the pool: 56 B each, so the
+/// change added 458,752 B to both builds (host test
+/// `cache_entries_are_56_bytes`).
+pub(crate) const AMPR_EMU_PACK_CACHE_ENTRY_CAP: usize = 16384;
 pub(crate) const AMPR_EMU_PACK_CACHE_PAGE_SHIFT: u32 = 14;
 pub(crate) const AMPR_EMU_PACK_CACHE_HASH_BUCKETS: usize = 16384;
 pub(crate) const AMPR_EMU_PACK_TOUCH_TABLE_SIZE: usize = 16384;
@@ -967,6 +1072,9 @@ pub(crate) struct VirtualAioSlot {
     /// zstd: the split group this job is a child of (pack_split), or
     /// INVALID_INDEX.
     pub split_group: u32,
+    /// A packed POSIX read on the caller's thread (fd_read.rs `submit_sync`):
+    /// its waiter sleeps on AIO_CV, the reactor does not own it.
+    pub sync_read: bool,
 }
 impl VirtualAioSlot {
     pub(crate) const EMPTY: Self = Self {
@@ -987,6 +1095,7 @@ impl VirtualAioSlot {
         park_kind: 0,
         requeued_ns: 0,
         split_group: INVALID_INDEX,
+        sync_read: false,
     };
 }
 
@@ -1219,7 +1328,8 @@ pub(crate) struct ReadPipelineContext {
     pub fd_reopen_retry: bool,
     pub native_accepted: bool,
     pub native_submitted: bool,
-    /// Physical backing reads this pipeline added to PACK_DISK_INFLIGHT (worker.rs).
+    /// Physical backing reads this pipeline added to PACK_DISK_INFLIGHT
+    /// (worker.rs; debug build only, 0 in release).
     pub disk_inflight: u32,
 }
 impl ReadPipelineContext {
@@ -1267,7 +1377,8 @@ pub(crate) struct PackSubmission {
 // Non-zero defaults `pack_state_create` (state.rs) must apply in place on the
 // zeroed storage: every array element = its type's `EMPTY` (virtual_fds,
 // virtual_directories, virtual_aio, pipelines, pack_handles, cache_entries;
-// the others are all-zero), queue_head/queue_tail = INVALID_INDEX,
+// the others are all-zero), queue_head/queue_tail and
+// retained_head/retained_tail = INVALID_INDEX,
 // decoded_cache_target_bytes
 // and requested_workers from `tune` (in release
 // AMPR_EMU_PACK_DECODED_CACHE_BYTES and AMPR_EMU_PACK_WORKERS),
@@ -1295,10 +1406,17 @@ pub(crate) struct PackState {
     pub virtual_directory_cursor: u32,
     pub virtual_aio: [VirtualAioSlot; AMPR_EMU_PACK_VIRTUAL_AIO_SLOTS],
     pub virtual_aio_cursor: u32,
+    /// Slots not Free (slots.rs allocate/free), so a split read checks its
+    /// room without scanning all 256 slots under PACK_M.
+    pub virtual_aio_used: u32,
     pub virtual_aio_groups: [VirtualAioGroupSlot; AMPR_EMU_PACK_VIRTUAL_AIO_SLOTS],
     pub virtual_aio_group_cursor: u32,
     pub queue_head: [[u32; PACK_WORK_CLASS_COUNT]; 3],
     pub queue_tail: [[u32; PACK_WORK_CLASS_COUNT]; 3],
+    /// Jobs queued while holding a pipeline (schedule.rs), apart from new
+    /// ones so a pop with no pipeline free takes a list head, no walk.
+    pub retained_head: [[u32; PACK_WORK_CLASS_COUNT]; 3],
+    pub retained_tail: [[u32; PACK_WORK_CLASS_COUNT]; 3],
     pub queue_depth: [u32; PACK_WORK_CLASS_COUNT],
     pub queue_pick_counter: u32,
     pub aio_completion_epoch: u64,
@@ -1313,7 +1431,6 @@ pub(crate) struct PackState {
     pub cache_waiter_count: u32,
     pub fd_waiter_count: u32,
     pub workers_started: u32,
-    pub worker_capacity: u32,
     pub pipeline_active_count: u32,
 
     pub pack_handles: [PackHandle; AMPR_EMU_PACK_MAX_PACKS],
@@ -1366,11 +1483,8 @@ pub(crate) static DIRECTORY_MUTEXES: [Mutex; AMPR_EMU_PACK_VIRTUAL_DIRECTORY_SLO
 pub(crate) static QUEUE_CV: Condvar = Condvar::new();
 pub(crate) static AIO_CV: Condvar = Condvar::new();
 pub(crate) static SUBMIT_CV: Condvar = Condvar::new();
-pub(crate) static CACHE_CVS: [Condvar; PACK_CACHE_WAIT_BUCKET_COUNT] =
-    [const { Condvar::new() }; PACK_CACHE_WAIT_BUCKET_COUNT];
 pub(crate) static MANIFEST_CV: Condvar = Condvar::new();
 pub(crate) static LOAD_STATE: AtomicU32 = AtomicU32::new(PACK_LOAD_UNINITIALIZED);
-pub(crate) static PROFILE_STARTED_WORKERS: AtomicU32 = AtomicU32::new(0);
 pub(crate) static PACK_FD_PROGRESS_EPOCH: AtomicU64 = AtomicU64::new(1);
 pub(crate) static PACK_FD_WAITER_COUNT: AtomicU32 = AtomicU32::new(0);
 pub(crate) static WORKER_STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
@@ -1397,6 +1511,18 @@ mod tests {
         PackFormat::Zstd,
         PackFormat::Pkg,
     ];
+
+    /// The entry array is .bss outside the pool, so its size feeds the
+    /// pool recompute (AGENTS.md memory budget): a change here moves both
+    /// PRX totals.
+    #[test]
+    fn cache_entries_are_56_bytes() {
+        assert_eq!(core::mem::size_of::<CacheEntry>(), 56);
+        assert_eq!(
+            core::mem::size_of::<[CacheEntry; AMPR_EMU_PACK_CACHE_ENTRY_CAP]>(),
+            917_504
+        );
+    }
 
     #[test]
     fn pack_format_round_trips_through_u8() {
@@ -1460,5 +1586,40 @@ mod tests {
             GATE.wait_drained(|| false),
             "an empty gate drains without a pause"
         );
+    }
+
+    extern "C" {
+        /// Host libc rmdir; the console one is resolved from libkernel.
+        fn rmdir(path: *const c_char) -> c_int;
+    }
+
+    /// The last step of `remove_old_cache_dir` on the host filesystem: an
+    /// emptied folder goes, a missing one is no error, and a folder that
+    /// still holds a file stays; errno is kept each time.
+    #[test]
+    fn old_cache_folder_goes_once_empty_and_a_named_file_keeps_it() {
+        let dir = std::env::temp_dir().join(format!("ampr_cache_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+        let c_dir = std::ffi::CString::new(dir.to_str().unwrap()).unwrap();
+        set_errno(EMFILE);
+        unsafe { remove_dir_keeping_errno(&c_dir, rmdir) };
+        assert_eq!(errno(), EMFILE);
+        assert!(!dir.exists());
+
+        // Missing folder: ENOENT is ignored.
+        set_errno(ENOSPC);
+        unsafe { remove_dir_keeping_errno(&c_dir, rmdir) };
+        assert_eq!(errno(), ENOSPC);
+
+        // A file left behind: ENOTEMPTY is ignored, the folder stays.
+        let file = dir.join("00000001.tmp");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(&file, b"x").unwrap();
+        set_errno(0);
+        unsafe { remove_dir_keeping_errno(&c_dir, rmdir) };
+        assert_eq!(errno(), 0);
+        assert!(file.exists());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

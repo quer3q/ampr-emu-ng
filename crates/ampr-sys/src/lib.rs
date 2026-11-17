@@ -36,7 +36,7 @@ pub unsafe extern "C" fn bcmp(left: *const c_void, right: *const c_void, len: us
     0
 }
 
-// iced-x86 (ampr-hook) needs `alloc`: a 256 KiB bump block in the pool,
+// iced-x86 (ampr-hook) needs `alloc`: a 384 KiB bump block in the pool,
 // then libc malloc when it is full (rt/heap.rs). Both are 16-byte aligned;
 // refuse stricter layouts rather than over-allocate. Host tests use std's
 // allocator.
@@ -54,6 +54,17 @@ unsafe impl core::alloc::GlobalAlloc for LibcAlloc {
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: core::alloc::Layout) {
         unsafe { rt::heap::dealloc(ptr, layout.size()) }
+    }
+
+    /// The last pool block grows in place (rt/heap.rs `realloc`); the
+    /// default would copy it and leave the old one behind in the bump block.
+    unsafe fn realloc(
+        &self,
+        ptr: *mut u8,
+        layout: core::alloc::Layout,
+        new_size: usize,
+    ) -> *mut u8 {
+        unsafe { rt::heap::realloc(ptr, layout.size(), new_size) }
     }
 }
 

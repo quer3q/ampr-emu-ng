@@ -18,6 +18,7 @@ name = "ampr-format"
 version = "0.4.1"
 dependencies = [
  "ampr-zstd",
+ "crc32fast",
 ]
 
 [[package]]

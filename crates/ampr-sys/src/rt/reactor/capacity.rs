@@ -65,6 +65,10 @@ impl AprAioReactor {
             self.stage_active_aio_poll(&mut batch, hotIt);
         }
         let mut slotIndex = 0u32;
+        // Only kernel-AIO externals are polled; none submitted skips the scan.
+        if self.externalAioSubmittedCount.load(Ordering::Acquire) == 0 {
+            slotIndex = kExternalAioCapacity;
+        }
         while slotIndex < kExternalAioCapacity && batch.count < kAioPollBatchLimit {
             let external = &self.externalAioReads[slotIndex as usize];
             if external.published.load(Ordering::Acquire)
@@ -107,7 +111,6 @@ impl AprAioReactor {
         let errorOff = active.desc.errorOff;
         let finishTimeNs = time_counter_now();
         let completeAgeMs = Self::active_read_age_ms(active, finishTimeNs);
-        self.note_aio_age_ms(completeAgeMs);
 
         let mut rc = 0;
         if finalState == SCE_KERNEL_AIO_STATE_ABORTED {
@@ -178,7 +181,6 @@ impl AprAioReactor {
                 AMPR_EMU_APR_AIO_COMPLETION_RETRY_DELAY_NS
             };
             if completionEfault {
-                self.note_efault_retry_event();
                 if active.ammEfaultRetries != u32::MAX {
                     active.ammEfaultRetries += 1;
                 }
@@ -206,7 +208,6 @@ impl AprAioReactor {
             );
         }
         if rc != 0 && !Self::job_failed(jobRef) && efaultRetryLimitReached {
-            self.note_efault_retry_limit_event();
             self.set_command_error(
                 jobRef,
                 c"aio-efault-retry-limit".as_ptr(),
@@ -231,8 +232,6 @@ impl AprAioReactor {
         apr_release_aio_read_desc(&mut active.desc);
         false
     }
-
-    pub(crate) fn note_reactor_progress(&mut self, _progressed: bool) {}
 }
 
 impl AprAioReactor {

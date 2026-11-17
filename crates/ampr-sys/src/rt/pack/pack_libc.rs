@@ -52,6 +52,12 @@ pub unsafe extern "C" fn underscore_close_emul(fd: c_int) -> c_int {
     if handled {
         return posix_result_from_pack(rc);
     }
+    // As in aio.rs `posix_close_emul`: the kept index fd (rt/index.rs
+    // `KEPT_FD`) is not the game's to close, so EBADF.
+    if crate::rt::index::is_kept_index_fd(fd) {
+        set_errno(crate::rt::sys::EBADF);
+        return -1;
+    }
     unsafe { kernel_slot::<KernelCloseFn>(sys::hook::_close) }
         .map_or_else(posix_missing_original, |f| unsafe { f(fd) })
 }
