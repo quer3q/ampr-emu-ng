@@ -84,11 +84,14 @@ cargo test --workspace                         # host tests
 
 Knobs and their defaults are at the top of the `Makefile`
 (`AMPR_INTERNAL_POOL_SIZE`, `AMPR_DEBUG_POOL_SIZE`, `AMPR_PACK_WORKERS`,
-`AMPR_PACK_PIPELINES`, read-ahead,
-`AMPR_ZSTD_LIBC_HOOKS`, `AMPR_ZSTD_MMAP`, `AMPR_MEM_REPORT`). A knob change
-rebuilds through `out/*/obj/build-config.txt`. The two `AMPR_ZSTD_*` knobs
-keep their zstd names but apply to LZ4 and pkg titles too; only `AMPR_ZSTD_MMAP=1`
-(decode on access) is zstd only. Those hooks (hook ids 78 and up), the
+`AMPR_PACK_PIPELINES`, `AMPR_PACK_LIBC_HOOKS`, `AMPR_PACK_MMAP` (0 or 2),
+`AMPR_MEM_REPORT`). A knob change rebuilds through
+`out/*/obj/build-config.txt`. `AMPR_PACK_LIBC_HOOKS` and `AMPR_PACK_MMAP`
+(formerly `AMPR_ZSTD_*`; the Makefile refuses the old names) apply to
+every pack format, as do `rt/pack/pack_libc.rs` and `rt/pack/pack_split.rs`
+(formerly `zstd_*`); zstd names stay on zstd-only code. Hook ids 98 and 99
+(munmap) are unused and never install; the ids are not renumbered. Those
+hooks (hook ids 78 and up), the
 eager index load and the mmap cache sweep apply only to a title that ships
 packs, zstd, LZ4 or pkg (`packs_present` in `rt/pack/mod.rs`, `hook_enabled` in
 `rt/hook.rs`); a title with no packs gets the shared ids 0..=77. Among them,
@@ -101,33 +104,59 @@ the symbol by name, which would re-enter the hook. The exception is ids
 they install in every title, packs or not. A game thread creation that
 fails with EAGAIN makes the runtime give threads back and is retried; the
 runtime-wide budget of 16 worker threads is cut and regrows by one per
-10 s quiet. The groups are capped at 4 decode workers (`AMPR_PACK_WORKERS`;
+5 s quiet. The groups are capped at 4 decode workers (`AMPR_PACK_WORKERS`;
 an LZ4 or pkg title's `ampr_assets.index.runtime` profile can ask for up to 16,
 `AMPR_EMU_PACK_WORKER_CAPACITY`; the worker start cuts workers until
 each has a pipeline in the Buffer ledger, 9 and 9 at 16, `buffer_split`
 in `rt/pack/worker.rs`),
-6 disk read threads (`tune::RELEASE_PREAD_THREADS`) and 4 fd read threads
-(`READ_THREADS` in `rt/pack/fd_read.rs`). Runtime threads retire by load,
-not by idle time (no idle timer): each group keeps its last 8192
-busy-thread counts (`LOAD_SAMPLES`), and a thread that finishes its work
-leaves after 8 such finishes in a row with more live than one above the load
-target (ceil(median x 1.5) + 1, at least 1). That EAGAIN
+and 6 disk read threads (`tune::RELEASE_PREAD_THREADS`). A packed POSIX
+read (read, pread, readv, preadv, libc `_read`/`_readv` on a virtual pack
+fd) queues its pack jobs and waits on the caller's own thread
+(`read_on_workers` in `rt/pack/fd_read.rs`); there are no fd read threads.
+A pack worker queues its window read to the pread pool itself
+(`queue_pack_pread` in `rt/reactor/pread_pool.rs`) and the pool thread
+requeues the job; the reactor only sees pack reads the pool refuses. Lock
+order: PACK_M before preadMutex and the pool's `m`, never the reverse.
+Runtime threads are not created under PACK_M or on the reactor thread for
+pack work, with two exceptions: the first decode worker of a mount starts
+under PACK_M (once per mount), and loose-read pool growth runs on the
+reactor thread, the only thread free to start one when every pool thread
+is busy.
+Runtime threads run on 16 KiB-page stacks carved from one 2 MiB pool block
+(`rt/thread_stack.rs`), each with a no-access 16 KiB guard page below it,
+up to 128 KiB a stack; the slot is freed after `scePthreadJoin` (a wrapper
+in `rt/reactor/mod.rs`). A larger stack, a full block or a missing or
+refused `scePthreadAttrSetstack` falls back to libkernel's stack.
+A runtime thread, once started, stays: threads start when work queues,
+up to the group caps (reactor, 4 decode workers, 6 pool threads: 11, 12
+with the debug metrics thread), and leave only under pressure. Load
+retirement (each group's last 8192 busy counts, `LOAD_SAMPLES`; leave after
+8 finishes in a row above the peak busy count + 1) is off by default; the
+debug knob `retire_load=1` turns it back on. That EAGAIN
 starts pressure mode: idle threads leave at once, each group runs at most
 one thread while it has work and none without (decode workers never go
-below one, `LoadGroup::floor`), until 10 s pass with no new failure
+below one, `LoadGroup::floor`), until 5 s pass with no new failure
 (`LoadGroup`, `pressure` in `rt/thread_hooks.rs`). Ids 112..=119 (dup,
 dup2, poll, select, openat, fstatat, faccessat, readlink) exist only in the
 debug build, as pass-through probes in titles with packs (`rt/probe.rs`).
 Pkg mode and a writable /app0 add no hook ids; the hook ids are as
 upstream. The
 runtime creates its own threads through `create_internal`
-(the pre-detour slot). Save data (`rt/save.rs`) is hooked by NID in a loaded
-`libSceSaveData` module, not through the libkernel table, in every title
-(the loader observer finds it outside `sceKernelGetModuleList`):
-`sceSaveDataMount3` passes every answer back to the game, a BUSY one
-included, and only counts the mounts and the BUSY answers, and
-`sceSaveDataSaveIconByPath` hands a packed icon to `sceSaveDataSaveIcon` as
-bytes.
+(the pre-detour slot). Save data (`rt/save.rs`) is hooked by NID in a
+loaded `libSceSaveData` module, not through the libkernel table, in every
+title (the loader observer finds it outside `sceKernelGetModuleList`), 4
+hooks: `sceSaveDataSaveIconByPath` hands a packed icon to
+`sceSaveDataSaveIcon` as bytes in a game libc heap buffer of its size,
+freed after the call (the save service cannot open a packed path, and a
+path to a decoded copy under /data/ampr_cache hung the service call);
+`sceSaveDataMount3` answers a BUSY mount of a directory the game already
+has mounted with that mount's point, and `sceSaveDataUmount2` counts its
+owners, so only the last owner's unmount reaches the service. An
+interrupted save left a slot the game kept mounted and mounted again: BUSY
+there hung the load forever when passed back, and unmounting the game's
+other points instead made another title hang on close. Every other mount
+and unmount passes through. The debug build adds pass-through probes on 13
+more save and dialog calls (`probe` in `rt/save.rs`, `fs V` lines).
 CI (`.github/workflows/build.yml`) runs the same commands; a pushed `v*` tag creates a draft release with both `.sprx` and `SHA256SUMS`.
 
 ## Conventions
@@ -140,32 +169,54 @@ CI (`.github/workflows/build.yml`) runs the same commands; a pushed `v*` tag cre
 - Memory budget: runtime memory is in the PRX's static .bss pool;
   nothing comes from the game's direct or flexible memory (the pool did not
   lower the game's free direct memory, direct allocations did; flexible
-  memory had 0-28 MiB free during play). The one exception is the Rust
-  global allocator (`LibcAlloc` in `lib.rs`), which uses the game's libc
-  heap: iced-x86 only. Keep it to that; zstd decoders use a static DCtx
+  memory had 0-28 MiB free during play). The Rust global allocator
+  (`LibcAlloc` in `lib.rs`, iced-x86 only) takes a 384 KiB bump block in
+  the pool (`rt/heap.rs`; iced-x86 peaked at 190,276 B on the host and its
+  bump top reached 246,688 B on a console) and
+  falls back to the game's libc heap only past it (debug `heap_libc_bytes`).
+  The one other use of the game's libc heap is a packed save icon
+  (`read_packed` in `rt/pack/mmap.rs`): a buffer of the icon's size for the
+  one sceSaveDataSaveIcon call, freed when it returns (551,096 B on one
+  title; a failed malloc skips the icon). Keep it to these two; zstd decoders use a static DCtx
   in a pool workspace (`ZstdDecoder::init_in` in `crates/ampr-codec`).
   Ledgers (`rt/index_memory.rs`):
   Index 80 MiB (the compiled index view, the pack index tables kept
-  after the mount, the walk build, the 64 KiB build windows, the save
-  icon buffer), Cache 64 MiB (one decoded chunk cache, carved at
-  startup; pack chunks are read with exact-size reads, the only read
-  path, and no read pages are cached), Buffer 28.44 MiB (4 x 1 MiB decode +
-  12 x 2 MiB I/O windows + 4 x 112 KiB zstd decoder workspaces, one per
-  live zstd worker, taken at its start and freed when it retires; with
-  `AMPR_ZSTD_MMAP=1` 4 more for the decode-on-access slots), plus a 2 MiB budget for the fixed sites
-  listed at `STATIC_POOL_SIZE` in `rt/runtime_memory.rs` (1.56 MiB used; a
-  host test fails on a new pool call). A build-time assert checks that the
-  caps plus the budget fit the pool. Both PRX builds load to the same
-  184.44 MiB (PT_LOAD memsz, below 192 MiB; v0.3.4 loaded at 200.7 MiB):
-  the release pool is 175.83 MiB
-  (`AMPR_INTERNAL_POOL_SIZE` `0xafd4000`), the debug one 174.47 MiB
-  (`AMPR_DEBUG_POOL_SIZE` `0xae78000`), the gap being the debug build's
-  larger non-pool part (9.97 vs 8.61 MiB). `AMPR_ZSTD_MMAP=1` grows both
-  pools by 448 KiB (184.88 MiB, computed). `dist` fails when the two totals
-  differ by more than 64 KiB or reach 192 MiB (`PRX_TOTAL_LIMIT` in
-  `tools/verify_payload_prx.py --prx-totals`); then update the gap in the
-  Makefile. A refused allocation degrades (index: one notice, packs
-  unserved; cache off; icon skipped). Every I/O window is taken at the
+  after the mount, the walk build, the 64 KiB build windows), Buffer
+  28.44 MiB (4 x 1 MiB decode + 12 x 2 MiB I/O windows + 4 x 112 KiB zstd
+  decoder workspaces, one per live zstd worker, taken at its start and
+  freed when it retires), and Cache, the rest of the pool
+  (`CACHE_MEMORY_MAX` = pool - Index - Buffer - sites budget - stack
+  block, rounded down to 16 KiB; 134.98 MiB release, 133.64 MiB debug).
+  The cache is one decoded chunk cache carved at the pack mount and carved
+  again, still empty, once the index view is finished: the Index cap's idle
+  room above 4 MiB (`INDEX_KEPT_ROOM`) moves to the Cache cap and the cache
+  takes it in one block (`grow_cache_from_index` in `rt/pack/manifest.rs`,
+  debug `cache_grown_bytes`; about 70 MiB more on a title using 5.6 MiB of
+  Index). Nothing may allocate from the Index ledger after startup beyond
+  that kept room; the debug /bench buffer is the only such use. Pack chunks are
+  read with exact-size reads, the only read path, and no read pages are
+  cached. It keeps a protected segment: the 3rd hit (`cache_protect_hits`)
+  protects an entry, and the clock skips protected entries while they hold
+  at most 50% of the cache (`cache_protect_pct`), so a scan does not evict
+  the hot set; a partial-chunk read is admitted on its first touch, a
+  full-chunk read on its second. Outside the ledgers: the 2 MiB thread
+  stack block (`STACK_MEMORY_MAX`, `rt/thread_stack.rs`) and a 2 MiB budget
+  for the fixed sites listed at `STATIC_POOL_SIZE` in
+  `rt/runtime_memory.rs` (1.94 MiB used, the heap block included; a host
+  test fails on a new pool call). A build-time assert checks that the
+  caps plus the budget fit the pool. Both PRX builds load to at most
+  256 MiB (PT_LOAD memsz), within a 16 KiB page of it, with no padding:
+  the release pool is 247.42 MiB (`AMPR_INTERNAL_POOL_SIZE` `0xf76c000`),
+  the debug one 246.07 MiB (`AMPR_DEBUG_POOL_SIZE` `0xf614000`), the gap
+  being the debug build's larger non-pool part (9.91 vs 8.57 MiB; totals
+  268,427,394 and 268,422,914 B, 4,480 B apart, from `dist`). `dist` fails
+  when the two totals differ by more than 64 KiB or exceed 256 MiB
+  (`PRX_TOTAL_LIMIT` in `tools/verify_payload_prx.py --prx-totals`); then
+  recompute both pools, (256 MiB - non-pool) rounded down to 16 KiB, and
+  update the Makefile comment, `DEFAULT_POOL_SIZE` and the host test
+  `cache_is_the_pool_remainder`. Before: 184.44 MiB totals, a 64 MiB
+  cache, pools `0xafd4000` and `0xae78000`. A refused allocation degrades
+  (index: one notice, packs unserved; cache off). Every I/O window is taken at the
   worker start, after the decode buffers, and the pipeline count is the
   windows granted: there is no slow path for a read without one. A title
   has one compiled index view, built at module_start in one pass over
@@ -205,7 +256,10 @@ CI (`.github/workflows/build.yml`) runs the same commands; a pushed `v*` tag cre
   memory, since. Pkg and rw mode add .bss statics outside
   the pool, in both builds: `KRAKEN_PKG_PATH` (269 B) and
   two atomics (9 B) in `rt/pack/pkg.rs`, `PACK_FORMAT` (1 B) in
-  `rt/pack/mod.rs` and `APP0_WRITABLE` (1 B) in `rt/rw.rs`. Any change
+  `rt/pack/mod.rs` and `APP0_WRITABLE` (1 B) in `rt/rw.rs`. The pool
+  stacks and heap add `STACKS` in `rt/thread_stack.rs` (24 records and a
+  128-bit page map, about 0.6 KiB) and `HEAP` in `rt/heap.rs` (about
+  48 B). Any change
   that grows runtime memory needs a measurement and an updated Makefile
   comment.
 - Comments: plain prose `//!` and `///`, saying why, with the measured numbers
@@ -223,8 +277,12 @@ CI (`.github/workflows/build.yml`) runs the same commands; a pushed `v*` tag cre
    `tools/verify_payload_prx.py` on the linked PRX and SPRX, and
    `tools/check_stack_frames.py`, which fails when a hook-path function's
    stack frame passes its budget (hooks run on the game's own small
-   stacks; v0.4.0 overflowed a save thread's). A change that grows one
-   moves the cold code out of line instead of raising the budget.
+   stacks; v0.4.0 overflowed a save thread's). It also sums three chains
+   against 0x1000 each: the packed open (0xcc8 release, 0x940 debug), the
+   packed POSIX read on the caller's thread (`READ_CHAIN`, 0x770 release,
+   0x750 debug), and the save icon's packed read under the icon hook
+   (`ICON_READ_CHAIN`, 0xbc8 release, 0x818 debug). A change that grows one moves the cold code out
+   of line instead of raising the budget.
 3. Runtime behavior changes need a run on a console with
    `libSceAmpr-debug.sprx`: read `http://<ps5-ip>:9090/metrics` before and
    after and compare game wait per read, pack job and disk read time
@@ -252,6 +310,36 @@ in `rt/hook.rs` (`sceKernelLoadStartModule_equeue_observer`).
 Performance numbers in `README.md` and the Makefile comments come from
 on-console runs read from the debug build's `/metrics` page. Raw run data is
 not kept in the repo; state the game, build and settings next to new numbers.
+
+## Removed
+
+Removed in the 256 MiB change. Do not rebuild one without new evidence.
+The save data hooks were removed too and came back: without them the title
+that needs the icon hook hung on its first save.
+
+- mmap decode on access (`rt/pack/mmap_fault.rs`, 1210 lines,
+  `AMPR_ZSTD_MMAP=1`, hook ids 98 and 99, 4 x 112 KiB Buffer workspaces,
+  2 MiB Index scratch). Three fully packed games on a console never mmapped
+  a packed file (`mmap_virtual` 0), and eight known limits were unsolved.
+  The mmap disk cache (mode 2, ids 96 and 97) stays.
+- Read-ahead (`rt/pack/readahead.rs`, knobs
+  `AMPR_PACK_READAHEAD_CHUNKS` and `..._MAX_DISK_INFLIGHT`, debug `ra`,
+  `ra_gate`). Off by default; with the pread pool it gave 1.62 vs 1.60 ms
+  per read, a worst read of 36.2 vs 26.7 ms, and on a second title doubled
+  disk bytes (1.69 vs 0.78 per game byte).
+- Lane EOP overlap (`rt/reactor/lane_overlap.rs`, 612 lines, knob
+  `lane_eop_overlap`). Off in both builds; 7.7 vs 6.1 ms per job at 32
+  pread threads on loose files.
+- Equeue user-space local wait (knob `equeue_local`). Off in both builds;
+  when on it missed native events from paths the overlay does not hook.
+  Queue tracking stays.
+- Upstream stubs never enabled: cross-EOP read-ahead
+  (`rt/reactor/backoff.rs`) and full-file fd promotion
+  (`rt/reactor/software.rs`, `rt/reactor/submit.rs`).
+- fd read threads (`READ_THREADS` in `rt/pack/fd_read.rs`, 4 threads of
+  128 KiB stack, their queue and load group). They existed because the AIO
+  path needed about 32 KB of the caller's stack (a game's video I/O thread
+  hit its guard page); the sync read on the caller's thread needs 0x758 B.
 
 ## Do not commit
 

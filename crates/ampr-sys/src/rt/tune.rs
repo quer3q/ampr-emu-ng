@@ -1,11 +1,11 @@
 //! Tuning knobs of the debug build (`make AMPR_MEM_REPORT=1`). All knobs are
 //! read from TUNE_PATH once, in module_start before the hooks install
 //! (rt/exports.rs). Startup knobs (cache size, workers, pipelines, pread
-//! threads, zstd_verify, equeue_local, pack worker stack) are used once at
+//! threads, zstd_verify, pack worker stack) are used once at
 //! startup; live knobs
-//! (read-ahead and its disk gate, pread pool on/off for pack and loose reads,
-//! the reactor's per-pass and per-read issue limits, lane EOP overlap, the
-//! thread budget and runtime thread spin and regrow times)
+//! (pread pool on/off for pack and loose reads,
+//! the reactor's per-pass and per-read issue limits, the thread budget and
+//! runtime thread spin and regrow times)
 //! take effect on the next read, reactor pass or thread idle check.
 //! `GET /set?k=v&...` on the metrics port changes both and rewrites TUNE_PATH,
 //! so startup knobs apply on the next game launch; `profile=low|medium|high`
@@ -13,12 +13,11 @@
 //! `ON` is false and the atomics are never read.
 
 use super::pack::{
-    AMPR_EMU_PACK_DECODED_CACHE_BYTES, AMPR_EMU_PACK_PIPELINE_SLOTS,
-    AMPR_EMU_PACK_READAHEAD_CHUNKS, AMPR_EMU_PACK_READAHEAD_MAX_DISK_INFLIGHT,
-    AMPR_EMU_PACK_WORKERS, AMPR_EMU_PACK_WORKER_CAPACITY,
+    AMPR_EMU_PACK_DECODED_CACHE_BYTES, AMPR_EMU_PACK_PIPELINE_SLOTS, AMPR_EMU_PACK_WORKERS,
+    AMPR_EMU_PACK_WORKER_CAPACITY,
 };
 use super::reactor::{
-    kSoftwareReadChunkMax, AMPR_EMU_APR_LANE_EOP_OVERLAP, AMPR_EMU_APR_LOOSE_PREAD,
+    kSoftwareReadChunkMax, AMPR_EMU_APR_LOOSE_PREAD,
     AMPR_EMU_APR_LOOSE_PREAD_PART_KIB, AMPR_EMU_APR_PER_READ_ACTIVE_BYTES,
     AMPR_EMU_APR_PER_READ_ACTIVE_CHUNKS, AMPR_EMU_APR_READ_CHUNK_QUANTUM,
     AMPR_EMU_APR_READ_PASS_MAX_BYTES, AMPR_EMU_PACK_PREAD_WORKERS,
@@ -48,8 +47,6 @@ pub(crate) const RELEASE_PREAD_THREADS: u32 = 6;
 /// Most worker threads the runtime grows, all groups together, both builds
 /// (rt/thread_hooks.rs budget); the debug knob `thread_budget` lowers it.
 pub(crate) const THREAD_BUDGET: u32 = 16;
-/// Upper bound of `ra` (one u64 bitmask per read-ahead job, pack/readahead.rs).
-pub(crate) const RA_MAX: u32 = 64;
 
 pub(crate) struct Knob {
     pub name: &'static str,
@@ -77,24 +74,23 @@ const MIB: u64 = 1024 * 1024;
 const DECODED_MIB: usize = 0;
 const WORKERS: usize = 1;
 const PIPELINES: usize = 2;
-const RA: usize = 3;
-const RA_GATE: usize = 4;
-const PREAD: usize = 5;
-const PREAD_THREADS: usize = 6;
-const LOOSE_PREAD: usize = 7;
-const LOOSE_PREAD_PART_KIB: usize = 8;
-const READ_PASS_KIB: usize = 9;
-const READ_CHUNK_QUANTUM: usize = 10;
-const PER_READ_ACTIVE_KIB: usize = 11;
-const PER_READ_ACTIVE_CHUNKS: usize = 12;
-const LANE_EOP_OVERLAP: usize = 13;
-const PREAD_WAKE_ALL: usize = 14;
-const ZSTD_VERIFY: usize = 15;
-const EQUEUE_LOCAL: usize = 16;
-const THREAD_BUDGET_KNOB: usize = 17;
-const SPIN_US: usize = 18;
-const REGROW_S: usize = 19;
-const WORKER_STACK_KIB: usize = 20;
+const PREAD: usize = 3;
+const PREAD_THREADS: usize = 4;
+const LOOSE_PREAD: usize = 5;
+const LOOSE_PREAD_PART_KIB: usize = 6;
+const READ_PASS_KIB: usize = 7;
+const READ_CHUNK_QUANTUM: usize = 8;
+const PER_READ_ACTIVE_KIB: usize = 9;
+const PER_READ_ACTIVE_CHUNKS: usize = 10;
+const PREAD_WAKE_ALL: usize = 11;
+const ZSTD_VERIFY: usize = 12;
+const THREAD_BUDGET_KNOB: usize = 13;
+const SPIN_US: usize = 14;
+const REGROW_S: usize = 15;
+const WORKER_STACK_KIB: usize = 16;
+const CACHE_PROTECT_HITS: usize = 17;
+const CACHE_PROTECT_PCT: usize = 18;
+const RETIRE_LOAD: usize = 19;
 
 // ---- runtime thread lifetime (rt/thread_hooks.rs) ----
 // Release values; the debug knobs of the same names default to them.
@@ -102,12 +98,25 @@ const WORKER_STACK_KIB: usize = 20;
 /// Microseconds an idle runtime thread spins before it parks; 0 parks at once.
 pub(crate) const SPIN_US_DEFAULT: u32 = 0;
 /// Quiet seconds after a thread creation failure before the budget regrows
-/// by one and pressure mode ends (rt/thread_hooks.rs). Retirement is by load,
-/// so the groups shrink by themselves; 10 s gives the budget back sooner
-/// than the earlier 30 s.
-pub(crate) const REGROW_S_DEFAULT: u32 = 10;
+/// by one and pressure mode ends (rt/thread_hooks.rs). With load retirement
+/// off a started thread stays, so pressure mode is the only way threads go
+/// back to the game: 5 s holds it after the last failure, against 10 s and
+/// 30 s before.
+pub(crate) const REGROW_S_DEFAULT: u32 = 5;
 /// Pack worker stack in KiB; 0 keeps the system default.
 pub(crate) const WORKER_STACK_KIB_DEFAULT: u32 = 0;
+
+// ---- decoded cache protected segment (pack/caches.rs) ----
+// Release values; the debug knobs of the same names default to them.
+
+/// Hits a cached chunk takes while cached before it turns protected; 0
+/// protects nothing (the plain clock). 3 separates chunks a game rereads
+/// from those read twice while loading; untuned starting value.
+pub(crate) const CACHE_PROTECT_HITS_DEFAULT: u32 = 3;
+/// Most of the cache, in percent, that protected entries keep before the
+/// hand demotes them. Half: a larger share leaves new level data churning
+/// in a small probation area.
+pub(crate) const CACHE_PROTECT_PCT_DEFAULT: u32 = 50;
 
 /// Smallest pass budget and per-read active window, in KiB: one full read
 /// slice (kSoftwareReadChunkMax, 512 KiB). A smaller value would leave a full
@@ -117,17 +126,15 @@ const READ_SLICE_KIB: u32 = (kSoftwareReadChunkMax / 1024) as u32;
 /// Largest pass budget and per-read active window, in KiB (16 MiB).
 const READ_LIMIT_MAX_KIB: u32 = 16 * 1024;
 
+/// `decoded_mib` default: the Cache cap in MiB rounded up (134 in the debug
+/// pool), so the default cache is cut to the whole cap, as in release.
+const DECODED_MIB_DEFAULT: u32 = AMPR_EMU_PACK_DECODED_CACHE_BYTES.div_ceil(MIB) as u32;
+
 /// Cache size: 0 turns the decoded cache off (reads bypass it); otherwise it is
 /// cut to the room under the Cache cap, and off when that leaves less than the
 /// smaller of the knob and 16 MiB (pack/manifest.rs `cache_region`).
-pub(crate) static KNOBS: [Knob; 21] = [
-    knob(
-        "decoded_mib",
-        false,
-        0,
-        512,
-        (AMPR_EMU_PACK_DECODED_CACHE_BYTES / MIB) as u32,
-    ),
+pub(crate) static KNOBS: [Knob; 20] = [
+    knob("decoded_mib", false, 0, 512, DECODED_MIB_DEFAULT),
     knob(
         "workers",
         false,
@@ -141,14 +148,6 @@ pub(crate) static KNOBS: [Knob; 21] = [
         1,
         AMPR_EMU_PACK_PIPELINE_SLOTS as u32,
         RELEASE_PIPELINES,
-    ),
-    knob("ra", true, 0, RA_MAX, AMPR_EMU_PACK_READAHEAD_CHUNKS),
-    knob(
-        "ra_gate",
-        true,
-        0,
-        64,
-        AMPR_EMU_PACK_READAHEAD_MAX_DISK_INFLIGHT,
     ),
     knob("pread", true, 0, 1, 1),
     knob(
@@ -194,20 +193,15 @@ pub(crate) static KNOBS: [Knob; 21] = [
         32,
         AMPR_EMU_APR_PER_READ_ACTIVE_CHUNKS,
     ),
-    knob(
-        "lane_eop_overlap",
-        true,
-        0,
-        1,
-        AMPR_EMU_APR_LANE_EOP_OVERLAP as u32,
-    ),
     knob("pread_wake_all", true, 0, 1, 0),
     knob("zstd_verify", false, 0, 1, ON as u32),
-    knob("equeue_local", false, 0, 1, 0),
     knob("thread_budget", true, 1, THREAD_BUDGET, THREAD_BUDGET),
     knob("spin_us", true, 0, 200, SPIN_US_DEFAULT),
     knob("regrow_s", true, 1, 60, REGROW_S_DEFAULT),
     knob("worker_stack_kib", false, 0, 1024, WORKER_STACK_KIB_DEFAULT),
+    knob("cache_protect_hits", true, 0, 255, CACHE_PROTECT_HITS_DEFAULT),
+    knob("cache_protect_pct", true, 0, 100, CACHE_PROTECT_PCT_DEFAULT),
+    knob("retire_load", true, 0, 1, 0),
 ];
 
 /// (name, [decoded_mib, workers, pipelines]). The decoded sizes are the
@@ -227,7 +221,7 @@ fn get(i: usize) -> u32 {
 
 pub(crate) fn decoded_bytes() -> usize {
     if ON {
-        get(DECODED_MIB) as usize * MIB as usize
+        (get(DECODED_MIB) as u64 * MIB).min(AMPR_EMU_PACK_DECODED_CACHE_BYTES) as usize
     } else {
         AMPR_EMU_PACK_DECODED_CACHE_BYTES as usize
     }
@@ -246,20 +240,6 @@ pub(crate) fn pipelines() -> usize {
         (get(PIPELINES) as usize).min(AMPR_EMU_PACK_PIPELINE_SLOTS)
     } else {
         AMPR_EMU_PACK_PIPELINE_SLOTS
-    }
-}
-pub(crate) fn ra() -> u32 {
-    if ON {
-        get(RA)
-    } else {
-        AMPR_EMU_PACK_READAHEAD_CHUNKS
-    }
-}
-pub(crate) fn ra_gate() -> u32 {
-    if ON {
-        get(RA_GATE)
-    } else {
-        AMPR_EMU_PACK_READAHEAD_MAX_DISK_INFLIGHT
     }
 }
 /// 1: pack physical reads go to the pread pool (reactor/pread_pool.rs); 0: kernel AIO.
@@ -299,17 +279,6 @@ pub(crate) fn pread_wake_all() -> bool {
 pub(crate) fn zstd_verify() -> bool {
     ON && get(ZSTD_VERIFY) != 0
 }
-/// 1 lets the equeue overlay wait on a queue it classified as AMPR-only in
-/// user space (rt/equeue.rs `queue_would_be_exclusive_local_ignoring_amm_health_locked`);
-/// 0, the default in both builds, keeps every tracked wait a native kernel
-/// wait, which the overlay wakes privately to hand over its own events.
-/// The user-space wait missed native events added by paths the overlay
-/// does not hook (a game's save mount was never unmounted, kernel log).
-/// Queues are tracked either way (rt/hook.rs `refresh`): the kernel merges
-/// two events of one id, which hung a save load. The knob is for A/B.
-pub(crate) fn equeue_local() -> bool {
-    ON && get(EQUEUE_LOCAL) != 0
-}
 /// `THREAD_BUDGET`; the debug build reads `thread_budget` (1..=16).
 pub(crate) fn thread_budget() -> u32 {
     if ON {
@@ -333,6 +302,33 @@ pub(crate) fn spin_us() -> u32 {
 pub(crate) fn regrow_ns() -> u64 {
     let s = if ON { get(REGROW_S) } else { REGROW_S_DEFAULT };
     s as u64 * 1_000_000_000
+}
+/// `CACHE_PROTECT_HITS_DEFAULT`; the debug build reads `cache_protect_hits`
+/// (0..=255).
+pub(crate) fn cache_protect_hits() -> u32 {
+    if ON {
+        get(CACHE_PROTECT_HITS)
+    } else {
+        CACHE_PROTECT_HITS_DEFAULT
+    }
+}
+/// `CACHE_PROTECT_PCT_DEFAULT`; the debug build reads `cache_protect_pct`
+/// (0..=100).
+pub(crate) fn cache_protect_pct() -> u32 {
+    if ON {
+        get(CACHE_PROTECT_PCT)
+    } else {
+        CACHE_PROTECT_PCT_DEFAULT
+    }
+}
+/// 0 (release, and the debug default): a runtime thread, once started,
+/// stays until pressure mode gives it back; 1: threads also retire by load
+/// in normal mode (rt/thread_hooks.rs `LoadGroup::retire_due`), as up to
+/// 0.4.1. Load retirement was retuned three times for churn and still
+/// recreated threads it had just retired; keeping them costs only their
+/// pool stacks. The debug build reads `retire_load` live.
+pub(crate) fn retire_load() -> bool {
+    ON && get(RETIRE_LOAD) != 0
 }
 /// Pack worker stack in bytes, 0 for the system default; the debug build
 /// reads `worker_stack_kib` (0..=1024) at startup.
@@ -389,16 +385,6 @@ pub(crate) fn per_read_active_chunks() -> u32 {
         get(PER_READ_ACTIVE_CHUNKS)
     } else {
         AMPR_EMU_APR_PER_READ_ACTIVE_CHUNKS
-    }
-}
-/// 1: a priority lane's next job may parse while the head job has only
-/// completion commands left (reactor/lane_overlap.rs); 0: one parsing job per
-/// lane, as in release.
-pub(crate) fn lane_eop_overlap() -> bool {
-    if ON {
-        get(LANE_EOP_OVERLAP) != 0
-    } else {
-        AMPR_EMU_APR_LANE_EOP_OVERLAP
     }
 }
 
@@ -611,7 +597,6 @@ pub(crate) mod tests {
             b"per_read_active_kib=16385",
             b"per_read_active_chunks=0",
             b"per_read_active_chunks=33",
-            b"lane_eop_overlap=2",
         ] {
             assert_eq!(
                 apply(bad),
@@ -624,24 +609,20 @@ pub(crate) mod tests {
             knob_value(READ_CHUNK_QUANTUM),
             AMPR_EMU_APR_READ_CHUNK_QUANTUM
         );
-        assert_eq!(knob_value(LANE_EOP_OVERLAP), 0);
         assert_eq!(
-            apply(b"read_pass_kib=4096&read_chunk_quantum=32&per_read_active_kib=8192&per_read_active_chunks=16&lane_eop_overlap=1"),
+            apply(b"read_pass_kib=4096&read_chunk_quantum=32&per_read_active_kib=8192&per_read_active_chunks=16"),
             Ok(())
         );
         assert_eq!(knob_value(READ_PASS_KIB), 4096);
         assert_eq!(knob_value(READ_CHUNK_QUANTUM), 32);
         assert_eq!(knob_value(PER_READ_ACTIVE_KIB), 8192);
         assert_eq!(knob_value(PER_READ_ACTIVE_CHUNKS), 16);
-        // Release builds ignore the knob and use the constant (off).
-        assert_eq!(lane_eop_overlap(), ON);
         assert_eq!(
-            apply(b"read_pass_kib=512\nread_chunk_quantum=8\nper_read_active_kib=2048\nper_read_active_chunks=4\nlane_eop_overlap=0"),
+            apply(b"read_pass_kib=512\nread_chunk_quantum=8\nper_read_active_kib=2048\nper_read_active_chunks=4"),
             Ok(())
         );
         assert_eq!(knob_value(READ_PASS_KIB), 512);
         assert_eq!(knob_value(PER_READ_ACTIVE_CHUNKS), 4);
-        assert!(!lane_eop_overlap());
     }
 
     /// The tune file may hold removed knobs and junk lines: they are skipped
@@ -651,14 +632,11 @@ pub(crate) mod tests {
     fn tune_file_skips_unknown_lines_and_save_fits() {
         let _lock = knob_lock();
         let file = b"ra=8\napp0_direct=1\napp0_backing=/data/homebrew/%5BX%5D\r\n\
-            # comment\nnot a pair\nread_chunk_quantum=32\nlane_eop_overlap=0\n";
+            # comment\nnot a pair\nread_chunk_quantum=32\nlane_eop_overlap=0\nequeue_local=1\n";
         apply_file(file);
-        assert_eq!(knob_value(RA), 8);
         assert_eq!(knob_value(READ_CHUNK_QUANTUM), 32);
-        assert_eq!(knob_value(LANE_EOP_OVERLAP), 0);
         // /set queries still report the first bad pair.
         assert_eq!(apply(b"app0_direct=1"), Err(&b"app0_direct=1"[..]));
-        KNOBS[RA].v.store(AMPR_EMU_PACK_READAHEAD_CHUNKS, Relaxed);
         KNOBS[READ_CHUNK_QUANTUM]
             .v
             .store(AMPR_EMU_APR_READ_CHUNK_QUANTUM, Relaxed);
@@ -697,14 +675,14 @@ pub(crate) mod tests {
     }
 
     /// The sizing knobs are plain numbers with the build defaults (workers
-    /// 4, pipelines 12, decoded cache 64 MiB); `auto`, junk and the removed
+    /// 4, pipelines 12, decoded cache the Cache cap); `auto`, junk and the removed
     /// `workers_min`/`pipelines_min` are rejected without storing; 0 turns
     /// the cache off.
     #[test]
     fn sizing_knobs_take_numbers_only() {
         let _lock = knob_lock();
         let defaults = [
-            (DECODED_MIB, 64),
+            (DECODED_MIB, DECODED_MIB_DEFAULT),
             (WORKERS, AMPR_EMU_PACK_WORKERS),
             (PIPELINES, RELEASE_PIPELINES),
         ];
@@ -755,7 +733,7 @@ pub(crate) mod tests {
         let file = buf[..len].to_vec();
         let text = String::from_utf8(file.clone()).unwrap();
         assert!(text.contains("workers=3\n") && text.contains("pipelines=7\n"), "{text}");
-        assert!(text.contains("decoded_mib=64\n"), "{text}");
+        assert!(text.contains(&format!("decoded_mib={DECODED_MIB_DEFAULT}\n")), "{text}");
         assert_eq!(apply(b"workers=2&pipelines=4&decoded_mib=48"), Ok(()));
         assert_eq!(apply(&file), Ok(()));
         let loaded: Vec<u32> = KNOBS.iter().map(|k| k.v.load(Relaxed)).collect();

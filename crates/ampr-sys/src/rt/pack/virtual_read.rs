@@ -86,20 +86,7 @@ pub(crate) unsafe fn cleanup_pipeline_continuation(
 ) {
     unsafe {
         if pipeline.decoded_lease.entry != INVALID_INDEX {
-            // A failed read-ahead drops its entry (transient error), so a later
-            // game read of the chunk loads it again instead of seeing Failed.
-            // Read through the raw state pointer: `pipeline` lives inside PackState.
-            let owner = pipeline.owner;
-            let prefetch = owner != INVALID_INDEX
-                && (*pack_state_create()).virtual_aio[owner as usize].prefetch_chunks != 0;
-            cache_publish(
-                &mut pipeline.decoded_lease,
-                if prefetch {
-                    SCE_KERNEL_ERROR_EAGAIN
-                } else {
-                    error
-                },
-            );
+            cache_publish(&mut pipeline.decoded_lease, error);
             cache_release(&mut pipeline.decoded_lease);
         }
         if pipeline.pack_fd >= 0 && !pipeline.native_accepted {
@@ -207,10 +194,7 @@ pub(crate) unsafe fn advance_virtual_read_aio(
             PipelineStep::Failed
         };
         let state = pack_state();
-        // A read-ahead job (readahead.rs) has no result or destination: it only loads
-        // missing chunks into the decoded cache and skips every other chunk.
-        let prefetch = job.prefetch_chunks != 0;
-        if (job.request.result.is_null() && !prefetch) || job.request.offset < 0 {
+        if job.request.result.is_null() || job.request.offset < 0 {
             return set_error(SCE_KERNEL_ERROR_EINVAL);
         }
         let (task_file, logical_size, file_flags) = match try_packed_read_file(state, job.file_id) {
@@ -223,7 +207,7 @@ pub(crate) unsafe fn advance_virtual_read_aio(
         if job.request.nbyte == 0 || offset >= logical_size {
             return PipelineStep::Complete;
         }
-        if job.request.buf.is_null() && !prefetch {
+        if job.request.buf.is_null() {
             return set_error(SCE_KERNEL_ERROR_EFAULT);
         }
         // Task destination offsets are u32: a read of 4 GiB or more is cut
@@ -265,7 +249,7 @@ pub(crate) unsafe fn advance_virtual_read_aio(
             let chunk = task.chunk;
             if pipeline.decoded_lease.entry == INVALID_INDEX {
                 match acquire_task_decoded_chunk(
-                    pipeline, &chunk, &task, file_flags, prefetch, output, error_out,
+                    pipeline, &chunk, &task, file_flags, output, error_out,
                 ) {
                     Ok(true) => {
                         pipeline.task_index += 1;
@@ -278,14 +262,13 @@ pub(crate) unsafe fn advance_virtual_read_aio(
 
             if !pipeline_window_contains(pipeline, &chunk) {
                 if let Some(step) = prepare_exact_task_window(
-                    state, pipeline, file_ptr, offset, length, &chunk, prefetch, error_out,
+                    state, pipeline, file_ptr, offset, length, &chunk, error_out,
                 ) {
                     return step;
                 }
             }
 
-            let decode_rc =
-                decode_task_chunk(state, worker, pipeline, &chunk, &task, prefetch, output);
+            let decode_rc = decode_task_chunk(state, worker, pipeline, &chunk, &task, output);
             if decode_rc != 0 {
                 note_decode_error(job.file_id, task.chunk_index, &chunk, decode_rc);
                 return fail_virtual_read(pipeline, decode_rc, error_out);
@@ -359,8 +342,8 @@ unsafe fn finish_virtual_read_native_io(
 }
 
 /// Looks the task's chunk up in the decoded cache: a hit is copied out, a
-/// miss takes the loader lease. Ok(true) when the task is finished (copied,
-/// or nothing to prefetch), Ok(false) when the chunk must be decoded,
+/// miss takes the loader lease. Ok(true) when the task is finished (copied),
+/// Ok(false) when the chunk must be decoded,
 /// Err(step) to return.
 #[allow(clippy::too_many_arguments)]
 unsafe fn acquire_task_decoded_chunk(
@@ -368,7 +351,6 @@ unsafe fn acquire_task_decoded_chunk(
     chunk: &AmprPackChunkView,
     task: &AmprPackBlockReadTask,
     file_flags: u32,
-    prefetch: bool,
     output: *mut u8,
     error_out: *mut c_int,
 ) -> Result<bool, PipelineStep> {
@@ -378,30 +360,23 @@ unsafe fn acquire_task_decoded_chunk(
     let waiter = key_hash != 0 && pipeline.decoded_wait_key == key_hash;
     pipeline.decoded_wait_key = 0;
     prepare_cache_wait(pipeline, key_hash);
-    let mut cache = cache_acquire(chunk, file_flags, false, prefetch, waiter);
-    if prefetch && cache.kind != CacheAcquireKind::Load {
-        // Cached, being loaded, failed or no room: nothing to prefetch.
-        cache_release(&mut cache.lease);
-        return Ok(true);
-    }
+    let full_chunk = task.source_offset == 0 && task.copy_length == chunk.raw_size;
+    let mut cache = cache_acquire(chunk, file_flags, full_chunk, false, waiter);
     // Pending retries the lookup after the loader publishes; count the final kind only.
     match cache.kind {
         CacheAcquireKind::Load | CacheAcquireKind::Bypass => {
             let repeat =
                 cfg!(feature = "mem_report") && stats::chunk_seen_before(chunk_key_hash(chunk));
-            if !prefetch {
-                stats::add(stats::Stat::CacheMisses, 1);
-                stats::add(
-                    if repeat {
-                        stats::Stat::CacheMissRepeat
-                    } else {
-                        stats::Stat::CacheMissFirst
-                    },
-                    1,
-                );
-            }
+            stats::add(stats::Stat::CacheMisses, 1);
+            stats::add(
+                if repeat {
+                    stats::Stat::CacheMissRepeat
+                } else {
+                    stats::Stat::CacheMissFirst
+                },
+                1,
+            );
         }
-        _ if prefetch => {}
         CacheAcquireKind::Ready => stats::add(stats::Stat::CacheHits, 1),
         CacheAcquireKind::Pending | CacheAcquireKind::Failed => {}
     }
@@ -460,7 +435,6 @@ unsafe fn prepare_exact_task_window(
     logical_offset: u64,
     logical_length: u64,
     chunk: &AmprPackChunkView,
-    prefetch: bool,
     error_out: *mut c_int,
 ) -> Option<PipelineStep> {
     unsafe {
@@ -505,7 +479,7 @@ unsafe fn prepare_exact_task_window(
             pack_id: chunk.pack_id,
         };
         let mut prepare_error = 0;
-        let prepared = prepare_exact_window_aio(&range, pipeline, prefetch, &mut prepare_error);
+        let prepared = prepare_exact_window_aio(&range, pipeline, &mut prepare_error);
         if matches!(
             prepared,
             PipelineStep::YieldIo | PipelineStep::YieldCache | PipelineStep::YieldFd
@@ -529,7 +503,6 @@ unsafe fn decode_task_chunk(
     pipeline: &mut ReadPipelineContext,
     chunk: &AmprPackChunkView,
     task: &AmprPackBlockReadTask,
-    prefetch: bool,
     output: *mut u8,
 ) -> c_int {
     let cache_loader = pipeline.decoded_lease.entry != INVALID_INDEX;
@@ -569,13 +542,8 @@ unsafe fn decode_task_chunk(
         stats::add(stats::Stat::DecodeErrors, 1);
     }
     if cache_loader {
-        let publish_rc = if prefetch && decode_rc != 0 {
-            SCE_KERNEL_ERROR_EAGAIN
-        } else {
-            decode_rc
-        };
-        let waited = cache_publish(&mut pipeline.decoded_lease, publish_rc);
-        if waited || prefetch {
+        let waited = cache_publish(&mut pipeline.decoded_lease, decode_rc);
+        if waited {
             // Requeue game reads parked on this chunk now, not after the whole run.
             let g = PACK_M.lock();
             if wake_cache_waiters_locked(state) {
@@ -583,7 +551,7 @@ unsafe fn decode_task_chunk(
                 QUEUE_CV.notify_all();
             }
         }
-        if decode_rc == 0 && !prefetch {
+        if decode_rc == 0 {
             timed_copy(
                 pipeline.decoded_lease.data.add(task.source_offset as usize),
                 output.add(task.destination_offset as usize),

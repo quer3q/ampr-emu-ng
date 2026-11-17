@@ -53,12 +53,13 @@ pub(crate) use worker::{
 pub(crate) use worker::pread_pool_yield;
 #[cfg(feature = "mem_report")]
 pub(crate) use worker::pread_pool_state;
-pub(crate) use pread_pool::{pread_pool_ask, pread_pool_live, pread_pool_reap};
+pub(crate) use pread_pool::{
+    pread_pool_ask, pread_pool_grow, pread_pool_live, pread_pool_queue_pack, pread_pool_reap,
+};
 #[cfg(feature = "mem_report")]
 pub(crate) use pread_pool::pread_pool_load;
 #[cfg(feature = "mem_report")]
 pub(crate) use native::EQUEUE_TARGETS;
-mod lane_overlap;
 mod loose_pread;
 mod pread_pool;
 pub(crate) use loose_pread::{LooseGpuRegions, LoosePartDone, LoosePartResult};
@@ -139,21 +140,13 @@ pub(crate) const AMPR_EMU_APR_READ_PASS_MAX_BYTES: u64 = 0x80000;
 /// a console (bench). At most 6 threads in both builds, grown by backlog and
 /// retired by load (`LoadGroup` in rt/thread_hooks.rs;
 /// tune::RELEASE_PREAD_THREADS has the measurements), shared by pack groups
-/// and split loose reads. Their 32 KiB stacks are libkernel memory, not the
-/// internal pool.
+/// and split loose reads. Their 64 KiB stacks come from the pool's stack
+/// block (rt/thread_stack.rs).
 pub(crate) const AMPR_EMU_PACK_PREAD_WORKERS: usize = crate::rt::tune::RELEASE_PREAD_THREADS as usize;
 pub(crate) const AMPR_EMU_PACK_PREAD_TASKS: usize = 128;
 /// Loose APR reads (the game's real-fd reads) through the pread pool
 /// (loose_pread.rs). Release default; the debug build reads `loose_pread`.
 pub(crate) const AMPR_EMU_APR_LOOSE_PREAD: bool = true;
-/// Let a lane's next job parse while the head job has only completion
-/// commands (EOP writes, nops, markers) left (lane_overlap.rs). Off in
-/// release; the debug build reads `lane_eop_overlap` (default 0). A game,
-/// loose files, internal SSD, 64 KiB parts, debug /metrics, estimated wait
-/// per job (first issue + reads + notify):
-/// 32 threads off ~6.1 ms, 32 threads on ~7.7 ms (28 loose tasks: the extra
-/// reads only queue), 64 threads off ~6.6 ms, on ~6.4 ms.
-pub(crate) const AMPR_EMU_APR_LANE_EOP_OVERLAP: bool = false;
 /// Part size (KiB) a loose pool read is split into, parts preaded in
 /// parallel into the same destination; the debug build reads
 /// `loose_pread_part_kib`. A game, loose files, internal SSD, 32 threads,
@@ -164,10 +157,11 @@ pub(crate) const AMPR_EMU_APR_LOOSE_PREAD_PART_KIB: u32 = 64;
 /// AMPR_EMU_APR_AIO_INFLIGHT, the most loose reads admission lets in flight.
 /// Debug: AMPR_EMU_PACK_PREAD_WORKERS (6), so the thread count alone sets
 /// the cap. The cap in effect is
-/// min(this, max(threads - AMPR_EMU_APR_LOOSE_PREAD_PACK_RESERVE, 1)), 2 at
-/// 6 threads, so at least 96 of the 128 AMPR_EMU_PACK_PREAD_TASKS stay free
-/// for pack groups; a full table returns EAGAIN and the read goes unsplit or
-/// to kernel AIO (loose_pread.rs).
+/// min(this, max(threads - loose_pread_pack_reserve(), 1)), 2 at 6
+/// threads with packs (6 without), so at least 96 of the 128
+/// AMPR_EMU_PACK_PREAD_TASKS stay free for pack groups; a full table
+/// returns EAGAIN and the read goes unsplit or to kernel AIO
+/// (loose_pread.rs).
 pub(crate) const AMPR_EMU_APR_LOOSE_PREAD_TASKS_MAX: u32 = if crate::rt::tune::ON {
     AMPR_EMU_PACK_PREAD_WORKERS as u32
 } else {
@@ -179,8 +173,22 @@ const _: () = assert!(
 );
 /// pread threads loose reads never take: 4 of the 6 threads
 /// (tune::RELEASE_PREAD_THREADS; debug `pread_threads`, default and max 6)
-/// stay for pack tasks (console peak was 1.9 busy pack threads).
+/// stay for pack tasks (console peak was 1.9 busy pack threads). Only a
+/// title that ships packs keeps it (`loose_pread_pack_reserve`).
 pub(crate) const AMPR_EMU_APR_LOOSE_PREAD_PACK_RESERVE: usize = 4;
+/// The pread threads loose reads leave for pack tasks: the reserve in a
+/// title with packs, 0 without, since no pack task ever comes there. With
+/// the reserve a title without packs split a loose read into at most 2
+/// parts at 6 threads; without it up to 6. The 1.10 ms per read of 64 KiB
+/// parts (docs/read-path-tuning.md) was at 32 threads with 98% of reads
+/// split.
+pub(crate) fn loose_pread_pack_reserve() -> usize {
+    if crate::rt::pack::packs_present() {
+        AMPR_EMU_APR_LOOSE_PREAD_PACK_RESERVE
+    } else {
+        0
+    }
+}
 pub(crate) const AMPR_EMU_APR_COMMAND_BUFFER_LIVE_MAX: usize = 4096;
 pub(crate) const AMPR_EMU_FD_OPEN_BUDGET_CAP: usize = 50;
 pub(crate) const AMPR_EMU_FD_CACHE_CAP: usize = 45; // min(50, max(50*90/100, 1))
@@ -317,12 +325,24 @@ unsafe extern "C" {
         arg: *mut c_void,
         name: *const c_char,
     ) -> c_int;
-    pub(crate) fn scePthreadJoin(thread: ScePthread, value: *mut *mut c_void) -> c_int;
+    /// The import; runtime code joins through `scePthreadJoin` below.
+    #[link_name = "scePthreadJoin"]
+    fn scePthreadJoin_import(thread: ScePthread, value: *mut *mut c_void) -> c_int;
     pub(crate) fn scePthreadSelf() -> ScePthread;
     pub(crate) fn scePthreadRename(thread: ScePthread, name: *const c_char) -> c_int;
     pub(crate) fn scePthreadGetprio(thread: ScePthread, prio: *mut c_int) -> c_int;
     pub(crate) fn scePthreadSetprio(thread: ScePthread, prio: c_int) -> c_int;
     pub(crate) fn scePthreadSetaffinity(thread: ScePthread, mask: SceKernelCpumask) -> c_int;
+}
+
+/// scePthreadJoin for the runtime's own threads: once the thread is gone,
+/// its pool stack is free again (rt/thread_stack.rs). Every runtime join
+/// goes through here (pack/mod.rs re-exports it).
+pub(crate) unsafe fn scePthreadJoin(thread: ScePthread, value: *mut *mut c_void) -> c_int {
+    let rec = crate::rt::thread_stack::detach(thread);
+    let rc = unsafe { scePthreadJoin_import(thread, value) };
+    unsafe { crate::rt::thread_stack::release(rec, rc == 0) };
+    rc
 }
 
 /// SDK macro `sceKernelAioInitialize(param)`.
@@ -1148,15 +1168,6 @@ pub(crate) struct JobState {
     pub(crate) statAcceptNs: u64,
     #[cfg(feature = "mem_report")]
     pub(crate) statReadDoneNs: u64,
-    /// Debug only (lane_overlap.rs, knob `lane_eop_overlap`): source offset + 1
-    /// at which the remaining commands were last classified (0: never), and
-    /// whether they were all completion commands. A positive answer holds for
-    /// every later offset (a suffix of a completion-only tail is one too); a
-    /// negative one only at the same offset. Release has no fields.
-    #[cfg(feature = "mem_report")]
-    pub(crate) laneTailMark: u32,
-    #[cfg(feature = "mem_report")]
-    pub(crate) laneTailCompletionOnly: bool,
     /// Debug only (job_state.rs `stat_gs_resolved`, stats.rs gs_retry_*): the
     /// file id and offset the gather/scatter read at the cursor first resolved
     /// to from the lane cursor, compared when a retry re-resolves it. Zeroed
@@ -1601,7 +1612,10 @@ pub(crate) struct PreadThreadArg {
 
 /// One request of a pread-backed external group. Only the reactor publishes
 /// or retires a slot; a pool thread claims it under preadMutex and publishes
-/// completion with Release.
+/// completion with Release. A pack task (`packCallback` set) is the
+/// exception: a pack worker publishes it (queue_pack_pread) and the pool
+/// thread that runs it retires it and calls `packCallback` itself, so it
+/// never reaches the reactor (it is never DONE).
 pub(crate) struct PreadTask {
     pub(crate) state: AtomicU32,
     pub(crate) request: SceKernelAioRWRequest,
@@ -1617,6 +1631,10 @@ pub(crate) struct PreadTask {
     /// The pread result, written by the pool thread before DONE; a loose
     /// part task (null `request.result`) reports only here.
     pub(crate) returnValue: i64,
+    /// Pack task: completion callback and its context (the pipeline); None
+    /// for a reactor task.
+    pub(crate) packCallback: AprExternalAioCallback,
+    pub(crate) packContext: *mut c_void,
 }
 
 // ---- AprAioReactor ----------------------------------------------------------------
@@ -1661,6 +1679,11 @@ pub(crate) struct AprAioReactor {
     pub(crate) preadArgs: [PreadThreadArg; AMPR_EMU_PACK_PREAD_WORKERS],
     /// Live pool threads (started, not exited), under preadMutex.
     pub(crate) preadThreadCount: usize,
+    /// Of preadThreadCount, the threads whose scePthreadCreate has not
+    /// returned yet, under preadMutex: a creation that fails takes its count
+    /// back, so a task queued for it, or a thread that left because it was
+    /// counted, would strand a queued read (pread_pool.rs `started`).
+    pub(crate) preadStarting: usize,
     /// Idle threads, exits asked of the pool, and the most threads it may
     /// grow to (0 until started); all under preadMutex.
     pub(crate) preadIdle: u32,

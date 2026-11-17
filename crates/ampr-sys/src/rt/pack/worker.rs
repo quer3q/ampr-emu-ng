@@ -3,6 +3,37 @@
 use super::*;
 use core::sync::atomic::{AtomicBool, AtomicI64};
 
+// ---- disk reads in flight ----
+
+/// The pack's physical backing reads in flight (submitted to the reactor, not
+/// yet completed or failed): the `disk_inflight` gauge on `/metrics`.
+pub(crate) static PACK_DISK_INFLIGHT: AtomicU32 = AtomicU32::new(0);
+
+/// Records `reads` accepted backing reads of `pipeline`. PACK_M held.
+pub(crate) fn disk_inflight_add(pipeline: &mut ReadPipelineContext, reads: u32) {
+    pipeline.disk_inflight += reads;
+    PACK_DISK_INFLIGHT.fetch_add(reads, Ordering::AcqRel);
+}
+
+/// Retires the backing reads `pipeline` recorded (terminal reactor event).
+/// PACK_M held; never underflows.
+pub(crate) fn disk_inflight_release(pipeline: &mut ReadPipelineContext) {
+    let reads = core::mem::take(&mut pipeline.disk_inflight);
+    if reads != 0 {
+        let mut current = PACK_DISK_INFLIGHT.load(Ordering::Acquire);
+        while let Err(seen) = PACK_DISK_INFLIGHT.compare_exchange_weak(
+            current,
+            current.saturating_sub(reads),
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            current = seen;
+        }
+    }
+}
+
+// ---- job completion ----
+
 pub(crate) unsafe fn complete_virtual_job(
     state: *mut PackState,
     index: u32,
@@ -14,10 +45,6 @@ pub(crate) unsafe fn complete_virtual_job(
     release_pipeline_locked(state, index);
     if was_fd_waiter {
         PACK_FD_WAITER_COUNT.fetch_sub(1, Ordering::SeqCst);
-    }
-    if (*state).virtual_aio[index as usize].prefetch_chunks != 0 {
-        finish_prefetch_locked(state, index);
-        return;
     }
     let split_group = (*state).virtual_aio[index as usize].split_group;
     let job = &mut (*state).virtual_aio[index as usize];
@@ -238,6 +265,13 @@ const WORKER_EXITED: u8 = 1;
 /// since an exited thread not yet joined may still count against the game's
 /// limit.
 static WORKER_REAP_PENDING: AtomicBool = AtomicBool::new(false);
+/// A queued job asked for one more worker (maybe_grow_workers_locked);
+/// grow_workers starts it with PACK_M released.
+static WORKER_GROW_WANTED: AtomicBool = AtomicBool::new(false);
+/// Claimed worker slots whose thread is being created (claim_worker_locked
+/// to create_claimed_worker), under PACK_M; shutdown waits for 0 before it
+/// joins the workers.
+pub(crate) static WORKER_SPAWNING: AtomicU32 = AtomicU32::new(0);
 static WORKER_EXIT_STATE: [core::sync::atomic::AtomicU8; AMPR_EMU_PACK_WORKER_CAPACITY] =
     [const { core::sync::atomic::AtomicU8::new(WORKER_RUNNING) }; AMPR_EMU_PACK_WORKER_CAPACITY];
 
@@ -309,7 +343,7 @@ fn idle_spin(g: &mut crate::rt::sync::MutexGuard<'_>) -> bool {
 
 // ---- queue wake-ups ----
 
-/// Under PACK_M: jobs in the scheduling queues (not read-ahead).
+/// Under PACK_M: jobs in the scheduling queues.
 unsafe fn queued_jobs_locked(state: *const PackState) -> u32 {
     unsafe { (*state).queue_depth.iter().sum() }
 }
@@ -332,20 +366,25 @@ pub(crate) fn wake_queue_workers(single: bool) {
     }
 }
 
-/// Under PACK_M: pack work a worker must finish: queued or read-ahead jobs,
-/// or a live pipeline (its job parked on I/O, cache or a descriptor).
+/// Under PACK_M: pack work a worker must finish: queued jobs, or a live
+/// pipeline (its job parked on I/O, cache or a descriptor).
 unsafe fn pack_work_locked(state: *const PackState) -> bool {
-    unsafe {
-        queued_jobs_locked(state) != 0
-            || (*state).prefetch_head != INVALID_INDEX
-            || (*state).pipeline_active_count != 0
-    }
+    unsafe { queued_jobs_locked(state) != 0 || (*state).pipeline_active_count != 0 }
 }
 
 /// Under PACK_M: an exit is asked and another worker stays (the last never
 /// leaves, see the worker count notes).
 fn worker_exit_due() -> bool {
-    WORKER_EXIT_REQUESTS.load(Ordering::Relaxed) != 0 && WORKERS_LIVE.load(Ordering::Relaxed) > 1
+    WORKER_EXIT_REQUESTS.load(Ordering::Relaxed) != 0 && workers_running() > 1
+}
+
+/// Under PACK_M: live workers whose creation returned. One still being
+/// created is not counted: its creation may fail, and a worker that left
+/// counting on it would strand the queued jobs if that creation failed.
+fn workers_running() -> u32 {
+    WORKERS_LIVE
+        .load(Ordering::Relaxed)
+        .saturating_sub(WORKER_SPAWNING.load(Ordering::Relaxed))
 }
 
 /// Debug /metrics: live workers and their ceiling.
@@ -377,6 +416,11 @@ unsafe fn reap_workers_locked(state: *mut PackState) {
             continue;
         }
         let worker = &mut (*state).workers[i];
+        // Its creator has not published the handle yet; it flags a reap
+        // once it has (create_claimed_worker).
+        if worker.started && worker.thread.is_null() {
+            continue;
+        }
         if worker.started {
             let _ = unsafe { scePthreadJoin(worker.thread, null_mut()) };
             unsafe { release_worker_decoder(worker) };
@@ -388,9 +432,10 @@ unsafe fn reap_workers_locked(state: *mut PackState) {
     }
 }
 
-/// Under PACK_M: starts the thread of prepared worker slot `i`; on failure
-/// the ceiling drops to the live count (no room).
-unsafe fn spawn_worker_locked(state: *mut PackState, i: usize) -> bool {
+/// Under PACK_M: claims prepared worker slot `i` for a new thread and counts
+/// it live (create_claimed_worker creates it); false when the slot is taken
+/// or the budget or a decoder workspace refuses it.
+unsafe fn claim_worker_locked(state: *mut PackState, i: usize) -> bool {
     let worker = &mut (*state).workers[i];
     if worker.started || worker.decoded_scratch.is_null() {
         return false;
@@ -409,60 +454,117 @@ unsafe fn spawn_worker_locked(state: *mut PackState, i: usize) -> bool {
         super::super::thread_hooks::unreserve();
         return false;
     }
-    let arg = worker as *mut WorkerContext as *mut c_void;
-    let rc = unsafe {
-        super::super::thread_hooks::create_counted(
-            (&mut worker.thread as *mut ScePthread).cast(),
-            pack_worker_entry,
-            arg,
-            c"ampr_pack_worker".as_ptr(),
-            worker_stack(),
-        )
-    };
-    if rc != 0 {
-        // create_counted released the slot and cut the budget; the ceiling
-        // stays, so the workers grow again when the budget does.
-        unsafe { release_worker_decoder(worker) };
-        stats::add(stats::Stat::PackWorkerCreateFailed, 1);
-        return false;
-    }
+    // Live from here, so the thread meets consistent counts when it first
+    // takes PACK_M; its handle is published by create_claimed_worker, and
+    // a reap leaves the slot alone until then.
     worker.started = true;
+    worker.thread = null_mut();
     WORKER_EXIT_STATE[i].store(WORKER_RUNNING, Ordering::Release);
+    WORKER_SPAWNING.fetch_add(1, Ordering::Relaxed);
     let live = WORKERS_LIVE.fetch_add(1, Ordering::Release) + 1;
     WORKER_LOAD.started(live);
     (*state).workers_started += 1;
     PROFILE_STARTED_WORKERS.store((*state).workers_started, Ordering::Release);
     (*state).worker_capacity = (*state).worker_capacity.max((*state).workers_started);
-    stats::add(stats::Stat::PackWorkersStarted, 1);
     true
 }
 
-/// Under PACK_M, after a job was queued: one more worker when none waits,
-/// only the first under pressure (LoadGroup::may_grow). Before the workers
-/// were prepared the ceiling is 0, so nothing starts here.
-pub(crate) unsafe fn maybe_grow_workers_locked(state: *mut PackState) {
-    let live = WORKERS_LIVE.load(Ordering::Relaxed);
-    if WORKERS_IDLE.load(Ordering::Relaxed) != 0
-        || live >= WORKERS_CEILING.load(Ordering::Relaxed)
-        || WORKER_STOP_REQUESTED.load(Ordering::Acquire)
-        || !WORKER_LOAD.may_grow(live)
-    {
-        return;
+/// Creates the thread of slot `i` (claim_worker_locked) and publishes its
+/// handle, or gives the slot back. `locked`: the caller holds PACK_M (the
+/// first start, ensure_workers_locked); otherwise PACK_M is taken only to
+/// publish, so the creation runs with it released (grow_workers).
+unsafe fn create_claimed_worker(state: *mut PackState, i: usize, locked: bool) -> bool {
+    let worker = unsafe { &raw mut (*state).workers[i] };
+    let mut thread: ScePthread = null_mut();
+    let rc = unsafe {
+        super::super::thread_hooks::create_counted(
+            (&mut thread as *mut ScePthread).cast(),
+            pack_worker_entry,
+            worker.cast(),
+            c"ampr_pack_worker".as_ptr(),
+            worker_stack(),
+        )
+    };
+    let _g = (!locked).then(|| PACK_M.lock());
+    let worker = unsafe { &mut *worker };
+    if rc != 0 {
+        // create_counted released the slot and cut the budget; the ceiling
+        // stays, so the workers grow again when the budget does.
+        worker.started = false;
+        let live = WORKERS_LIVE.fetch_sub(1, Ordering::Release) - 1;
+        (*state).workers_started -= 1;
+        PROFILE_STARTED_WORKERS.store((*state).workers_started, Ordering::Release);
+        // An exit asked of the group may have counted this slot: drop what
+        // no live worker can meet (the last never leaves).
+        let meetable = live.saturating_sub(1);
+        if WORKER_EXIT_REQUESTS.load(Ordering::Relaxed) > meetable {
+            WORKER_EXIT_REQUESTS.store(meetable, Ordering::Relaxed);
+        }
+        unsafe { release_worker_decoder(worker) };
+        stats::add(stats::Stat::PackWorkerCreateFailed, 1);
+        WORKER_SPAWNING.fetch_sub(1, Ordering::Release);
+        return false;
     }
-    unsafe { reap_workers_locked(state) };
-    if let Some(i) = (0..AMPR_EMU_PACK_WORKER_CAPACITY)
-        .find(|&i| !(*state).workers[i].started && !(*state).workers[i].decoded_scratch.is_null())
-    {
-        let _ = unsafe { spawn_worker_locked(state, i) };
+    worker.thread = thread;
+    // It may have left already: the next pass through a worker loop joins it.
+    if WORKER_EXIT_STATE[i].load(Ordering::Acquire) == WORKER_EXITED {
+        WORKER_REAP_PENDING.store(true, Ordering::Release);
+    }
+    stats::add(stats::Stat::PackWorkersStarted, 1);
+    WORKER_SPAWNING.fetch_sub(1, Ordering::Release);
+    true
+}
+
+/// Under PACK_M: room for one more worker. One more when none waits, only
+/// the first under pressure (LoadGroup::may_grow). Before the workers were
+/// prepared the ceiling is 0, so nothing starts.
+fn worker_growth_due() -> bool {
+    let live = WORKERS_LIVE.load(Ordering::Relaxed);
+    WORKERS_IDLE.load(Ordering::Relaxed) == 0
+        && live < WORKERS_CEILING.load(Ordering::Relaxed)
+        && !WORKER_STOP_REQUESTED.load(Ordering::Acquire)
+        && WORKER_LOAD.may_grow(live)
+}
+
+/// Under PACK_M, after a job was queued: asks for one more worker when
+/// worker_growth_due. grow_workers starts it once PACK_M is released, on a
+/// thread that holds no lock: a worker after its step, or a pool thread
+/// after it requeued a job (fd_read.rs `complete_pack_pread`). Never the
+/// reactor thread, which queues most jobs: a creation there stalled every
+/// read behind it, and under PACK_M every pack caller.
+pub(crate) unsafe fn maybe_grow_workers_locked(_state: *mut PackState) {
+    if worker_growth_due() {
+        WORKER_GROW_WANTED.store(true, Ordering::Release);
     }
 }
 
-/// Under PACK_M, after read-ahead was queued: a worker when none is live
-/// (all left under pressure). Read-ahead alone grows no more than that.
-pub(crate) unsafe fn start_first_worker_locked(state: *mut PackState) {
-    if WORKERS_LIVE.load(Ordering::Relaxed) == 0 {
-        unsafe { maybe_grow_workers_locked(state) };
+/// Starts the worker maybe_grow_workers_locked asked for. The caller holds
+/// no lock and is not the reactor thread.
+pub(crate) unsafe fn grow_workers() {
+    if !WORKER_GROW_WANTED.load(Ordering::Acquire) {
+        return;
     }
+    let state = g_pack_state.load(Ordering::Acquire);
+    if state.is_null() {
+        return;
+    }
+    let slot = {
+        let _g = PACK_M.lock();
+        if !WORKER_GROW_WANTED.swap(false, Ordering::AcqRel) || !worker_growth_due() {
+            return;
+        }
+        unsafe { reap_workers_locked(state) };
+        let Some(i) = (0..AMPR_EMU_PACK_WORKER_CAPACITY)
+            .find(|&i| !(*state).workers[i].started && !(*state).workers[i].decoded_scratch.is_null())
+        else {
+            return;
+        };
+        if !unsafe { claim_worker_locked(state, i) } {
+            return;
+        }
+        i
+    };
+    let _ = unsafe { create_claimed_worker(state, slot, false) };
 }
 
 /// Pack worker exits asked (`pack_workers_ask`) not yet done; none after
@@ -570,15 +672,14 @@ pub(crate) unsafe extern "C" fn pack_worker_entry(argument: *mut c_void) -> *mut
                 let ready = (stopping && (*state).pipeline_active_count == 0)
                     || worker_exit_due()
                     || wake_fd_waiters_locked(state)
-                    || queue_has_work_for_worker_locked(state, worker_index)
-                    || prefetch_has_work_for_worker_locked(state, worker_index);
+                    || queue_has_work_for_worker_locked(state, worker_index);
                 // After a job, above the load target: leave (never the
                 // last, WORKER_LOAD's floor), meeting an exit asked of the
                 // group if any.
                 if core::mem::take(&mut finished)
                     && !stopping
                     && WORKER_LOAD.retire_due(
-                        WORKERS_LIVE.load(Ordering::Relaxed),
+                        workers_running(),
                         WORKERS_CEILING.load(Ordering::Relaxed),
                         ready || pack_work_locked(state),
                     )
@@ -627,10 +728,7 @@ pub(crate) unsafe extern "C" fn pack_worker_entry(argument: *mut c_void) -> *mut
                 QUEUE_CV.notify_all();
                 return null_mut();
             }
-            index = match queue_pop_locked(state, worker_index) {
-                INVALID_INDEX => prefetch_pop_locked(state, worker_index),
-                popped => popped,
-            };
+            index = queue_pop_locked(state, worker_index);
             if index == INVALID_INDEX {
                 continue;
             }
@@ -665,7 +763,7 @@ pub(crate) unsafe extern "C" fn pack_worker_entry(argument: *mut c_void) -> *mut
         let mut return_value: i64 = 0;
         let mut pipeline_error: c_int = 0;
         let step_start = stats::now();
-        let mut step = unsafe {
+        let step = unsafe {
             advance_virtual_read_aio(
                 &mut *job,
                 &mut *worker,
@@ -675,12 +773,8 @@ pub(crate) unsafe extern "C" fn pack_worker_entry(argument: *mut c_void) -> *mut
             )
         };
         stats::add(stats::Stat::WorkerStepNs, stats::since(step_start));
-        // Read-ahead never competes for pack descriptors.
-        if unsafe { (*job).prefetch_chunks } != 0 && step == PipelineStep::YieldFd {
-            unsafe { cleanup_pipeline_continuation(&mut *pipeline, SCE_KERNEL_ERROR_EAGAIN) };
-            step = PipelineStep::Failed;
-        }
         let mut notify_workers;
+        let mut pread_grow = 0usize;
         let queued_before;
         let single_wake;
         {
@@ -697,7 +791,7 @@ pub(crate) unsafe extern "C" fn pack_worker_entry(argument: *mut c_void) -> *mut
                     if canceled_or_stopping() {
                         queue_push_locked(state, index, pack_telemetry_usecs());
                         notify_workers = true;
-                    } else if submit_pipeline_io_locked(state, index, job, p) {
+                    } else if submit_pipeline_io_locked(state, index, job, p, &mut pread_grow) {
                         notify_workers = true;
                     }
                 }
@@ -740,6 +834,13 @@ pub(crate) unsafe extern "C" fn pack_worker_entry(argument: *mut c_void) -> *mut
         if notify_workers {
             wake_queue_workers(single_wake);
         }
+        // Thread creation, with PACK_M released: the pool threads the read
+        // queued above asked for, and a decode worker queue_push_locked asked
+        // for (grow_workers).
+        if pread_grow != 0 {
+            reactor::pread_pool_grow(pread_grow);
+        }
+        unsafe { grow_workers() };
     }
 }
 
@@ -749,13 +850,18 @@ unsafe fn job_canceled_or_stopping(job: *mut VirtualAioSlot) -> bool {
         || WORKER_STOP_REQUESTED.load(Ordering::Acquire)
 }
 
-/// Hands the pipeline's window read to the reactor. A refused submit requeues the job to finish with that error;
-/// returns true then (workers to wake).
+/// Hands the pipeline's window read to a pread pool thread, queued here
+/// (reactor/pread_pool.rs `queue_pack_pread`, lock order PACK_M ->
+/// preadMutex), or through the reactor when the pool refuses it. A refused
+/// submit requeues the job to finish with that error; returns true then
+/// (workers to wake). `pread_grow`: pool threads to start once PACK_M is
+/// released (reactor::pread_pool_grow).
 unsafe fn submit_pipeline_io_locked(
     state: *mut PackState,
     index: u32,
     job: *mut VirtualAioSlot,
     p: &mut ReadPipelineContext,
+    pread_grow: &mut usize,
 ) -> bool {
     unsafe {
         (*state).virtual_aio[index as usize].phase = VirtualAioPhase::IoQueued;
@@ -765,6 +871,27 @@ unsafe fn submit_pipeline_io_locked(
         let aio_priority = native_pack_priority(priority);
         let io_class = native_pack_io_class(work_class, physical_bytes);
         let ctx = p as *mut ReadPipelineContext as *mut c_void;
+        // The pool thread calls complete_pack_pread, which takes PACK_M, so
+        // it cannot run before this block ends: marking the read submitted
+        // here stands for the reactor's Submitted event.
+        if crate::rt::tune::pread() {
+            if let Ok(grow) = reactor::pread_pool_queue_pack(
+                &*(&p.native_request as *const SceKernelAioRWRequest).cast(),
+                aio_priority,
+                complete_pack_pread,
+                ctx,
+            ) {
+                AtomicBool::from_ptr(&mut p.native_submitted).store(true, Ordering::Release);
+                note_park(&mut (*state).virtual_aio[index as usize], b'i');
+                stats::add(stats::Stat::PackDiskReads, 1);
+                stats::add(stats::Stat::PackPreadDirect, 1);
+                disk_inflight_add(p, 1);
+                stats::add(stats::Stat::PackDiskBytes, physical_bytes as u64);
+                *pread_grow += grow;
+                return false;
+            }
+            stats::add(stats::Stat::PackPreadReactor, 1);
+        }
         let submit_rc = reactor::apr_reactor_submit_external_aio_read(
             (&p.native_request as *const SceKernelAioRWRequest).cast(),
             aio_priority,
@@ -844,19 +971,12 @@ unsafe fn park_on_fd_locked(
 /// Workers and pipelines that fit `room` bytes of the Buffer ledger: a
 /// worker takes its 1 MiB decode buffer at the start and later its 112 KiB
 /// zstd decoder workspace (counted for LZ4 too, so the fit is one bound),
-/// a pipeline its 2 MiB I/O window, and `reserve` stays free for the
-/// decode-on-access decoders. Workers are cut until each has a pipeline,
+/// and a pipeline its 2 MiB I/O window. Workers are cut until each has a pipeline,
 /// so a large worker ask still keeps pipelines for every worker. At the
 /// defaults (28.44 MiB) that is 4 workers and 12 pipelines, 8 workers get
 /// 9. (0, 0) when not one worker fits.
-pub(crate) fn buffer_split(
-    room: usize,
-    reserve: usize,
-    workers: u32,
-    pipelines: usize,
-) -> (u32, usize) {
+pub(crate) fn buffer_split(room: usize, workers: u32, pipelines: usize) -> (u32, usize) {
     let per_worker = PACK_MAX_BLOCK_BYTES + ampr_codec::ZSTD_DECODER_WORKSPACE;
-    let room = room.saturating_sub(reserve);
     let mut workers = workers;
     while workers != 0 {
         let left = room.saturating_sub(workers as usize * per_worker);
@@ -894,8 +1014,24 @@ unsafe fn prepare_worker_scratch(state: *mut PackState, workers: u32) {
         worker.decoded_scratch = scratch;
         worker.decoded_scratch_size = PACK_MAX_BLOCK_BYTES;
         // The zstd decoder (Buffer ledger) is made when the thread starts
-        // and freed when it leaves (spawn_worker_locked, reap_workers_locked).
+        // and freed when it leaves (claim_worker_locked, reap_workers_locked).
     }
+}
+
+/// At the end of startup (rt/index.rs `ensure_ready_slow`, after the cache
+/// regrow, on the thread that loads the index): starts the first decode
+/// worker and takes the Buffer ledger's windows. A packed POSIX read waits on
+/// the game's own thread (fd_read.rs `read_on_workers`), and a first read
+/// would otherwise create that worker there, inside libkernel, on a stack
+/// the stack check does not cover. Decode workers never drop below one
+/// (`LoadGroup::floor`), so no game thread creates one later either.
+pub(crate) unsafe fn start_first_worker() {
+    let state = g_pack_state.load(Ordering::Acquire);
+    if state.is_null() || LOAD_STATE.load(Ordering::Acquire) != PACK_LOAD_READY {
+        return;
+    }
+    let _g = PACK_M.lock();
+    let _ = unsafe { ensure_workers_locked(state) };
 }
 
 pub(crate) unsafe fn ensure_workers_locked(state: *mut PackState) -> bool {
@@ -912,14 +1048,8 @@ pub(crate) unsafe fn ensure_workers_locked(state: *mut PackState) -> bool {
             .iter()
             .map(|w| w.decoded_scratch_size)
             .sum();
-        let reserve = if super::mmap::MMAP_MODE == 1 && !super::mmap_fault::slots_made() {
-            super::mmap_fault::SLOTS * ampr_codec::ZSTD_DECODER_WORKSPACE
-        } else {
-            0
-        };
         let (workers, pipelines) = buffer_split(
             crate::rt::index_memory::buffer_room() + held,
-            reserve,
             (*state)
                 .requested_workers
                 .min(AMPR_EMU_PACK_WORKER_CAPACITY as u32),
@@ -968,7 +1098,7 @@ pub(crate) unsafe fn ensure_workers_locked(state: *mut PackState) -> bool {
         if started >= PACK_WORKERS_START {
             break;
         }
-        if unsafe { spawn_worker_locked(state, i) } {
+        if unsafe { claim_worker_locked(state, i) && create_claimed_worker(state, i, true) } {
             started += 1;
         }
     }
@@ -993,7 +1123,6 @@ pub(crate) fn reset_virtual_aio_slot(
     slot.completion_state = 0;
     slot.return_value = 0;
     slot.submit_ns = 0;
-    slot.prefetch_chunks = 0;
     slot.split_group = INVALID_INDEX;
 }
 
@@ -1001,17 +1130,10 @@ pub(crate) fn reset_virtual_aio_slot(
 mod tests {
     use super::*;
 
-    /// The Buffer cap at the default knobs, with the decode-on-access room
-    /// kept as the worker start keeps it.
+    /// The Buffer cap at the default knobs.
     fn split(workers: u32, pipelines: usize) -> (u32, usize) {
-        let reserve = if super::super::mmap::MMAP_MODE == 1 {
-            super::super::mmap_fault::SLOTS * ampr_codec::ZSTD_DECODER_WORKSPACE
-        } else {
-            0
-        };
         buffer_split(
             crate::rt::index_memory::BUFFER_MEMORY_MAX,
-            reserve,
             workers,
             pipelines,
         )
@@ -1027,9 +1149,9 @@ mod tests {
         assert_eq!(split(16, 16), (9, 9));
         assert_eq!(split(1, 0), (0, 0));
         let one = PACK_MAX_BLOCK_BYTES + ampr_codec::ZSTD_DECODER_WORKSPACE;
-        assert_eq!(buffer_split(one + PACK_PIPELINE_IO_BYTES, 0, 4, 12), (1, 1));
+        assert_eq!(buffer_split(one + PACK_PIPELINE_IO_BYTES, 4, 12), (1, 1));
         assert_eq!(
-            buffer_split(one + PACK_PIPELINE_IO_BYTES - 1, 0, 4, 12),
+            buffer_split(one + PACK_PIPELINE_IO_BYTES - 1, 4, 12),
             (0, 0)
         );
     }

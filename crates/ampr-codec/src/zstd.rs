@@ -19,8 +19,7 @@ const WARM_UP_RAW_SIZE: usize = ZSTD_MAX_CHUNK_SIZE;
 /// 256 KiB of `i % 7`, `zstd -19 -C` (content size and checksum): two
 /// 128 KiB blocks, a 256 KiB window: warm-up decodes the largest frame a
 /// real chunk can be, so a workspace too small for it fails at setup, not on
-/// a game read (the decode-on-access fault handler, ampr-sys
-/// rt/pack/mmap_fault.rs, decodes inside a signal handler).
+/// a game read.
 const WARM_UP_FRAME: [u8; 42] = [
     40, 181, 47, 253, 164, 0, 0, 4, 0, 124, 0, 0, 56, 0, 1, 2, 3, 4, 5, 6, 1, 0, 246, 255, 202,
     139, 17, 69, 0, 0, 0, 1, 0, 253, 255, 202, 11, 16, 147, 29, 0, 1,

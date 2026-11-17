@@ -1,33 +1,30 @@
 //! mmap and sceKernelMmap of a packed file, LZ4 (AMPRPAK4) or zstd packs
 //! (hook ids 96 and 97, installed in both builds while Makefile
-//! `AMPR_ZSTD_MMAP` is not 0; the knob keeps its zstd name), and
-//! munmap/sceKernelMunmap (98 and 99, knob 1 only). A packed file has no
-//! physical copy, so the original call fails on a virtual pack fd. Knob 2
-//! (the default) sends every map to the disk fallback. Knob 1, opt-in and
-//! unverified, decodes zstd packed files on access (rt/pack/mmap_fault.rs:
-//! nothing is decoded until a page is touched); a map it cannot serve, and
-//! every map of an LZ4 packed file, takes the disk fallback. The disk
-//! fallback reads the whole file once through the virtual pread path
-//! (rt/pack/fd_read.rs, which decodes either format in
-//! rt/pack/virtual_read.rs) into an unlinked file under /data/ampr_cache
-//! (the folder is removed right after the unlink), keeps that fd for the
-//! session and maps it with the caller's
+//! `AMPR_PACK_MMAP` is not 0). A packed file
+//! has no physical copy, so the original call fails on a virtual pack fd.
+//! Every map of one goes to the disk cache: the whole file is read once
+//! through the virtual pread path (rt/pack/fd_read.rs, which decodes either
+//! format in rt/pack/virtual_read.rs) into an unlinked file under
+//! /data/ampr_cache (the folder is removed right after the unlink), that fd
+//! is kept for the session and mapped with the caller's
 //! addr/len/prot/flags/offset. Any other fd goes to the original
 //! unchanged. Pool use: one transient 256 KiB buffer while a cache file is
 //! written; unmeasured on a console (Makefile).
+//!
+//! Decode on access (knob 1, its fault handler and the munmap hooks, ids
+//! 98 and 99) was removed: no measured game mmapped a packed file (three
+//! fully packed games on a console: mmap_virtual 0), so it never served a
+//! game, and eight of its limits were unsolved. Ids 98 and 99 stay unused.
 
-use super::super::index::{
-    sdk_alloc, sdk_release, title_alloc, title_free, write_all, MEM_TRANSIENT,
-};
+use super::super::index::{sdk_alloc, sdk_release, write_all, MEM_TRANSIENT};
 use super::*;
 
 // ---- knob ---------------------------------------------------------------------
 
-/// Makefile `AMPR_ZSTD_MMAP`, for both pack formats: 0 off (not hooked), 1
-/// decode on access with the disk fallback (zstd packs only, opt-in,
-/// unverified; LZ4 packs take the fallback), 2 disk fallback only (the
-/// Makefile default, also used when the variable is absent).
-pub(crate) const MMAP_MODE: u8 = match option_env!("AMPR_ZSTD_MMAP") {
+/// Makefile `AMPR_PACK_MMAP`, for both pack formats: 0 off (not hooked), 2
+/// disk cache (the Makefile default, also used when the variable is
+/// absent). 1 was decode on access, removed; it fails the build.
+pub(crate) const MMAP_MODE: u8 = match option_env!("AMPR_PACK_MMAP") {
     Some(s) => parse_mode(s.as_bytes()),
     None => 2,
 };
@@ -35,16 +32,15 @@ pub(crate) const MMAP_MODE: u8 = match option_env!("AMPR_ZSTD_MMAP") {
 const fn parse_mode(s: &[u8]) -> u8 {
     match s {
         b"0" => 0,
-        b"1" => 1,
+        b"1" => panic!("AMPR_PACK_MMAP=1 (decode on access) was removed: use 0 or 2"),
         b"2" => 2,
-        _ => panic!("AMPR_ZSTD_MMAP: not 0, 1 or 2"),
+        _ => panic!("AMPR_PACK_MMAP: not 0 or 2"),
     }
 }
 
 // ---- hooks --------------------------------------------------------------------
 
 const MAP_FAILED: *mut c_void = usize::MAX as *mut c_void;
-pub(crate) const MAP_FIXED: c_int = 0x10;
 const MAP_SHARED: c_int = 0x1;
 /// FreeBSD MAP_ANON: the fd is not mapped (it is -1 by convention, but the
 /// kernel ignores it), so the map is never a packed file's.
@@ -62,23 +58,14 @@ enum Served {
     /// The original call on this dup of a cache file's fd; the caller
     /// closes it after the call (`disk_fd`).
     Cache(c_int),
-    /// A decode-on-access reservation at this address.
-    Reserved(*mut c_void),
     /// Failed with this POSIX errno.
     Failed(c_int),
 }
 
-/// Routes a map of `fd`. A virtual pack fd tries decode on access (knob 1,
-/// zstd packs), then its disk cache file; MAP_ANON and any other fd go to
-/// the original. The u8 is the debug lookup letter.
-unsafe fn serve(
-    addr: *mut c_void,
-    len: usize,
-    prot: c_int,
-    flags: c_int,
-    fd: c_int,
-    off: off_t,
-) -> (Served, u8) {
+/// Routes a map of `fd`. A virtual pack fd maps its disk cache file;
+/// MAP_ANON and any other fd go to the original. The u8 is the debug
+/// lookup letter.
+unsafe fn serve(prot: c_int, flags: c_int, fd: c_int) -> (Served, u8) {
     if flags & MAP_ANON != 0 {
         return (Served::Original(fd), b'v');
     }
@@ -93,19 +80,6 @@ unsafe fn serve(
         SCE_KERNEL_PROT_CPU_RW | SCE_KERNEL_PROT_GPU_WRITE | SCE_KERNEL_PROT_AMPR_WRITE;
     if flags & MAP_SHARED != 0 && prot & WRITE != 0 {
         return (Served::Failed(EACCES), b'v');
-    }
-    // try_map reads the zstd mount and index, so it runs under a
-    // ManifestReader. Refused once shutdown starts, it falls back to the
-    // disk copy, whose reads take a PackSubmission instead. The guard is
-    // dropped before that copy: it may wait on pack workers.
-    if MMAP_MODE == 1 {
-        if let Some(_reader) = ManifestReader::enter() {
-            match unsafe { mmap_fault::try_map(addr, len, prot, flags, file_id, off) } {
-                mmap_fault::MapResult::Mapped(p) => return (Served::Reserved(p), b'f'),
-                mmap_fault::MapResult::Failed(e) => return (Served::Failed(e), b'f'),
-                mmap_fault::MapResult::Fallback => {}
-            }
-        }
     }
     match unsafe { disk_fd(fd, file_id) } {
         Ok(real) => {
@@ -140,12 +114,7 @@ pub(crate) unsafe extern "C" fn mmap_emul(
 ) -> *mut c_void {
     #[cfg(feature = "mem_report")]
     let seen = unsafe { super::super::probe::fd_path(fd) };
-    let fixed = MMAP_MODE == 1 && flags & MAP_FIXED != 0;
-    let span = mmap_fault::replace_len(len);
-    if fixed {
-        mmap_fault::begin_replace(addr as usize, span);
-    }
-    let (served, _how) = unsafe { serve(addr, len, prot, flags, fd, off) };
+    let (served, _how) = unsafe { serve(prot, flags, fd) };
     let p = match served {
         Served::Original(real) | Served::Cache(real) => {
             let p = match unsafe { kernel_slot::<MmapFn>(hook::mmap) } {
@@ -160,15 +129,11 @@ pub(crate) unsafe extern "C" fn mmap_emul(
             }
             p
         }
-        Served::Reserved(p) => p,
         Served::Failed(e) => {
             set_errno(e);
             MAP_FAILED
         }
     };
-    if fixed {
-        mmap_fault::end_replace(addr as usize, span, p != MAP_FAILED);
-    }
     #[cfg(feature = "mem_report")]
     {
         let rc = if p == MAP_FAILED {
@@ -193,12 +158,7 @@ pub(crate) unsafe extern "C" fn sceKernelMmap_emul(
 ) -> c_int {
     #[cfg(feature = "mem_report")]
     let seen = unsafe { super::super::probe::fd_path(fd) };
-    let fixed = MMAP_MODE == 1 && flags & MAP_FIXED != 0;
-    let span = mmap_fault::replace_len(len);
-    if fixed {
-        mmap_fault::begin_replace(addr as usize, span);
-    }
-    let (served, _how) = unsafe { serve(addr, len, prot, flags, fd, off) };
+    let (served, _how) = unsafe { serve(prot, flags, fd) };
     let rc = match served {
         Served::Original(real) | Served::Cache(real) => {
             let rc = unsafe { kernel_slot::<SceMmapFn>(hook::sceKernelMmap) }
@@ -210,46 +170,10 @@ pub(crate) unsafe extern "C" fn sceKernelMmap_emul(
             }
             rc
         }
-        Served::Reserved(p) => {
-            if !res.is_null() {
-                unsafe { *res = p };
-            }
-            0
-        }
         Served::Failed(e) => sce_errno(e),
     };
-    if fixed {
-        mmap_fault::end_replace(addr as usize, span, rc == 0);
-    }
     #[cfg(feature = "mem_report")]
     note(b'Y', b"sceKernelMmap", seen, _how, rc.into());
-    rc
-}
-
-type MunmapFn = unsafe extern "C" fn(*mut c_void, usize) -> c_int;
-
-/// munmap: the decode-on-access mappings in the range stop serving faults,
-/// the original runs, and they are freed if it succeeded or served again if
-/// it failed (`AMPR_ZSTD_MMAP=1`, rt/pack/mmap_fault.rs begin/end_replace).
-pub(crate) unsafe extern "C" fn munmap_emul(addr: *mut c_void, len: usize) -> c_int {
-    mmap_fault::begin_replace(addr as usize, len);
-    let rc = match unsafe { kernel_slot::<MunmapFn>(hook::munmap) } {
-        Some(f) => unsafe { f(addr, len) },
-        None => {
-            set_errno(EIO);
-            -1
-        }
-    };
-    mmap_fault::end_replace(addr as usize, len, rc == 0);
-    rc
-}
-
-#[allow(non_snake_case)]
-pub(crate) unsafe extern "C" fn sceKernelMunmap_emul(addr: *mut c_void, len: usize) -> c_int {
-    mmap_fault::begin_replace(addr as usize, len);
-    let rc = unsafe { kernel_slot::<MunmapFn>(hook::sceKernelMunmap) }
-        .map_or(SCE_KERNEL_ERROR_EIO, |f| unsafe { f(addr, len) });
-    mmap_fault::end_replace(addr as usize, len, rc == 0);
     rc
 }
 
@@ -344,7 +268,7 @@ const O_EXCL: c_int = 0x800;
 // dynamic symbol (the sweep runs at module_start, before any hook), so no
 // call here goes through the index path hooks. The open is the `_open`
 // original (`pack::libkernel::real_open`): libkernel `open` calls `_open`,
-// which routes through the index by default (AMPR_ZSTD_LIBC_HOOKS=0xfff).
+// which routes through the index by default (AMPR_PACK_LIBC_HOOKS=0xfff).
 // Before any hook installs, dynamic `open` reaches the undetoured `_open`.
 unsafe fn real_open_path(path: *const c_char, flags: c_int, mode: c_int) -> c_int {
     unsafe { real_open() }.map_or_else(eio, |f| unsafe { f(path, flags, mode) })
@@ -504,10 +428,22 @@ unsafe fn create_cache_file(vfd: c_int, file_id: u32) -> Result<c_int, c_int> {
 /// Returns the bytes written. The piece is a fixed pool site: one at a
 /// time, under CACHE_M (`disk_fd`).
 unsafe fn copy_virtual_file(vfd: c_int, fd: c_int) -> Result<u64, c_int> {
+    unsafe { with_piece(|buf| copy_with(vfd, fd, buf)) }.unwrap_or(Err(ENOMEM))
+}
+
+/// The one PIECE buffer (a fixed pool site) for `f`; None when refused.
+/// Callers hold CACHE_M, so one is out at a time.
+unsafe fn with_piece<R>(f: impl FnOnce(*mut u8) -> R) -> Option<R> {
     let buf = unsafe { sdk_alloc(PIECE, MEM_TRANSIENT) }.cast::<u8>();
     if buf.is_null() {
-        return Err(ENOMEM);
+        return None;
     }
+    let r = f(buf);
+    unsafe { sdk_release(buf.cast(), PIECE, MEM_TRANSIENT) };
+    Some(r)
+}
+
+unsafe fn copy_with(vfd: c_int, fd: c_int, buf: *mut u8) -> Result<u64, c_int> {
     let mut off = 0u64;
     let rc = loop {
         let mut handled = false;
@@ -525,37 +461,35 @@ unsafe fn copy_virtual_file(vfd: c_int, fd: c_int) -> Result<u64, c_int> {
         }
         off += n as u64;
     };
-    unsafe { sdk_release(buf.cast(), PIECE, MEM_TRANSIENT) };
     rc
 }
 
-/// Largest packed file `read_packed` reads whole. The buffer comes from the
-/// Index ledger's free room, which can be less: a larger icon is then
-/// skipped like one over this size, counted in `save_icon_skipped`
-/// without the index notice (rt/save.rs `save_icon_by_path_emul`).
-pub(crate) const READ_PACKED_MAX: usize = 8 * 1024 * 1024;
+// ---- packed bytes for system services ---------------------------------------------
 
-/// For a system service that opens a path itself, past the path hooks (the
-/// save data icon, rt/save.rs): when `path` opens as a packed file of at
-/// most READ_PACKED_MAX bytes, `use_bytes` gets its decoded bytes in a
-/// transient buffer from the pool's Index ledger (sized by the file, so not
-/// a fixed pool site).
-/// None for a loose or missing file; Some(Err) for a packed file it could
-/// not read (too large, no buffer, a failed read).
+/// For a system service that opens a game path itself, past the path hooks
+/// (the save data icon, rt/save.rs): when `path` opens as a packed file,
+/// `use_bytes` gets its decoded bytes in a buffer of its size from the
+/// game's libc heap, freed as soon as `use_bytes` returns: the icon is held
+/// only for the one call, outside the pool, at any size (a title's
+/// /app0/images/icon0.png is 551,096 B). A failed malloc or read is
+/// Some(Err) and the caller skips the icon, as is an open that failed for
+/// lack of fds or memory. None for a loose or missing file, or another
+/// failed open. A path handed to the save service instead (a file under
+/// CACHE_DIR) hung a title's save inside the service call.
 pub(crate) unsafe fn read_packed<R>(
     path: *const c_char,
     use_bytes: impl FnOnce(&[u8]) -> R,
 ) -> Option<Result<R, ()>> {
     let vfd = unsafe { super::super::index::posix_open_emul(path, 0, 0) };
     if vfd < 0 {
-        return None;
+        // Out of fds or memory: the icon may be packed, where the service
+        // cannot open it (0x809f000e there stalled a title's save), so it
+        // is skipped. Any other failure (missing, refused) goes to the
+        // service, which opens a loose icon itself and answers the rest.
+        return matches!(errno(), EMFILE | ENFILE | ENOMEM).then_some(Err(()));
     }
     let out = if unsafe { virtual_fd_file_id(vfd) }.is_some() {
-        Some(unsafe { read_whole(vfd) }.ok_or(()).map(|(buf, len)| {
-            let r = use_bytes(unsafe { core::slice::from_raw_parts(buf, len) });
-            unsafe { title_free(buf, c"apr.read-packed") };
-            r
-        }))
+        Some(unsafe { read_to_heap(vfd, use_bytes) })
     } else {
         None
     };
@@ -563,34 +497,43 @@ pub(crate) unsafe fn read_packed<R>(
     out
 }
 
-/// The whole decoded file behind `vfd` in an index memory buffer of its
-/// size; None when refused (the save icon is then skipped, rt/save.rs).
-unsafe fn read_whole(vfd: c_int) -> Option<(*mut u8, usize)> {
+/// The whole decoded file behind `vfd`, in game heap memory, to `use_bytes`.
+unsafe fn read_to_heap<R>(vfd: c_int, use_bytes: impl FnOnce(&[u8]) -> R) -> Result<R, ()> {
     let mut st: SceKernelStat = unsafe { core::mem::zeroed() };
     if unsafe { posix_fstat_emul(vfd, &mut st) } != 0 {
-        return None;
+        return Err(());
     }
-    let len = usize::try_from(st.st_size)
-        .ok()
-        .filter(|&n| n > 0 && n <= READ_PACKED_MAX)?;
-    let buf = unsafe { title_alloc(len, c"apr.read-packed") };
+    let len = usize::try_from(st.st_size).ok().filter(|&n| n > 0).ok_or(())?;
+    let buf = unsafe { super::super::heap::libc_malloc(len) };
     if buf.is_null() {
-        return None;
+        return Err(());
     }
+    let out = unsafe { read_into(vfd, buf, len, use_bytes) };
+    unsafe { super::super::heap::libc_free(buf) };
+    out
+}
+
+unsafe fn read_into<R>(
+    vfd: c_int,
+    buf: *mut u8,
+    len: usize,
+    use_bytes: impl FnOnce(&[u8]) -> R,
+) -> Result<R, ()> {
     let mut off = 0usize;
+    let mut rc = Ok(());
     while off < len {
         let mut handled = false;
-        let want = (len - off).min(PIECE);
+        let want = len - off;
         let n = unsafe {
             ampr_pack_try_pread_fd(vfd, buf.add(off).cast(), want, off as off_t, &mut handled)
         };
         if n <= 0 || n as usize > want {
-            unsafe { title_free(buf, c"apr.read-packed") };
-            return None;
+            rc = Err(());
+            break;
         }
         off += n as usize;
     }
-    Some((buf, len))
+    rc.map(|()| use_bytes(unsafe { core::slice::from_raw_parts(buf, len) }))
 }
 
 /// At module_start (rt/pack/mod.rs `select_pack_format`): unlinks every

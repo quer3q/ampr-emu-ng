@@ -22,8 +22,9 @@
 //! the read finishes when the last part is in. On a console, 64 KiB parts
 //! took 1.10 ms per read against 2.51 ms unsplit (debug /metrics,
 //! `AMPR_EMU_APR_LOOSE_PREAD_PART_KIB` in mod.rs). The loose task cap
-//! (threads minus `AMPR_EMU_APR_LOOSE_PREAD_PACK_RESERVE`) is 2 at 6 threads,
-//! so only reads of up to two parts split there.
+//! (threads minus `loose_pread_pack_reserve`, 4 with packs and 0 without)
+//! is 2 at 6 threads in a title with packs, so only reads of up to two
+//! parts split there, and 6 in a title without.
 
 use super::*;
 use crate::rt::stats::{self, Stat};
@@ -352,7 +353,7 @@ impl AprAioReactor {
             LoosePreadRoute::Pool => {}
         }
         // Loose tasks (queued + running) stay below the thread count, so
-        // AMPR_EMU_APR_LOOSE_PREAD_PACK_RESERVE threads always serve pack tasks:
+        // loose_pread_pack_reserve() threads always serve pack tasks:
         // workers pick strictly by priority, and a high-priority loose stream
         // could otherwise hold every thread while a pack read stays queued.
         // Workers start on the first queued task; start them here so the
@@ -372,7 +373,7 @@ impl AprAioReactor {
             (self.preadThreadCount + crate::rt::thread_hooks::budget_room() as usize)
                 .min(self.preadCeiling as usize)
         };
-        let looseCap = (reachable.saturating_sub(AMPR_EMU_APR_LOOSE_PREAD_PACK_RESERVE))
+        let looseCap = (reachable.saturating_sub(loose_pread_pack_reserve()))
         .max(1)
         .min(AMPR_EMU_APR_LOOSE_PREAD_TASKS_MAX as usize) as u32;
         if self.preadLooseCount >= looseCap {

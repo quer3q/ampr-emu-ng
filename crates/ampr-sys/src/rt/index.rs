@@ -380,14 +380,6 @@ pub(crate) unsafe fn sdk_release(base: *mut c_void, size: usize, class: u8) {
     }
 }
 
-/// A transient buffer sized by the title (save icon, decode-on-access
-/// slots) from the pool's Index ledger, not a fixed pool site
-/// (rt/index_memory.rs); null when refused, counted without the index
-/// notice.
-pub(crate) unsafe fn title_alloc(bytes: usize, tag: &CStr) -> *mut u8 {
-    unsafe { super::index_memory::index_scratch_alloc(bytes, MAX_ALIGN, tag.as_ptr()) }
-}
-
 /// A file index build buffer (file count, path bytes, directories) from the
 /// pool's Index ledger; null when refused, after the one-time index notice:
 /// the build fails and the title runs without the index.
@@ -395,7 +387,7 @@ unsafe fn build_alloc(bytes: usize, tag: &CStr) -> *mut u8 {
     unsafe { super::index_memory::index_alloc(bytes, MAX_ALIGN, tag.as_ptr()) }
 }
 
-/// Frees a `title_alloc` or `build_alloc` result (null is a no-op).
+/// Frees a `build_alloc` result (null is a no-op).
 pub(crate) unsafe fn title_free(base: *mut u8, tag: &CStr) {
     unsafe { super::index_memory::index_free(base.cast(), tag.as_ptr()) };
 }
@@ -1679,6 +1671,12 @@ pub(crate) unsafe fn ensure_ready_slow(allow_build: bool) -> bool {
         // A title with packs finishes the view here, after the pack index
         // load; with none `load_from` already did.
         work.compact.finish();
+        // The Index ledger is final now: its idle room goes to the cache,
+        // before the index is published and any read can reach the cache.
+        if final_loaded && work.available && packs {
+            unsafe { crate::rt::pack::grow_cache_from_index(crate::rt::pack::pack_state()) };
+            unsafe { crate::rt::pack::start_first_worker() };
+        }
         stats::set(stats::Stat::IndexMountNs, stats::since(started));
 
         let _g = INDEX_LOCK.lock();
@@ -3111,6 +3109,18 @@ fn creat_mode(flags: c_int, mode: c_int) -> SceKernelMode {
     }
 }
 
+/// Debug: one call into libc open hook `id` that returned `fd`, packed
+/// when `fd` is a virtual pack fd (rt/stats.rs `libc_hit`).
+#[inline(always)]
+fn note_libc_open(id: usize, fd: c_int) {
+    if cfg!(feature = "mem_report") {
+        stats::libc_hit(
+            id,
+            fd >= 0 && unsafe { super::pack::ampr_pack_is_virtual_fd(fd) },
+        );
+    }
+}
+
 /// `_open`, variadic like `open` (see `posix_open_emul`).
 pub unsafe extern "C" fn underscore_open_emul(
     path: *const c_char,
@@ -3120,9 +3130,10 @@ pub unsafe extern "C" fn underscore_open_emul(
     if super::hook::observed_only(hook::_open) {
         let rc = unsafe { real_underscore_open_raw(path, flags, mode) };
         unsafe { observe_note(path, b'O', rc) };
+        note_libc_open(hook::_open, rc);
         return rc;
     }
-    unsafe {
+    let fd = unsafe {
         open_with(
             path,
             flags,
@@ -3130,7 +3141,9 @@ pub unsafe extern "C" fn underscore_open_emul(
             real_underscore_open,
             b'O',
         )
-    }
+    };
+    note_libc_open(hook::_open, fd);
+    fd
 }
 
 /// `_openat`: an absolute or cwd-relative path takes the `open` routing; a
@@ -3142,17 +3155,22 @@ pub unsafe extern "C" fn underscore_openat_emul(
     mode: c_int,
 ) -> c_int {
     if path.is_null() || (unsafe { *path } != b'/' as c_char && dirfd != AT_FDCWD) {
+        stats::libc_hit(hook::_openat, false);
         return unsafe { real_openat(dirfd, path, flags, mode) };
     }
     if super::hook::observed_only(hook::_openat) {
         let rc = unsafe { real_openat(dirfd, path, flags, mode) };
         unsafe { observe_note(path, b'A', rc) };
+        note_libc_open(hook::_openat, rc);
         return rc;
     }
-    unsafe { open_with(path, flags, creat_mode(flags, mode), real_openat_cwd, b'A') }
+    let fd = unsafe { open_with(path, flags, creat_mode(flags, mode), real_openat_cwd, b'A') };
+    note_libc_open(hook::_openat, fd);
+    fd
 }
 
 pub unsafe extern "C" fn posix_lstat_emul(path: *const c_char, sb: *mut Stat) -> c_int {
+    stats::libc_hit(hook::lstat, false);
     if super::hook::observed_only(hook::lstat) {
         let rc = unsafe { real_lstat(path, sb.cast()) };
         unsafe { observe_note(path, b'l', rc) };
@@ -3169,6 +3187,7 @@ pub unsafe extern "C" fn posix_lstat_emul(path: *const c_char, sb: *mut Stat) ->
 /// authoritative miss takes the stat routing (pack overlay, else ENOENT);
 /// others the original.
 pub unsafe extern "C" fn posix_access_emul(path: *const c_char, mode: c_int) -> c_int {
+    stats::libc_hit(hook::access, false);
     if super::hook::observed_only(hook::access) {
         let rc = unsafe { real_access(path, mode) };
         unsafe { observe_note(path, b'a', rc) };

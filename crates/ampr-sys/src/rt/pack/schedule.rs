@@ -114,11 +114,6 @@ pub(crate) unsafe fn queue_remove_locked(state: *mut PackState, index: u32) -> b
     if index as usize >= AMPR_EMU_PACK_VIRTUAL_AIO_SLOTS {
         return false;
     }
-    if (*state).virtual_aio[index as usize].prefetch_chunks != 0
-        && (*state).virtual_aio[index as usize].pipeline_index == INVALID_INDEX
-    {
-        return prefetch_queue_remove_locked(state, index);
-    }
     let lane = (*state).virtual_aio[index as usize].priority as usize;
     let class_index = work_class_index((*state).virtual_aio[index as usize].work_class) as usize;
     let mut previous = INVALID_INDEX;

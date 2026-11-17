@@ -152,8 +152,10 @@ Contiguous chunks are one byte range in one volume, so a batch is one
 pread whose chunks the decode workers decode in parallel. The pread is
 exact-size: it covers the chunks' stored bytes, not rounded to pages, and
 never past the volume's end. Read bytes are not cached; decoded chunks go
-to the 64 MiB decoded cache. A game read spanning several chunks is split
-into chunk-aligned child jobs (`rt/pack/zstd_split.rs`).
+to the decoded cache, the rest of the runtime pool (134.98 MiB release at
+the mount, then grown into the Index ledger's idle room once the index is
+built: 204 MiB on a title using 5.6 MiB of Index). A game read spanning several chunks is split
+into chunk-aligned child jobs (`rt/pack/pack_split.rs`).
 
 ## What is packed
 
@@ -202,7 +204,7 @@ names) and install only when the zstd index or the LZ4 manifest is in
   entries.
 - libc stdio and dirent (`fopen`, `fread`, `opendir`, ...) through the
   libkernel internal-entry hooks `_open` .. `sceKernelFcntl`, all on by
-  default (Makefile `AMPR_ZSTD_LIBC_HOOKS = 0xfff`).
+  default (Makefile `AMPR_PACK_LIBC_HOOKS = 0xfff`).
 - `mmap`/`sceKernelMmap` (below).
 - The game's own kernel AIO (`sceKernelAioSubmitReadCommands*`, poll,
   wait, delete, cancel) on a packed file, by the runtime's AIO emulation
@@ -244,8 +246,8 @@ baseline.
 ## mmap of packed files
 
 A packed file has no physical copy, so mmap of its virtual fd fails on
-its own. Makefile `AMPR_ZSTD_MMAP` picks the fix; 0 leaves the call
-unhooked. MAP_ANON maps and other fds go to the original. At 1 and 2 a
+its own. Makefile `AMPR_PACK_MMAP` picks the fix; 0 leaves the call
+unhooked. MAP_ANON maps and other fds go to the original. At 2 a
 MAP_SHARED map with PROT_WRITE fails with EACCES, as for any O_RDONLY fd.
 
 2 (default, also when the variable is absent): disk cache, for zstd and
@@ -265,20 +267,8 @@ title with packs, it is emptied and removed (`select_pack_format`,
 `rt/pack/mmap.rs`). A folder that still holds a file a crash left named
 stays until the next module_start sweep.
 
-1 (opt-in, never run on a console): zstd packed files decode on access;
-LZ4 ones take the disk cache, since the fault path reads zstd chunk
-records. The range is reserved PROT_NONE and nothing decodes until a page
-is touched. A SIGSEGV/SIGBUS handler then decodes the 256 KiB chunks
-behind the page and opens it with the caller's prot
-(`rt/pack/mmap_fault.rs`). A page partly past EOF gets a zero tail; a
-fault wholly past EOF goes to the previous handler, as SIGBUS would. A
-write or exec on an open page retries once, then goes to the previous
-handler. The disk cache takes maps this path cannot serve: GPU prot, an
-offset not 4 KiB aligned, more volumes than its volume fds, a full table,
-over 512 MiB, or no sigaction. No measured game mmapped a packed file
-(`mmap_virtual` 0), so it has never served one. Cost: 2 MiB of Index
-ledger scratch (4 x 512 KiB), 4 x 112 KiB decoder workspaces in the Buffer ledger, one pool
-byte per mapped chunk. Unsolved: a syscall given an untouched page gets
-EFAULT, mprotect on the range is not tracked, the handler runs on the
-faulting thread's stack, ranges replaced by unhooked VM calls stay
-registered, and the handler stays installed after module_stop.
+1 was decode on access (zstd packed files decoded in a SIGSEGV/SIGBUS
+handler on first touch) and is removed; the build refuses it. No measured
+game mmapped a packed file (`mmap_virtual` 0 on three fully packed games),
+so it never served one, and eight of its limits were unsolved. Its
+munmap hooks, ids 98 and 99, stay unused.

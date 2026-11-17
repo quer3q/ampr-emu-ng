@@ -306,8 +306,8 @@ pub(crate) fn zstd_index() -> Option<&'static ZstdIndex> {
 /// The extent of packed one-based AMPRIDX3 `ampr_id`: first chunk and
 /// size from the published view, which the join set and checked against
 /// the zstd record. Memory only (no lock, wait or pread), so the open
-/// hooks, the read jobs and the decode-on-access signal handler may call
-/// it. None before the mount is ready and for a loose or unknown id.
+/// hooks and the read jobs may call it. None before the mount is ready and
+/// for a loose or unknown id.
 pub(crate) fn zstd_extent(ampr_id: u32) -> Option<ZstdExtent> {
     ready_mount()?;
     let view = super::super::index::published()?.view()?;
@@ -318,7 +318,7 @@ pub(crate) fn zstd_volume_count() -> u32 {
     zstd_index().map_or(0, |i| i.volume_count())
 }
 
-/// Debug only: the metrics bench (readahead.rs `bench_volume_path`).
+/// Debug only: the metrics bench (leases.rs `bench_volume_path`).
 #[cfg(feature = "mem_report")]
 pub(crate) fn zstd_volume_size(volume: u32) -> Option<u64> {
     zstd_index().and_then(|i| i.volume_size(volume).ok())
@@ -326,22 +326,6 @@ pub(crate) fn zstd_volume_size(volume: u32) -> Option<u64> {
 
 pub(crate) fn zstd_chunk_count() -> u32 {
     zstd_index().map_or(0, |i| i.chunk_count())
-}
-
-/// Chunk record `id` read from memory only: the chunk tables; never a
-/// lock, wait or pread, so the decode-on-access signal handler may call it
-/// (rt/pack/mmap_fault.rs). None for an unknown id.
-pub(crate) fn zstd_chunk_resident(id: u32) -> Option<ampr_format::zstd::ChunkRecord> {
-    let index = zstd_index()?;
-    zstd_chunks_resident()
-        .then(|| index.chunk(id).ok())
-        .flatten()
-}
-
-/// Whether `zstd_chunk_resident` can answer: false before the mount is
-/// ready (an index mounts only with its chunk tables).
-pub(crate) fn zstd_chunks_resident() -> bool {
-    zstd_index().is_some_and(|i| i.has_chunks())
 }
 
 // ---- service names ----------------------------------------------------------

@@ -30,8 +30,23 @@ type PosixCreateFn =
 
 /// scePthreadCreate through libkernel's original entry point (the detour's
 /// trampoline once installed, else the plain import), for every thread the
-/// runtime creates itself.
+/// runtime creates itself. Without `attr` the thread gets a pool stack of
+/// libkernel's default size (`create_internal_stack`); a caller's `attr`
+/// (the debug thread hold) is passed as given.
 pub(crate) unsafe fn create_internal(
+    thread: *mut *mut c_void,
+    attr: *const c_void,
+    entry: ThreadEntry,
+    arg: *mut c_void,
+    name: *const c_char,
+) -> c_int {
+    if attr.is_null() {
+        return unsafe { create_internal_stack(thread, entry, arg, name, 0) };
+    }
+    unsafe { create_raw(thread, attr, entry, arg, name) }
+}
+
+unsafe fn create_raw(
     thread: *mut *mut c_void,
     attr: *const c_void,
     entry: ThreadEntry,
@@ -47,8 +62,34 @@ pub(crate) unsafe fn create_internal(
     }
 }
 
-/// `create_internal` with a `stack`-byte stack; with the default stack
-/// when libkernel refuses the attribute.
+type AttrFn = unsafe extern "C" fn(*mut *mut c_void) -> c_int;
+type StackSizeFn = unsafe extern "C" fn(*mut *mut c_void, usize) -> c_int;
+type GetStackSizeFn = unsafe extern "C" fn(*const *mut c_void, *mut usize) -> c_int;
+type SetStackFn = unsafe extern "C" fn(*mut *mut c_void, *mut c_void, usize) -> c_int;
+static ATTR_INIT: sys::LazySym = sys::LazySym::new(c"scePthreadAttrInit");
+static ATTR_DESTROY: sys::LazySym = sys::LazySym::new(c"scePthreadAttrDestroy");
+static ATTR_SET_STACK_SIZE: sys::LazySym = sys::LazySym::new(c"scePthreadAttrSetstacksize");
+static ATTR_GET_STACK_SIZE: sys::LazySym = sys::LazySym::new(c"scePthreadAttrGetstacksize");
+static ATTR_SET_STACK: sys::LazySym = sys::LazySym::new(c"scePthreadAttrSetstack");
+
+/// The stack size of a fresh attribute, libkernel's default; 0 when it
+/// will not say (the thread then gets libkernel's own stack).
+unsafe fn default_stack_size(attr: &*mut c_void) -> usize {
+    let Some(get) = (unsafe { ATTR_GET_STACK_SIZE.get::<GetStackSizeFn>() }) else {
+        return 0;
+    };
+    let mut v = 0usize;
+    match unsafe { get(attr, &mut v) } {
+        0 => v,
+        _ => 0,
+    }
+}
+
+/// `create_internal` with a `stack`-byte stack (0: libkernel's default
+/// size, read from a fresh attribute). The stack comes from the pool
+/// (rt/thread_stack.rs) when the block has room and libkernel takes it;
+/// otherwise libkernel allocates it as before, with the default stack when
+/// it refuses the size.
 pub(crate) unsafe fn create_internal_stack(
     thread: *mut *mut c_void,
     entry: ThreadEntry,
@@ -56,24 +97,49 @@ pub(crate) unsafe fn create_internal_stack(
     name: *const c_char,
     stack: usize,
 ) -> c_int {
-    type AttrFn = unsafe extern "C" fn(*mut *mut c_void) -> c_int;
-    type StackFn = unsafe extern "C" fn(*mut *mut c_void, usize) -> c_int;
-    let init = unsafe { sys::resolve_kernel::<AttrFn>(c"scePthreadAttrInit") };
-    let set = unsafe { sys::resolve_kernel::<StackFn>(c"scePthreadAttrSetstacksize") };
-    let destroy = unsafe { sys::resolve_kernel::<AttrFn>(c"scePthreadAttrDestroy") };
+    let init = unsafe { ATTR_INIT.get::<AttrFn>() };
     let mut attr: *mut c_void = core::ptr::null_mut();
-    let have = match (init, set) {
-        (Some(init), Some(set)) => unsafe { init(&mut attr) == 0 && set(&mut attr, stack) == 0 },
-        _ => false,
-    };
-    let attr_ptr: *const c_void = if have {
+    let have = init.is_some_and(|init| unsafe { init(&mut attr) } == 0);
+    let mut slot = None;
+    let mut set = false;
+    if have {
+        let size = match stack {
+            0 => unsafe { default_stack_size(&attr) },
+            n => n,
+        };
+        if let Some(put) = unsafe { ATTR_SET_STACK.get::<SetStackFn>() } {
+            slot = unsafe { super::thread_stack::take(size) };
+            if let Some(s) = &slot {
+                set = unsafe { put(&mut attr, s.addr, s.size) } == 0;
+            }
+        }
+        if !set {
+            if let Some(s) = slot.take() {
+                unsafe { super::thread_stack::cancel(s) };
+            }
+            if stack != 0 {
+                set = unsafe { ATTR_SET_STACK_SIZE.get::<StackSizeFn>() }
+                    .is_some_and(|f| unsafe { f(&mut attr, stack) } == 0);
+            }
+        }
+    }
+    let attr_ptr: *const c_void = if set {
         (&attr as *const *mut c_void).cast()
     } else {
         core::ptr::null()
     };
-    let rc = unsafe { create_internal(thread, attr_ptr, entry, arg, name) };
-    if !attr.is_null() {
-        if let Some(destroy) = destroy {
+    let rc = unsafe { create_raw(thread, attr_ptr, entry, arg, name) };
+    match slot {
+        Some(s) if rc == 0 => {
+            super::thread_stack::bind(s, unsafe { *thread });
+            stats::add(Stat::ThreadStacksPool, 1);
+        }
+        Some(s) => unsafe { super::thread_stack::cancel(s) },
+        None if rc == 0 => stats::add(Stat::ThreadStacksLibkernel, 1),
+        None => {}
+    }
+    if have {
+        if let Some(destroy) = unsafe { ATTR_DESTROY.get::<AttrFn>() } {
             let _ = unsafe { destroy(&mut attr) };
         }
     }
@@ -117,49 +183,37 @@ fn note(how: u8, rc: i64, call: &[u8], name: *const c_char) {
 
 /// After a failed game creation (pressure mode): true when the runtime gave
 /// threads back, so a retry may succeed. Every group gives its idle
-/// threads: the read pool and fd read threads down to none (reads then go
-/// to kernel AIO or run inline), the decode workers down to one. The budget
+/// threads: the read pool down to none (reads then go to kernel AIO), the
+/// decode workers down to one. The budget
 /// stops every group growing meanwhile.
 fn make_room() -> bool {
     use super::{pack, reactor};
-    let before = [
-        reactor::pread_pool_live(),
-        pack::read_threads_live(),
-        pack::pack_workers_live(),
-    ];
-    // All three asked first, then one wait: each thread leaves after its
+    let before = [reactor::pread_pool_live(), pack::pack_workers_live()];
+    // Both asked first, then one wait: each thread leaves after its
     // current call, so the groups drain in parallel within the 50 ms.
     unsafe {
         let _ = reactor::pread_pool_ask(u32::MAX);
-        let _ = pack::read_threads_ask(u32::MAX);
         let _ = pack::pack_workers_ask(u32::MAX);
     }
     // Includes exits another failing creation asked for: wait for them too,
     // and retry while some leave, since a request no thread can meet must
     // not keep the game retrying.
+    // No exit pending may also mean every asked thread left already: the
+    // reap below counts those, so the game's creation is still retried.
     let pending = pending_exits();
-    if pending == 0 {
-        return false;
-    }
     for _ in 0..50 {
-        unsafe { sys::sceKernelUsleep(1000) };
-        if pending_exits() == 0 {
+        if pending == 0 || pending_exits() == 0 {
             break;
         }
+        unsafe { sys::sceKernelUsleep(1000) };
     }
-    let left = unsafe {
-        reactor::pread_pool_reap(before[0])
-            + pack::read_threads_reap(before[1])
-            + pack::pack_workers_reap(before[2])
-    };
+    let left = unsafe { reactor::pread_pool_reap(before[0]) + pack::pack_workers_reap(before[1]) };
     left != 0 || pending_exits() < pending
 }
 
 /// Thread exits asked of the groups that have not happened yet.
 fn pending_exits() -> u32 {
-    super::reactor::pread_pool_pending_exits()
-        + super::pack::read_threads_pending_exits()
-        + super::pack::pack_workers_pending_exits()
+    super::reactor::pread_pool_pending_exits() + super::pack::pack_workers_pending_exits()
 }
 
 #[allow(non_snake_case)]
@@ -222,15 +276,15 @@ fn retried(ok: bool, rc: i64, call: &[u8], name: *const c_char) {
 
 // ---- thread budget ----------------------------------------------------------
 //
-// One budget for every worker thread the runtime grows (read pool, fd read
-// threads, pack workers): the lower of what failures left (BUDGET) and the
+// One budget for every worker thread the runtime grows (read pool, pack
+// workers): the lower of what failures left (BUDGET) and the
 // `thread_budget` knob (16, read at each reservation). A group's first
 // thread is always allowed, even past the knob, so no group is starved.
 // Lowering the knob stops no thread: new reservations wait until the live
 // count drops below it; raising it lets regrowth reach the new value. When a
 // game creation fails with EAGAIN no group grows (`cut_at`), the groups give
 // threads back, and the budget becomes what is left (`settle_at`). After
-// tune::regrow_ns (10 s) with no failure it grows by one (`reserve`), up to
+// tune::regrow_ns (5 s) with no failure it grows by one (`reserve`), up to
 // one below the failure level, which is forgotten after FAIL_MEMORY_NS. So
 // the runtime finds the game's room over a run instead of staying cut or
 // failing the game again at every regrowth.
@@ -353,7 +407,11 @@ fn retry_with_room(mut rc: c_int, failed: c_int, mut create: impl FnMut() -> c_i
         return rc;
     }
     cut_at(super::services::time_counter_now());
-    while rc == failed && make_room() {
+    // At least one retry: threads another failing creation asked to leave
+    // may be gone before this call's make_room looks, so it finds none to
+    // count yet the room is there. Further retries only while room is made.
+    let mut first = true;
+    while rc == failed && (make_room() || core::mem::take(&mut first)) {
         rc = create();
     }
     settle_at(super::services::time_counter_now());
@@ -396,7 +454,7 @@ unsafe extern "C" fn counted_entry(slot: *mut c_void) -> *mut c_void {
     rc
 }
 
-/// `create_internal_stack` (stack 0: libkernel's default) for a worker
+/// `create_internal_stack` (stack 0: libkernel's default size) for a worker
 /// thread holding a `reserve`d slot: the slot is released when `entry`
 /// returns, or here when the creation fails.
 pub(crate) unsafe fn create_counted(
@@ -417,13 +475,7 @@ pub(crate) unsafe fn create_counted(
     };
     COUNTED_ARG[i].store(arg as usize, Release);
     COUNTED_ENTRY[i].store(entry as usize, Release);
-    let rc = unsafe {
-        if stack == 0 {
-            create_internal(thread, core::ptr::null(), counted_entry, i as *mut c_void, name)
-        } else {
-            create_internal_stack(thread, counted_entry, i as *mut c_void, name, stack)
-        }
-    };
+    let rc = unsafe { create_internal_stack(thread, counted_entry, i as *mut c_void, name, stack) };
     if rc != 0 {
         COUNTED_ENTRY[i].store(0, Release);
         unreserve();
@@ -437,25 +489,32 @@ pub(crate) unsafe fn create_counted(
 
 // ---- load-based retirement ----
 //
-// Each group (pack workers, read pool, fd read threads) keeps its last
+// Each group (pack workers, read pool) keeps its last
 // LOAD_SAMPLES busy-thread counts, taken at every job start and finish under
-// the group's lock. A thread that finishes its work leaves while the group
-// has more live threads than `load_target` + 1 (`load_target`: ceil(median x
-// 1.5) + 1, at least 1) for RETIRE_STREAK finishes in a row. No idle timer:
+// the group's lock. A thread that finishes its work with none left to take
+// leaves while the group has more live threads than `load_target` + 1
+// (`load_target`: the window's peak busy count, at least 1) for
+// RETIRE_STREAK finishes in a row; a finish with work queued resets the
+// streak and never retires, so a burst does not shed threads it then
+// recreates. No idle timer:
 // peak busy was 4 decode workers (~0.2 cores of work) and 4-5 disk threads
 // with 9-11 runtime threads live on two titles (debug /metrics), and a game
-// creation failed with 6 decoders alive. In pressure
-// mode (a game creation failed with EAGAIN in the last tune::regrow_ns, 10 s)
+// creation failed with 6 decoders alive. Normal-mode retirement is off by
+// default (tune::retire_load): a started thread stays; the debug knob
+// `retire_load=1` turns it back on. In pressure
+// mode (a game creation failed with EAGAIN in the last tune::regrow_ns, 5 s)
 // idle threads leave at once and each group keeps at most one: while it has
 // work, or the one it started after the yield (`LoadGroup::held`), so a
 // read stream does not create and retire a thread per read. The decode
 // workers never go below one (`LoadGroup::floor`).
 
 /// Busy-count samples kept per group: 8192, about 2.7 s at the ~1500 pack
-/// jobs/s (two samples each) one title ran; 64 covered ~20 ms, so the median
-/// flipped between 0 and 1 and decode workers retired and restarted 1.4 times
-/// a second (164 in 120 s, debug /metrics). A running histogram keeps the
-/// median O(LOAD_BUCKETS) at any window.
+/// jobs/s (two samples each) one title ran. The target was once the median
+/// of the window: reads are idle most of the time, so it stayed at 1 or 2
+/// whatever a burst needed, and over 64 samples (~20 ms) it flipped between
+/// 0 and 1 and decode workers retired and restarted 1.4 times a second
+/// (164 in 120 s, debug /metrics). A running histogram keeps the peak
+/// O(LOAD_BUCKETS) at any window.
 const LOAD_SAMPLES: usize = 8192;
 /// Finishes in a row above the target before a thread retires (normal mode).
 const RETIRE_STREAK: u32 = 8;
@@ -464,46 +523,32 @@ const LOAD_BUCKETS: usize = 16;
 /// Last game creation failure (settled), ns; 0: none, normal mode.
 static PRESSURE_NS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
-/// Twice the median of `samples` (the two middle values summed when the
-/// count is even); 0 when empty. Counting sort over LOAD_BUCKETS values;
-/// the runtime keeps a running histogram instead (LoadGroup), tests use this.
+/// Highest busy count in `samples`, clamped to LOAD_BUCKETS - 1; 0 when
+/// empty. The runtime keeps a running histogram instead (LoadGroup), tests
+/// use this.
 #[cfg(test)]
-pub(crate) fn load_median2(samples: &[u8]) -> u32 {
+pub(crate) fn load_peak(samples: &[u8]) -> u32 {
     let mut count = [0u32; LOAD_BUCKETS];
     for &s in samples {
         count[(s as usize).min(LOAD_BUCKETS - 1)] += 1;
     }
-    median2_of(&count, samples.len() as u32)
+    peak_of(&count)
 }
 
-/// Twice the median of `n` samples given as a histogram over LOAD_BUCKETS.
-fn median2_of(count: &[u32; LOAD_BUCKETS], n: u32) -> u32 {
-    if n == 0 {
-        return 0;
-    }
-    // Values at sorted positions lo and hi (equal when n is odd).
-    let (lo, hi) = ((n - 1) / 2, n / 2);
-    let at = |k: u32| {
-        let mut seen = 0;
-        for (v, &c) in count.iter().enumerate() {
-            seen += c;
-            if seen > k {
-                return v as u32;
-            }
-        }
-        (LOAD_BUCKETS - 1) as u32
-    };
-    at(lo) + at(hi)
+/// The highest non-empty bucket of a histogram over LOAD_BUCKETS; 0 when
+/// all are empty.
+fn peak_of(count: &[u32; LOAD_BUCKETS]) -> u32 {
+    count.iter().rposition(|&c| c != 0).unwrap_or(0) as u32
 }
 
-/// Threads a group may keep: normal, ceil(median x 1.5) + 1 in [1, cap]
-/// (`median2` is twice the median); pressure, 1 while `hold` (work, or a
-/// thread restarted under pressure, `LoadGroup::started`), else 0.
-pub(crate) fn load_target(median2: u32, cap: u32, pressure: bool, hold: bool) -> u32 {
+/// Threads a group may keep: normal, the window's `peak` busy count in
+/// [1, cap]; pressure, 1 while `hold` (work, or a thread restarted under
+/// pressure, `LoadGroup::started`), else 0.
+pub(crate) fn load_target(peak: u32, cap: u32, pressure: bool, hold: bool) -> u32 {
     if pressure {
         return (hold as u32).min(cap);
     }
-    ((median2 * 3).div_ceil(4) + 1).clamp(1, cap.max(1))
+    peak.clamp(1, cap.max(1))
 }
 
 /// Exits a yield asks of a group with `live` threads: up to `want`, leaving
@@ -568,7 +613,8 @@ pub(crate) struct LoadGroup {
     busy: core::sync::atomic::AtomicU32,
     peak: core::sync::atomic::AtomicU32,
     target: core::sync::atomic::AtomicU32,
-    median2: core::sync::atomic::AtomicU32,
+    /// Peak busy count over the window at the last retirement check.
+    busy_peak: core::sync::atomic::AtomicU32,
     retired_load: core::sync::atomic::AtomicU32,
     retired_pressure: core::sync::atomic::AtomicU32,
     /// Finishes in a row with the group above its target (normal mode).
@@ -594,7 +640,7 @@ impl LoadGroup {
             busy: AtomicU32::new(0),
             peak: AtomicU32::new(0),
             target: AtomicU32::new(1),
-            median2: AtomicU32::new(0),
+            busy_peak: AtomicU32::new(0),
             retired_load: AtomicU32::new(0),
             retired_pressure: AtomicU32::new(0),
             over: AtomicU32::new(0),
@@ -656,24 +702,40 @@ impl LoadGroup {
     /// A thread that finished its work leaves now: `live` (it included) is
     /// above the target. `has_work`: work it could take next. Counts it.
     pub(crate) fn retire_due(&self, live: u32, cap: u32, has_work: bool) -> bool {
-        self.retire_due_with(live, cap, has_work, pressure())
+        let retire = super::tune::retire_load();
+        self.retire_due_with(live, cap, has_work, pressure(), retire)
     }
-    /// `retire_due` with the mode passed in.
-    fn retire_due_with(&self, live: u32, cap: u32, has_work: bool, pressure: bool) -> bool {
+    /// `retire_due` with the mode passed in; `retire`: normal-mode
+    /// retirement on (tune::retire_load).
+    fn retire_due_with(
+        &self,
+        live: u32,
+        cap: u32,
+        has_work: bool,
+        pressure: bool,
+        retire: bool,
+    ) -> bool {
         use core::sync::atomic::Ordering::Relaxed;
         let mut count = [0u32; LOAD_BUCKETS];
         for (c, h) in count.iter_mut().zip(&self.hist) {
             *c = h.load(Relaxed);
         }
-        let n = (self.taken.load(Relaxed) as usize).min(LOAD_SAMPLES) as u32;
-        let median2 = median2_of(&count, n);
+        let busy_peak = peak_of(&count);
         if !pressure {
             self.held.store(false, Relaxed);
         }
         let hold = has_work || self.held.load(Relaxed);
-        let target = load_target(median2, cap, pressure, hold);
-        self.median2.store(median2, Relaxed);
+        let target = load_target(busy_peak, cap, pressure, hold);
+        self.busy_peak.store(busy_peak, Relaxed);
         self.target.store(target, Relaxed);
+        // Normal mode never retires a thread with work queued: `has_work`
+        // was once used only under pressure, so a burst shorter than the
+        // window shed a thread every RETIRE_STREAK finishes and the queue
+        // created it again (read from code, not seen on a console).
+        if !pressure && (has_work || !retire) {
+            self.over.store(0, Relaxed);
+            return false;
+        }
         // Normal mode keeps one thread above the target: retiring at the
         // target made a burst start a thread and retire it right after,
         // 509 decode worker retirements in 159 s on a console (debug
@@ -684,7 +746,7 @@ impl LoadGroup {
             return false;
         }
         // Normal mode also waits for RETIRE_STREAK finishes in a row above
-        // it: a title whose busy median flips between 0 and 1 still retired
+        // it: a title whose busy median flipped between 0 and 1 still retired
         // and restarted 1.5 decode workers per second with the margin alone
         // (217 in 147 s, debug /metrics).
         if !pressure {
@@ -703,15 +765,15 @@ impl LoadGroup {
     pub(crate) fn yielded(&self, n: u32) {
         self.retired_pressure.fetch_add(n, core::sync::atomic::Ordering::Relaxed);
     }
-    /// Debug /metrics: (peak, target, busy median rounded up, retired by
-    /// load, retired under pressure).
+    /// Debug /metrics: (peak live, target, peak busy over the window,
+    /// retired by load, retired under pressure).
     #[cfg_attr(not(feature = "mem_report"), allow(dead_code))]
     pub(crate) fn metrics(&self) -> [u64; 5] {
         use core::sync::atomic::Ordering::Relaxed;
         [
             self.peak.load(Relaxed).into(),
             self.target.load(Relaxed).into(),
-            self.median2.load(Relaxed).div_ceil(2).into(),
+            self.busy_peak.load(Relaxed).into(),
             self.retired_load.load(Relaxed).into(),
             self.retired_pressure.load(Relaxed).into(),
         ]
@@ -890,28 +952,30 @@ mod tests {
         }
     }
 
-    /// Twice the median: odd and even counts, unsorted input, clamping.
+    /// The peak: empty, unsorted input, a single high sample among idle
+    /// ones (a burst the median never saw), clamping.
     #[test]
-    fn load_median() {
-        assert_eq!(load_median2(&[]), 0);
-        assert_eq!(load_median2(&[3]), 6);
-        assert_eq!(load_median2(&[4, 1, 3]), 6);
-        assert_eq!(load_median2(&[1, 0, 1, 0]), 1); // median 0.5
-        assert_eq!(load_median2(&[4, 3, 4, 3, 4, 3]), 7); // median 3.5
-        assert_eq!(load_median2(&[200, 200]), 30); // clamped to 15
+    fn load_peak_of_window() {
+        assert_eq!(load_peak(&[]), 0);
+        assert_eq!(load_peak(&[0, 0, 0]), 0);
+        assert_eq!(load_peak(&[3]), 3);
+        assert_eq!(load_peak(&[4, 1, 3]), 4);
+        let mut idle = [0u8; 100];
+        idle[57] = 5;
+        assert_eq!(load_peak(&idle), 5);
+        assert_eq!(load_peak(&[200, 200]), 15); // clamped to 15
     }
 
-    /// Normal mode: ceil(median x 1.5) + 1, clamped to [1, cap], so never
-    /// 0. Pressure: 1 with work, 0 without.
+    /// Normal mode: the window's peak busy count, clamped to [1, cap], so
+    /// never 0. Pressure: 1 with work, 0 without.
     #[test]
     fn load_target_math() {
         assert_eq!(load_target(0, 4, false, false), 1); // floor 1
         assert_eq!(load_target(0, 0, false, true), 1); // cap 0 still keeps 1
-        assert_eq!(load_target(1, 4, false, false), 2); // 0.5 -> ceil(0.75) + 1
-        assert_eq!(load_target(2, 4, false, false), 3); // 1 -> ceil(1.5) + 1
-        assert_eq!(load_target(4, 6, false, true), 4); // 2 -> 3 + 1
-        assert_eq!(load_target(7, 4, false, true), 4); // 3.5 -> 7, clamped
-        assert_eq!(load_target(8, 6, false, false), 6); // 4 -> 7, clamped
+        assert_eq!(load_target(1, 4, false, false), 1);
+        assert_eq!(load_target(3, 4, false, false), 3);
+        assert_eq!(load_target(4, 6, false, true), 4);
+        assert_eq!(load_target(7, 4, false, true), 4); // clamped
         assert_eq!(load_target(8, 6, true, true), 1); // pressure: one
         assert_eq!(load_target(8, 6, true, false), 0); // pressure: none
         assert_eq!(load_target(0, 0, true, true), 0);
@@ -930,40 +994,38 @@ mod tests {
     }
 
     /// The histogram follows the ring: a full window of 4s replaced by a
-    /// full window of 1s gives median 1, and halfway the two meet.
+    /// full window of 1s gives peak 1 only once the last 4 has left it.
     #[test]
     fn load_window_evicts_old_samples() {
         use core::sync::atomic::Ordering::Relaxed;
         let g = LoadGroup::new(0);
-        let median2 = |g: &LoadGroup| {
+        let peak = |g: &LoadGroup| {
             let mut count = [0u32; LOAD_BUCKETS];
             for (c, h) in count.iter_mut().zip(&g.hist) {
                 *c = h.load(Relaxed);
             }
-            median2_of(&count, (g.taken.load(Relaxed) as usize).min(LOAD_SAMPLES) as u32)
+            peak_of(&count)
         };
         for _ in 0..LOAD_SAMPLES {
             g.sample(4);
         }
-        assert_eq!(median2(&g), 8);
-        for _ in 0..LOAD_SAMPLES / 2 {
+        assert_eq!(peak(&g), 4);
+        for _ in 0..LOAD_SAMPLES - 1 {
             g.sample(1);
         }
-        assert_eq!(median2(&g), 5); // 4096 of each: (1 + 4)
-        for _ in 0..LOAD_SAMPLES / 2 {
-            g.sample(1);
-        }
-        assert_eq!(median2(&g), 2);
+        assert_eq!(peak(&g), 4); // one 4 left
+        g.sample(1);
+        assert_eq!(peak(&g), 1);
         assert_eq!(g.hist.iter().map(|h| h.load(Relaxed)).sum::<u32>(), LOAD_SAMPLES as u32);
     }
 
-    /// Retirement: normal mode keeps one thread above the target (target 4:
-    /// 5 stay, a 6th leaves after RETIRE_STREAK finishes in a row), never
-    /// drops below 1, and counts by load.
+    /// Retirement: normal mode keeps one thread above the target (target
+    /// 2: 3 stay, a 4th leaves after RETIRE_STREAK finishes in a row), never
+    /// with work queued, never with `retire_load` off, and counts by load.
     #[test]
     fn load_group_retires_above_target() {
         let g = LoadGroup::new(0);
-        let due = |live, cap, work| g.retire_due_with(live, cap, work, false);
+        let due = |live, cap, work| g.retire_due_with(live, cap, work, false, true);
         assert!(!due(1, 4, false)); // no samples: target 1, floor
         assert!(!due(2, 4, false)); // target + 1 stays
         // Above target + 1: leaves on the RETIRE_STREAK-th finish in a row.
@@ -977,6 +1039,14 @@ mod tests {
         }
         assert!(!due(2, 4, false));
         assert!(!due(3, 4, false));
+        // So does a finish with work queued, which never retires.
+        for _ in 0..4 * RETIRE_STREAK {
+            assert!(!due(3, 4, true));
+        }
+        for _ in 1..RETIRE_STREAK {
+            assert!(!due(3, 4, false));
+        }
+        assert!(due(3, 4, false));
         for _ in 0..2 {
             g.begin();
         }
@@ -984,18 +1054,25 @@ mod tests {
             g.end();
             g.begin();
         }
-        // Samples alternate 2 and 1 busy: median 1.5, target 4.
-        assert!(!due(4, 4, true));
-        assert!(!due(3, 4, false)); // no retirement below target
-        assert!(!due(5, 6, true)); // target + 1 stays
-        for _ in 1..RETIRE_STREAK {
-            assert!(!due(6, 6, true));
+        // Samples alternate 2 and 1 busy: peak 2, target 2, 3 stay.
+        assert!(!due(2, 4, false)); // no retirement below target
+        for _ in 0..4 * RETIRE_STREAK {
+            assert!(!due(3, 6, false)); // target + 1 stays
+            assert!(!due(5, 6, true)); // work queued
         }
-        assert!(due(6, 6, true));
-        assert_eq!(g.metrics()[1..4], [4, 2, 2]); // target, median, by load
+        // retire_load off: no normal-mode retirement, and the streak restarts.
+        let off = |live| g.retire_due_with(live, 6, false, false, false);
+        for _ in 0..4 * RETIRE_STREAK {
+            assert!(!off(6));
+        }
+        for _ in 1..RETIRE_STREAK {
+            assert!(!due(5, 6, false));
+        }
+        assert!(due(5, 6, false));
+        assert_eq!(g.metrics()[1..4], [2, 2, 3]); // target, peak busy, by load
         // Pressure: one thread stays while there is work, none without,
-        // and those retirements count apart.
-        let hot = |live, work| g.retire_due_with(live, 4, work, true);
+        // those retirements count apart, and the knob does not apply.
+        let hot = |live, work| g.retire_due_with(live, 4, work, true, false);
         assert!(hot(2, true));
         assert!(!hot(1, true));
         assert!(hot(1, false));
@@ -1013,7 +1090,7 @@ mod tests {
     #[test]
     fn pressure_keeps_restarted_thread() {
         let g = LoadGroup::new(0);
-        let hot = |live, work| g.retire_due_with(live, 4, work, true);
+        let hot = |live, work| g.retire_due_with(live, 4, work, true, true);
         assert!(hot(1, false)); // started before the pressure: leaves
         g.started_with(1, true); // restarted under pressure
         assert!(!hot(1, false)); // kept with no work
@@ -1022,11 +1099,11 @@ mod tests {
         g.asked(); // a later failed creation asks again
         assert!(hot(1, false));
         g.started_with(1, true);
-        assert!(!g.retire_due_with(1, 4, false, false)); // normal: floor 1
+        assert!(!g.retire_due_with(1, 4, false, false, true)); // normal: floor 1
         assert!(hot(1, false)); // normal mode dropped it
         let decode = LoadGroup::new(1);
-        assert!(!decode.retire_due_with(1, 4, false, true)); // floor 1
-        assert!(decode.retire_due_with(2, 4, false, true));
-        assert!(!decode.retire_due_with(1, 4, false, false));
+        assert!(!decode.retire_due_with(1, 4, false, true, true)); // floor 1
+        assert!(decode.retire_due_with(2, 4, false, true, true));
+        assert!(!decode.retire_due_with(1, 4, false, false, true));
     }
 }

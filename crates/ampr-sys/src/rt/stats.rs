@@ -32,11 +32,20 @@ stats! {
     /// Decoded-chunk cache lookups.
     CacheHits = "cache_hits",
     CacheMisses = "cache_misses",
-    /// Demand misses split by whether the chunk was read before (demand or
-    /// read-ahead) and later evicted: "repeat" misses are what a bigger or
-    /// smarter cache could save, "first" misses only earlier prefetch can.
+    /// Misses split by whether the chunk was read before and later evicted:
+    /// "repeat" misses are what a bigger or smarter cache could save,
+    /// "first" misses only earlier prefetch can.
     CacheMissFirst = "cache_miss_first",
     CacheMissRepeat = "cache_miss_repeat",
+    /// The protected cache segment (pack/caches.rs): bytes held by protected
+    /// entries now (a gauge), entries promoted after `cache_protect_hits`
+    /// hits, and protected entries the hand demoted back to probation.
+    CacheProtectedBytes = "cache_protected_bytes",
+    /// Bytes the decoded cache grew by when the index finished, from the
+    /// Index ledger's idle room (rt/pack/manifest.rs `grow_cache_from_index`).
+    CacheGrownBytes = "cache_grown_bytes",
+    CachePromotions = "cache_promotions",
+    CacheDemotions = "cache_demotions",
     /// Reactor active reads (the game's APR read commands): submit->observed
     /// latency, polls per read, and the gap between the last "not done" poll
     /// and the "done" poll (how late a completion was noticed, upper bound).
@@ -52,10 +61,6 @@ stats! {
     ExtReadNsMax = "ext_read_ns_max",
     ExtPolls = "ext_polls",
     ExtDetectNs = "ext_detect_ns",
-    /// Read-ahead: chunks queued for prefetch, and candidates skipped (already
-    /// cached, random-access file, no free slot or worker).
-    PrefetchChunks = "prefetch_chunks",
-    PrefetchSkipped = "prefetch_skipped",
     /// Reads served by the blocking pread pool (reactor/pread_pool.rs): calls and
     /// bytes, time queued for a pool thread, time in pread, and the peak
     /// number of queued + running reads since the last scrape. Pack reads
@@ -71,6 +76,11 @@ stats! {
     /// that only takes the lock and scans the table).
     PreadWakeups = "pread_wakeups",
     PreadWakeupsIdle = "pread_wakeups_idle",
+    /// Pack window reads a worker queued to the pread pool itself, and those
+    /// that went through the reactor instead (no free task or no live pool
+    /// thread; reactor/pread_pool.rs `queue_pack_pread`).
+    PackPreadDirect = "pack_pread_direct",
+    PackPreadReactor = "pack_pread_reactor",
     /// Debug: threads created through scePthreadCreate/pthread_create, the
     /// game's and the runtime's, and the creations that failed (each failure
     /// is also a 'P' event; rt/probe.rs).
@@ -81,37 +91,89 @@ stats! {
     ThreadCreateRetried = "thread_create_retried",
     ThreadCreateRescued = "thread_create_rescued",
     /// The runtime-wide thread budget (rt/thread_hooks.rs): cuts after a
-    /// game creation failed, and growths back by one after 10 s quiet.
+    /// game creation failed, and growths back by one after 5 s quiet.
     ThreadBudgetCuts = "thread_budget_cuts",
     ThreadBudgetRegrows = "thread_budget_regrows",
-    /// Packed reads run on the caller's own thread because no read thread
-    /// was running or startable (rt/pack/fd_read.rs `read_inline`), the ones
-    /// whose caller had under 48 KiB of stack left (the read needs about
-    /// 32 KB), and the stack left at the last one (0 when libkernel would
-    /// not say).
-    ReadInline = "read_inline",
+    /// Runtime threads started on a pool stack (rt/thread_stack.rs) and
+    /// those that got libkernel's own stack instead (no symbol, no slot, a
+    /// refused attribute), the pool stack bytes in use with their guard
+    /// pages, and the most at once.
+    ThreadStacksPool = "thread_stacks_pool",
+    ThreadStacksLibkernel = "thread_stacks_libkernel",
+    ThreadStackBytes = "thread_stack_bytes",
+    ThreadStackBytesMax = "thread_stack_bytes_max",
+    /// The Rust global allocator (rt/heap.rs, iced-x86 only): bytes live,
+    /// the most at once, the pool heap's bump top, and bytes that went to
+    /// libc malloc because the pool heap was full or absent.
+    HeapBytes = "heap_bytes",
+    HeapBytesMax = "heap_bytes_max",
+    HeapBumpTop = "heap_bump_top",
+    HeapLibcBytes = "heap_libc_bytes",
+    /// Packed POSIX reads run on the caller's own thread (rt/pack/fd_read.rs
+    /// `note_caller_stack`, one in 16 sampled): the ones whose caller had
+    /// under 16 KiB of stack left, and the least stack a sampled caller had
+    /// left (0 until libkernel says).
     ReadInlineLowStack = "read_inline_low_stack",
     ReadInlineStackLeft = "read_inline_stack_left",
-    /// Save data (rt/save.rs): mounts, the mounts the save service answered
-    /// with SAVE_DATA_ERROR_BUSY (passed back to the game unchanged), icon
-    /// bytes handed over through sceSaveDataSaveIcon, and packed icons the
-    /// runtime could not handle (the original path call is left to fail as
-    /// before).
-    SaveMounts = "save_mounts",
-    SaveBusy = "save_busy",
+    /// Packed POSIX reads (read, readv, pread, preadv and libc's `_read`,
+    /// `_readv` on a virtual pack fd, rt/pack/fd_read.rs `read_slot_at`)
+    /// of one byte or more, and their latency as the caller sees it: the
+    /// queue wait, the pack job and the wake-up, all on the caller's thread.
+    PosixReads = "posix_reads",
+    PosixReadNs = "posix_read_ns",
+    PosixReadNsMax = "posix_read_ns_max",
+    /// Calls into the libc entry hooks, by hook id (rt/sys.rs `hook`):
+    /// 84 `_open`, 85 `_openat`, 86 `_read`, 87 `_readv`, 88 `_close`,
+    /// 89 `_fstat`, 90 `_getdirentries`, 91 `access`, 92 `lstat`, 93 `fcntl`,
+    /// 94 `_fcntl`, 95 `sceKernelFcntl`. They install only in a title with
+    /// packs; which ones a game reaches decides which can go.
+    LibcHits84 = "libc_hits_84",
+    LibcHits85 = "libc_hits_85",
+    LibcHits86 = "libc_hits_86",
+    LibcHits87 = "libc_hits_87",
+    LibcHits88 = "libc_hits_88",
+    LibcHits89 = "libc_hits_89",
+    LibcHits90 = "libc_hits_90",
+    LibcHits91 = "libc_hits_91",
+    LibcHits92 = "libc_hits_92",
+    LibcHits93 = "libc_hits_93",
+    LibcHits94 = "libc_hits_94",
+    LibcHits95 = "libc_hits_95",
+    /// The same calls that the runtime served on a virtual pack fd: the fd
+    /// hooks on one (or on a packed directory fd), `_open`/`_openat` that
+    /// returned one. `access` (91) and `lstat` (92) take no fd and stay 0.
+    LibcPacked84 = "libc_packed_84",
+    LibcPacked85 = "libc_packed_85",
+    LibcPacked86 = "libc_packed_86",
+    LibcPacked87 = "libc_packed_87",
+    LibcPacked88 = "libc_packed_88",
+    LibcPacked89 = "libc_packed_89",
+    LibcPacked90 = "libc_packed_90",
+    LibcPacked91 = "libc_packed_91",
+    LibcPacked92 = "libc_packed_92",
+    LibcPacked93 = "libc_packed_93",
+    LibcPacked94 = "libc_packed_94",
+    LibcPacked95 = "libc_packed_95",
+    /// Save data icon (rt/save.rs): bytes of packed icons handed over through
+    /// sceSaveDataSaveIcon, and packed icons the runtime could not read or
+    /// the service refused (the call then answers 0: the icon is cosmetic,
+    /// the error stalled a save).
     SaveIconBytes = "save_icon_bytes",
     SaveIconSkipped = "save_icon_skipped",
-    /// sceSaveDataMount3 calls answered non-zero (BUSY included) and the
-    /// last such code; what sceSaveDataSaveIcon answered the last packed
-    /// icon handed over, before the hook maps a failure to 0; what the
-    /// original sceSaveDataSaveIconByPath answered the last call forwarded
-    /// to it (a loose or missing icon). The three codes are set, not
-    /// summed, and print as hex on /metrics (`is_code`); 0 there is also
-    /// "no such call yet".
-    SaveMountErrors = "save_mount_errors",
-    SaveMountLastError = "save_mount_last_error",
+    /// What sceSaveDataSaveIcon answered the last packed icon handed over,
+    /// before the hook maps a failure to 0, and the last call forwarded
+    /// unchanged (a loose or missing icon). Set, not summed, and printed as
+    /// hex on /metrics (`is_code`); 0 there is also "no such call yet".
     SaveIconLastResult = "save_icon_last_result",
     SaveIconPathLastResult = "save_icon_path_last_result",
+    /// sceSaveDataMount3 (rt/save.rs): mounts, BUSY answers, BUSY mounts of
+    /// a directory this title already had mounted that were answered with
+    /// that point instead (a second owner), and unmounts of a shared point
+    /// answered without unmounting (an owner left).
+    SaveMounts = "save_mounts",
+    SaveBusy = "save_busy",
+    SaveMountsShared = "save_mounts_shared",
+    SaveUmountsShared = "save_umounts_shared",
     /// Read pool size (reactor/pread_pool.rs): threads started, the most
     /// live at once, threads given back to the game, and our own creations
     /// that failed (the pool stops growing). Exits by load are
@@ -149,7 +211,7 @@ stats! {
     LoosePreadSplitReads = "loose_pread_split_reads",
     LoosePreadParts = "loose_pread_parts",
     /// Packed reads split into chunk-aligned child jobs that workers decode
-    /// in parallel (rt/pack/zstd_split.rs), and the children they made.
+    /// in parallel (rt/pack/pack_split.rs), and the children they made.
     PackSplitReads = "pack_split_reads",
     PackSplitChildren = "pack_split_children",
     /// Highest number of reactor AIO reads in flight since the last scrape.
@@ -239,13 +301,13 @@ stats! {
     /// maybe_release_reactor_job) and its successor's reads are all done with
     /// its cursor on a completion command, its read-done time -> this
     /// release. N before N+1 forces this wait; job_notify_ns minus it is the
-    /// reactor's own share (reactor/lane_overlap.rs note_successor_order_wait).
+    /// reactor's own share (reactor/progress.rs note_successor_order_wait).
     JobOrderWaits = "job_order_waits",
     JobOrderWaitNs = "job_order_wait_ns",
     /// Lane loop (reactor/progress.rs) stops before a job that has a
     /// successor queued in its priority lane, so the successor does not parse
     /// in this pass. Counted once per stop (per lane pass), by what the head
-    /// is parked on (reactor/lane_overlap.rs lane_block_kind):
+    /// is parked on (reactor/progress.rs lane_block_kind):
     /// lane_successor_blocked_fence: a completion command (EOP write, counter,
     /// equeue) waiting on the head's own read fence or deferred native EOP;
     /// lane_successor_blocked_wait: a WaitOnAddress/WaitOnCounter, or a
@@ -254,10 +316,6 @@ stats! {
     LaneSuccessorBlockedFence = "lane_successor_blocked_fence",
     LaneSuccessorBlockedWait = "lane_successor_blocked_wait",
     LaneSuccessorBlockedOther = "lane_successor_blocked_other",
-    /// Completion commands (not nops/markers) in head jobs whose tail the
-    /// live knob lane_eop_overlap let the successor run past, counted once
-    /// per job when its tail is first verified (reactor/lane_overlap.rs).
-    EopDeferred = "eop_deferred",
     /// Gather/scatter re-resolves from the lane cursor
     /// (`gatherScatterStates[prioIndex]`) after a first resolution of the
     /// same command did not issue, counted per retry (a command parked and
@@ -265,8 +323,8 @@ stats! {
     /// from that first resolution (job_state.rs `GsPrepRecord`). A mismatch
     /// means another job advanced the shared lane cursor and the retry would
     /// read another file's bytes. Each is also logged as a 'G'
-    /// event in /fsfail (`gs_retry_mismatch`). Release can reach neither
-    /// while cross-EOP read-ahead is stubbed and lane overlap is off.
+    /// event in /fsfail (`gs_retry_mismatch`). No path advances another
+    /// job's lane cursor today, so a mismatch means a new bug.
     GsRetryChecks = "gs_retry_checks",
     GsRetryMismatches = "gs_retry_mismatches",
     /// Gauges that rise and fall (`enter`/`leave`): game threads blocked
@@ -330,13 +388,6 @@ stats! {
     MmapDisk = "mmap_disk",
     MmapDiskBytes = "mmap_disk_bytes",
     MmapDiskFailed = "mmap_disk_failed",
-    /// zstd, `AMPR_ZSTD_MMAP=1` (rt/pack/mmap_fault.rs): maps served by
-    /// decode on access, faults taken in them, bytes decoded into them, and
-    /// chunks whose read or decode failed (that mapping then fails).
-    MmapFaultMappings = "mmap_fault_mappings",
-    MmapFaults = "mmap_faults",
-    MmapFaultBytes = "mmap_fault_bytes",
-    MmapFaultErrors = "mmap_fault_errors",
     /// Index memory held for lookups once an index is mounted: the
     /// resident block of the compiled index view (rt/index_view.rs), the
     /// zstd chunk tables (8 B per chunk and volume, rt/pack/zstd.rs) and
@@ -370,13 +421,13 @@ fn resets_on_read(s: usize) -> bool {
         || s == Stat::PreadPendingMax as usize
         || s == Stat::JobFirstIssueNsMax as usize
         || s == Stat::JobNotifyNsMax as usize
+        || s == Stat::PosixReadNsMax as usize
 }
 
 /// Stats that hold a 32-bit SCE return code, printed as hex on /metrics.
 #[cfg(feature = "mem_report")]
 pub(crate) fn is_code(s: usize) -> bool {
-    s == Stat::SaveMountLastError as usize
-        || s == Stat::SaveIconLastResult as usize
+    s == Stat::SaveIconLastResult as usize
         || s == Stat::SaveIconPathLastResult as usize
 }
 
@@ -422,14 +473,10 @@ pub(crate) fn now() -> u64 {
 /// b'G' a gather/scatter retry that re-resolved to
 /// another file id or offset than its first resolution (path = both pairs,
 /// see `gs_retry_mismatch`). b'X' mmap and b'Y' sceKernelMmap of a virtual
-/// fd (rt/pack/mmap.rs, both builds hook them with `AMPR_ZSTD_MMAP` on;
+/// fd (rt/pack/mmap.rs, both builds hook them with `AMPR_PACK_MMAP` on;
 /// `/fsfail` keeps only the failed ones): path "<call> <packed file path>",
-/// lookup b'f' a decode-on-access mapping (rt/pack/mmap_fault.rs), b'k'
-/// mapped from the disk cache file, b'v' the cache file failed or the fd
-/// is a virtual directory; b'X' with lookup b'F' is a decode-on-access
-/// failure, path "mmap-fault sigaction" (the handler could not be
-/// installed) or "mmap-fault fid=<hex> chunk=<hex>" (a chunk read or decode
-/// failed in the handler). b'I' a game's own
+/// lookup b'k' mapped from the disk cache file, b'v' the cache file failed
+/// or the fd is a virtual directory. b'I' a game's own
 /// sceKernelAioSubmitReadCommands(Multiple) with a request on a packed fd,
 /// which the runtime's AIO emulation served (rt/pack/aio.rs, logged through
 /// rt/probe.rs `note_aio_submit` whatever the result), lookup b'v'.
@@ -440,7 +487,7 @@ pub(crate) fn now() -> u64 {
 /// fd>`) and their lookup letter b'p' a packed file, b'd' an indexed
 /// directory, b'v' a virtual fd. In debug
 /// builds the libc hooks b'O', b'A', b'a', b'l' whose
-/// `AMPR_ZSTD_LIBC_HOOKS` bit is off run as such pass-through observers too (rt/hook.rs `observed_only`), logged with
+/// `AMPR_PACK_LIBC_HOOKS` bit is off run as such pass-through observers too (rt/hook.rs `observed_only`), logged with
 /// lookup b'p' or b'd' only. Resident lookup: b'h' hit,
 /// b'm' miss the index answers, b'M' miss sent to the FS, b'd' directory,
 /// b'n' index not ready, b'x' not /app0, b'-' none. Then result and path.
@@ -615,7 +662,7 @@ pub(crate) fn fs_event(op: u8, how: u8, rc: i64, path: *const core::ffi::c_char)
 /// written to the black box (rt/blackbox.rs) whatever `rc` is, once each:
 /// a probe that succeeds is still in the trace when the game dies before
 /// :9090 answers, and a repeat costs no file write. Also called by rt/save.rs and
-/// rt/pack/mmap_fault.rs; a no-op in release builds, like `fs_event`.
+/// rt/pack/directories.rs; a no-op in release builds, like `fs_event`.
 #[inline(always)]
 #[cfg_attr(not(feature = "mem_report"), allow(dead_code))]
 pub(crate) fn fs_note(op: u8, how: u8, rc: i64, path: *const core::ffi::c_char) {
@@ -749,6 +796,55 @@ pub(crate) fn set(s: Stat, v: u64) {
 pub(crate) fn max(s: Stat, v: u64) {
     if ON {
         VALUES[s as usize].fetch_max(v, Relaxed);
+    }
+}
+
+/// First libc entry hook id counted by `libc_hit`, and the stats of each
+/// id from it on, in id order.
+const LIBC_FIRST: usize = super::sys::hook::_open;
+const LIBC_HITS: [Stat; 12] = [
+    Stat::LibcHits84,
+    Stat::LibcHits85,
+    Stat::LibcHits86,
+    Stat::LibcHits87,
+    Stat::LibcHits88,
+    Stat::LibcHits89,
+    Stat::LibcHits90,
+    Stat::LibcHits91,
+    Stat::LibcHits92,
+    Stat::LibcHits93,
+    Stat::LibcHits94,
+    Stat::LibcHits95,
+];
+const LIBC_PACKED: [Stat; 12] = [
+    Stat::LibcPacked84,
+    Stat::LibcPacked85,
+    Stat::LibcPacked86,
+    Stat::LibcPacked87,
+    Stat::LibcPacked88,
+    Stat::LibcPacked89,
+    Stat::LibcPacked90,
+    Stat::LibcPacked91,
+    Stat::LibcPacked92,
+    Stat::LibcPacked93,
+    Stat::LibcPacked94,
+    Stat::LibcPacked95,
+];
+const _: () = assert!(
+    super::sys::hook::sceKernelFcntl - LIBC_FIRST + 1 == LIBC_HITS.len(),
+    "one libc_hits and one libc_packed stat per libc entry hook id"
+);
+
+/// One call into libc entry hook `id` (84..=95), and with `packed` one the
+/// runtime served on a virtual pack fd. Other ids are ignored.
+#[inline(always)]
+pub(crate) fn libc_hit(id: usize, packed: bool) {
+    let Some(i) = id.checked_sub(LIBC_FIRST).filter(|&i| i < LIBC_HITS.len()) else {
+        return;
+    };
+    add(LIBC_HITS[i], 1);
+    if packed {
+        add(LIBC_PACKED[i], 1);
     }
 }
 

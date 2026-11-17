@@ -51,15 +51,49 @@ CHAIN = [
 ]
 CHAIN_BUDGET = 0x1000
 
+# Frames summed along a packed POSIX read (read, pread, readv, preadv),
+# which queues its pack jobs and waits on the caller's own thread
+# (rt/pack/fd_read.rs `read_on_workers`), each function once. 0x770
+# release, 0x750 debug, with `ensure_workers_locked` counted (the first
+# worker now starts at startup, rt/pack/worker.rs `start_first_worker`). Before,
+# a read thread took the call because the AIO API path needed about 32 KB.
+READ_CHAIN = [
+    r"7fd_read(12virtual_read|13virtual_pread)$",
+    r"7fd_read12read_slot_at$",
+    r"7fd_read15read_on_workers$",
+    # The submit and the wait run one after the other under read_on_workers;
+    # both are counted, so the sum is an upper bound. A frame the compiler
+    # inlined is in its caller's and matches nothing here.
+    r"7fd_read11submit_sync$",
+    r"7fd_read18submit_sync_locked$",
+    r"7fd_read9wait_sync$",
+    r"3aio30prepare_virtual_request_locked$",
+    r"10pack_split25split_virtual_read_locked$",
+    r"6worker21ensure_workers_locked$",
+    r"8schedule17queue_push_locked$",
+]
+READ_CHAIN_BUDGET = 0x1000
+
+# The save icon hook reads a packed icon (rt/pack/mmap.rs `read_packed`):
+# after the open returns, a packed read runs on the game's save thread
+# under the hook's own frames, each function once.
+ICON_READ_CHAIN = [
+    r"4save22save_icon_by_path_emul",
+    r"4mmap11read_packed",
+    r"4mmap12read_to_heap",
+] + READ_CHAIN
+FRAME_BUDGETS += [
+    (r"7fd_read15read_on_workers$", 0x600, True, "0x2e8 / 0x2e8"),
+    (r"3aio30prepare_virtual_request_locked$", 0x400, True, "0x218 / 0x208"),
+]
+
 # Large frames kept as they are, pinned so they cannot grow unnoticed. The
-# AIO emulation holds arrays for 128 requests (rt/pack/fd_read.rs
-# `READ_STACK`); they are reached only for a call on a packed fd, and
-# `read_on_workers` also runs on the caller's thread when no read thread can
-# start.
+# AIO emulation holds arrays for 128 requests; it is reached for the game's
+# own AIO calls on a packed fd and the reactor's APR submits (reactor/mod.rs,
+# reactor/flush.rs), never for a POSIX read.
 PINNED = [
-    (r"7fd_read15read_on_workers", 0x3000, True, "0x2e58"),
-    (r"3aio38sceKernelAioSubmitReadCommandsMultiple$", 0x3800, True, "0x2b00 / 0x3600"),
-    (r"3aio20publish_virtual_jobs", 0x800, True, "0x18 / 0x728"),
+    (r"3aio38sceKernelAioSubmitReadCommandsMultiple$", 0x3800, True, "0x26d8 / 0x26d8"),
+    (r"3aio20publish_virtual_jobs", 0x800, True, "0x18 / 0x18"),
 ]
 
 SUB_RSP = re.compile(r"subq\s+\$0x([0-9a-f]+), %rsp")
@@ -114,14 +148,29 @@ def main() -> int:
             failures.append(f"{pattern}: frame 0x{size:x} over budget 0x{limit:x}")
     chain = sum(biggest(table, pattern) or 0 for pattern in CHAIN)
     if chain > CHAIN_BUDGET:
-        failures.append(f"save icon open chain: 0x{chain:x} over budget 0x{CHAIN_BUDGET:x}")
+        failures.append(f"packed open chain: 0x{chain:x} over budget 0x{CHAIN_BUDGET:x}")
+    read_chain = sum(biggest(table, pattern) or 0 for pattern in READ_CHAIN)
+    if read_chain > READ_CHAIN_BUDGET:
+        failures.append(
+            f"packed read chain: 0x{read_chain:x} over budget 0x{READ_CHAIN_BUDGET:x}"
+        )
+
+    icon_chain = sum(biggest(table, pattern) or 0 for pattern in ICON_READ_CHAIN)
+    if icon_chain > READ_CHAIN_BUDGET:
+        failures.append(
+            f"save icon read chain: 0x{icon_chain:x} over budget 0x{READ_CHAIN_BUDGET:x}"
+        )
 
     if failures:
         print(f"stack frame budget exceeded in {args.prx}:", file=sys.stderr)
         for failure in failures:
             print(f"  {failure}", file=sys.stderr)
         return 1
-    print(f"stack frames ok: {args.prx} (open chain 0x{chain:x} of 0x{CHAIN_BUDGET:x})")
+    print(
+        f"stack frames ok: {args.prx} (open chain 0x{chain:x} of 0x{CHAIN_BUDGET:x}, "
+        f"read chain 0x{read_chain:x} of 0x{READ_CHAIN_BUDGET:x}, "
+        f"icon read chain 0x{icon_chain:x} of 0x{READ_CHAIN_BUDGET:x})"
+    )
     return 0
 
 

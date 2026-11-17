@@ -47,6 +47,30 @@ pub(crate) unsafe fn build_pack_path(
     }
 }
 
+/// Bench helper for the metrics endpoint: when the manifest is mounted (loads
+/// it like a first read would), writes the NUL-terminated absolute path of pack
+/// volume 0 (as acquire_pack_fd opens it; `ampr_zstd-000.pak` in the zstd build)
+/// into `out` and returns (path length without NUL, volume file size from the
+/// manifest pack record or the zstd volume record).
+#[cfg(feature = "mem_report")]
+pub(crate) unsafe fn bench_volume_path(out: &mut [u8; 1024]) -> Option<(usize, u64)> {
+    if !unsafe { ensure_manifest_ready() } {
+        return None;
+    }
+    let state = unsafe { pack_state() };
+    let _lock = PACK_M.lock();
+    if !unsafe { build_pack_path(state, 0, out.as_mut_ptr() as *mut c_char, out.len()) } {
+        return None;
+    }
+    let length = out.iter().position(|&b| b == 0)?;
+    let file_size = if zstd_mode() {
+        zstd::zstd_volume_size(0)?
+    } else {
+        unsafe { lz4_pack(state, 0) }?.file_size
+    };
+    Some((length, file_size))
+}
+
 unsafe fn build_pack_path_zstd(
     state: *const PackState,
     pack_id: u16,
@@ -295,9 +319,7 @@ pub(crate) unsafe fn release_pack_fd_after_read(
     result
 }
 
-/// `open_only` (read-ahead, readahead.rs): use only an already-open handle; return
-/// EAGAIN instead of evicting another handle or opening this one.
-pub(crate) unsafe fn acquire_pack_fd(pack_id: u16, open_only: bool) -> c_int {
+pub(crate) unsafe fn acquire_pack_fd(pack_id: u16) -> c_int {
     let state = pack_state();
     let mut path = [0 as c_char; SCE_KERNEL_PATH_MAX];
     let (Some(open_fn), Some(_), Some(fstat_fn)) = (real_open(), real_close(), real_fstat()) else {
@@ -313,7 +335,7 @@ pub(crate) unsafe fn acquire_pack_fd(pack_id: u16, open_only: bool) -> c_int {
         if handle.fd >= 0 && handle.reopen.is_stale() {
             // No new pins on a stale fd; the last unpin bumps
             // PACK_FD_PROGRESS_EPOCH and wakes this job to reopen it.
-            if open_only || handle.pins != 0 {
+            if handle.pins != 0 {
                 return SCE_KERNEL_ERROR_EAGAIN;
             }
             let fd = handle.fd;
@@ -355,7 +377,7 @@ pub(crate) unsafe fn acquire_pack_fd(pack_id: u16, open_only: bool) -> c_int {
             (*state).tick += 1;
             return (*state).pack_handles[id].fd;
         }
-        if open_only || (*state).pack_handles[id].opening {
+        if (*state).pack_handles[id].opening {
             return SCE_KERNEL_ERROR_EAGAIN;
         }
         if !build_pack_path(state, pack_id, path.as_mut_ptr(), path.len()) {

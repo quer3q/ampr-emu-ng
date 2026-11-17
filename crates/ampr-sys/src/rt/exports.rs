@@ -1050,8 +1050,8 @@ mod mem_report {
                     .u(v.registrations.into());
                 out.s(b" native_intent=")
                     .u(v.native_intent.into())
-                    .s(b" parked=");
-                out.u(v.parked.into()).s(b" trigger=").u(v.trigger.into());
+                    .s(b" trigger=")
+                    .u(v.trigger.into());
                 out.s(b" flags=").u(v.flags.into());
             } else {
                 out.s(b" untracked");
@@ -1232,10 +1232,13 @@ mod mem_report {
             // refused by a cap counts in ledger_alloc_refused, a failed
             // pool one in pool_alloc_failed.
             use super::super::index_memory as im;
+            // The caps as they are now: the Index cap's idle room moves to
+            // the cache once the index is built (grow_cache_from_index).
+            let (index_cap, cache_cap) = im::live_caps();
             out.kv("index_mem_bytes", im::index_mem_bytes() as u64)
-                .kv("index_mem_cap_bytes", im::INDEX_MEMORY_MAX as u64);
+                .kv("index_mem_cap_bytes", index_cap as u64);
             out.kv("cache_mem_bytes", im::cache_mem_bytes() as u64)
-                .kv("cache_mem_cap_bytes", im::CACHE_MEMORY_MAX as u64);
+                .kv("cache_mem_cap_bytes", cache_cap as u64);
             out.kv("buffer_mem_bytes", im::buffer_mem_bytes() as u64)
                 .kv("buffer_mem_cap_bytes", im::BUFFER_MEMORY_MAX as u64);
             out.kv("ledger_mem_bytes", im::ledger_mem_bytes() as u64)
@@ -1295,9 +1298,8 @@ mod mem_report {
             out.kv("thread_mode", super::super::thread_hooks::pressure() as u64);
             let (workers, worker_ceiling) = super::super::pack::pack_workers_state();
             out.kv("pack_workers_ceiling", worker_ceiling as u64);
-            let (fd_live, fd_load) = super::super::pack::read_threads_load();
             // Per group (rt/thread_hooks.rs LoadGroup): live, peak, target,
-            // busy median (rounded up), retired by load, under pressure.
+            // peak busy over the window, retired by load, under pressure.
             let groups = [
                 (
                     &b"decode"[..],
@@ -1305,13 +1307,12 @@ mod mem_report {
                     super::super::pack::pack_workers_load(),
                 ),
                 (b"pread", live, super::super::reactor::pread_pool_load()),
-                (b"fdread", fd_live as u64, fd_load),
             ];
             const KEYS: [&[u8]; 6] = [
                 b"_threads_live ",
                 b"_threads_peak ",
                 b"_target ",
-                b"_busy_median ",
+                b"_busy_peak ",
                 b"_retired_load ",
                 b"_retired_pressure ",
             ];
@@ -1496,7 +1497,7 @@ pub unsafe extern "C" fn module_start(_args: usize, _argp: *const c_void) -> c_i
     FLEX_AT_START.store(flex_free_now(), core::sync::atomic::Ordering::Relaxed);
     // The knobs once (debug only; release returns at once), before the hooks
     // and the pack state, so titles with no packs read them too (thread
-    // budget, pool size, equeue_local).
+    // budget, pool size).
     unsafe { super::tune::load() };
     // Before any hook: the mode picks the hooks and the notification text.
     unsafe { super::pack::select_pack_format() };

@@ -2,13 +2,13 @@
 //! `_fstat`, `_getdirentries`, and `fcntl`/`_fcntl`/`sceKernelFcntl`), which
 //! libc's stdio and dirent call in place of the hooked public names. They
 //! serve LZ4 (AMPRPAK4) and zstd packs alike: nothing here reads the pack
-//! format, and the pack helpers they call branch on it themselves. The file
-//! and the `AMPR_ZSTD_LIBC_HOOKS` knob keep their zstd names, from the
-//! format they were first written for. A virtual pack fd takes the pack
+//! format, and the pack helpers they call branch on it themselves. Hook ids 84..=95,
+//! Makefile `AMPR_PACK_LIBC_HOOKS`. A virtual pack fd takes the pack
 //! helpers; any other fd calls that entry point's own original, so a
 //! libkernel wrapper calling another never loops.
 
 use super::*;
+use crate::rt::stats;
 
 const F_GETFD: c_int = 1;
 const F_SETFD: c_int = 2;
@@ -22,6 +22,7 @@ pub unsafe extern "C" fn underscore_read_emul(
 ) -> ssize_t {
     let mut handled = false;
     let rc = unsafe { ampr_pack_try_read_fd(fd, buffer, size, &mut handled) };
+    stats::libc_hit(sys::hook::_read, handled);
     if handled {
         return posix_count_from_pack(rc);
     }
@@ -36,6 +37,7 @@ pub unsafe extern "C" fn underscore_readv_emul(
 ) -> ssize_t {
     let mut handled = false;
     let rc = unsafe { ampr_pack_try_readv_fd(fd, iov, iovcnt, &mut handled) };
+    stats::libc_hit(sys::hook::_readv, handled);
     if handled {
         return posix_count_from_pack(rc);
     }
@@ -46,6 +48,7 @@ pub unsafe extern "C" fn underscore_readv_emul(
 pub unsafe extern "C" fn underscore_close_emul(fd: c_int) -> c_int {
     let mut handled = false;
     let rc = unsafe { ampr_pack_try_close_fd(fd, &mut handled) };
+    stats::libc_hit(sys::hook::_close, handled);
     if handled {
         return posix_result_from_pack(rc);
     }
@@ -56,6 +59,7 @@ pub unsafe extern "C" fn underscore_close_emul(fd: c_int) -> c_int {
 pub unsafe extern "C" fn underscore_fstat_emul(fd: c_int, stat: *mut SceKernelStat) -> c_int {
     let mut handled = false;
     let rc = unsafe { ampr_pack_try_fstat_fd(fd, stat, &mut handled) };
+    stats::libc_hit(sys::hook::_fstat, handled);
     if handled {
         return posix_result_from_pack(rc);
     }
@@ -71,6 +75,7 @@ pub unsafe extern "C" fn underscore_getdirentries_emul(
 ) -> c_int {
     let mut handled = false;
     let rc = unsafe { ampr_pack_try_getdirentries_fd(fd, buffer, size, basep, &mut handled) };
+    stats::libc_hit(sys::hook::_getdirentries, handled);
     if handled {
         return posix_result_from_pack(rc);
     }
@@ -102,7 +107,9 @@ type FcntlFn = unsafe extern "C" fn(c_int, c_int, ...) -> c_int;
 /// `fcntl` calls the hooked `_fcntl`, so its original would only re-enter
 /// `underscore_fcntl_emul` (the order `pack::real_close` uses).
 unsafe fn posix_fcntl(id: usize, fd: c_int, cmd: c_int, arg: c_long) -> c_int {
-    if let Some(rc) = virtual_fcntl(fd, cmd) {
+    let virtual_rc = virtual_fcntl(fd, cmd);
+    stats::libc_hit(id, virtual_rc.is_some());
+    if let Some(rc) = virtual_rc {
         return posix_result_from_pack(rc);
     }
     unsafe { kernel_slot::<FcntlFn>(sys::hook::_fcntl).or_else(|| kernel_slot::<FcntlFn>(id)) }
@@ -118,7 +125,9 @@ pub unsafe extern "C" fn underscore_fcntl_emul(fd: c_int, cmd: c_int, arg: c_lon
 }
 
 pub unsafe extern "C" fn sceKernelFcntl_emul(fd: c_int, cmd: c_int, arg: c_long) -> c_int {
-    if let Some(rc) = virtual_fcntl(fd, cmd) {
+    let virtual_rc = virtual_fcntl(fd, cmd);
+    stats::libc_hit(sys::hook::sceKernelFcntl, virtual_rc.is_some());
+    if let Some(rc) = virtual_rc {
         return rc;
     }
     unsafe { kernel_slot::<FcntlFn>(sys::hook::sceKernelFcntl) }

@@ -27,7 +27,11 @@ const LIBKERNEL: SceKernelModule = 0x2001;
 const HOOK_COUNT: usize = id::COUNT;
 const EXT_COUNT: usize = 5;
 /// Save data hooks in loaded system modules (rt/save.rs), not libkernel ids.
-const SAVE_COUNT: usize = 3;
+#[cfg(not(feature = "mem_report"))]
+const SAVE_COUNT: usize = 4;
+/// Debug builds add the save call probes (rt/save.rs `probe`).
+#[cfg(feature = "mem_report")]
+const SAVE_COUNT: usize = 4 + super::save::probe::COUNT;
 /// `sceKernelLoadStartModule` and `sceKernelLoadStartModuleForSysmodule`.
 const LOADER_COUNT: usize = 2;
 const TRAMP_PAGES: usize =
@@ -40,8 +44,9 @@ const _: () = {
     assert!(POOL_COPY_PAGES <= 64 && TRAMP_PAGES == 4 + cfg!(feature = "mem_report") as usize);
     // 10 game AIO slots 100..=109 and 2 thread-creation slots 110..=111 in
     // both builds, and in debug builds the 8 probe slots 112..=119
-    // (rt/probe.rs). With the 5 external equeue hooks, the 3 save data hooks
-    // (rt/save.rs) and the 2 loader hooks that is 122 (release) or 130 (debug)
+    // (rt/probe.rs). With the 5 external equeue hooks, the 4 save data hooks
+    // (rt/save.rs; debug adds 13 save call probes) and the 2 loader hooks that
+    // is 123 (release) or 144 (debug)
     // trampolines: 4 pages x 32 slots = 128 in release, 5 pages = 160 in debug.
     assert!(HOOK_COUNT == 112 + 8 * cfg!(feature = "mem_report") as usize);
     assert!(HOOK_COUNT + EXT_COUNT + SAVE_COUNT + LOADER_COUNT <= TRAMP_PAGES * SLOTS_PER_PAGE);
@@ -129,8 +134,8 @@ use super::index::{
     posix_unlink_emul, sceKernelCheckReachability_emul, sceKernelOpen_emul, sceKernelStat_emul,
     underscore_open_emul, underscore_openat_emul,
 };
-use super::pack::mmap::{mmap_emul, munmap_emul, sceKernelMmap_emul, sceKernelMunmap_emul};
-use super::pack::zstd_libc::{
+use super::pack::mmap::{mmap_emul, sceKernelMmap_emul};
+use super::pack::pack_libc::{
     posix_fcntl_emul, sceKernelFcntl_emul, underscore_close_emul, underscore_fcntl_emul,
     underscore_fstat_emul, underscore_getdirentries_emul, underscore_read_emul,
     underscore_readv_emul,
@@ -183,6 +188,10 @@ macro_rules! specs {
 const M: bool = true;
 const O: bool = false;
 use super::amm as a;
+
+/// The replacement of an unused id (98, 99): `hook_enabled` never installs
+/// one, so it is never called.
+unsafe extern "C" fn unused_slot() {}
 
 /// `HOOKS` from one entry list, plus its symbols and mandatory flags alone
 /// for host tests, which cannot take `HOOKS` itself: its `_emul` pointers
@@ -302,15 +311,16 @@ hook_table! {
     c"fcntl" => posix_fcntl_emul, O;
     c"_fcntl" => underscore_fcntl_emul, O;
     c"sceKernelFcntl" => sceKernelFcntl_emul, O;
-    // Both pack formats, `AMPR_ZSTD_MMAP` != 0: mmap of a virtual pack fd
-    // maps a disk cache copy of the packed file (zstd with mode 1 decodes
-    // on fault instead, rt/pack/mmap_fault.rs); other fds call the original.
+    // Both pack formats, `AMPR_PACK_MMAP` != 0: mmap of a virtual pack fd
+    // maps a disk cache copy of the packed file (rt/pack/mmap.rs); other
+    // fds call the original.
     c"mmap" => mmap_emul, O;
     c"sceKernelMmap" => sceKernelMmap_emul, O;
-    // `AMPR_ZSTD_MMAP` == 1: unregister decode-on-fault mappings, then the
-    // original.
-    c"munmap" => munmap_emul, O;
-    c"sceKernelMunmap" => sceKernelMunmap_emul, O;
+    // Ids 98 and 99: unused, never installed (`hook_enabled`). They held the
+    // munmap hooks of decode on access, which was removed; the later ids
+    // keep their numbers.
+    c"munmap" => unused_slot, O;
+    c"sceKernelMunmap" => unused_slot, O;
     // Both pack formats: the game's own kernel AIO. Requests on a packed fd
     // and ids from such a submit are served by the runtime's AIO emulation;
     // the rest call the original (rt/pack/aio.rs, rt/pack/aio_wait.rs).
@@ -363,9 +373,10 @@ static EXT_HOOKS: Table<HookSpec, EXT_COUNT> = Table(specs![
 
 // Index into `SAVE_HOOKS` and `g_amprOriginalSaveDataById`; rt/save.rs calls
 // `save_original` with these.
-pub(crate) const SAVE_MOUNT3: usize = 0;
-pub(crate) const SAVE_ICON: usize = 1;
-pub(crate) const SAVE_ICON_PATH: usize = 2;
+pub(crate) const SAVE_ICON: usize = 0;
+pub(crate) const SAVE_ICON_PATH: usize = 1;
+pub(crate) const SAVE_MOUNT3: usize = 2;
+pub(crate) const SAVE_UMOUNT2: usize = 3;
 
 /// A symbol in a loaded system module: try the NID first (PS5 libraries
 /// export NIDs), then the plain name (debug SDKs and libkernel).
@@ -377,11 +388,6 @@ struct SaveSpec {
 
 static SAVE_HOOKS: Table<SaveSpec, SAVE_COUNT> = Table([
     SaveSpec {
-        nid: c"ZP4e7rlzOUk",
-        symbol: c"sceSaveDataMount3",
-        replacement: super::save::mount3_emul as *mut c_void,
-    },
-    SaveSpec {
         nid: c"c88Yy54Mx0w",
         symbol: c"sceSaveDataSaveIcon",
         replacement: super::save::save_icon_emul as *mut c_void,
@@ -390,6 +396,94 @@ static SAVE_HOOKS: Table<SaveSpec, SAVE_COUNT> = Table([
         nid: c"Z7z6HXWORJY",
         symbol: c"sceSaveDataSaveIconByPath",
         replacement: super::save::save_icon_by_path_emul as *mut c_void,
+    },
+    SaveSpec {
+        nid: c"ZP4e7rlzOUk",
+        symbol: c"sceSaveDataMount3",
+        replacement: super::save::mount3_emul as *mut c_void,
+    },
+    SaveSpec {
+        nid: c"uW4vfTwMQVo",
+        symbol: c"sceSaveDataUmount2",
+        replacement: super::save::umount2_emul as *mut c_void,
+    },
+    #[cfg(feature = "mem_report")]
+    SaveSpec {
+        nid: c"TywrFKCoLGY",
+        symbol: c"sceSaveDataInitialize3",
+        replacement: super::save::probe::initialize3 as *mut c_void,
+    },
+    #[cfg(feature = "mem_report")]
+    SaveSpec {
+        nid: c"ie7qhZ4X0Cc",
+        symbol: c"sceSaveDataCommit",
+        replacement: super::save::probe::commit as *mut c_void,
+    },
+    #[cfg(feature = "mem_report")]
+    SaveSpec {
+        nid: c"sDCBrmc61XU",
+        symbol: c"sceSaveDataPrepare",
+        replacement: super::save::probe::prepare as *mut c_void,
+    },
+    #[cfg(feature = "mem_report")]
+    SaveSpec {
+        nid: c"85zul--eGXs",
+        symbol: c"sceSaveDataSetParam",
+        replacement: super::save::probe::set_param as *mut c_void,
+    },
+    #[cfg(feature = "mem_report")]
+    SaveSpec {
+        nid: c"S1GkePI17zQ",
+        symbol: c"sceSaveDataDelete",
+        replacement: super::save::probe::delete as *mut c_void,
+    },
+    #[cfg(feature = "mem_report")]
+    SaveSpec {
+        nid: c"dyIhnXq-0SM",
+        symbol: c"sceSaveDataDirNameSearch",
+        replacement: super::save::probe::dir_name_search as *mut c_void,
+    },
+    #[cfg(feature = "mem_report")]
+    SaveSpec {
+        nid: c"gjRZNnw0JPE",
+        symbol: c"sceSaveDataCreateTransactionResource",
+        replacement: super::save::probe::create_transaction as *mut c_void,
+    },
+    #[cfg(feature = "mem_report")]
+    SaveSpec {
+        nid: c"lJUQuaKqoKY",
+        symbol: c"sceSaveDataDeleteTransactionResource",
+        replacement: super::save::probe::delete_transaction as *mut c_void,
+    },
+    #[cfg(feature = "mem_report")]
+    SaveSpec {
+        nid: c"s9e3+YpRnzw",
+        symbol: c"sceSaveDataDialogInitialize",
+        replacement: super::save::probe::dialog_initialize as *mut c_void,
+    },
+    #[cfg(feature = "mem_report")]
+    SaveSpec {
+        nid: c"4tPhsP6FpDI",
+        symbol: c"sceSaveDataDialogOpen",
+        replacement: super::save::probe::dialog_open as *mut c_void,
+    },
+    #[cfg(feature = "mem_report")]
+    SaveSpec {
+        nid: c"YuH2FA7azqQ",
+        symbol: c"sceSaveDataDialogTerminate",
+        replacement: super::save::probe::dialog_terminate as *mut c_void,
+    },
+    #[cfg(feature = "mem_report")]
+    SaveSpec {
+        nid: c"b06Hh0DPEaE",
+        symbol: c"sceMsgDialogOpen",
+        replacement: super::save::probe::msg_dialog_open as *mut c_void,
+    },
+    #[cfg(feature = "mem_report")]
+    SaveSpec {
+        nid: c"ePw-kqZmelo",
+        symbol: c"sceMsgDialogTerminate",
+        replacement: super::save::probe::msg_dialog_terminate as *mut c_void,
     },
 ]);
 
@@ -1516,9 +1610,8 @@ pub(crate) fn installed_bits(base: usize) -> u64 {
         .fold(0, |bits, i| bits | 1 << i)
 }
 
-/// Makefile `AMPR_ZSTD_LIBC_HOOKS` (both pack formats, the name is
-/// historical): bit i enables hook id 84 + i in a title with packs.
-const ZSTD_LIBC_HOOKS: u32 = match option_env!("AMPR_ZSTD_LIBC_HOOKS") {
+/// Makefile `AMPR_PACK_LIBC_HOOKS` (every pack format): bit i enables hook id 84 + i in a title with packs.
+const PACK_LIBC_HOOKS: u32 = match option_env!("AMPR_PACK_LIBC_HOOKS") {
     Some(s) => parse_mask(s.as_bytes()),
     // Builds outside the Makefile (cargo check/test): its default, every
     // entry routing.
@@ -1538,7 +1631,7 @@ const fn parse_mask(s: &[u8]) -> u32 {
             c @ b'0'..=b'9' => c - b'0',
             c @ b'a'..=b'f' if radix == 16 => c - b'a' + 10,
             c @ b'A'..=b'F' if radix == 16 => c - b'A' + 10,
-            _ => panic!("AMPR_ZSTD_LIBC_HOOKS: not a number"),
+            _ => panic!("AMPR_PACK_LIBC_HOOKS: not a number"),
         };
         v = v * radix + d as u32;
         i += 1;
@@ -1547,11 +1640,11 @@ const fn parse_mask(s: &[u8]) -> u32 {
 }
 
 /// Whether hook `id` routes through the index: true except for the libc
-/// internal entries 84..96 whose `ZSTD_LIBC_HOOKS` bit is off. The `_emul`
+/// internal entries 84..96 whose `PACK_LIBC_HOOKS` bit is off. The `_emul`
 /// of an observed id (`observed_only`) checks it and, when false, only
 /// calls its original and logs (rt/index.rs).
 pub(crate) const fn routing_enabled(id: usize) -> bool {
-    id < id::_open || id > id::sceKernelFcntl || ZSTD_LIBC_HOOKS & 1 << (id - id::_open) != 0
+    id < id::_open || id > id::sceKernelFcntl || PACK_LIBC_HOOKS & 1 << (id - id::_open) != 0
 }
 
 /// Debug: libc entries installed even with their bit off, as pass-through
@@ -1559,7 +1652,7 @@ pub(crate) const fn routing_enabled(id: usize) -> bool {
 /// Their `_emul` in rt/index.rs then calls the original with the caller's
 /// arguments. With the default 0xfff every bit is set and this is false; it
 /// applies only to a build that clears a bit (Makefile
-/// `AMPR_ZSTD_LIBC_HOOKS`). Release builds install those hooks only with
+/// `AMPR_PACK_LIBC_HOOKS`). Release builds install those hooks only with
 /// their bit set, so there it is always false.
 pub(crate) const fn observed_only(id: usize) -> bool {
     cfg!(feature = "mem_report")
@@ -1571,13 +1664,12 @@ pub(crate) const fn observed_only(id: usize) -> bool {
 /// that ships packs (`packs_present`, decided in rt/pack/mod.rs
 /// `select_pack_format`): an LZ4 pack can hold files with no physical copy
 /// too, so a game's plain open(), libc and mmap calls must reach them. A
-/// title with no packs gets the shared 78 only. Of the ids past 78, 84..96 also need their `ZSTD_LIBC_HOOKS`
+/// title with no packs gets the shared 78 only. Of the ids past 78, 84..96 also need their `PACK_LIBC_HOOKS`
 /// bit (or, in debug builds, `observed_only`), 96 and 97
-/// need `AMPR_ZSTD_MMAP` on, 98 and 99 need it at 1 (rt/pack/mmap.rs),
-/// 100..=109 (the game's kernel AIO, rt/pack/aio.rs) need nothing more,
+/// need `AMPR_PACK_MMAP` on (rt/pack/mmap.rs), 98 and 99 are unused and
+/// never install, 100..=109 (the game's kernel AIO, rt/pack/aio.rs) need nothing more,
 /// 110..=111 (thread creation) install in every title, and 112..=119 exist
-/// only in debug builds (rt/probe.rs). The knobs keep their zstd names but
-/// apply to both formats.
+/// only in debug builds (rt/probe.rs). Both knobs apply to every pack format.
 fn hook_enabled(id: usize) -> bool {
     if id < FALLBACK_SHARED.len() {
         return true;
@@ -1595,7 +1687,7 @@ fn hook_enabled(id: usize) -> bool {
         return super::pack::mmap::MMAP_MODE != 0;
     }
     if id == id::munmap || id == id::sceKernelMunmap {
-        return super::pack::mmap::MMAP_MODE == 1;
+        return false;
     }
     routing_enabled(id) || observed_only(id)
 }
@@ -1670,13 +1762,12 @@ unsafe fn refresh(st: &mut State) {
     INSTALLED.store((any_mandatory && mandatory_all) as u32, Release);
 
     let h = |i: usize| st.hooks[i].installed;
-    let local = h(51) && h(52) && h(53) && h(54);
-    // Classification also turns queue tracking on, so it must not depend on
-    // the local-wait knob (rt/tune.rs `equeue_local`): an untracked queue
-    // gets AMPR events from the kernel, which merges two of one id before the
-    // game reads them (a save load hung that way).
+    let overlay = h(51) && h(52) && h(53) && h(54);
+    // Classification turns queue tracking on: an untracked queue gets AMPR
+    // events from the kernel, which merges two of one id before the game
+    // reads them (a save load hung that way).
     let classification = h(50) && (55..=63).all(h) && st.loader.installed && st.ext_coverage_safe;
-    unsafe { apr_equeue_overlay_set_hook_availability(local, classification) };
+    unsafe { apr_equeue_overlay_set_hook_availability(overlay, classification) };
 }
 
 /// Installs the save data hooks this module exports. A module loaded by
@@ -2103,7 +2194,7 @@ mod tests {
         }
         assert_eq!(HOOK_SYMBOLS.len(), id::COUNT);
         // The AIO ids are past the libc routing range, so no
-        // `AMPR_ZSTD_LIBC_HOOKS` bit can turn them off.
+        // `AMPR_PACK_LIBC_HOOKS` bit can turn them off.
         for i in id::sceKernelAioSubmitReadCommands..=id::sceKernelAioCancelRequests {
             assert!(routing_enabled(i) && !observed_only(i));
             assert!(!HOOK_SYMBOLS[i].1);

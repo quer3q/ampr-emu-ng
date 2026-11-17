@@ -57,7 +57,7 @@ real_fn!(
 
 /// The runtime's own physical open: the `_open` original while `_open` is
 /// detoured, else `open`. libkernel's `open` calls `_open`, so with the
-/// `_open` hook routing (`AMPR_ZSTD_LIBC_HOOKS` bit 0) an open through
+/// `_open` hook routing (`AMPR_PACK_LIBC_HOOKS` bit 0) an open through
 /// `open` re-entered the index routing: a title opens
 /// `/app0/..` as a directory, and `ampr_pack_open_directory`'s physical open
 /// looped `open` -> `_open` hook -> `ampr_pack_open_directory` until the main

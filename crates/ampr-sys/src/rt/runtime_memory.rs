@@ -17,19 +17,20 @@ use core::ptr::{null, null_mut};
 /// direct memory lines).
 ///
 /// Layout: the Index, Cache and Buffer ledgers (rt/index_memory.rs,
-/// 80 + 64 + 28 MiB caps) and `POOL_SITES_BUDGET` (2 MiB) for these fixed
+/// 80 + remainder + 28.44 MiB caps), the 2 MiB thread stack block
+/// (rt/thread_stack.rs) and `POOL_SITES_BUDGET` (2 MiB) for these fixed
 /// sites with their largest live size:
 /// - small slab (`sdk_alloc` up to a page): at most 64 blocks of 16 KiB,
-///   1 MiB; its users are the getdents buffer up to 16 KiB and the
-///   decode-on-access chunk states, 2 KiB per mapping (pack/mmap_fault.rs
-///   `STATES_MAX`, 64 mappings, 128 KiB);
+///   1 MiB; its user is the getdents buffer up to 16 KiB;
 /// - the index writer's buffer, 256 KiB, one (rt/index.rs `BufWriter`);
 /// - a getdents buffer over 16 KiB, at most 64 KiB, one (rt/index.rs
 ///   `DENTS_POOL_MAX`; a larger st_blksize takes index memory);
 /// - the disk cache copy piece, 256 KiB, one under CACHE_M
-///   (pack/mmap.rs `PIECE`).
-/// Sites sum: 1.56 MiB (`POOL_SITES_MAX`); the caps plus the budget, 174 MiB,
-/// are checked against the pool at build time (index_memory.rs).
+///   (pack/mmap.rs `PIECE`);
+/// - the iced-x86 heap, 384 KiB, one (rt/heap.rs `HEAP_BYTES`).
+/// Sites sum: 1.94 MiB (`POOL_SITES_MAX`). The cache cap is what is left
+/// after the other caps, the stack block and the budget, so the pool is
+/// full to its last 16 KiB page (index_memory.rs `CACHE_MEMORY_MAX`).
 pub(crate) const STATIC_POOL_SIZE: usize = {
     let v = match option_env!("AMPR_INTERNAL_POOL_SIZE") {
         Some(s) => parse_size(s.as_bytes()),
@@ -39,8 +40,8 @@ pub(crate) const STATIC_POOL_SIZE: usize = {
 };
 
 /// The Makefile's `AMPR_DEBUG_POOL_SIZE`, the smaller of the two pools, so
-/// host tests check the tighter fit.
-pub(crate) const DEFAULT_POOL_SIZE: usize = 0xae7_8000;
+/// host tests check the tighter fit (and the smaller cache).
+pub(crate) const DEFAULT_POOL_SIZE: usize = 0xf61_4000;
 
 /// Compile-time number parser (Makefile knobs); a malformed value fails the build.
 pub(crate) const fn parse_size(s: &[u8]) -> usize {
@@ -73,11 +74,12 @@ pub(crate) const fn parse_size(s: &[u8]) -> usize {
 const _: () = assert!(STATIC_POOL_SIZE % SCE_KERNEL_PAGE_SIZE == 0);
 
 /// The fixed pool sites above, largest live bytes each.
-pub(crate) const POOL_SITES: [(&str, usize); 4] = [
+pub(crate) const POOL_SITES: [(&str, usize); 5] = [
     ("small slab", SMALL_SLAB_BLOCKS * SCE_KERNEL_PAGE_SIZE),
     ("index writer", super::index::BUF_WRITER_SIZE),
     ("getdents", super::index::DENTS_POOL_MAX),
     ("disk cache piece", super::pack::mmap::PIECE),
+    ("iced-x86 heap", super::heap::HEAP_BYTES),
 ];
 pub(crate) const POOL_SITES_MAX: usize = {
     let mut sum = 0;
@@ -88,7 +90,7 @@ pub(crate) const POOL_SITES_MAX: usize = {
     }
     sum
 };
-/// Pool room set aside for the fixed sites: 2 MiB, 1.56 MiB used, the rest
+/// Pool room set aside for the fixed sites: 2 MiB, 1.94 MiB used, the rest
 /// for page rounding and fragmentation between them.
 pub(crate) const POOL_SITES_BUDGET: usize = 2 << 20;
 const _: () = assert!(POOL_SITES_MAX <= POOL_SITES_BUDGET);
@@ -868,7 +870,14 @@ pub unsafe fn ampr_small_slab_free(
 mod pool_site_tests {
     /// Every pool allocation call in the runtime, with why it is fixed in
     /// size or held under a ledger cap.
-    const ALLOWED: [(&str, &str); 10] = [
+    const ALLOWED: [(&str, &str); 11] = [
+        // The thread stack block, STACK_MEMORY_MAX, and the iced-x86 heap,
+        // HEAP_BYTES: one block each.
+        (
+            "rt/thread_stack.rs",
+            "ampr_internal_amm_pool_alloc(STACK_MEMORY_MAX",
+        ),
+        ("rt/heap.rs", "ampr_internal_amm_pool_alloc(HEAP_BYTES"),
         // The Index, Cache and Buffer ledgers, each under its cap.
         (
             "rt/index_memory.rs",
@@ -891,7 +900,6 @@ mod pool_site_tests {
         ),
         ("rt/runtime_memory.rs", "ampr_internal_amm_pool_alloc("),
         ("rt/pack/mmap.rs", "sdk_alloc(PIECE"),
-        ("rt/pack/mmap_fault.rs", "sdk_alloc(count"),
     ];
     const CALLS: [&str; 5] = [
         "sdk_alloc(",

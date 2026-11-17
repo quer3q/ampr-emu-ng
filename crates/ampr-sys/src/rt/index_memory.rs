@@ -4,8 +4,9 @@
 //! index tables and every build buffer sized by file count, path bytes or
 //! file size), Cache (the
 //! decoded chunk cache) and Buffer (the pipeline I/O windows and worker decode
-//! buffers). The caps plus the fixed pool sites fit the pool (checked at
-//! build time), so no ledger can take another's room and none needs room
+//! buffers). The Index and Buffer caps, the fixed pool sites and the thread
+//! stack block are fixed and the Cache cap is the rest of the pool (checked
+//! at build time), so no ledger can take another's room and none needs room
 //! held back for it. Never direct or flexible memory: the pool is PRX .bss and did not
 //! lower the game's free direct memory, while our direct allocations did (a
 //! title had 42 MiB of direct memory free during play), and flexible memory
@@ -16,8 +17,7 @@
 //! packs unserved (packed files read as missing, ENOENT) after one console
 //! notice naming the size and the cap; a refused cache stays off; every
 //! I/O window is taken at the worker start and a refused one lowers the
-//! pipeline count (pack/worker.rs `buffer_split`); a refused save icon is skipped
-//! (pack/mmap.rs).
+//! pipeline count (pack/worker.rs `buffer_split`).
 
 use super::runtime_memory::{ampr_internal_amm_pool_alloc, ampr_internal_amm_pool_free};
 use super::sync::{SpinLock, SyncCell};
@@ -33,7 +33,7 @@ const MIB: usize = 1 << 20;
 /// volume tables, the AMPRPAK4 header, record sections and pack names and
 /// its mismatch bitmap) and the
 /// transient buffers (the 64 KiB windows a build reads an index file
-/// through, the walk build, save icon, decode-on-access slots). A
+/// through, the walk build, the debug /bench buffer). A
 /// walk-built AMPRIDX3 is built whole first, at 104-124 bytes per file at
 /// 48-byte paths (a 24-byte record, the path, 16-32 bytes of hash slots;
 /// tests below), so a build image of 699,050 files fits
@@ -55,16 +55,40 @@ const MIB: usize = 1 << 20;
 /// (Makefile `AMPR_INTERNAL_POOL_SIZE`), not from another ledger.
 pub(crate) const INDEX_MEMORY_MAX: usize = 80 * MIB;
 
-/// Cap on cache memory: the 64 MiB decoded cache default, the only pack
-/// cache (rt/pack/mod.rs). A runtime profile or debug knob asking more gets
-/// what is left under the cap (pack/manifest.rs `cache_region`).
-pub(crate) const CACHE_MEMORY_MAX: usize = 64 * MIB;
+/// Cap on cache memory: what the pool has left after the Index and Buffer
+/// caps, the fixed sites budget and the thread stack block, rounded down to
+/// a 16 KiB cache page. The cache is the only part whose size changes
+/// behaviour (more I/O windows, 12 vs 16, and more decode workers, 4 vs 8,
+/// measured flat: 312 vs 315 us game wait per read), so the PRX total is a
+/// round number and the cache takes the rest: 133.64 MiB in the debug pool,
+/// 134.98 MiB in the release one at the 256 MiB layout (pools fitted from
+/// a `dist` build, Makefile).
+/// The decoded cache default is this whole cap (rt/pack/mod.rs
+/// `AMPR_EMU_PACK_DECODED_CACHE_BYTES`); a runtime profile or debug knob
+/// asking less gets that (pack/manifest.rs `cache_region`).
+pub(crate) const CACHE_MEMORY_MAX: usize = {
+    let fixed = INDEX_MEMORY_MAX
+        + BUFFER_MEMORY_MAX
+        + super::runtime_memory::POOL_SITES_BUDGET
+        + STACK_MEMORY_MAX;
+    let page = crate::rt::pack::PACK_CACHE_PAGE_BYTES;
+    match super::runtime_memory::STATIC_POOL_SIZE.checked_sub(fixed) {
+        Some(left) => left / page * page,
+        None => panic!("AMPR_INTERNAL_POOL_SIZE / AMPR_DEBUG_POOL_SIZE below the Index and Buffer caps, the sites budget and the stack block"),
+    }
+};
+
+/// Pool block for the runtime's own thread stacks (rt/thread_stack.rs),
+/// carved at the first thread start. Worst case under the 16-thread budget:
+/// 4 x 128 KiB + 12 x 64 KiB + reactor and metrics 64 KiB each = 1.38 MiB,
+/// plus one 16 KiB guard page per stack (18, 0.28 MiB): 1.66 MiB
+/// (`the_block_holds_the_worst_case_thread_set`).
+pub(crate) const STACK_MEMORY_MAX: usize = 2 * MIB;
 
 /// Cap on buffer memory: a 1 MiB decode buffer and a 112 KiB zstd decoder
 /// workspace for each build worker (Makefile `AMPR_PACK_WORKERS`, default
 /// 4), a 2 MiB I/O window for each build pipeline (`AMPR_PACK_PIPELINES`,
-/// default 12) and, with `AMPR_ZSTD_MMAP=1`, a decoder workspace per
-/// decode-on-access slot: 28.44 MiB at the defaults (rt/pack/mod.rs).
+/// default 12): 28.44 MiB at the defaults (rt/pack/mod.rs).
 /// Buffers past it are refused: a worker without one does not start, a
 /// pipeline without a window is not used (worker.rs `buffer_split`).
 pub(crate) const BUFFER_MEMORY_MAX: usize = BUFFER_WORKERS * crate::rt::pack::PACK_MAX_BLOCK_BYTES
@@ -72,26 +96,26 @@ pub(crate) const BUFFER_MEMORY_MAX: usize = BUFFER_WORKERS * crate::rt::pack::PA
     + BUFFER_DECODERS * ampr_codec::ZSTD_DECODER_WORKSPACE;
 const BUFFER_WORKERS: usize = crate::rt::pack::AMPR_EMU_PACK_WORKERS as usize;
 const BUFFER_PIPELINES: usize = crate::rt::tune::RELEASE_PIPELINES as usize;
-/// zstd decoder workspaces: one per build worker and per decode-on-access
-/// slot (rt/pack/mmap_fault.rs).
-const BUFFER_DECODERS: usize = BUFFER_WORKERS + BUFFER_MMAP_SLOTS;
-const BUFFER_MMAP_SLOTS: usize = if crate::rt::pack::mmap::MMAP_MODE == 1 {
-    crate::rt::pack::mmap_fault::SLOTS
-} else {
-    0
-};
+/// zstd decoder workspaces: one per build worker.
+const BUFFER_DECODERS: usize = BUFFER_WORKERS;
 // A workspace is whole pages, so the ledger counts it at its size.
 const _: () = assert!(ampr_codec::ZSTD_DECODER_WORKSPACE % SCE_KERNEL_PAGE_SIZE == 0);
 
-/// The three caps together, 156.44 MiB at the default knobs; the pool also
-/// holds the 2 MiB fixed sites budget (rt/runtime_memory.rs
-/// `POOL_SITES_BUDGET`). A knob that grows a cap past the pool fails the
-/// build here instead of refusing buffers at run time.
+/// The three caps together; with the 2 MiB fixed sites budget
+/// (rt/runtime_memory.rs `POOL_SITES_BUDGET`) and the 2 MiB stack block
+/// they fill the pool to its last 16 KiB page. A knob that grows a cap past
+/// the pool fails the build in `CACHE_MEMORY_MAX` or here instead of
+/// refusing buffers at run time.
 pub(crate) const LEDGER_MEMORY_MAX: usize = INDEX_MEMORY_MAX + CACHE_MEMORY_MAX + BUFFER_MEMORY_MAX;
 const _: () = assert!(
-    LEDGER_MEMORY_MAX + super::runtime_memory::POOL_SITES_BUDGET
+    LEDGER_MEMORY_MAX + super::runtime_memory::POOL_SITES_BUDGET + STACK_MEMORY_MAX
         <= super::runtime_memory::STATIC_POOL_SIZE,
-    "AMPR_INTERNAL_POOL_SIZE / AMPR_DEBUG_POOL_SIZE below the ledger caps plus the 2 MiB sites budget"
+    "AMPR_INTERNAL_POOL_SIZE / AMPR_DEBUG_POOL_SIZE below the ledger caps plus the sites budget and the stack block"
+);
+const _: () = assert!(
+    CACHE_MEMORY_MAX as u64 >= crate::rt::pack::AMPR_EMU_PACK_DECODED_CACHE_MIN_BYTES
+        && CACHE_MEMORY_MAX as u64 <= crate::rt::pack::AMPR_EMU_PACK_DECODED_CACHE_MAX_BYTES,
+    "the pool leaves the decoded cache outside its 16 MiB minimum or its maximum"
 );
 
 /// Who an allocation is for; each kind has its own ledger and cap.
@@ -133,16 +157,14 @@ const PENDING: usize = 1;
 /// doubles), its getdents buffer over `DENTS_POOL_MAX` and its image, the
 /// one block of two 64 KiB windows an index file is read through
 /// (rt/index_file.rs; the AMPRIDX3 load gives its block back before the
-/// pack index mount takes one), the save icon buffer, the
-/// decode-on-access scratch and the debug /bench buffer: 16.
-const INDEX_BLOCKS: usize = 16;
+/// pack index mount takes one) and the debug /bench buffer: 14.
+const INDEX_BLOCKS: usize = 14;
 /// The decoded cache.
 const CACHE_BLOCKS: usize = 1;
-/// One per pipeline window, per worker decode buffer and decoder workspace,
-/// and one for the decode-on-access decoder workspaces.
+/// One per pipeline window and per worker decode buffer and decoder
+/// workspace.
 const BUFFER_BLOCKS: usize = crate::rt::pack::AMPR_EMU_PACK_PIPELINE_SLOTS
-    + 2 * crate::rt::pack::AMPR_EMU_PACK_WORKER_CAPACITY
-    + (BUFFER_MMAP_SLOTS != 0) as usize;
+    + 2 * crate::rt::pack::AMPR_EMU_PACK_WORKER_CAPACITY;
 const BLOCK_ARRAY: usize = if BUFFER_BLOCKS > INDEX_BLOCKS {
     BUFFER_BLOCKS
 } else {
@@ -233,6 +255,22 @@ impl Ledgers {
             cache: Ledger::new(CACHE_MEMORY_MAX, CACHE_BLOCKS),
             buffer: Ledger::new(BUFFER_MEMORY_MAX, BUFFER_BLOCKS),
         }
+    }
+
+    /// `move_index_room_to_cache` on these ledgers.
+    fn move_index_room(&mut self, page: usize) -> usize {
+        let room = self.index.cap - self.index.used;
+        let moved = room.saturating_sub(INDEX_KEPT_ROOM) / page * page;
+        self.index.cap -= moved;
+        self.cache.cap += moved;
+        moved
+    }
+
+    /// `return_cache_room_to_index` on these ledgers.
+    fn return_cache_room(&mut self, bytes: usize) {
+        let b = bytes.min(self.cache.cap - self.cache.used);
+        self.cache.cap -= b;
+        self.index.cap += b;
     }
 
     fn get(&mut self, kind: Kind) -> &mut Ledger {
@@ -432,10 +470,11 @@ pub(crate) unsafe fn index_alloc(bytes: usize, align: usize, tag: *const c_char)
     unsafe { index_alloc_with(bytes, align, tag, true) }
 }
 
-/// `index_alloc` for a transient buffer sized by the title (save icon,
-/// decode-on-access slots, debug /bench), freed with `index_free` after
+/// `index_alloc` for a transient buffer sized by the title (debug
+/// /bench), freed with `index_free` after
 /// use. A refusal is only counted (`ledger_alloc_refused`), no notice: the
 /// caller skips its work and the packs stay served.
+#[cfg(any(test, feature = "mem_report"))]
 pub(crate) unsafe fn index_scratch_alloc(
     bytes: usize,
     align: usize,
@@ -497,6 +536,31 @@ pub(crate) fn cache_room() -> usize {
     with_kind(Kind::Cache, |l| l.cap - l.used)
 }
 
+/// Index room kept when the rest moves to the cache: for any later Index
+/// allocation (debug /bench) and the holes the build left in the pool.
+pub(crate) const INDEX_KEPT_ROOM: usize = 4 * MIB;
+
+/// Once the index is finished (rt/pack/manifest.rs `grow_cache_from_index`):
+/// moves the Index cap's unused room above INDEX_KEPT_ROOM to the Cache cap,
+/// in whole `page`s, and returns the bytes moved. The caps' sum stays the
+/// same, so the pool still holds every ledger. Nothing allocates from the
+/// Index ledger after startup but the debug /bench buffer.
+pub(crate) fn move_index_room_to_cache(page: usize) -> usize {
+    with_all(|l| l.move_index_room(page))
+}
+
+/// Debug /metrics: the Index and Cache caps now, after any room moved.
+#[cfg(feature = "mem_report")]
+pub(crate) fn live_caps() -> (usize, usize) {
+    with_all(|l| (l.index.cap, l.cache.cap))
+}
+
+/// Gives `bytes` of unused Cache cap back to the Index cap: the part of a
+/// move the cache could not take in one block.
+pub(crate) fn return_cache_room_to_index(bytes: usize) {
+    with_all(|l| l.return_cache_room(bytes))
+}
+
 /// Frees a `cache_alloc` result (null is a no-op).
 pub(crate) unsafe fn cache_free(ptr: *mut c_void, tag: *const c_char) {
     unsafe { free_kind(Kind::Cache, ptr, tag) }
@@ -514,8 +578,7 @@ pub(crate) fn cache_mem_bytes() -> usize {
 /// `bytes` from the pool under the buffer cap, page-aligned. Returns the
 /// block and its usable size, (null, 0) when refused. Called at the worker
 /// start (decode buffers, then I/O windows; both kept until shutdown), at a zstd
-/// worker's start (its decoder, freed when it leaves) and on the first
-/// decode-on-access map (slot decoders, kept).
+/// worker's start (its decoder, freed when it leaves).
 pub(crate) unsafe fn buffer_alloc(bytes: usize, tag: *const c_char) -> (*mut u8, usize) {
     if bytes == 0 || bytes > usize::MAX - SCE_KERNEL_PAGE_SIZE {
         return (null_mut(), 0);
@@ -591,16 +654,18 @@ mod tests {
     #[test]
     fn caps_and_sites_fit_the_pool() {
         assert_eq!(INDEX_MEMORY_MAX, 80 << 20);
-        assert_eq!(CACHE_MEMORY_MAX, 64 << 20);
         assert_eq!(BUFFER_DECODERS, 4);
         assert_eq!(BUFFER_MEMORY_MAX, ((4 + 12 * 2) << 20) + 4 * (112 << 10));
-        assert_eq!(LEDGER_MEMORY_MAX, (172 << 20) + (448 << 10));
+        assert_eq!(STACK_MEMORY_MAX, 2 << 20);
         // Host tests build with the debug pool, the smaller of the two.
         assert_eq!(
             STATIC_POOL_SIZE,
             crate::rt::runtime_memory::DEFAULT_POOL_SIZE
         );
-        assert!(LEDGER_MEMORY_MAX + POOL_SITES_BUDGET <= STATIC_POOL_SIZE);
+        // The ledgers, sites and stacks leave less than one cache page.
+        let all = LEDGER_MEMORY_MAX + POOL_SITES_BUDGET + STACK_MEMORY_MAX;
+        assert!(all <= STATIC_POOL_SIZE);
+        assert!(STATIC_POOL_SIZE - all < crate::rt::pack::PACK_CACHE_PAGE_BYTES);
         assert!(POOL_SITES_MAX <= POOL_SITES_BUDGET);
         // Every ledger full stops at its own cap.
         let mut l = Ledgers::new();
@@ -613,6 +678,41 @@ mod tests {
             );
         }
         assert_eq!(l.total(), LEDGER_MEMORY_MAX);
+    }
+
+    #[test]
+    fn idle_index_room_moves_to_the_cache_and_back() {
+        use crate::rt::pack::PACK_CACHE_PAGE_BYTES as PAGE;
+        let mut l = Ledgers::new();
+        let sum = l.index.cap + l.cache.cap;
+        l.index.used = 5 * MIB + 3; // a title's view and pack tables
+        let moved = l.move_index_room(PAGE);
+        assert_eq!(moved % PAGE, 0);
+        assert!(l.index.cap - l.index.used >= INDEX_KEPT_ROOM);
+        assert!(l.index.cap - l.index.used < INDEX_KEPT_ROOM + PAGE);
+        assert_eq!(l.index.cap + l.cache.cap, sum);
+        // What the cache could not take goes back; never more than it has free.
+        l.cache.used = CACHE_MEMORY_MAX + moved / 2;
+        l.return_cache_room(moved);
+        assert_eq!(l.cache.cap, l.cache.used);
+        assert_eq!(l.index.cap + l.cache.cap, sum);
+        // A full Index ledger moves nothing.
+        let mut full = Ledgers::new();
+        full.index.used = INDEX_MEMORY_MAX - MIB;
+        assert_eq!(full.move_index_room(PAGE), 0);
+    }
+
+    #[test]
+    fn cache_is_the_pool_remainder() {
+        use crate::rt::pack::PACK_CACHE_PAGE_BYTES as PAGE;
+        let fixed = INDEX_MEMORY_MAX + BUFFER_MEMORY_MAX + POOL_SITES_BUDGET + STACK_MEMORY_MAX;
+        assert_eq!(CACHE_MEMORY_MAX, (STATIC_POOL_SIZE - fixed) / PAGE * PAGE);
+        assert_eq!(CACHE_MEMORY_MAX % PAGE, 0);
+        // The debug pool of the 256 MiB layout, 0xf614000 (246.07 MiB):
+        // 80 + 28.44 + 2 + 2 MiB fixed, the cache 133.64 MiB.
+        assert_eq!(STATIC_POOL_SIZE, 0xf61_4000);
+        assert_eq!(CACHE_MEMORY_MAX, 0xf61_4000 - fixed);
+        assert_eq!(CACHE_MEMORY_MAX, 140_132_352);
     }
 
     #[test]
@@ -683,9 +783,9 @@ mod tests {
         let state = unsafe { std::alloc::alloc_zeroed(layout) }.cast::<PackState>();
         assert!(!state.is_null());
         unsafe {
-            (*state).decoded_cache_target_bytes = 64 << 20;
+            (*state).decoded_cache_target_bytes = CACHE_MEMORY_MAX as _;
             initialize_caches(state);
-            assert_eq!((*state).cache_bytes, 64 << 20);
+            assert_eq!((*state).cache_bytes as usize, CACHE_MEMORY_MAX);
             assert!(!(*state).cache_base.is_null());
         }
         assert_eq!(cache_room(), 0);

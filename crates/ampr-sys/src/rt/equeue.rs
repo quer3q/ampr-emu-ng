@@ -10,18 +10,18 @@
 //!
 //! State: `OV` (`SyncCell<Overlay>`) holds the lock-protected overlay state;
 //! take `overlay_lock()` and use `ov()`. Lock-free overlay fields are separate atomic statics (`HOOKS_AVAILABLE`,
-//! `WAKE_TRIGGER_STATE`, `LOCAL_WAKE_EPOCH`, `AMM_QUEUE_HASH`, ...). The
-//! `AmmCommandBufferRegistry` is `AMM_CB_*`. Local waits use
-//! `LOCAL_WAIT_MUTEX`/`LOCAL_WAIT_COND`; queue control uses the recursive
-//! pthread mutex behind `ControlLock`.
+//! `WAKE_TRIGGER_STATE`, `AMM_QUEUE_HASH`, ...). The
+//! `AmmCommandBufferRegistry` is `AMM_CB_*`. Queue control uses the recursive
+//! pthread mutex behind `ControlLock`. Every tracked wait is a native kernel
+//! wait, which the overlay wakes privately to hand over its own events.
 #![allow(non_snake_case, non_upper_case_globals)]
 
 use core::ffi::{c_char, c_int, c_void};
 use core::sync::atomic::{
-    fence, AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering,
+    AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering,
 };
 
-use super::sync::{spin_pause_or_yield, Condvar, Mutex, Once, SpinGuard, SpinLock, SyncCell};
+use super::sync::{spin_pause_or_yield, Once, SpinGuard, SpinLock, SyncCell};
 use super::sys::*;
 
 // ---- constants -------------------------------------------------------------
@@ -284,25 +284,15 @@ struct PrivateWakeCompletion {
     native_wait_intent: u32,
 }
 
-#[derive(Clone, Copy, Default)]
-struct QueuePromotion {
-    changed: bool,
-    was_exclusive: bool,
-}
-
 #[derive(Clone, Copy)]
 struct QueueControlTransaction {
     queue_index: u32,
     queue_generation: u64,
-    was_exclusive: bool,
-    wake_local_waiter: bool,
 }
 impl QueueControlTransaction {
     const DEFAULT: Self = Self {
         queue_index: INVALID_INDEX,
         queue_generation: 0,
-        was_exclusive: false,
-        wake_local_waiter: false,
     };
     /// True when the transaction holds a valid queue slot.
     fn ok(&self) -> bool {
@@ -412,21 +402,14 @@ struct Align64<T>(T);
 static OVERLAY_LOCK: SpinLock = SpinLock::new();
 static HOOKS_AVAILABLE: AtomicBool = AtomicBool::new(false);
 static CLASSIFICATION_HOOKS_AVAILABLE: AtomicBool = AtomicBool::new(false);
-static LOCAL_WAIT_SYNC_READY: AtomicBool = AtomicBool::new(false);
 /// Set once by `initialize_control_once` (0 = use CLOCK_MONOTONIC).
 static PROCESS_TIME_COUNTER_FREQUENCY: AtomicU64 = AtomicU64::new(0);
 /// Slot-local wake trigger state, for waiting after the overlay lock drops
 /// (the bit in `TrackedEqueue` is the lock-protected hot-path predicate).
 static WAKE_TRIGGER_STATE: Align64<[AtomicU8; QCAP]> = Align64([const { AtomicU8::new(0) }; QCAP]);
-static LOCAL_WAKE_EPOCH: Align64<[AtomicU64; QCAP]> = Align64([const { AtomicU64::new(0) }; QCAP]);
-/// Threads parked in `wait_for_local_change` per queue slot; changed only under `LOCAL_WAIT_MUTEX`.
-static LOCAL_WAIT_PARKED: Align64<[AtomicU32; QCAP]> = Align64([const { AtomicU32::new(0) }; QCAP]);
 /// AMM-classified queue set: 0 empty, `AMM_QUEUE_HASH_TOMBSTONE`, else the equeue address.
 static AMM_QUEUE_HASH: Align64<[AtomicUsize; QHASH]> =
     Align64([const { AtomicUsize::new(0) }; QHASH]);
-
-static LOCAL_WAIT_MUTEX: Mutex = Mutex::new();
-static LOCAL_WAIT_COND: Condvar = Condvar::new();
 
 static CONTROL_ONCE: Once = Once::new();
 static CONTROL_MUTEX: SyncCell<ScePthreadMutex> = SyncCell::new(core::ptr::null_mut());
@@ -476,11 +459,6 @@ fn initialize_control_once() {
         },
         Ordering::Relaxed,
     );
-    if !LOCAL_WAIT_SYNC_READY.load(Ordering::Relaxed) {
-        // sync::Mutex/Condvar create lazily and abort on failure.
-        let _ = LOCAL_WAIT_MUTEX.raw();
-        LOCAL_WAIT_SYNC_READY.store(true, Ordering::Release);
-    }
     CONTROL_INIT_RC.store(rc, Ordering::Release);
 }
 
@@ -597,7 +575,6 @@ unsafe fn initialize_locked() {
     }
     for i in 0..QCAP {
         WAKE_TRIGGER_STATE.0[i].store(0, Ordering::Relaxed);
-        LOCAL_WAKE_EPOCH.0[i].store(0, Ordering::Relaxed);
         o.controls[i] = QueueControlState::ZERO;
         o.queues[i] = TrackedEqueue::ZERO;
         o.queues[i].next_free = if i + 1 < QCAP {
@@ -807,28 +784,6 @@ unsafe fn find_queue_index_locked(eq: SceKernelEqueue) -> u32 {
     INVALID_INDEX
 }
 
-const fn ownership_allows_local_wait(ampr: bool, mixed: bool, amm: bool) -> bool {
-    ampr && !mixed && !amm
-}
-
-fn queue_would_be_exclusive_local_ignoring_amm_health_locked(q: &TrackedEqueue) -> bool {
-    super::tune::equeue_local()
-        && HOOKS_AVAILABLE.load(Ordering::Relaxed)
-        && ownership_allows_local_wait(q.ampr_source_seen, q.mixed_source_seen, q.amm_source_seen)
-        && q.registration_head < REGISTRATION_CAPACITY
-        && CLASSIFICATION_HOOKS_AVAILABLE.load(Ordering::Relaxed)
-        && LOCAL_WAIT_SYNC_READY.load(Ordering::Relaxed)
-}
-
-fn queue_would_be_exclusive_local_locked(q: &TrackedEqueue) -> bool {
-    !AMM_CB_TRACKING_LOST.load(Ordering::Relaxed)
-        && queue_would_be_exclusive_local_ignoring_amm_health_locked(q)
-}
-
-fn queue_is_exclusive_local_locked(q: &TrackedEqueue) -> bool {
-    q.control_depth == 0 && queue_would_be_exclusive_local_locked(q)
-}
-
 const fn queue_has_meaningful_classification(ampr: bool, mixed: bool, amm: bool) -> bool {
     ampr || mixed || amm
 }
@@ -857,46 +812,16 @@ const _: () = {
         scope: QueueControlScope::WholeQueue,
     };
     assert!(registration_control_conflicts(whole, AMPR_EVENT_FILTER, 1));
-    assert!(ownership_allows_local_wait(true, false, false));
-    assert!(!ownership_allows_local_wait(false, false, false));
-    assert!(!ownership_allows_local_wait(true, true, false));
-    assert!(!ownership_allows_local_wait(true, false, true));
     assert!(!queue_has_meaningful_classification(false, false, false));
     assert!(queue_has_meaningful_classification(true, false, false));
 };
 
-/// Wakes every thread parked in the local-wait condvar. A valid `queue_index`
-/// (whose epoch the caller already bumped) skips the wake when nobody is
-/// parked on that slot; `INVALID_INDEX` always wakes.
-fn notify_local_waiters(queue_index: u32) {
-    if !LOCAL_WAIT_SYNC_READY.load(Ordering::Acquire) {
-        return;
-    }
-    if queue_index < QUEUE_CAPACITY {
-        // Pairs with the fence in wait_for_local_change: either the waiter
-        // sees the new epoch or this load sees the waiter parked.
-        fence(Ordering::SeqCst);
-        if LOCAL_WAIT_PARKED.0[queue_index as usize].load(Ordering::Relaxed) == 0 {
-            return;
-        }
-    }
-    let _g = LOCAL_WAIT_MUTEX.lock();
-    LOCAL_WAIT_COND.notify_all();
-}
-
 // ---- queue control + mixed promotion --------------------------------------
 
-unsafe fn mark_queue_mixed_locked(queue_index: u32) -> QueuePromotion {
-    let q = unsafe { &mut ov().queues[queue_index as usize] };
-    let mut r = QueuePromotion::default();
-    if q.mixed_source_seen {
-        return r;
-    }
-    r.was_exclusive = queue_would_be_exclusive_local_locked(q);
-    q.mixed_source_seen = true;
-    LOCAL_WAKE_EPOCH.0[queue_index as usize].fetch_add(1, Ordering::Release);
-    r.changed = true;
-    r
+/// Records that the queue has a source other than mirrored AMPR
+/// registrations (shown in the debug /queues flags).
+unsafe fn mark_queue_mixed_locked(queue_index: u32) {
+    unsafe { ov() }.queues[queue_index as usize].mixed_source_seen = true;
 }
 
 fn begin_queue_control(eq: SceKernelEqueue, filter: i16, id: c_int) -> QueueControlTransaction {
@@ -913,7 +838,6 @@ fn begin_queue_control(eq: SceKernelEqueue, filter: i16, id: c_int) -> QueueCont
     let i = t.queue_index as usize;
     let q = &mut o.queues[i];
     t.queue_generation = q.lifetime_generation;
-    t.was_exclusive = queue_is_exclusive_local_locked(q);
     let c = &mut o.controls[i];
     if q.control_depth == 0 {
         *c = QueueControlState {
@@ -926,10 +850,6 @@ fn begin_queue_control(eq: SceKernelEqueue, filter: i16, id: c_int) -> QueueCont
         c.scope = QueueControlScope::WholeQueue;
     }
     q.control_depth += 1;
-    if t.was_exclusive {
-        LOCAL_WAKE_EPOCH.0[i].fetch_add(1, Ordering::Release);
-        t.wake_local_waiter = true;
-    }
     t
 }
 
@@ -973,22 +893,16 @@ unsafe fn queue_control_conflicts_with_registration_locked(
     matches!(c.scope, QueueControlScope::None) || registration_control_conflicts(c, filter, id)
 }
 
-fn disable_exclusive_local_waits_for_amm_tracking_loss() {
-    let mut notify = false;
-    {
-        let _g = overlay_lock();
-        if unsafe { ov() }.initialized {
-            for i in 0..QUEUE_CAPACITY {
-                if unsafe { ov() }.queues[i as usize].used
-                    && unsafe { mark_queue_mixed_locked(i) }.changed
-                {
-                    notify = true;
-                }
+/// The AMM command-buffer registry overflowed: no queue can be shown free
+/// of AMM sources any more, so every tracked queue is marked mixed.
+fn mark_all_queues_mixed_for_amm_tracking_loss() {
+    let _g = overlay_lock();
+    if unsafe { ov() }.initialized {
+        for i in 0..QUEUE_CAPACITY {
+            if unsafe { ov() }.queues[i as usize].used {
+                unsafe { mark_queue_mixed_locked(i) };
             }
         }
-    }
-    if notify {
-        notify_local_waiters(INVALID_INDEX);
     }
 }
 
@@ -997,17 +911,12 @@ fn forward_non_ampr_add(eq: SceKernelEqueue, call: impl FnOnce() -> c_int) -> c_
     if !HOOKS_AVAILABLE.load(Ordering::Acquire) {
         return call();
     }
-    let mut promotion = QueuePromotion::default();
-    let i = {
+    {
         let _g = overlay_lock();
         let i = unsafe { find_queue_index_locked(eq) };
         if i < QUEUE_CAPACITY {
-            promotion = unsafe { mark_queue_mixed_locked(i) };
+            unsafe { mark_queue_mixed_locked(i) };
         }
-        i
-    };
-    if promotion.changed {
-        notify_local_waiters(i);
     }
     call()
 }
@@ -1611,8 +1520,6 @@ fn execute_private_wake(req: &PrivateWakeRequest) -> PrivateWakeCompletion {
         .cast::<TrackedEqueue>()
         .wrapping_add(req.queue_index as usize);
     r.rc = unsafe { sceKernelTriggerUserEvent(req.eq, req.wake_id as c_int, udata.cast()) };
-    let mut promotion = QueuePromotion::default();
-    let mut notify_local = false;
     let g = overlay_lock();
     if req.queue_index < QUEUE_CAPACITY {
         let q = &mut unsafe { ov() }.queues[req.queue_index as usize];
@@ -1626,15 +1533,6 @@ fn execute_private_wake(req: &PrivateWakeRequest) -> PrivateWakeCompletion {
                 // native registration (old drain-time drop semantics).
                 if unsafe { wake_registration_is_current_locked(req.queue_index, req) } {
                     unsafe { append_pending_locked(req.queue_index, req.pending_index) };
-                    // The native waiter may return without draining: local
-                    // waiters must see the node too.
-                    if queue_is_exclusive_local_locked(
-                        &unsafe { ov() }.queues[req.queue_index as usize],
-                    ) {
-                        LOCAL_WAKE_EPOCH.0[req.queue_index as usize]
-                            .fetch_add(1, Ordering::Release);
-                        notify_local = true;
-                    }
                 } else {
                     unsafe { release_pending_locked(req.pending_index) };
                 }
@@ -1642,9 +1540,8 @@ fn execute_private_wake(req: &PrivateWakeRequest) -> PrivateWakeCompletion {
             } else if r.rc != 0 {
                 // Trigger failures are permanent for this (equeue, id): keep
                 // FIFO nodes drainable, route later publications natively.
-                // Mixed sends local waiters native so they see those events.
                 unsafe { ov() }.queues[req.queue_index as usize].wake_ready = false;
-                promotion = unsafe { mark_queue_mixed_locked(req.queue_index) };
+                unsafe { mark_queue_mixed_locked(req.queue_index) };
             }
             let q = &mut unsafe { ov() }.queues[req.queue_index as usize];
             q.wake_triggering = false;
@@ -1659,9 +1556,6 @@ fn execute_private_wake(req: &PrivateWakeRequest) -> PrivateWakeCompletion {
         WAKE_TRIGGER_STATE.0[req.queue_index as usize].store(0, Ordering::Release);
     }
     drop(g);
-    if promotion.changed || notify_local {
-        notify_local_waiters(req.queue_index);
-    }
     r
 }
 
@@ -1804,7 +1698,6 @@ unsafe fn release_queue_locked(queue_index: u32) -> bool {
         }
     }
     let notify_reactor = unsafe { take_pending_backpressure_progress_locked() };
-    LOCAL_WAKE_EPOCH.0[qi].fetch_add(1, Ordering::Release);
     let eq = o.queues[qi].eq;
     if o.queues[qi].amm_source_seen {
         unsafe { erase_amm_queue_hash_locked(eq) };
@@ -1920,31 +1813,6 @@ fn remaining_timeout_us(d: &NativeWaitDeadline) -> SceKernelUseconds {
     us.min(max) as SceKernelUseconds
 }
 
-/// Parks on the local-wait condvar while the queue's wake epoch is unchanged.
-fn wait_for_local_change(
-    queue_index: u32,
-    observed_epoch: u64,
-    timeout: Option<SceKernelUseconds>,
-) {
-    if queue_index >= QUEUE_CAPACITY || !LOCAL_WAIT_SYNC_READY.load(Ordering::Acquire) {
-        return;
-    }
-    let qi = queue_index as usize;
-    let mut g = LOCAL_WAIT_MUTEX.lock();
-    // Count as parked before the epoch check; pairs with notify_local_waiters.
-    LOCAL_WAIT_PARKED.0[qi].fetch_add(1, Ordering::Relaxed);
-    fence(Ordering::SeqCst);
-    if LOCAL_WAKE_EPOCH.0[qi].load(Ordering::Acquire) == observed_epoch {
-        match timeout {
-            Some(t) => {
-                LOCAL_WAIT_COND.wait_for_us(&mut g, t as u64);
-            }
-            None => LOCAL_WAIT_COND.wait(&mut g),
-        }
-    }
-    LOCAL_WAIT_PARKED.0[qi].fetch_sub(1, Ordering::Relaxed);
-}
-
 // ---- AMPR registration forwarding ------------------------------------------
 
 use super::reactor::apr_reactor_notify_external_progress;
@@ -1967,9 +1835,6 @@ fn forward_ampr_registration_add(
     }
     let _control = ControlLock::new();
     let t = begin_queue_control(eq, filter, id);
-    if t.wake_local_waiter {
-        notify_local_waiters(t.queue_index);
-    }
     let rc = call();
     if !t.ok() {
         return rc;
@@ -1985,7 +1850,6 @@ fn forward_ampr_registration_add(
             wake_available = attach_hidden_wake_unlocked(t.queue_index, t.queue_generation);
         }
     }
-    let mut forced_mixed = QueuePromotion::default();
     let mut notify_reactor = false;
     {
         let _g = overlay_lock();
@@ -1995,15 +1859,15 @@ fn forward_ampr_registration_add(
         let qi = qidx as usize;
         if rc == 0 {
             if !wake_available || !unsafe { ov() }.queues[qi].wake_registered {
-                forced_mixed = unsafe { mark_queue_mixed_locked(qidx) };
+                unsafe { mark_queue_mixed_locked(qidx) };
             } else if unsafe {
                 allocate_registration_locked(qidx, filter, id, udata, Some(&mut notify_reactor))
             } >= REGISTRATION_CAPACITY
             {
-                forced_mixed = unsafe { mark_queue_mixed_locked(qidx) };
+                unsafe { mark_queue_mixed_locked(qidx) };
             } else if filter == AMPR_SYSTEM_EVENT_FILTER {
                 // Only the kernel posts system events: waits must stay native.
-                forced_mixed = unsafe { mark_queue_mixed_locked(qidx) };
+                unsafe { mark_queue_mixed_locked(qidx) };
             } else {
                 unsafe { ov() }.queues[qi].ampr_source_seen = true;
             }
@@ -2012,9 +1876,6 @@ fn forward_ampr_registration_add(
     }
     if notify_reactor {
         notify_reactor_progress();
-    }
-    if forced_mixed.changed {
-        notify_local_waiters(t.queue_index);
     }
     rc
 }
@@ -2031,9 +1892,6 @@ fn forward_ampr_registration_delete(
     }
     let _control = ControlLock::new();
     let t = begin_queue_control(eq, filter, id);
-    if t.wake_local_waiter {
-        notify_local_waiters(t.queue_index);
-    }
     let rc = call();
     if !t.ok() {
         return rc;
@@ -2071,11 +1929,8 @@ pub unsafe fn apr_equeue_try_publish(
     if !HOOKS_AVAILABLE.load(Ordering::Acquire) {
         return NativeFallback;
     }
-    let mut notify_local = false;
-    let local_qi: u32;
     {
         let mut wake_request = PrivateWakeRequest::DEFAULT;
-        let mut control_promotion = QueuePromotion::default();
         let mut execute_wake = false;
         let mut control_fallback = false;
         {
@@ -2087,7 +1942,6 @@ pub unsafe fn apr_equeue_try_publish(
             if qidx >= QUEUE_CAPACITY {
                 return NativeFallback;
             }
-            local_qi = qidx;
             let qi = qidx as usize;
             let o = unsafe { ov() };
             if unsafe {
@@ -2098,7 +1952,7 @@ pub unsafe fn apr_equeue_try_publish(
                     id,
                 )
             } {
-                control_promotion = unsafe { mark_queue_mixed_locked(qidx) };
+                unsafe { mark_queue_mixed_locked(qidx) };
                 control_fallback = true;
             } else if private_wake_in_flight_locked(&o.queues[qi]) {
                 return Backpressure;
@@ -2137,24 +1991,14 @@ pub unsafe fn apr_equeue_try_publish(
                 } else {
                     unsafe { append_pending_locked(qidx, pidx) };
                 }
-                if !execute_wake && queue_is_exclusive_local_locked(&unsafe { ov() }.queues[qi]) {
-                    LOCAL_WAKE_EPOCH.0[qi].fetch_add(1, Ordering::Release);
-                    notify_local = true;
-                }
             }
         }
         if control_fallback {
-            if control_promotion.changed {
-                notify_local_waiters(local_qi);
-            }
             return NativeFallback;
         }
         if execute_wake && !execute_private_wake(&wake_request).publication_handled {
             return NativeFallback;
         }
-    }
-    if notify_local {
-        notify_local_waiters(local_qi);
     }
     Published
 }
@@ -2163,26 +2007,9 @@ pub unsafe fn apr_equeue_overlay_set_hook_availability(
     hooks_available: bool,
     classification_available: bool,
 ) {
-    let mut wake_local = false;
-    {
-        let _g = overlay_lock();
-        let was_complete = HOOKS_AVAILABLE.load(Ordering::Relaxed)
-            && CLASSIFICATION_HOOKS_AVAILABLE.load(Ordering::Relaxed);
-        let o = unsafe { ov() };
-        if was_complete && !(hooks_available && classification_available) && o.initialized {
-            for i in 0..QCAP {
-                if o.queues[i].used {
-                    LOCAL_WAKE_EPOCH.0[i].fetch_add(1, Ordering::Release);
-                    wake_local = true;
-                }
-            }
-        }
-        CLASSIFICATION_HOOKS_AVAILABLE.store(classification_available, Ordering::Relaxed);
-        HOOKS_AVAILABLE.store(hooks_available, Ordering::Release);
-    }
-    if wake_local {
-        notify_local_waiters(INVALID_INDEX);
-    }
+    let _g = overlay_lock();
+    CLASSIFICATION_HOOKS_AVAILABLE.store(classification_available, Ordering::Relaxed);
+    HOOKS_AVAILABLE.store(hooks_available, Ordering::Release);
 }
 
 pub unsafe fn apr_equeue_register_amm_command_buffer(cb: *const c_void) {
@@ -2222,7 +2049,7 @@ pub unsafe fn apr_equeue_register_amm_command_buffer(cb: *const c_void) {
         }
     }
     if !inserted && tracking_lost {
-        disable_exclusive_local_waits_for_amm_tracking_loss();
+        mark_all_queues_mixed_for_amm_tracking_loss();
     }
 }
 
@@ -2253,21 +2080,15 @@ pub unsafe fn apr_equeue_note_command_buffer_event(cb: *const c_void, eq: SceKer
     if eq.is_null() || amm_queue_classified_fast(eq) || !is_registered_amm_command_buffer(cb) {
         return;
     }
-    let (promotion, qidx) = {
-        let _g = overlay_lock();
-        let qidx = unsafe { find_queue_index_locked(eq) };
-        if qidx >= QUEUE_CAPACITY {
-            return;
-        }
-        unsafe { ov() }.queues[qidx as usize].amm_source_seen = true;
-        let p = unsafe { mark_queue_mixed_locked(qidx) };
-        // Publish the lock-free fast-path key only after mixed is committed.
-        unsafe { insert_amm_queue_hash_locked(eq) };
-        (p, qidx)
-    };
-    if promotion.changed {
-        notify_local_waiters(qidx);
+    let _g = overlay_lock();
+    let qidx = unsafe { find_queue_index_locked(eq) };
+    if qidx >= QUEUE_CAPACITY {
+        return;
     }
+    unsafe { ov() }.queues[qidx as usize].amm_source_seen = true;
+    unsafe { mark_queue_mixed_locked(qidx) };
+    // Publish the lock-free fast-path key only after mixed is committed.
+    unsafe { insert_amm_queue_hash_locked(eq) };
 }
 
 pub unsafe fn apr_equeue_overlay_shutdown() {
@@ -2319,7 +2140,6 @@ pub unsafe fn apr_equeue_overlay_shutdown() {
     if notify_reactor {
         notify_reactor_progress();
     }
-    notify_local_waiters(INVALID_INDEX);
 }
 
 // ---- hook targets ----------------------------------------------------------
@@ -2338,7 +2158,7 @@ pub unsafe extern "C" fn sceKernelCreateEqueue_emul(
     let rc = unsafe { original(eq, name) };
     if rc == 0 && !eq.is_null() && !unsafe { *eq }.is_null() {
         let e = unsafe { *eq };
-        let (mut notify_reactor, mut notify_local) = (false, false);
+        let mut notify_reactor = false;
         loop {
             let mut wait_qi = INVALID_INDEX;
             {
@@ -2352,7 +2172,6 @@ pub unsafe extern "C" fn sceKernelCreateEqueue_emul(
                             wait_qi = stale;
                         } else {
                             notify_reactor |= unsafe { release_queue_locked(stale) };
-                            notify_local = true;
                         }
                     }
                     if wait_qi >= QUEUE_CAPACITY
@@ -2373,9 +2192,6 @@ pub unsafe extern "C" fn sceKernelCreateEqueue_emul(
         }
         if notify_reactor {
             notify_reactor_progress();
-        }
-        if notify_local {
-            notify_local_waiters(INVALID_INDEX);
         }
     }
     drop(control);
@@ -2545,32 +2361,23 @@ pub unsafe extern "C" fn sceKernelDeleteEqueue_emul(eq: SceKernelEqueue) -> c_in
                         let q = &mut o.queues[qi];
                         t.queue_index = qidx;
                         t.queue_generation = q.lifetime_generation;
-                        t.was_exclusive = queue_is_exclusive_local_locked(q);
                         o.controls[qi].scope = QueueControlScope::WholeQueue;
                         q.control_depth += 1;
-                        if t.was_exclusive {
-                            LOCAL_WAKE_EPOCH.0[qi].fetch_add(1, Ordering::Release);
-                            t.wake_local_waiter = true;
-                        }
                     }
                 }
             }
             if wait_qi >= QUEUE_CAPACITY {
-                if t.wake_local_waiter {
-                    notify_local_waiters(t.queue_index);
-                }
                 if forward_direct {
                     return unsafe { original(eq) };
                 }
                 let rc = unsafe { original(eq) };
-                let (mut notify_reactor, mut notify_local) = (false, false);
+                let mut notify_reactor = false;
                 {
                     let _g = overlay_lock();
                     if let Some(qidx) = unsafe { find_queue_control_locked(&t) } {
                         if rc == 0 {
                             // The real deletion already removed the private EVFILT_USER.
                             notify_reactor = unsafe { release_queue_locked(qidx) };
-                            notify_local = true;
                         } else {
                             unsafe { finish_queue_control_locked(qidx) };
                         }
@@ -2578,9 +2385,6 @@ pub unsafe extern "C" fn sceKernelDeleteEqueue_emul(eq: SceKernelEqueue) -> c_in
                 }
                 if notify_reactor {
                     notify_reactor_progress();
-                }
-                if notify_local {
-                    notify_local_waiters(t.queue_index);
                 }
                 return rc;
             }
@@ -2670,7 +2474,6 @@ pub(crate) struct EqueueView {
     pub(crate) pending: u32,
     pub(crate) registrations: u32,
     pub(crate) native_intent: u32,
-    pub(crate) parked: u32,
     pub(crate) trigger: u8,
     /// Bits: 1 ampr source, 2 mixed, 4 amm, 8 wake ready, 16 wake armed,
     /// 32 wake triggering, 64 wake registered.
@@ -2684,7 +2487,6 @@ unsafe fn fill_queue_view(v: &mut EqueueView, qidx: u32) {
     v.tracked = true;
     v.pending = q.pending_count;
     v.native_intent = q.native_wait_intent;
-    v.parked = LOCAL_WAIT_PARKED.0[qidx as usize].load(Ordering::Relaxed);
     v.trigger = WAKE_TRIGGER_STATE.0[qidx as usize].load(Ordering::Relaxed);
     v.flags = q.ampr_source_seen as u32
         | (q.mixed_source_seen as u32) << 1
@@ -2776,8 +2578,6 @@ unsafe fn wait_equeue(
     } else {
         unsafe { *timeout }
     };
-    let mut deadline = NativeWaitDeadline::default();
-    let mut local_wait_attempted = false;
     let mut native_intent = false;
     loop {
         let mut tracked = false;
@@ -2785,9 +2585,6 @@ unsafe fn wait_equeue(
         let mut replacement = PrivateWakeRequest::DEFAULT;
         let mut exec_replacement = false;
         let mut wait_qi = INVALID_INDEX;
-        let mut use_local_wait = false;
-        let mut local_poll_timeout = false;
-        let mut observed_epoch = 0u64;
         {
             let _g = overlay_lock();
             let qidx = unsafe { find_queue_index_locked(eq) };
@@ -2818,13 +2615,6 @@ unsafe fn wait_equeue(
                                 )
                             } == BeginPrivateWakeResult::Scheduled;
                         }
-                    } else if queue_is_exclusive_local_locked(q) {
-                        if !timeout.is_null() && requested == 0 {
-                            local_poll_timeout = true;
-                        } else {
-                            use_local_wait = true;
-                            observed_epoch = LOCAL_WAKE_EPOCH.0[qi].load(Ordering::Relaxed);
-                        }
                     } else {
                         unsafe { ov() }.queues[qi].native_wait_intent += 1;
                         native_intent = true;
@@ -2840,14 +2630,7 @@ unsafe fn wait_equeue(
             execute_replacement_wake(&replacement);
         }
         if !tracked {
-            let mut remaining: SceKernelUseconds;
-            let mut remaining_ptr = timeout;
-            if local_wait_attempted && !timeout.is_null() && requested != 0 && deadline.expires != 0
-            {
-                remaining = remaining_timeout_us(&deadline);
-                remaining_ptr = &mut remaining;
-            }
-            return unsafe { original(eq, events, num, out, remaining_ptr) };
+            return unsafe { original(eq, events, num, out, timeout) };
         }
         if unsafe { *out } != 0 {
             if notify_reactor {
@@ -2855,37 +2638,7 @@ unsafe fn wait_equeue(
             }
             return 0;
         }
-        if local_poll_timeout {
-            return SCE_KERNEL_ERROR_ETIMEDOUT;
-        }
-        if !use_local_wait {
-            break;
-        }
-        if !timeout.is_null() && requested != 0 && deadline.expires == 0 {
-            deadline = make_native_wait_deadline(requested, counter_frequency);
-            if deadline.expires == 0 {
-                let tr = prepare_native_wait(tracked_qi, queue_generation, events, num);
-                native_intent = tr.native_wait_intent_installed;
-                if tr.notify_reactor {
-                    notify_reactor_progress();
-                }
-                if tr.synthetic_count != 0 {
-                    unsafe { *out = tr.synthetic_count };
-                    return 0;
-                }
-                break;
-            }
-        }
-        let mut local_timeout = None;
-        if !timeout.is_null() {
-            let t = remaining_timeout_us(&deadline);
-            if t == 0 {
-                return SCE_KERNEL_ERROR_ETIMEDOUT;
-            }
-            local_timeout = Some(t);
-        }
-        local_wait_attempted = true;
-        wait_for_local_change(tracked_qi, observed_epoch, local_timeout);
+        break;
     }
     unsafe {
         native_wait_loop(
@@ -2896,12 +2649,10 @@ unsafe fn wait_equeue(
             out,
             timeout,
             requested,
-            deadline,
             counter_frequency,
             tracked_qi,
             queue_generation,
             wake_token,
-            local_wait_attempted,
             native_intent,
         )
     }
@@ -2918,18 +2669,17 @@ unsafe fn native_wait_loop(
     out: *mut c_int,
     timeout: *mut SceKernelUseconds,
     requested: SceKernelUseconds,
-    mut deadline: NativeWaitDeadline,
     counter_frequency: u64,
     tracked_qi: u32,
     queue_generation: u64,
     wake_token: *const TrackedEqueue,
-    local_wait_attempted: bool,
     mut native_intent: bool,
 ) -> c_int {
-    if !timeout.is_null() && requested != 0 && deadline.expires == 0 {
+    let mut deadline = NativeWaitDeadline::default();
+    if !timeout.is_null() && requested != 0 {
         deadline = make_native_wait_deadline(requested, counter_frequency);
     }
-    let mut first = !local_wait_attempted;
+    let mut first = true;
     let mut attempted = false;
     loop {
         if !native_intent {

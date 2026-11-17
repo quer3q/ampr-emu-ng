@@ -88,7 +88,6 @@ pub(crate) unsafe fn ensure_pipeline_io_scratch(pipeline: &mut ReadPipelineConte
 pub(crate) unsafe fn prepare_exact_window_aio(
     range: &PipelineIoRange,
     pipeline: &mut ReadPipelineContext,
-    prefetch: bool,
     error_out: *mut c_int,
 ) -> PipelineStep {
     unsafe {
@@ -107,7 +106,7 @@ pub(crate) unsafe fn prepare_exact_window_aio(
         }
         pipeline.fd_wait_epoch = PACK_FD_PROGRESS_EPOCH.load(Ordering::Acquire);
         pipeline.fd_budget_wait_epoch = ampr_index_fd_open_budget_progress_generation();
-        let fd = acquire_pack_fd(range.pack_id, prefetch);
+        let fd = acquire_pack_fd(range.pack_id);
         if fd < 0 {
             pipeline.io_range = PipelineIoRange::EMPTY;
             if fd == SCE_KERNEL_ERROR_EAGAIN {
@@ -205,4 +204,3 @@ pub(crate) unsafe fn finish_pipeline_window_aio(pipeline: &mut ReadPipelineConte
         0
     }
 }
-

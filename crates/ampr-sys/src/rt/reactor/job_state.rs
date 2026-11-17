@@ -629,8 +629,8 @@ mod gs_retry_tests {
         assert_eq!(retry.fileId, prep.fileId);
         assert_eq!(a.check(1, 0x40, retry.fileId, retry.offset), GsCheck::Match);
 
-        // Job B advances the same lane (cross-EOP read-ahead or lane overlap,
-        // both off in release): the retry now resolves to B's file.
+        // Job B advances the same lane (no path does this today; the check
+        // guards one that would): the retry now resolves to B's file.
         let b0 = read_op(APR_READ_FILE, 9, 0x30000, 0x40, 0x5000);
         let r = resolve(&lane, &b0);
         AprAioReactor::update_software_gs_cursor(&mut lane, &r);

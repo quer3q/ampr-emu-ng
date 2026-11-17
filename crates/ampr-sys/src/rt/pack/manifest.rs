@@ -346,6 +346,7 @@ unsafe fn initialize_decoded_cache(state: *mut PackState) {
     (*state).cache_page_bitmap.fill(0);
     (*state).cache_hash_heads.fill(0);
     (*state).cache_page_cursor = 0;
+    (*state).cache_protected_bytes = 0;
     (*state).cache_free_head = 0;
     for (i, entry) in (*state).cache_entries.iter_mut().enumerate() {
         *entry = CacheEntry::EMPTY;
@@ -357,7 +358,7 @@ unsafe fn initialize_decoded_cache(state: *mut PackState) {
     }
 }
 
-/// Carves the 64 MiB decoded cache from the pool at startup. No reserve is
+/// Carves the decoded cache (the whole Cache cap) from the pool at startup. No reserve is
 /// held for the pipelines and workers: their windows and decode buffers
 /// have their own Buffer ledger, and the Index, Cache and Buffer caps plus
 /// the fixed sites fit the pool (rt/index_memory.rs), so a cache cannot
@@ -366,6 +367,48 @@ pub(crate) unsafe fn initialize_caches(state: *mut PackState) {
     unsafe {
         initialize_decoded_cache(state);
     }
+}
+
+/// Once the index view is finished (rt/index.rs `ensure_ready_slow`, before
+/// it publishes the index, so no read has reached the cache): the Index
+/// ledger's room left over its kept room moves to the Cache cap and the
+/// still-empty cache is carved again as one block at the new size. The
+/// Index ledger takes nothing after startup, so its room was idle: 74 of
+/// 80 MiB on one zstd title (5.6 MiB used, debug /metrics). If the pool has
+/// no block that large, the size steps down by an eighth of the moved room
+/// to the old size; what the cache does not take goes back to the Index cap.
+/// A runtime profile or debug knob that asked a smaller cache keeps it.
+pub(crate) unsafe fn grow_cache_from_index(state: *mut PackState) {
+    // Under CACHE_MUTEX, which shutdown also holds to free the cache
+    // (fd_read.rs `free_worker_and_cache_memory`): once it stops, no regrow.
+    let _lock = CACHE_MUTEX.lock();
+    if WORKER_STOP_REQUESTED.load(Ordering::Acquire)
+        || (*state).cache_base.is_null()
+        || (*state).decoded_cache_target_bytes < crate::rt::index_memory::CACHE_MEMORY_MAX
+        || (*state).cache_page_bitmap.iter().any(|&w| w != 0)
+    {
+        return;
+    }
+    let moved = im::move_index_room_to_cache(PACK_CACHE_PAGE_BYTES);
+    if moved == 0 {
+        return;
+    }
+    let old = (*state).cache_bytes;
+    unsafe { im::cache_free((*state).cache_base.cast(), c"apr.pack.decoded-cache.regrow".as_ptr()) };
+    (*state).cache_base = null_mut();
+    let step = (moved / 8).max(PACK_CACHE_PAGE_BYTES) / PACK_CACHE_PAGE_BYTES * PACK_CACHE_PAGE_BYTES;
+    let mut extra = moved;
+    loop {
+        (*state).decoded_cache_target_bytes = old + extra;
+        unsafe { initialize_decoded_cache(state) };
+        if !(*state).cache_base.is_null() || extra == 0 {
+            break;
+        }
+        extra = extra.saturating_sub(step);
+    }
+    let got = if (*state).cache_base.is_null() { 0 } else { (*state).cache_bytes };
+    im::return_cache_room_to_index(moved.saturating_sub(got.saturating_sub(old)));
+    stats::set(stats::Stat::CacheGrownBytes, got.saturating_sub(old) as u64);
 }
 
 pub(crate) unsafe fn clear_manifest_view(state: *mut PackState) {

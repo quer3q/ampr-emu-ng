@@ -333,20 +333,8 @@ pub unsafe fn sceKernelAioSubmitReadCommandsMultiple(
         let mut virtual_positions = [0usize; J];
         // Split group of each request position, or INVALID_INDEX.
         let mut split_groups = [INVALID_INDEX; N];
-        // Per virtual request: (fd index, file_id, last local chunk read or u32::MAX);
-        // then per file: (file_id, first local chunk, end local chunk) to read ahead.
-        const RA: usize = if AMPR_EMU_PACK_READAHEAD_CHUNKS == 0 && !super::super::tune::ON {
-            0
-        } else {
-            N
-        };
-        let mut readahead_reads = [(0u32, 0u32, u32::MAX); RA];
-        let mut readahead = [(0u32, 0u32, 0u32); RA];
-        let readahead_count;
         let mut real_count = 0usize;
         let mut virtual_count = 0usize;
-        // Virtual requests (split or not); equals virtual_count without splits.
-        let mut virtual_requests = 0usize;
         let mut prepare_rc = 0;
 
         {
@@ -359,70 +347,31 @@ pub unsafe fn sceKernelAioSubmitReadCommandsMultiple(
                     real_count += 1;
                     continue;
                 };
-                let fd_slot = (*state).virtual_fds[fd_index as usize];
-                if !fd_slot.holds(req.fd) {
-                    prepare_rc = SCE_KERNEL_ERROR_EBADF;
-                    break;
-                }
-                let aio_index = allocate_virtual_aio_locked(state);
-                if aio_index == INVALID_INDEX {
-                    prepare_rc = SCE_KERNEL_ERROR_EAGAIN;
-                    break;
-                }
-                let Some((task_file, _file_size, file_flags)) =
-                    packed_read_file(state, fd_slot.file_id)
-                else {
-                    free_virtual_aio_locked(state, aio_index);
-                    prepare_rc = SCE_KERNEL_ERROR_EIO;
-                    break;
-                };
-                let aio = &mut (*state).virtual_aio[aio_index as usize];
-                aio.request = req;
-                aio.file_id = fd_slot.file_id;
-                aio.priority = queue_priority(priority);
-                aio.work_class = classify_work(file_flags, &aio.request);
-                aio.cancel_requested.store(false, Ordering::Relaxed);
-                let result = aio.request.result;
-                if !result.is_null() {
-                    AtomicI64::from_ptr(&raw mut (*result).return_value)
-                        .store(0, Ordering::Relaxed);
-                    AtomicU32::from_ptr(&raw mut (*result).state).store(0, Ordering::Release);
-                }
-                if RA != 0 {
-                    let last =
-                        readahead_last_chunk(state, fd_slot.file_id, &req).unwrap_or(u32::MAX);
-                    readahead_reads[virtual_requests] = (fd_index, fd_slot.file_id, last);
-                }
-                virtual_indexes[virtual_count] = aio_index;
-                virtual_positions[virtual_count] = i;
-                virtual_count += 1;
-                virtual_requests += 1;
-                // A read over >= 2 chunks becomes parallel child jobs, while the
-                // rest of the batch and SPLIT_MIN_FREE_SLOTS keep free slots (else
-                // it stays one job). Chunks are the file's read tasks: 256 KiB in
-                // zstd, `1 << block_shift` in LZ4 and pkg (zstd_split.rs).
                 let mut children = [0u32; SPLIT_MAX_CHILDREN];
                 let rest = count as usize - i - 1;
-                if let Some((group_index, n)) = split_virtual_read_locked(
+                let (group_index, n) = match prepare_virtual_request_locked(
                     state,
-                    aio_index,
-                    task_file.ptr(),
-                    _file_size,
+                    req,
+                    fd_index,
+                    priority,
                     rest + SPLIT_MIN_FREE_SLOTS,
                     &mut children,
                 ) {
-                    if virtual_count + (n - 1) + rest > J {
-                        abort();
+                    Ok(v) => v,
+                    Err(rc) => {
+                        prepare_rc = rc;
+                        break;
                     }
-                    for &child in &children[1..n] {
-                        virtual_indexes[virtual_count] = child;
-                        virtual_positions[virtual_count] = i;
-                        virtual_count += 1;
-                    }
-                    split_groups[i] = group_index;
-                    stats::add(stats::Stat::PackSplitReads, 1);
-                    stats::add(stats::Stat::PackSplitChildren, n as u64);
+                };
+                if group_index != INVALID_INDEX && virtual_count + n + rest > J {
+                    abort();
                 }
+                for &child in &children[..n] {
+                    virtual_indexes[virtual_count] = child;
+                    virtual_positions[virtual_count] = i;
+                    virtual_count += 1;
+                }
+                split_groups[i] = group_index;
             }
             if prepare_rc == 0 && virtual_count != 0 && !ensure_workers_locked(state) {
                 prepare_rc = SCE_KERNEL_ERROR_ENOMEM;
@@ -433,12 +382,6 @@ pub unsafe fn sceKernelAioSubmitReadCommandsMultiple(
                 }
                 free_split_groups_locked(state, &split_groups[..count as usize]);
             }
-            let reads = &readahead_reads[..if prepare_rc == 0 {
-                virtual_requests.min(RA)
-            } else {
-                0
-            }];
-            readahead_count = plan_batch_readahead_locked(state, reads, &mut readahead);
         }
         if prepare_rc != 0 {
             return prepare_rc;
@@ -466,41 +409,68 @@ pub unsafe fn sceKernelAioSubmitReadCommandsMultiple(
                 &virtual_indexes[..virtual_count],
                 &virtual_positions[..virtual_count],
                 &split_groups,
-                &readahead[..readahead_count],
             );
         }
         0
     }
 }
 
-/// One read-ahead window per file, past the highest chunk the whole batch
-/// reads in it, so read-ahead never covers chunks this batch reads itself.
-/// `reads` holds (fd index, file_id, last chunk read or u32::MAX) per
-/// virtual request; returns the windows written to `readahead`.
-#[inline]
-unsafe fn plan_batch_readahead_locked(
+/// Reserves the virtual job of `req`, a read of virtual fd slot `fd_index`,
+/// zeroes its result, and splits a read over >= 2 chunks into parallel child
+/// jobs while `reserve` slots stay free besides them (else it stays one
+/// job). Chunks are the file's read tasks: 256 KiB in zstd, `1 << block_shift`
+/// in LZ4 and pkg (pack_split.rs). `children[..n]` gets every job's slot,
+/// the first being the request's own. Returns (split group or INVALID_INDEX,
+/// n); on Err nothing stays reserved. Shared by the AIO submit above and the
+/// sync read (fd_read.rs `submit_sync_locked`). PACK_M held.
+pub(crate) unsafe fn prepare_virtual_request_locked(
     state: *mut PackState,
-    reads: &[(u32, u32, u32)],
-    readahead: &mut [(u32, u32, u32)],
-) -> usize {
-    let mut readahead_count = 0usize;
-    for (i, &(_, file_id, last)) in reads.iter().enumerate() {
-        if last == u32::MAX || reads[..i].iter().any(|r| r.1 == file_id && r.2 != u32::MAX) {
-            continue;
+    req: SceKernelAioRWRequest,
+    fd_index: u32,
+    priority: c_int,
+    reserve: usize,
+    children: &mut [u32; SPLIT_MAX_CHILDREN],
+) -> Result<(u32, usize), c_int> {
+    unsafe {
+        let fd_slot = (*state).virtual_fds[fd_index as usize];
+        if !fd_slot.holds(req.fd) {
+            return Err(SCE_KERNEL_ERROR_EBADF);
         }
-        let mut best = i;
-        for (j, r) in reads.iter().enumerate().skip(i + 1) {
-            if r.1 == file_id && r.2 != u32::MAX && r.2 >= reads[best].2 {
-                best = j;
-            }
+        let aio_index = allocate_virtual_aio_locked(state);
+        if aio_index == INVALID_INDEX {
+            return Err(SCE_KERNEL_ERROR_EAGAIN);
         }
-        let (start, end) = unsafe { readahead_window_locked(state, reads[best].0, reads[best].2) };
-        if start < end {
-            readahead[readahead_count] = (file_id, start, end);
-            readahead_count += 1;
+        let Some((task_file, file_size, file_flags)) = packed_read_file(state, fd_slot.file_id)
+        else {
+            free_virtual_aio_locked(state, aio_index);
+            return Err(SCE_KERNEL_ERROR_EIO);
+        };
+        let aio = &mut (*state).virtual_aio[aio_index as usize];
+        aio.request = req;
+        aio.file_id = fd_slot.file_id;
+        aio.priority = queue_priority(priority);
+        aio.work_class = classify_work(file_flags, &aio.request);
+        aio.cancel_requested.store(false, Ordering::Relaxed);
+        let result = aio.request.result;
+        if !result.is_null() {
+            AtomicI64::from_ptr(&raw mut (*result).return_value).store(0, Ordering::Relaxed);
+            AtomicU32::from_ptr(&raw mut (*result).state).store(0, Ordering::Release);
         }
+        children[0] = aio_index;
+        let Some((group_index, n)) = split_virtual_read_locked(
+            state,
+            aio_index,
+            task_file.ptr(),
+            file_size,
+            reserve,
+            children,
+        ) else {
+            return Ok((INVALID_INDEX, 1));
+        };
+        stats::add(stats::Stat::PackSplitReads, 1);
+        stats::add(stats::Stat::PackSplitChildren, n as u64);
+        Ok((group_index, n))
     }
-    readahead_count
 }
 
 /// Submits the batch's real-fd requests to the kernel and stores their ids
@@ -551,14 +521,12 @@ unsafe fn submit_real_requests(
 /// reads / 213 MB with no I/O and no errors; queuing that read instead
 /// reached 25,823 reads / 657 MB. The debug build with its probes installed
 /// moved the window past the hang, which is why only release showed it.
-/// Also queues the batch's read-ahead windows.
 unsafe fn publish_virtual_jobs(
     state: *mut PackState,
     ids: *mut SceKernelAioSubmitId,
     virtual_indexes: &[u32],
     virtual_positions: &[usize],
     split_groups: &[u32],
-    readahead: &[(u32, u32, u32)],
 ) {
     unsafe {
         let virtual_count = virtual_indexes.len();
@@ -583,13 +551,6 @@ unsafe fn publish_virtual_jobs(
             } else {
                 QUEUE_CV.notify_all();
             }
-        }
-        let mut prefetch_queued = false;
-        for &(file_id, start, end) in readahead {
-            prefetch_queued |= queue_readahead(file_id, start, end);
-        }
-        if prefetch_queued {
-            QUEUE_CV.notify_all();
         }
     }
 }

@@ -3,7 +3,7 @@
 //! the fakelib packed): they show on a console which file APIs the runtime
 //! does not serve a game uses on packed files (dup, poll, openat, ...).
 //! Each calls its own original libkernel entry point (`sys::kernel_slot`,
-//! as rt/pack/zstd_libc.rs does) and never changes the result; it only
+//! as rt/pack/pack_libc.rs does) and never changes the result; it only
 //! logs through `stats::fs_note`, so `/fsfail` lists each distinct
 //! (op, file) once. The op letters are documented at
 //! `FsEvents` in rt/stats.rs. Built only with `mem_report`; rt/hook.rs
@@ -354,7 +354,7 @@ pub(crate) unsafe extern "C" fn readlink_probe(
 const AT_FDCWD: c_int = -100;
 
 /// Logs `op` with the result `rc` of a pass-through libc path call (`_open`,
-/// `_openat`, `access`, `lstat` whose `AMPR_ZSTD_LIBC_HOOKS` bit is off)
+/// `_openat`, `access`, `lstat` whose `AMPR_PACK_LIBC_HOOKS` bit is off)
 /// already made on `path`, when `path` is a packed file or indexed directory.
 pub(crate) unsafe fn probe_path(path: *const c_char, op: u8, rc: c_int) {
     if let Some(how) = unsafe { probe_packed_path(path) } {

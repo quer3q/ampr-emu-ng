@@ -46,10 +46,8 @@ pub const SCE_KERNEL_PROT_CPU_READ: c_int = 0x01;
 pub const SCE_KERNEL_PROT_CPU_RW: c_int = 0x02;
 pub const SCE_KERNEL_PROT_CPU_EXEC: c_int = 0x04;
 pub const SCE_KERNEL_PROT_CPU_ALL: c_int = 0x07;
-/// GPU access bits of mmap/sceKernelMmap prot, the PS4 SDK values (the
-/// ps5-payload-sdk headers do not define them); a GPU fault never reaches
-/// a CPU signal handler (rt/pack/mmap_fault.rs).
-pub const SCE_KERNEL_PROT_GPU_READ: c_int = 0x10;
+/// GPU and AMPR write bits of mmap/sceKernelMmap prot, the PS4 SDK values (the
+/// ps5-payload-sdk headers do not define them).
 pub const SCE_KERNEL_PROT_GPU_WRITE: c_int = 0x20;
 pub const SCE_KERNEL_PROT_AMPR_WRITE: c_int = 0x80;
 pub const SCE_KERNEL_PROT_AMPR_ALL: c_int = 0xc0;
@@ -362,7 +360,7 @@ unsafe extern "C" {
     ) -> c_int;
 
     // libc (LIBC_IMPORTS). Prefer core::ptr for copies; these are for parity.
-    // Only the global allocator (lib.rs, non-test) calls these two.
+    // Only the global allocator (rt/heap.rs, non-test) calls these two.
     #[cfg(not(test))]
     pub fn malloc(size: usize) -> *mut c_void;
     #[cfg(not(test))]
@@ -435,13 +433,13 @@ pub mod hook {
     pub const fcntl: usize = 93;
     pub const _fcntl: usize = 94;
     pub const sceKernelFcntl: usize = 95;
-    // Both formats, Makefile `AMPR_ZSTD_MMAP` != 0: mmap of a virtual pack fd
+    // Both formats, Makefile `AMPR_PACK_MMAP` != 0: mmap of a virtual pack fd
     // maps a disk cache copy of the packed file (rt/pack/mmap.rs). Both
     // builds.
     pub const mmap: usize = 96;
     pub const sceKernelMmap: usize = 97;
-    // `AMPR_ZSTD_MMAP` == 1: munmap unregisters decode-on-fault mappings
-    // (rt/pack/mmap.rs). Both builds.
+    // Unused, never installed: they held the munmap hooks of decode on
+    // access, which was removed. Kept so the later ids keep their numbers.
     pub const munmap: usize = 98;
     pub const sceKernelMunmap: usize = 99;
     // 100..=109: the game's own kernel AIO, both formats, both builds: a

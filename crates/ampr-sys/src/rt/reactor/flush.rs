@@ -50,7 +50,7 @@ impl AprAioReactor {
             }
             self.detach_staged_read_chain(job, chain);
             unsafe { (*chain).allIssued = true };
-            self.set_or_defer_read_command_error(
+            self.set_command_error(
                 unsafe { &mut *job },
                 c"aio-resubmit".as_ptr(),
                 apr_backend_read_error_to_apr(submitSceRc),
@@ -89,7 +89,7 @@ impl AprAioReactor {
         unsafe { (*chain).allIssued = true };
         self.maybe_finish_read_chain(chain);
         if !Self::job_failed(unsafe { &*job }) {
-            self.set_or_defer_read_command_error(
+            self.set_command_error(
                 unsafe { &mut *job },
                 c"aio-submit".as_ptr(),
                 apr_backend_read_error_to_apr(submitSceRc),

@@ -190,26 +190,6 @@ impl AprAioReactor {
         self.set_fail(job, reason, rc, errorOffset, backendRc);
     }
 
-    pub(crate) fn set_or_defer_read_command_error(
-        &mut self,
-        job: &mut JobState,
-        reason: *const c_char,
-        rc: c_int,
-        errorOffset: u32,
-        backendRc: c_int,
-    ) -> bool {
-        self.set_command_error(job, reason, rc, errorOffset, backendRc);
-        false
-    }
-
-    pub(crate) fn publish_deferred_cross_eop_error(&mut self, _job: &mut JobState) -> bool {
-        false
-    }
-
-    pub(crate) fn cross_eop_suffix_is_canceled(_job: &JobState, _sourceOffset: u32) -> bool {
-        false
-    }
-
     pub(crate) fn publish_job_result(&self, job: &mut JobState) {
         if job.aprRes.is_null() {
             return;

@@ -46,13 +46,12 @@ pub(crate) fn apr_adaptive_direct_fd_cap(
     cap
 }
 
-pub(crate) fn apr_update_read_desc_fd_policy(rd: &mut AprAioReadDesc, promoteFullFile: bool) {
+pub(crate) fn apr_update_read_desc_fd_policy(rd: &mut AprAioReadDesc) {
     if !rd.fileMetadataValid {
         return;
     }
     rd.bypassFdCache =
-        apr_read_is_single_quantum_full_file(rd.offset, rd.length, rd.fileSize as u64)
-            && !promoteFullFile;
+        apr_read_is_single_quantum_full_file(rd.offset, rd.length, rd.fileSize as u64);
 }
 
 /// The file index entry of `rd` for an open: a desc keeps no path of its

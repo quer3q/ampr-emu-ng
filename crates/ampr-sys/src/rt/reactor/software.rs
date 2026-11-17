@@ -548,7 +548,7 @@ impl AprAioReactor {
         self.maybe_finish_read_chain(chain);
 
         if outcome.has_error() && !Self::job_failed(unsafe { &*j }) {
-            self.set_or_defer_read_command_error(
+            self.set_command_error(
                 unsafe { &mut *j },
                 outcome.errorReason,
                 outcome.errorRc,
@@ -650,7 +650,7 @@ impl AprAioReactor {
             return null_mut();
         }
         logicalRead.coalescedCommandCount = sourceCommandCount as u8;
-        apr_update_read_desc_fd_policy(&mut logicalRead, false);
+        apr_update_read_desc_fd_policy(&mut logicalRead);
 
         let chain = self.allocate_read_chain();
         if chain.is_null() {

@@ -152,7 +152,7 @@ impl AprAioReactor {
             self.note_slow_aio_completion(finishTimeNs, completeAgeMs);
         }
         if rc == 0 && shortRead {
-            self.set_or_defer_read_command_error(
+            self.set_command_error(
                 jobRef,
                 c"aio-short-read".as_ptr(),
                 SCE_AMPR_ERROR_APR_INVALIDFILEOFFSET,
@@ -168,7 +168,6 @@ impl AprAioReactor {
 
         if rc != 0
             && !Self::job_failed(jobRef)
-            && !Self::cross_eop_suffix_is_canceled(jobRef, errorOff)
             && (completionEfault || completionRetryable)
             && !efaultRetryLimitReached
             && !completionRetryLimitReached
@@ -198,7 +197,7 @@ impl AprAioReactor {
         }
 
         if rc != 0 && !Self::job_failed(jobRef) && completionRetryLimitReached {
-            self.set_or_defer_read_command_error(
+            self.set_command_error(
                 jobRef,
                 c"aio-completion-retry-limit".as_ptr(),
                 apr_backend_read_error_to_apr(rc),
@@ -208,7 +207,7 @@ impl AprAioReactor {
         }
         if rc != 0 && !Self::job_failed(jobRef) && efaultRetryLimitReached {
             self.note_efault_retry_limit_event();
-            self.set_or_defer_read_command_error(
+            self.set_command_error(
                 jobRef,
                 c"aio-efault-retry-limit".as_ptr(),
                 apr_backend_read_error_to_apr(rc),
@@ -217,7 +216,7 @@ impl AprAioReactor {
             );
         }
         if rc != 0 && !Self::job_failed(jobRef) && !completionEfault && !completionRetryable {
-            self.set_or_defer_read_command_error(
+            self.set_command_error(
                 jobRef,
                 c"aio-completion-nonretryable".as_ptr(),
                 apr_backend_read_error_to_apr(rc),

@@ -76,8 +76,8 @@ use super::reactor;
 pub(crate) use super::reactor::apr_reactor_notify_external_progress;
 
 // ---- libScePthread thread API (same signatures as rt/reactor/mod.rs) -------
+pub(crate) use super::reactor::scePthreadJoin;
 unsafe extern "C" {
-    pub(crate) fn scePthreadJoin(thread: ScePthread, value: *mut *mut c_void) -> c_int;
     pub(crate) fn scePthreadSelf() -> ScePthread;
     pub(crate) fn scePthreadSetprio(thread: ScePthread, prio: c_int) -> c_int;
     pub(crate) fn scePthreadSetaffinity(thread: ScePthread, mask: u64) -> c_int;
@@ -126,20 +126,15 @@ mod aio;
 pub(crate) use aio::*;
 mod aio_wait;
 pub(crate) use aio_wait::*;
-mod readahead;
-pub(crate) use readahead::*;
 /// mmap of a packed file (both formats) through a disk cache copy (hook ids
 /// 96, 97).
 pub(crate) mod mmap;
-/// `AMPR_ZSTD_MMAP=1`: decode-on-access mappings and their fault handler.
-/// zstd only; an LZ4 mapping takes the disk cache copy in `mmap`.
-pub(crate) mod mmap_fault;
 /// zstd mount state and accessors (reached as `zstd::x`).
 pub(crate) mod zstd;
-pub(crate) mod zstd_libc;
+pub(crate) mod pack_libc;
 /// A multi-chunk packed read split into parallel child jobs (aio.rs).
-mod zstd_split;
-pub(crate) use zstd_split::*;
+mod pack_split;
+pub(crate) use pack_split::*;
 /// Pkg mode: pack 0 read straight from the .pkg `/app0/kraken.image` names.
 mod pkg;
 pub(crate) use pkg::*;
@@ -505,7 +500,6 @@ pub(crate) const AMPR_PACK_BLOCK_SHIFT_MAX: u8 = 20;
 pub(crate) const AMPR_PACK_FILE_PACKED: u32 = 1 << 0;
 pub(crate) const AMPR_PACK_FILE_STREAMING: u32 = 1 << 2;
 pub(crate) const AMPR_PACK_FILE_HOT: u32 = 1 << 3;
-pub(crate) const AMPR_PACK_FILE_RANDOM_ACCESS: u32 = ampr_lz4::FILE_RANDOM_ACCESS;
 
 pub(crate) const AMPR_PACK_CHUNK_RAW: u8 = 0;
 pub(crate) const AMPR_PACK_CHUNK_LZ4: u8 = 1;
@@ -659,27 +653,6 @@ const _: () = assert!(
     AMPR_EMU_PACK_WORKERS >= 1 && AMPR_EMU_PACK_WORKERS as usize <= AMPR_EMU_PACK_WORKER_CAPACITY
 );
 pub(crate) const AMPR_EMU_PACK_WORKER_CAPACITY: usize = 16;
-/// Sequential read-ahead window in chunks, from the Makefile's
-/// `AMPR_PACK_READAHEAD_CHUNKS` (Makefile default 0, off; 32, a ~1-1.5 MiB
-/// prefetch run, when built outside the Makefile); 0 disables read-ahead
-/// (readahead.rs).
-pub(crate) const AMPR_EMU_PACK_READAHEAD_CHUNKS: u32 =
-    match option_env!("AMPR_PACK_READAHEAD_CHUNKS") {
-        Some(s) if s.len() == 1 && s.as_bytes()[0] == b'0' => 0,
-        Some(s) => super::runtime_memory::parse_size(s.as_bytes()) as u32,
-        None => 32,
-    };
-const _: () = assert!(AMPR_EMU_PACK_READAHEAD_CHUNKS <= 64);
-/// Read-ahead disk-saturation gate, from the Makefile's
-/// `AMPR_PACK_READAHEAD_MAX_DISK_INFLIGHT` (default 2): prefetch is skipped
-/// while the pack has at least this many physical backing reads in flight
-/// (readahead.rs); 0 disables prefetch starts entirely.
-pub(crate) const AMPR_EMU_PACK_READAHEAD_MAX_DISK_INFLIGHT: u32 =
-    match option_env!("AMPR_PACK_READAHEAD_MAX_DISK_INFLIGHT") {
-        Some(s) if s.len() == 1 && s.as_bytes()[0] == b'0' => 0,
-        Some(s) => super::runtime_memory::parse_size(s.as_bytes()) as u32,
-        None => 2,
-    };
 pub(crate) const AMPR_EMU_PACK_DECODED_CACHE_MAX_BYTES: u64 = 512 * 1024 * 1024;
 /// Pipeline slots, from the Makefile's `AMPR_PACK_PIPELINES` (default 12,
 /// at most AMPR_EMU_PACK_PIPELINE_MAX) in both builds: each pipeline keeps a
@@ -760,14 +733,17 @@ pub(crate) const AMPR_EMU_PACK_MAX_PACKS: usize = 1024;
 /// recently used closes to open another. A zstd title with 28 volumes kept
 /// all 18 of the old cap busy (debug /metrics).
 pub(crate) const AMPR_EMU_PACK_OPEN_PACK_FD_CAP: u32 = 32;
-/// 64 MiB (both builds; debug `decoded_mib`), the whole 64 MiB Cache
-/// ledger: the only pack cache. Exact reads with 64 MiB decoded gave 11-14%
-/// lower game wait per read than 32 + 32 MiB page reads on two zstd titles
-/// (debug /metrics). At 16 MiB a zstd title (debug /metrics, 150 s)
+/// The whole Cache ledger, the pool's remainder (rt/index_memory.rs
+/// `CACHE_MEMORY_MAX`: 133.64 MiB debug, 134.98 MiB release at the 256 MiB
+/// layout; debug knob `decoded_mib`): the only pack cache, so the release
+/// cache is about 1% larger than the debug one. Exact reads with 64 MiB
+/// decoded gave 11-14% lower game wait per read than 32 + 32 MiB page reads
+/// on two zstd titles (debug /metrics). At 16 MiB a zstd title (debug /metrics, 150 s)
 /// re-decoded an evicted chunk in 73% of its misses: 29.9 GB decoded for
 /// 6.56 GB read. It is off when less than its 16 MiB minimum is left under
 /// the Cache cap.
-pub(crate) const AMPR_EMU_PACK_DECODED_CACHE_BYTES: u64 = 64 * 1024 * 1024;
+pub(crate) const AMPR_EMU_PACK_DECODED_CACHE_BYTES: u64 =
+    super::index_memory::CACHE_MEMORY_MAX as u64;
 pub(crate) const AMPR_EMU_PACK_DECODED_CACHE_MIN_BYTES: u64 = 16 * 1024 * 1024;
 pub(crate) const AMPR_EMU_PACK_CACHE_ENTRY_CAP: usize = 8192;
 pub(crate) const AMPR_EMU_PACK_CACHE_PAGE_SHIFT: u32 = 14;
@@ -889,8 +865,6 @@ pub(crate) struct VirtualFdSlot {
     /// The value returned to the game: `AMPR_EMU_PACK_VIRTUAL_FD_BASE + slot`.
     /// A reused slot returns the same number, like a reused OS fd.
     pub handle: c_int,
-    /// First local chunk not yet covered by read-ahead (readahead.rs).
-    pub readahead_next: u32,
     pub cursor: u64,
     pub active: bool,
 }
@@ -898,7 +872,6 @@ impl VirtualFdSlot {
     pub(crate) const EMPTY: Self = Self {
         file_id: 0,
         handle: -1,
-        readahead_next: 0,
         cursor: 0,
         active: false,
     };
@@ -991,10 +964,7 @@ pub(crate) struct VirtualAioSlot {
     pub parked_ns: u64,
     pub park_kind: u8,
     pub requeued_ns: u64,
-    /// Nonzero: a read-ahead job (readahead.rs) loading this many chunks into the
-    /// decoded cache; no destination, no id, no game-visible completion.
-    pub prefetch_chunks: u32,
-    /// zstd: the split group this job is a child of (zstd_split), or
+    /// zstd: the split group this job is a child of (pack_split), or
     /// INVALID_INDEX.
     pub split_group: u32,
 }
@@ -1016,7 +986,6 @@ impl VirtualAioSlot {
         parked_ns: 0,
         park_kind: 0,
         requeued_ns: 0,
-        prefetch_chunks: 0,
         split_group: INVALID_INDEX,
     };
 }
@@ -1096,6 +1065,12 @@ pub(crate) struct CacheEntry {
     pub pack_id: u16,
     pub state: CacheEntryState,
     pub referenced: bool,
+    /// Hits while cached, saturating; at `tune::cache_protect_hits` the
+    /// entry turns protected (caches.rs `cache_note_hit_locked`).
+    pub hits: u8,
+    /// In the protected segment: the hand skips it while the protected
+    /// bytes are within their share (caches.rs `cache_evict_one_locked`).
+    pub protected: bool,
     pub error: c_int,
 }
 impl CacheEntry {
@@ -1112,6 +1087,8 @@ impl CacheEntry {
         pack_id: 0,
         state: CacheEntryState::Free,
         referenced: false,
+        hits: 0,
+        protected: false,
         error: 0,
     };
 }
@@ -1242,7 +1219,7 @@ pub(crate) struct ReadPipelineContext {
     pub fd_reopen_retry: bool,
     pub native_accepted: bool,
     pub native_submitted: bool,
-    /// Physical backing reads this pipeline added to PACK_DISK_INFLIGHT (readahead.rs).
+    /// Physical backing reads this pipeline added to PACK_DISK_INFLIGHT (worker.rs).
     pub disk_inflight: u32,
 }
 impl ReadPipelineContext {
@@ -1290,8 +1267,8 @@ pub(crate) struct PackSubmission {
 // Non-zero defaults `pack_state_create` (state.rs) must apply in place on the
 // zeroed storage: every array element = its type's `EMPTY` (virtual_fds,
 // virtual_directories, virtual_aio, pipelines, pack_handles, cache_entries;
-// the others are all-zero), queue_head/queue_tail =
-// prefetch_head/prefetch_tail = INVALID_INDEX, decoded_cache_target_bytes
+// the others are all-zero), queue_head/queue_tail = INVALID_INDEX,
+// decoded_cache_target_bytes
 // and requested_workers from `tune` (in release
 // AMPR_EMU_PACK_DECODED_CACHE_BYTES and AMPR_EMU_PACK_WORKERS),
 // latency_reserve_workers = AMPR_EMU_PACK_LATENCY_RESERVE_WORKERS,
@@ -1325,11 +1302,6 @@ pub(crate) struct PackState {
     pub queue_depth: [u32; PACK_WORK_CLASS_COUNT],
     pub queue_pick_counter: u32,
     pub aio_completion_epoch: u64,
-    /// Read-ahead jobs not yet started (linked by `next`), and the chunks of
-    /// all read-ahead jobs in flight (readahead.rs).
-    pub prefetch_head: u32,
-    pub prefetch_tail: u32,
-    pub prefetch_chunks_inflight: u32,
 
     pub decoded_cache_target_bytes: usize,
     pub requested_workers: u32,
@@ -1361,6 +1333,8 @@ pub(crate) struct PackState {
     /// One past the highest entry index ever allocated: the LIFO free list
     /// hands out low indices first, so the CLOCK hand scans only below it.
     pub cache_entry_high_water: u32,
+    /// Bytes (whole pages) of the protected entries; CACHE_MUTEX.
+    pub cache_protected_bytes: usize,
     pub touches: [TouchEntry; AMPR_EMU_PACK_TOUCH_TABLE_SIZE],
 }
 

@@ -39,8 +39,6 @@ pub(crate) unsafe fn pack_state_create() -> *mut PackState {
             let st = &mut *s;
             st.queue_head = [[INVALID_INDEX; PACK_WORK_CLASS_COUNT]; 3];
             st.queue_tail = [[INVALID_INDEX; PACK_WORK_CLASS_COUNT]; 3];
-            st.prefetch_head = INVALID_INDEX;
-            st.prefetch_tail = INVALID_INDEX;
             st.decoded_cache_target_bytes = super::super::tune::decoded_bytes();
             st.requested_workers = super::super::tune::workers();
             st.latency_reserve_workers = AMPR_EMU_PACK_LATENCY_RESERVE_WORKERS;
