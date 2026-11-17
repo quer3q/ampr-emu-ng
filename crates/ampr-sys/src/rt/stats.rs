@@ -232,6 +232,17 @@ stats! {
     /// Failures: pack virtual reads completed with an error, chunk decodes that failed.
     PackJobErrors = "pack_job_errors",
     DecodeErrors = "decode_errors",
+    /// Pack tasks whose game destination was not mapped CPU-writable when
+    /// they were about to write it, so the worker waited for it, and those
+    /// still missing after the 64 x 10 ms retries, failed with EFAULT
+    /// (pack/virtual_read.rs wait_destination_mapped). Without the wait the
+    /// write faulted the worker and killed the game (PPSA10665).
+    PackDestWaits = "pack_dest_waits",
+    PackDestFaults = "pack_dest_faults",
+    /// Pages of those destinations whose sceKernelQueryMemoryProtection the
+    /// kernel refused (EACCES) and that were probed with a kernel copy out
+    /// instead (pack/virtual_read.rs destination_covered).
+    PackDestQueryDenied = "pack_dest_query_denied",
     /// Software WaitOnAddress / WriteAddress commands failed with an APR
     /// error because sceKernelQueryMemoryProtection found the target
     /// unmapped or without CPU read (wait) or write (write) protection
