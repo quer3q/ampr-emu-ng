@@ -329,6 +329,11 @@ written as events happen, so it survives the crash, and holds:
 - every failed file event `/fsfail` would keep, and every module load (`K`);
 - probe events once per (op, path), whatever their result; a served `I`
   line shows what the game did with packed files before it died.
+- the index load (rt/index.rs `ensure_ready_slow`): one `idx <how>
+  files=<count>` line per load attempt, `how` one of `Loaded`, `Missing`,
+  `Invalid`, `Memory`, `Unreadable`, or `walk memory`/`walk installed`
+  when a walk build replaced it; then `idx join ok|fail` for the pack join
+  of a title with packs (a failed join unlinks every packed row).
 
 Successful file calls are not written. The file is truncated at each start;
 copy it off before relaunching.
