@@ -52,6 +52,7 @@ answer. The pages are listed in `serve` in `crates/ampr-sys/src/rt/exports.rs`.
 | `/modules` | Loaded modules. |
 | `/queues` | Event queue waits in progress and queues with pending events. The first line, `eqpeak queues=N/1024 regs=N/4096 pending=N/5120 extras=N/1024`, is the overlay tables' live peaks against their caps (`equeue_peaks` in `rt/equeue.rs`); a queue line's `flags=` keeps bits 8, 16, 32 and 64. |
 | `/threads` | Thread counts; `?hold=N`, `?release=1`, `?yield=N` and `?yield_workers=N` test the game's thread limit. |
+| `/crash` | Nothing: it crashes the game on purpose (a write to address 0 on the metrics thread), so the system's core dump captures it as it is, e.g. while frozen. |
 
 ```sh
 curl http://<ps5-ip>:9090/metrics

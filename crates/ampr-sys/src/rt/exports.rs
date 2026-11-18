@@ -1441,6 +1441,12 @@ mod mem_report {
                 queues(metrics);
             } else if n > 0 && req[..n as usize].starts_with(b"GET /modules") {
                 unsafe { modules(metrics) };
+            } else if n > 0 && req[..n as usize].starts_with(b"GET /crash") {
+                // Fault this thread on purpose so the system's core dump
+                // captures the game as it is now, e.g. a frozen title for
+                // offline analysis.
+                unsafe { core::ptr::null_mut::<u8>().write_volatile(0) };
+                unreachable!();
             } else {
                 body(start_ns, metrics);
             }
