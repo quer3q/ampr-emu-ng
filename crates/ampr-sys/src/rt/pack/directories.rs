@@ -363,6 +363,18 @@ pub(crate) fn directory_open_flags(flags: c_int) -> bool {
     flags & O_DIRECTORY != 0 || flags & O_ACCMODE == O_RDONLY
 }
 
+/// Whether a plain read-only open of a directory that exists on disk may
+/// answer with the kernel's fd and its own entries: only in a title with no
+/// packs. With packs, packed entries may sit below any existing directory.
+/// A game that walks `/app0` with flags 0 at boot and later looks files up
+/// only among the names it listed fails on every packed file, and that
+/// lookup makes no filesystem call, so no trace or `/fsfail` line shows it.
+/// The merge below still answers from the kernel fd (`fallback`) when
+/// nothing is packed below the directory.
+fn plain_physical_fd_answers(flags: c_int, real_fd: c_int, packs: bool) -> bool {
+    flags & O_DIRECTORY == 0 && real_fd >= 0 && !packs
+}
+
 #[inline(never)]
 pub(crate) unsafe fn ampr_pack_open_directory_impl(
     path: *const c_char,
@@ -394,8 +406,10 @@ pub(crate) unsafe fn ampr_pack_open_directory_impl(
         }
         // A plain read-only open of a directory that really is on disk (a
         // folder install) keeps the kernel's fd and its own entries; only a
-        // missing directory is served from the index.
-        if allow_physical_open && flags & O_DIRECTORY == 0 && real_fd >= 0 {
+        // missing directory is served from the index. A title with packs
+        // goes on to the merge instead, so packed entries below an existing
+        // directory are listed too (`plain_physical_fd_answers`).
+        if allow_physical_open && plain_physical_fd_answers(flags, real_fd, packs_present()) {
             return real_fd;
         }
         if allow_physical_open && real_fd < 0 {
@@ -1264,6 +1278,21 @@ mod tests {
         direct.read_at(4, &mut out).unwrap();
         assert_eq!(src.1.get(), 3);
         assert_eq!(out[..], bytes[4..14]);
+    }
+
+    /// A plain read-only open of an existing directory answers with the
+    /// kernel's fd only without packs: with packs the listing must merge
+    /// the packed entries below it, so the open goes on to the overlay. An
+    /// `O_DIRECTORY` open always did.
+    #[test]
+    fn plain_physical_fd_only_without_packs() {
+        assert!(plain_physical_fd_answers(0, 3, false));
+        assert!(plain_physical_fd_answers(O_RDONLY, 3, false));
+        assert!(!plain_physical_fd_answers(0, 3, true));
+        assert!(!plain_physical_fd_answers(0, -1, false));
+        assert!(!plain_physical_fd_answers(O_DIRECTORY, 3, false));
+        // A writable open never reaches the check: the impl answers it with
+        // the physical fd first (`O_ACCMODE != O_RDONLY`).
     }
 
     /// A physical `getdents` that fails for good ends the physical
