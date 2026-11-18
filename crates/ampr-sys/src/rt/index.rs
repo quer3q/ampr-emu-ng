@@ -454,7 +454,11 @@ impl ScratchBuffer {
         if !self.base.is_null() {
             unsafe { sdk_release(self.base.cast(), self.size, self.class) };
         }
-        *self = Self::new();
+        // Field writes, not `*self = Self::new()`: an assignment drops the
+        // old value first, and `Drop::drop` calls this function.
+        self.base = null_mut();
+        self.size = 0;
+        self.class = MEM_TRANSIENT;
     }
     pub fn data(&self) -> *mut u8 {
         self.base
@@ -3764,6 +3768,25 @@ pub unsafe fn ampr_pack_core_make_task(
 pub(crate) mod tests {
     use super::super::index_memory as im;
     use super::*;
+
+    /// `reset` once ended in `*self = Self::new()`, which drops the old
+    /// value first: `Drop::drop` calls `reset`, so every reset and every
+    /// drop of a ScratchBuffer, empty ones included, recursed until the
+    /// stack was gone. The walk build of a title without `ampr_emu.index`
+    /// (a getdents buffer per directory, then the index writer's buffer)
+    /// died with a stack overflow in the main thread at module load:
+    /// Final Fantasy XVI (PPSA10665, coredump PPSA10665_1794984023), and
+    /// v0.4.1 carries it too. The host has no pool, so only an empty buffer
+    /// is tested; the recursion did not depend on holding memory, since the
+    /// compiled drop called itself on the null path as well.
+    #[test]
+    fn an_empty_scratch_buffer_resets_and_drops() {
+        let mut b = ScratchBuffer::new();
+        b.reset();
+        assert!(!b.valid());
+        b.reset();
+        drop(b);
+    }
 
     /// zstd runtime files and the shared AMPRIDX3 index bypass the index.
     #[test]
