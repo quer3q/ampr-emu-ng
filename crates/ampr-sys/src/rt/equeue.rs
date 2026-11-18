@@ -15,17 +15,24 @@
 //! is a native kernel wait, which the overlay wakes privately to hand over
 //! its own events.
 //!
-//! Every queue the game creates is tracked; its non-AMPR sources (timers,
-//! fds, user events, the AGC and VideoOut producers, AMM command buffers)
-//! are not observed. The queue classification that marked them (hooks
-//! 55..=63, five external producer hooks, the AMM queue hash and
-//! command-buffer registry) fed only the debug /queues flags and was
-//! removed; a failed install of one of those hooks had turned tracking off.
+//! A queue is tracked from the game's first sceKernelAddAmprEvent on it; its
+//! non-AMPR sources (timers, fds, user events, the AGC and VideoOut
+//! producers, AMM command buffers) are not observed. A wait on a queue with
+//! no AMPR registration (flip, vblank, timer queues) goes to the kernel
+//! without the overlay lock (`bypass_wait`). Before, every queue was tracked
+//! from its creation and every wait took the global lock twice. Tracking
+//! cannot be off: with ids 50..=54 not installed a title's load hung once
+//! its reads stopped, all 109,089 completions posted natively to one AMPR
+//! id, which the kernel merges while one is unread (debug /queues
+//! `eqtarget`). The queue classification (hooks 55..=63, five external
+//! producer hooks, the AMM queue hash and command-buffer registry) fed only
+//! the debug /queues flags and was removed; a failed install of one of
+//! those hooks had turned tracking off.
 #![allow(non_snake_case, non_upper_case_globals)]
 
 use core::ffi::{c_char, c_int, c_void};
 use core::sync::atomic::{
-    AtomicBool, AtomicI32, AtomicU64, AtomicU8, Ordering,
+    AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicU8, Ordering,
 };
 
 use super::sync::{spin_pause_or_yield, Once, SpinGuard, SpinLock, SyncCell};
@@ -268,18 +275,20 @@ struct PrivateWakeCompletion {
     rc: c_int,
     publication_handled: bool,
     pending_count: u32,
-    native_wait_intent: u32,
 }
 
 #[derive(Clone, Copy)]
 struct QueueControlTransaction {
     queue_index: u32,
     queue_generation: u64,
+    /// The slot was allocated by this transaction (a first AMPR add).
+    fresh: bool,
 }
 impl QueueControlTransaction {
     const DEFAULT: Self = Self {
         queue_index: INVALID_INDEX,
         queue_generation: 0,
+        fresh: false,
     };
     /// True when the transaction holds a valid queue slot.
     fn ok(&self) -> bool {
@@ -418,6 +427,32 @@ static PROCESS_TIME_COUNTER_FREQUENCY: AtomicU64 = AtomicU64::new(0);
 /// Slot-local wake trigger state, for waiting after the overlay lock drops
 /// (the bit in `TrackedEqueue` is the lock-protected hot-path predicate).
 static WAKE_TRIGGER_STATE: Align64<[AtomicU8; QCAP]> = Align64([const { AtomicU8::new(0) }; QCAP]);
+
+/// Buckets of the lock-free tracked test (`bypass_bucket`). A queue that
+/// shares a bucket with a tracked one only takes the locked path, which is
+/// correct for any queue; 256 keeps that rare at a few AMPR queues.
+const BYPASS_BUCKETS: usize = 256;
+/// Tracked queues per bucket, changed under the overlay lock.
+static TRACKED_IN_BUCKET: [AtomicU32; BYPASS_BUCKETS] =
+    [const { AtomicU32::new(0) }; BYPASS_BUCKETS];
+/// Waits in the kernel through `bypass_wait` per bucket. A first AMPR
+/// registration that sees one wakes its queue once, so a waiter that went
+/// direct before the queue was tracked comes back through the overlay.
+static BYPASS_WAITERS: [AtomicU32; BYPASS_BUCKETS] =
+    [const { AtomicU32::new(0) }; BYPASS_BUCKETS];
+
+fn bypass_bucket(eq: SceKernelEqueue) -> usize {
+    hash_queue(eq) as usize & (BYPASS_BUCKETS - 1)
+}
+
+/// A thread may be in a kernel wait on `q` that a synthetic event must
+/// wake: a tracked native wait, or a direct one that began before `q` was
+/// tracked (`BYPASS_WAITERS` counts its bucket, so another queue's direct
+/// waiter costs at most a hidden wake no one reads). The first-add wake
+/// frees one direct waiter; this keeps waking until none are left.
+fn kernel_waiters_locked(q: &TrackedEqueue) -> bool {
+    q.native_wait_intent != 0 || BYPASS_WAITERS[bypass_bucket(q.eq)].load(Ordering::SeqCst) != 0
+}
 
 static CONTROL_ONCE: Once = Once::new();
 static CONTROL_MUTEX: SyncCell<ScePthreadMutex> = SyncCell::new(core::ptr::null_mut());
@@ -677,13 +712,24 @@ const _: () = {
 
 // ---- queue control ---------------------------------------------------------
 
-fn begin_queue_control(eq: SceKernelEqueue, filter: i16, id: c_int) -> QueueControlTransaction {
+/// `track` starts tracking an untracked queue (an AMPR add); a delete only
+/// finds one.
+fn begin_queue_control(
+    eq: SceKernelEqueue,
+    filter: i16,
+    id: c_int,
+    track: bool,
+) -> QueueControlTransaction {
     let mut t = QueueControlTransaction::DEFAULT;
     let _g = overlay_lock();
     if !HOOKS_AVAILABLE.load(Ordering::Relaxed) {
         return t;
     }
     t.queue_index = unsafe { find_queue_index_locked(eq) };
+    if t.queue_index >= QUEUE_CAPACITY && track && !eq.is_null() {
+        t.queue_index = unsafe { allocate_queue_locked(eq) };
+        t.fresh = true;
+    }
     if t.queue_index >= QUEUE_CAPACITY {
         return t;
     }
@@ -868,6 +914,8 @@ unsafe fn allocate_queue_locked(eq: SceKernelEqueue) -> u32 {
     }
     unsafe { ov() }.live_queues += 1;
     unsafe { note_peaks_locked() };
+    // SeqCst against `bypass_wait`: it counts itself, then reads this.
+    TRACKED_IN_BUCKET[bypass_bucket(eq)].fetch_add(1, Ordering::SeqCst);
     index
 }
 
@@ -1389,7 +1437,6 @@ fn execute_private_wake(req: &PrivateWakeRequest) -> PrivateWakeCompletion {
             let q = &mut unsafe { ov() }.queues[req.queue_index as usize];
             q.wake_triggering = false;
             r.pending_count = q.pending_count;
-            r.native_wait_intent = q.native_wait_intent;
         }
     }
     if req.pending_index < PENDING_CAPACITY && !r.publication_handled {
@@ -1405,7 +1452,7 @@ fn execute_private_wake(req: &PrivateWakeRequest) -> PrivateWakeCompletion {
 /// A replacement wake covers nodes already in the synthetic FIFO.
 fn execute_replacement_wake(req: &PrivateWakeRequest) {
     let result = execute_private_wake(req);
-    if result.rc == 0 || result.pending_count == 0 || result.native_wait_intent == 0 {
+    if result.rc == 0 || result.pending_count == 0 {
         return;
     }
     {
@@ -1418,7 +1465,7 @@ fn execute_replacement_wake(req: &PrivateWakeRequest) {
             || q.lifetime_generation != req.queue_generation
             || q.wake_id != req.wake_id
             || q.pending_count == 0
-            || q.native_wait_intent == 0
+            || !kernel_waiters_locked(q)
         {
             return;
         }
@@ -1434,7 +1481,7 @@ fn execute_replacement_wake(req: &PrivateWakeRequest) {
         q.used
             && q.lifetime_generation == req.queue_generation
             && q.pending_count != 0
-            && q.native_wait_intent != 0
+            && kernel_waiters_locked(q)
             && unsafe {
                 begin_private_wake_locked(req.queue_index, INVALID_INDEX, Some(&mut replacement))
             } == BeginPrivateWakeResult::Scheduled
@@ -1542,6 +1589,7 @@ unsafe fn release_queue_locked(queue_index: u32) -> bool {
     let notify_reactor = unsafe { take_pending_backpressure_progress_locked() };
     let eq = o.queues[qi].eq;
     unsafe { erase_queue_hash_locked(eq) };
+    TRACKED_IN_BUCKET[bypass_bucket(eq)].fetch_sub(1, Ordering::SeqCst);
     o.controls[qi] = QueueControlState::ZERO;
     o.queues[qi] = TrackedEqueue {
         next_free: o.queue_free_head,
@@ -1611,9 +1659,13 @@ fn prepare_native_wait(
 /// Matches any id from the private wake range rather than one captured at
 /// wait entry, so a wake attached after the wait began is still hidden.
 fn is_hidden_wake(event: &SceKernelEvent, token: *const TrackedEqueue) -> bool {
+    is_private_wake_ident(event) && event.udata as *const TrackedEqueue == token
+}
+
+/// The filter and id range of every private wake (`attach_hidden_wake_unlocked`).
+fn is_private_wake_ident(event: &SceKernelEvent) -> bool {
     event.filter == SCE_KERNEL_EVFILT_USER
         && (WAKE_ID_BASE..=i32::MAX as u32).contains(&(event.ident as u32))
-        && event.udata as *const TrackedEqueue == token
 }
 
 fn remaining_timeout_us(d: &NativeWaitDeadline) -> SceKernelUseconds {
@@ -1666,13 +1718,18 @@ fn forward_ampr_registration_add(
     if !HOOKS_AVAILABLE.load(Ordering::Acquire) {
         return call();
     }
-    let _control = ControlLock::new();
-    let t = begin_queue_control(eq, filter, id);
+    let control = ControlLock::new();
+    let t = begin_queue_control(eq, filter, id, true);
     let rc = call();
     if !t.ok() {
         return rc;
     }
     let mut wake_available = rc == 0;
+    let mut bypass_wake = PrivateWakeRequest::DEFAULT;
+    let mut exec_bypass_wake = false;
+    // This add attached the queue's hidden wake: the first one that can
+    // reach a direct waiter started before the queue was tracked.
+    let mut attached = false;
     if rc == 0 {
         let needs_wake = {
             let _g = overlay_lock();
@@ -1681,6 +1738,7 @@ fn forward_ampr_registration_add(
         };
         if needs_wake {
             wake_available = attach_hidden_wake_unlocked(t.queue_index, t.queue_generation);
+            attached = wake_available;
         }
     }
     let mut notify_reactor = false;
@@ -1694,8 +1752,35 @@ fn forward_ampr_registration_add(
             unsafe {
                 allocate_registration_locked(qidx, filter, id, udata, Some(&mut notify_reactor))
             };
+            // A thread may be in a direct kernel wait on this queue, started
+            // before it was tracked: no native intent, so a publish would
+            // not wake it. Wake it once (the queue went tracked before this
+            // load, SeqCst). Armed or in flight, the edge is already coming.
+            // Further direct waiters are woken by later publishes and drains
+            // (`kernel_waiters_locked`).
+            if attached && BYPASS_WAITERS[bypass_bucket(eq)].load(Ordering::SeqCst) != 0 {
+                exec_bypass_wake = unsafe {
+                    begin_private_wake_locked(qidx, INVALID_INDEX, Some(&mut bypass_wake))
+                } == BeginPrivateWakeResult::Scheduled;
+            }
         }
         unsafe { finish_queue_control_locked(qidx) };
+        // A failed first add (a stale or refused handle) gives its slot back,
+        // so repeated failures cannot fill the table or keep the bucket off
+        // the bypass.
+        // One a tracked waiter already entered stays, so that waiter stays
+        // counted in its native wait intent.
+        let q = &unsafe { ov() }.queues[qi];
+        if rc != 0 && t.fresh && q.registration_head >= REGISTRATION_CAPACITY && q.native_wait_intent == 0
+        {
+            notify_reactor |= unsafe { release_queue_locked(qidx) };
+        }
+    }
+    // Outside the lifecycle lock, as in Delete: the trigger may enter
+    // another queue hook, which waits for this wake to finish.
+    drop(control);
+    if exec_bypass_wake {
+        let _ = execute_private_wake(&bypass_wake);
     }
     if notify_reactor {
         notify_reactor_progress();
@@ -1714,7 +1799,7 @@ fn forward_ampr_registration_delete(
         return call();
     }
     let _control = ControlLock::new();
-    let t = begin_queue_control(eq, filter, id);
+    let t = begin_queue_control(eq, filter, id, false);
     let rc = call();
     if !t.ok() {
         return rc;
@@ -1795,7 +1880,7 @@ pub unsafe fn apr_equeue_try_publish(
                 // A future waiter drains an already-pending event directly. A
                 // waiter committed to the native call needs the private edge;
                 // the reserved node is published by the wake completion.
-                if o.queues[qi].native_wait_intent != 0 {
+                if kernel_waiters_locked(&o.queues[qi]) {
                     match unsafe { begin_private_wake_locked(qidx, pidx, Some(&mut wake_request)) }
                     {
                         BeginPrivateWakeResult::Scheduled => execute_wake = true,
@@ -1904,15 +1989,13 @@ pub unsafe extern "C" fn sceKernelCreateEqueue_emul(
                     // The kernel just handed out `e`: a tracked entry with this
                     // handle is a queue closed without the Delete hook.
                     let stale = unsafe { find_queue_index_locked(e) };
+                    // The new queue stays untracked until its first AMPR add.
                     if stale < QUEUE_CAPACITY {
                         if private_wake_in_flight_locked(&unsafe { ov() }.queues[stale as usize]) {
                             wait_qi = stale;
                         } else {
                             notify_reactor |= unsafe { release_queue_locked(stale) };
                         }
-                    }
-                    if wait_qi >= QUEUE_CAPACITY {
-                        unsafe { allocate_queue_locked(e) };
                     }
                 }
             }
@@ -2194,6 +2277,144 @@ pub(crate) fn equeue_views(out: &mut [EqueueView; 48]) -> usize {
     n
 }
 
+// ---- untracked bypass ------------------------------------------------------
+
+enum Bypass {
+    /// The kernel's answer, for the game.
+    Done(c_int),
+    /// A tracked queue shares the bucket: take the overlay path.
+    Locked,
+    /// Only stray private wakes came back; the timeout left, in us.
+    Retry(SceKernelUseconds),
+}
+
+/// A wait on a queue that shares no bucket with a tracked one goes straight
+/// to the kernel, without the overlay lock.
+#[inline(always)]
+unsafe fn bypass_wait(
+    original: WaitEqueueFn,
+    eq: SceKernelEqueue,
+    events: *mut SceKernelEvent,
+    num: c_int,
+    out: *mut c_int,
+    timeout: *mut SceKernelUseconds,
+) -> Bypass {
+    let b = bypass_bucket(eq);
+    if TRACKED_IN_BUCKET[b].load(Ordering::Relaxed) != 0 {
+        return Bypass::Locked;
+    }
+    // Count, then read: with the SeqCst add and load in
+    // `forward_ampr_registration_add` either this sees the queue tracked or
+    // the add sees this waiter and wakes the queue.
+    BYPASS_WAITERS[b].fetch_add(1, Ordering::SeqCst);
+    if TRACKED_IN_BUCKET[b].load(Ordering::SeqCst) != 0 {
+        BYPASS_WAITERS[b].fetch_sub(1, Ordering::Release);
+        return Bypass::Locked;
+    }
+    unsafe { direct_wait(original, b, eq, events, num, out, timeout) }
+}
+
+/// The kernel wait of an untracked queue, counted in `BYPASS_WAITERS[b]` by
+/// the caller (`bypass_wait`, or `wait_equeue` under the overlay lock when
+/// the queue's bucket holds a tracked one). A private wake in its answer
+/// means the queue was tracked during the wait (its first AMPR add or a
+/// publish woke it): it is dropped and disarmed, and the caller waits again
+/// through the overlay when nothing else came back.
+#[inline(always)]
+unsafe fn direct_wait(
+    original: WaitEqueueFn,
+    b: usize,
+    eq: SceKernelEqueue,
+    events: *mut SceKernelEvent,
+    num: c_int,
+    out: *mut c_int,
+    timeout: *mut SceKernelUseconds,
+) -> Bypass {
+    let deadline = match unsafe { timeout.as_ref() } {
+        Some(&t) if t != 0 => make_native_wait_deadline(
+            t,
+            PROCESS_TIME_COUNTER_FREQUENCY.load(Ordering::Relaxed),
+        ),
+        _ => NativeWaitDeadline::default(),
+    };
+    let rc = unsafe { original(eq, events, num, out, timeout) };
+    BYPASS_WAITERS[b].fetch_sub(1, Ordering::Release);
+    // The count only once the kernel succeeded: a failed wait need not
+    // write it.
+    if rc != 0 {
+        return Bypass::Done(rc);
+    }
+    let n = unsafe { *out };
+    if n <= 0 || n > num {
+        return Bypass::Done(rc);
+    }
+    let mut real: c_int = 0;
+    let mut stray = None;
+    for i in 0..n {
+        let ev = unsafe { *events.add(i as usize) };
+        if let Some(qi) = stray_wake_slot(&ev) {
+            stray = Some(qi);
+            continue;
+        }
+        if real != i {
+            unsafe { *events.add(real as usize) = ev };
+        }
+        real += 1;
+    }
+    if let Some(qi) = stray {
+        disarm_stray_wake(qi, eq, real != 0);
+    }
+    // A timeout after a stray wake must not report the dropped event.
+    unsafe { *out = real };
+    if real != 0 {
+        return Bypass::Done(0);
+    }
+    Bypass::Retry(remaining_timeout_us(&deadline))
+}
+
+/// The slot of a private wake (`execute_private_wake` sets udata to the
+/// `TrackedEqueue` slot address), for a waiter that has no token.
+fn stray_wake_slot(ev: &SceKernelEvent) -> Option<usize> {
+    if !is_private_wake_ident(ev) {
+        return None;
+    }
+    let base = unsafe { core::ptr::addr_of!((*OV.get()).queues) } as usize;
+    let off = (ev.udata as usize).wrapping_sub(base);
+    let size = core::mem::size_of::<TrackedEqueue>();
+    (off % size == 0 && off / size < QCAP).then_some(off / size)
+}
+
+/// The edge was consumed outside the overlay: clear `wake_armed`, as the
+/// tracked path does on a hidden wake, or later publishes would see it armed
+/// and never trigger it again. `rewake` (this waiter returns without
+/// draining): a tracked waiter still in the kernel gets a new edge for the
+/// pending events, as after a tracked drain.
+#[cold]
+fn disarm_stray_wake(qi: usize, eq: SceKernelEqueue, rewake: bool) {
+    let mut req = PrivateWakeRequest::DEFAULT;
+    loop {
+        {
+            let _g = overlay_lock();
+            let q = &mut unsafe { ov() }.queues[qi];
+            if !private_wake_in_flight_locked(q) {
+                if !q.used || q.eq != eq {
+                    return;
+                }
+                q.wake_armed = false;
+                if !(rewake && q.pending_count != 0 && kernel_waiters_locked(q))
+                    || unsafe { begin_private_wake_locked(qi as u32, INVALID_INDEX, Some(&mut req)) }
+                        != BeginPrivateWakeResult::Scheduled
+                {
+                    return;
+                }
+                break;
+            }
+        }
+        wait_for_private_wake(qi as u32);
+    }
+    execute_replacement_wake(&req);
+}
+
 /// `sceKernelWaitEqueue_emul` without the debug gauge.
 unsafe fn wait_equeue(
     eq: SceKernelEqueue,
@@ -2209,17 +2430,30 @@ unsafe fn wait_equeue(
     if !HOOKS_AVAILABLE.load(Ordering::Acquire) || events.is_null() || out.is_null() || num <= 0 {
         return unsafe { original(eq, events, num, out, timeout) };
     }
+    let mut timeout = timeout;
+    let mut retry_timeout: SceKernelUseconds;
+    let mut direct = unsafe { bypass_wait(original, eq, events, num, out, timeout) };
     let mut tracked_qi = INVALID_INDEX;
     let mut queue_generation = 0u64;
     let mut counter_frequency = 0u64;
     let mut wake_token: *const TrackedEqueue = core::ptr::null();
-    let requested = if timeout.is_null() {
-        0
-    } else {
-        unsafe { *timeout }
-    };
     let mut native_intent = false;
     loop {
+        match direct {
+            Bypass::Done(rc) => return rc,
+            Bypass::Locked => {}
+            Bypass::Retry(left) => {
+                // Only the stray wake came back: wait out the rest through
+                // the overlay. A poll (0) or a spent timeout still drains
+                // once, since the publish that woke it may be pending; with
+                // nothing pending its native poll times out.
+                if !timeout.is_null() {
+                    retry_timeout = left;
+                    timeout = &mut retry_timeout;
+                }
+            }
+        }
+        direct = Bypass::Locked;
         let mut tracked = false;
         let mut notify_reactor = false;
         let mut replacement = PrivateWakeRequest::DEFAULT;
@@ -2246,7 +2480,7 @@ unsafe fn wait_equeue(
                     let q = &unsafe { ov() }.queues[qi];
                     if synthetic != 0 {
                         unsafe { *out = synthetic };
-                        if q.pending_count != 0 && q.native_wait_intent != 0 {
+                        if q.pending_count != 0 && kernel_waiters_locked(q) {
                             exec_replacement = unsafe {
                                 begin_private_wake_locked(
                                     qidx,
@@ -2260,6 +2494,11 @@ unsafe fn wait_equeue(
                         native_intent = true;
                     }
                 }
+            } else {
+                // Untracked, in a bucket a tracked queue shares: count the
+                // direct wait under the lock, so a first AMPR add that
+                // tracks this queue afterwards sees it and wakes it.
+                BYPASS_WAITERS[bypass_bucket(eq)].fetch_add(1, Ordering::SeqCst);
             }
         }
         if wait_qi != INVALID_INDEX {
@@ -2270,7 +2509,9 @@ unsafe fn wait_equeue(
             execute_replacement_wake(&replacement);
         }
         if !tracked {
-            return unsafe { original(eq, events, num, out, timeout) };
+            let b = bypass_bucket(eq);
+            direct = unsafe { direct_wait(original, b, eq, events, num, out, timeout) };
+            continue;
         }
         if unsafe { *out } != 0 {
             if notify_reactor {
@@ -2280,6 +2521,11 @@ unsafe fn wait_equeue(
         }
         break;
     }
+    let requested = if timeout.is_null() {
+        0
+    } else {
+        unsafe { *timeout }
+    };
     unsafe {
         native_wait_loop(
             original,
@@ -2404,7 +2650,7 @@ unsafe fn native_wait_loop(
                         )
                     };
                     let q = &unsafe { ov() }.queues[qi];
-                    if q.pending_count != 0 && q.native_wait_intent != 0 {
+                    if q.pending_count != 0 && kernel_waiters_locked(q) {
                         exec_replacement = unsafe {
                             begin_private_wake_locked(
                                 tracked_qi,

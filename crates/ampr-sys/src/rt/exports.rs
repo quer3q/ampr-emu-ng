@@ -1010,6 +1010,35 @@ mod mem_report {
             .kv("pread_threads_idle", idle)
             .kv("pack_workers_live", workers as u64)
             .kv("pack_workers_ceiling", worker_ceiling as u64);
+        // One line per thread created since module_start: owner (g game
+        // scePthreadCreate, p game pthread_create, a runtime, m the
+        // module_start thread), priority now (256 highest, 767 lowest) and
+        // core mask now, or the error code (an exited thread). Rows stop at
+        // 15 KiB: the body and the whole response (header included) are
+        // 16 KiB each, and 256 rows of exited threads pass that.
+        use super::super::thread_hooks::census;
+        out.kv("census_threads", census::count() as u64);
+        let mut listed = 0;
+        for i in 0..census::count() {
+            if out.len > 15 * 1024 {
+                break;
+            }
+            let Some(r) = census::row(i) else { continue };
+            listed += 1;
+            let n = r.name.iter().position(|&b| b == 0).unwrap_or(r.name.len());
+            out.s(b"thread ").s(&[r.owner]).s(b" prio ");
+            match r.prio {
+                Ok(p) => out.u(p as u64),
+                Err(rc) => out.s(b"err ").x(rc as u32),
+            };
+            out.s(b" cpus ");
+            match r.affinity {
+                Ok(m) => out.x(m as u32),
+                Err(rc) => out.s(b"err ").x(rc as u32),
+            };
+            out.s(b" ").s(&r.name[..n]).s(b"\n");
+        }
+        out.kv("census_unlisted", (census::total() - listed) as u64);
     }
 
     /// `GET /fsfail`: every distinct failed path hook call since load (op,
@@ -1531,7 +1560,15 @@ fn flex_free_now() -> u64 {
 #[no_mangle]
 pub unsafe extern "C" fn module_start(_args: usize, _argp: *const c_void) -> c_int {
     #[cfg(feature = "mem_report")]
-    FLEX_AT_START.store(flex_free_now(), core::sync::atomic::Ordering::Relaxed);
+    {
+        FLEX_AT_START.store(flex_free_now(), core::sync::atomic::Ordering::Relaxed);
+        // The game thread that loads the module, for /threads.
+        super::thread_hooks::census::note(
+            b'm',
+            unsafe { super::reactor::scePthreadSelf() },
+            c"module_start".as_ptr(),
+        );
+    }
     // The knobs once (debug only; release returns at once), before the hooks
     // and the pack state, so titles with no packs read them too (thread
     // budget, pool size).

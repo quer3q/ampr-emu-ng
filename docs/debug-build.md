@@ -8,12 +8,12 @@ with it, then ship the release build.
 
 `./ps5/build-docker.sh` (`make dist`) builds both files. The debug one is
 `make AMPR_MEM_REPORT=1` (Cargo feature `mem_report`) with the pool set to
-`AMPR_DEBUG_POOL_SIZE` (`0xf7f4000`, 247.95 MiB); the release pool is
-`0xf94c000` (249.30 MiB). The smaller pool offsets the larger debug code, so
+`AMPR_DEBUG_POOL_SIZE` (`0xf7f0000`, 247.94 MiB); the release pool is
+`0xf948000` (249.28 MiB). The smaller pool offsets the larger debug code, so
 both PRX files load to 256 MiB (within a 16 KiB page) with the same Index
 and Buffer caps and thread limits. The decoded cache is the rest of the
-pool, so the debug cache is 1.34 MiB (about 1%) smaller: 135.77 vs
-137.11 MiB; debug cache numbers are that much conservative. Those are the
+pool, so the debug cache is 1.34 MiB (about 1%) smaller: 135.75 vs
+137.09 MiB; debug cache numbers are that much conservative. Those are the
 sizes carved at the pack mount: once the index is built the cache grows
 into the Index ledger's idle room above 4 MiB (`cache_grown_bytes`; 204 MiB
 on a zstd title using 5.6 MiB of Index, 208 MiB on a pkg title using
@@ -50,8 +50,8 @@ answer. The pages are listed in `serve` in `crates/ampr-sys/src/rt/exports.rs`.
 | `/bench?path=/app0/<file>[&backing=/abs/file]` | Read speed of a loose file through `/app0` and, with `backing=`, through its backing path. |
 | `/fsfail` | Every distinct failed call since load. |
 | `/modules` | Loaded modules. |
-| `/queues` | Event queue waits in progress and queues with pending events. The first line, `eqpeak queues=N/1024 regs=N/4096 pending=N/5120 extras=N/1024`, is the overlay tables' live peaks against their caps (`equeue_peaks` in `rt/equeue.rs`); a queue line's `flags=` keeps bits 8, 16, 32 and 64. |
-| `/threads` | Thread counts; `?hold=N`, `?release=1`, `?yield=N` and `?yield_workers=N` test the game's thread limit. |
+| `/queues` | Event queue waits in progress and queues with pending events. Only queues with an AMPR registration are tracked (from the first `sceKernelAddAmprEvent`), so a queue that never had one is not listed or counted. The first line, `eqpeak queues=N/1024 regs=N/4096 pending=N/5120 extras=N/1024`, is the overlay tables' live peaks against their caps (`equeue_peaks` in `rt/equeue.rs`); a queue line's `flags=` keeps bits 8, 16, 32 and 64. |
+| `/threads` | Thread counts; `?hold=N`, `?release=1`, `?yield=N` and `?yield_workers=N` test the game's thread limit. Then one `thread <owner> prio <p> cpus <mask> <name>` line per thread created since module_start (owner `g` game scePthreadCreate, `p` game pthread_create, `a` runtime, `m` the module_start thread), priority and core mask read now (256 highest, 767 lowest; `err` for an exited thread), up to 256 threads (`census` in `rt/thread_hooks.rs`). |
 | `/crash` | Nothing: it crashes the game on purpose (a write to address 0 on the metrics thread), so the system's core dump captures it as it is, e.g. while frozen. |
 
 ```sh
@@ -117,7 +117,7 @@ Pack chunks are read with exact-size reads, the only read path: one disk
 read covers a chunk's stored bytes, adjacent chunks coalesced.
 `pack_disk_reads` counts those reads and `pack_disk_bytes` their bytes.
 Read bytes are not cached; decoded chunks go to the decoded cache, the
-Cache ledger (135.77 MiB in the debug build).
+Cache ledger (135.75 MiB in the debug build).
 
 Most runs compare three numbers:
 
@@ -254,7 +254,7 @@ rewrites the file and lists every knob. Live knobs (pread pool switches,
 reactor issue limits, thread budget,
 `spin_us`, `regrow_s`, `pread_wake_all`, `cache_protect_hits`,
 `cache_protect_pct`) apply from the next read or reactor
-pass. `spin_us` (0..=200, release 0) is read at each idle wait of a pack
+pass. `spin_us` (0..=200, release 100) is read at each idle wait of a pack
 worker and pread pool thread, so `/set?spin_us=50` or `100`
 takes effect at once; compare game wait per read and `pread_wakeups_idle`
 before and after. Grown runtime threads stay until a failed game thread

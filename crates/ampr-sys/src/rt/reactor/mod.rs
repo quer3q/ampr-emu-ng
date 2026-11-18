@@ -130,6 +130,12 @@ pub(crate) const AMPR_EMU_APR_FD_PRESSURE_COOLDOWN_MS: u64 = 2000;
 pub(crate) const AMPR_EMU_APR_PER_READ_ACTIVE_BYTES: u64 = 0x200000;
 pub(crate) const AMPR_EMU_APR_PER_READ_ACTIVE_CHUNKS: u32 = 4;
 pub(crate) const AMPR_EMU_APR_REACTOR_THREAD_AFFINITY: u64 = 0x3f;
+/// The reactor, the highest; the pread pool runs at the workers' 384
+/// (pread_pool.rs). With reactor and pool both at 384 a title whose audio
+/// threads run at 256 on every CPU waited
+/// 3,092 us per read against 2,427-2,492 (disk read +17%, pool queue 2x,
+/// worker step unchanged), and a title with its GameThread at 300 did not
+/// change (debug /metrics, /threads, one run each).
 pub(crate) const AMPR_EMU_APR_REACTOR_THREAD_PRIORITY: c_int = 256;
 pub(crate) const AMPR_EMU_APR_READ_CHUNK_QUANTUM: u32 = 8;
 pub(crate) const AMPR_EMU_APR_READ_CREDIT_GRANULE_BYTES: u64 = 0x10000;

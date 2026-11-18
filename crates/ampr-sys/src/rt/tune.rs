@@ -94,8 +94,14 @@ const CACHE_PROTECT_PCT: usize = 18;
 // ---- runtime thread lifetime (rt/thread_hooks.rs) ----
 // Release values; the debug knobs of the same names default to them.
 
-/// Microseconds an idle runtime thread spins before it parks; 0 parks at once.
-pub(crate) const SPIN_US_DEFAULT: u32 = 0;
+/// Microseconds an idle runtime thread (decode worker, pread pool) spins
+/// before it parks; 0 parks at once. 100 against 0 (debug /metrics, one run
+/// each, same build): a pkg title's game wait per read 2,268 vs 2,427-2,492
+/// us (pack job -10%, disk read -11%, queue to first step 25.6 vs 32-36 us),
+/// a zstd title's 316 vs 327 us (queue to first step 5.7 vs 10.7 us); both
+/// played much smoother to the owner. The CPU the spin takes from the game
+/// is not measured.
+pub(crate) const SPIN_US_DEFAULT: u32 = 100;
 /// Quiet seconds after a thread creation failure before the budget regrows
 /// by one and pressure mode ends (rt/thread_hooks.rs). A started thread
 /// stays, so pressure mode is the only way threads go back to the game: 5 s

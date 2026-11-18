@@ -102,12 +102,17 @@ pub(crate) fn pread_pool_grow(n: usize) {
 
 impl AprAioReactor {
     unsafe extern "C" fn pread_worker_entry(arg: *mut c_void) -> *mut c_void {
-        // Reactor priority, above the decode workers: a finished read is handed
-        // on and the next one issued before decode work runs; the threads
-        // spend nearly all their time blocked in pread. Workers' affinity.
+        // The decode workers' priority and affinity (pack/mod.rs), below the
+        // reactor. At 256 up to 6 pool threads outranked every game thread
+        // but audio on CPUs 0-5. At equal priority (FIFO) a pool thread
+        // waking while workers hold every core waits for one to block. With
+        // the pool at 384 and the reactor at 256 (and the 100 us idle spin) a
+        // pkg title waited 2,268 us per read against 2,427-2,492 with the pool
+        // at 256; with reactor and pool both at 384, 3,092 (reactor/mod.rs;
+        // debug /metrics, one run each).
         unsafe {
             let this = scePthreadSelf();
-            let _ = scePthreadSetprio(this, AMPR_EMU_APR_REACTOR_THREAD_PRIORITY);
+            let _ = scePthreadSetprio(this, crate::rt::pack::AMPR_EMU_PACK_WORKER_PRIORITY);
             if crate::rt::pack::AMPR_EMU_PACK_WORKER_AFFINITY != 0 {
                 let _ = scePthreadSetaffinity(
                     this,

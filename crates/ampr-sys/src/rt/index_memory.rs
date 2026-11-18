@@ -60,8 +60,8 @@ pub(crate) const INDEX_MEMORY_MAX: usize = 80 * MIB;
 /// a 16 KiB cache page. The cache is the only part whose size changes
 /// behaviour (more I/O windows, 12 vs 16, and more decode workers, 4 vs 8,
 /// measured flat: 312 vs 315 us game wait per read), so the PRX total is a
-/// round number and the cache takes the rest: 135.77 MiB in the debug pool,
-/// 137.11 MiB in the release one at the 256 MiB layout (pools fitted from
+/// round number and the cache takes the rest: 135.75 MiB in the debug pool,
+/// 137.09 MiB in the release one at the 256 MiB layout (pools fitted from
 /// a `dist` build, Makefile).
 /// The decoded cache default is this whole cap (rt/pack/mod.rs
 /// `AMPR_EMU_PACK_DECODED_CACHE_BYTES`); a runtime profile or debug knob
@@ -715,12 +715,12 @@ mod tests {
         let fixed = INDEX_MEMORY_MAX + BUFFER_MEMORY_MAX + POOL_SITES_BUDGET + STACK_MEMORY_MAX;
         assert_eq!(CACHE_MEMORY_MAX, (STATIC_POOL_SIZE - fixed) / PAGE * PAGE);
         assert_eq!(CACHE_MEMORY_MAX % PAGE, 0);
-        // The debug pool of the 256 MiB layout, 0xf7f4000 (247.95 MiB):
-        // 80 + 28.44 + 1.75 + 2 MiB fixed, the cache 135.77 MiB.
-        assert_eq!(STATIC_POOL_SIZE, 0xf7f_4000);
+        // The debug pool of the 256 MiB layout, 0xf7f0000 (247.94 MiB):
+        // 80 + 28.44 + 1.75 + 2 MiB fixed, the cache 135.75 MiB.
+        assert_eq!(STATIC_POOL_SIZE, 0xf7f_0000);
         assert_eq!(POOL_SITES_BUDGET, 0x1c_0000);
-        assert_eq!(CACHE_MEMORY_MAX, 0xf7f_4000 - fixed);
-        assert_eq!(CACHE_MEMORY_MAX, 142_360_576);
+        assert_eq!(CACHE_MEMORY_MAX, 0xf7f_0000 - fixed);
+        assert_eq!(CACHE_MEMORY_MAX, 142_344_192);
     }
 
     #[test]

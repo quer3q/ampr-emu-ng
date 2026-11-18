@@ -146,8 +146,14 @@ below one, `LoadGroup::floor`), until 5 s pass with no new failure
 `scePthreadJoin` of a pool thread or decode worker frees its slot (a
 retry could join a reused handle) and leaves its pool stack reserved
 (debug `thread_join_failed`). The idle spin
-(`spin_us`, decode workers and pool threads) stays 0 in release, the
-owner's decision until a console run shows a gain. Ids 96 and 97 (mmap)
+(`spin_us`, decode workers and pool threads) is 100 us in release
+(`SPIN_US_DEFAULT`, was 0): on a pkg title game wait per read fell
+2,427-2,492 to 2,268 us and on a zstd title 327 to 316 us, workers
+picking up a queued job 25-47% sooner, and both played much smoother
+(one run each, debug /metrics; its CPU cost is not measured). Pool
+threads run at the decode workers' priority and cores (384, CPUs 0-5,
+`rt/pack/mod.rs`), below the reactor's 256 (they ran at 256 before;
+`rt/reactor/pread_pool.rs`). Ids 96 and 97 (mmap)
 and 112..=119 (dup, dup2, poll, select, openat, fstatat, faccessat,
 readlink) exist only in the debug build, as pass-through probes in titles
 with packs (`rt/probe.rs`).
@@ -199,7 +205,7 @@ CI (`.github/workflows/build.yml`) runs the same commands; a pushed `v*` tag cre
   decoder workspaces, one per live zstd worker, taken at its start and
   freed when it retires), and Cache, the rest of the pool
   (`CACHE_MEMORY_MAX` = pool - Index - Buffer - sites budget - stack
-  block, rounded down to 16 KiB; 137.11 MiB release, 135.77 MiB debug).
+  block, rounded down to 16 KiB; 137.09 MiB release, 135.75 MiB debug).
   The cache is one decoded chunk cache carved at the pack mount and carved
   again, still empty, once the index view is finished: the Index cap's idle
   room above 4 MiB (`INDEX_KEPT_ROOM`) moves to the Cache cap and the cache
@@ -228,10 +234,10 @@ CI (`.github/workflows/build.yml`) runs the same commands; a pushed `v*` tag cre
   test fails on a new pool call). A build-time assert checks that the
   caps plus the budget fit the pool. Both PRX builds load to at most
   256 MiB (PT_LOAD memsz), within a 16 KiB page of it, with no padding:
-  the release pool is 249.30 MiB (`AMPR_INTERNAL_POOL_SIZE` `0xf94c000`),
-  the debug one 247.95 MiB (`AMPR_DEBUG_POOL_SIZE` `0xf7f4000`), the gap
-  being the debug build's larger non-pool part (8.04 vs 6.70 MiB; totals
-  268,432,498 and 268,433,386 B, 888 B apart, from `dist`). `dist` fails
+  the release pool is 249.28 MiB (`AMPR_INTERNAL_POOL_SIZE` `0xf948000`),
+  the debug one 247.94 MiB (`AMPR_DEBUG_POOL_SIZE` `0xf7f0000`), the gap
+  being the debug build's larger non-pool part (8.06 vs 6.70 MiB; totals
+  268,420,826 and 268,432,682 B, 11,856 B apart, from `dist`). `dist` fails
   when the two totals differ by more than 64 KiB or exceed 256 MiB
   (`PRX_TOTAL_LIMIT` in `tools/verify_payload_prx.py --prx-totals`); then
   recompute both pools, (256 MiB - non-pool) rounded down to 16 KiB, and
@@ -289,7 +295,14 @@ CI (`.github/workflows/build.yml`) runs the same commands; a pushed `v*` tag cre
   registrations, 1024 extras, 5120 pending nodes; 376,896 B, was
   1,507,392, host size_of), whose full table leaves a queue or
   registration native, never an error to the game (debug `/queues`
-  `eqpeak` prints the live peaks against these caps); and
+  `eqpeak` prints the live peaks against these caps). A queue is tracked
+  from its first `sceKernelAddAmprEvent`, not from its creation; a wait on
+  a queue sharing none of 256 buckets with a tracked one goes to the kernel
+  without the overlay lock (`bypass_wait`, two 256-entry atomic tables,
+  2 KiB of .bss), and a first AMPR add that finds such a waiter wakes its
+  queue once through the hidden wake. Tracking stays on: a build without
+  ids 50..=54 hung a title's load, its 109,089 completions posted natively
+  to one AMPR id (debug `/queues` `eqtarget`); and
   `POOL_COPY` in `rt/hook.rs`, 4 pages (64 KiB, 2048 entries of 32 B, was
   64 pages), past which `sceKernelMemoryPoolBatch` passes the caller's
   array unadjusted. Any change
@@ -428,6 +441,16 @@ titles and a zstd title against v0.4.1 with no regression:
   publication epoch stay.
 - Pack telemetry timestamps (`pack_telemetry_usecs`, the `queued_at_usec`
   arguments): constant 0, never ported.
+- A timer tick (debug knob `tick_us`, never committed): one thread
+  sleeping in a loop at priority 256 on CPUs 0-5, as an older release's
+  last pread pool thread did on its 1 us idle timeout until that was
+  fixed, to test whether that loop made games smoother. A 10 us sleep took
+  about 110 us on the console (about 9,000 wakeups a second, worst
+  3.9-7.3 ms late), so the old loop woke at that rate too. With the 100 us idle spin on, it
+  changed nothing beyond noise on two pkg titles (-4% and none), and a
+  zstd title waited 14% longer per read (360 vs 316 us, disk read +20%,
+  debug /metrics, one run each). The idle spin (`SPIN_US_DEFAULT` 100)
+  gave the smoothness without it.
 - A single 1 ms safety poll for packed APR reads in place of the 10 us
   doubling to 100 us poll ladder (`rt/reactor/backoff.rs`), relying on
   the pack's completion notify. Tried and reverted: on a zstd title with

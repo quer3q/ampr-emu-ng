@@ -37,7 +37,12 @@ AMPR_MEM_REPORT ?= 0
 # moved to the cache): non-pool parts release 7025778 B (6.70 MiB) and
 # debug 8431594 B (8.04 MiB); release pool 249.30 MiB (cache 137.11 at
 # the mount), debug 247.95 MiB (cache 135.77), totals 256 MiB minus
-# 2958 B and minus 2070 B, 888 B apart. Once the index is
+# 2958 B and minus 2070 B, 888 B apart. The 100 us idle spin in release
+# (rt/tune.rs SPIN_US_DEFAULT, its code no longer compiled out) and the
+# debug /threads census (rt/thread_hooks.rs) grew them to 7030490 B and
+# 8451370 B: release pool 249.28 MiB (cache 137.09), debug 247.94 MiB
+# (cache 135.75), totals 256 MiB minus 14630 B and minus 2774 B, 11856 B
+# apart. Once the index is
 # built the cache grows into the Index ledger's idle room
 # (rt/pack/manifest.rs `grow_cache_from_index`). (The first guess, from the non-pool parts before the removals,
 # 9027282 B and 10452034 B, was 0xf764000 and 0xf608000.) Recompute both
@@ -71,12 +76,12 @@ AMPR_MEM_REPORT ?= 0
 # did (a title had 42 MiB of direct memory free during play), and flexible
 # memory had 0-28 MiB free in another title (debug /metrics flex_* and the
 # former direct memory lines).
-AMPR_INTERNAL_POOL_SIZE ?= 0xf94c000
+AMPR_INTERNAL_POOL_SIZE ?= 0xf948000
 # Debug build pool (passed to it as AMPR_INTERNAL_POOL_SIZE by `dist`):
-# T minus the debug non-pool part, 247.95 MiB, the same fixed caps as
+# T minus the debug non-pool part, 247.94 MiB, the same fixed caps as
 # release and a cache 1.34 MiB smaller; host tests build with it
 # (rt/runtime_memory.rs `DEFAULT_POOL_SIZE`).
-AMPR_DEBUG_POOL_SIZE ?= 0xf7f4000
+AMPR_DEBUG_POOL_SIZE ?= 0xf7f0000
 # Pread pool threads: at most 6 (tune::RELEASE_PREAD_THREADS), grown by
 # backlog and kept until pressure mode gives them back, within the
 # runtime-wide budget of 16 worker

@@ -773,6 +773,12 @@ const _: () = assert!(
         && super::tune::RELEASE_PIPELINES as usize <= AMPR_EMU_PACK_PIPELINE_SLOTS
         && AMPR_EMU_PACK_PIPELINE_SLOTS <= AMPR_EMU_PACK_PIPELINE_MAX
 );
+/// Decode workers and pread pool (rt/reactor/pread_pool.rs), below the
+/// reactor (256). On one title,
+/// whose GameThread runs at 300 and JobThread(High) at 500 on CPUs 0-7, game
+/// wait per read stayed in the run-to-run noise with the workers at 256
+/// (1,459 vs 1,434 us), and moving workers and pool to CPUs 8-12 (0x1f00)
+/// cost 9 us from queue to first step (debug /threads, /metrics).
 pub(crate) const AMPR_EMU_PACK_WORKER_PRIORITY: c_int = 384;
 pub(crate) const AMPR_EMU_PACK_WORKER_AFFINITY: u64 = 0x3f;
 pub(crate) const AMPR_EMU_PACK_LATENCY_RESERVE_WORKERS: u32 = 0;
@@ -832,7 +838,7 @@ pub(crate) const AMPR_EMU_PACK_MAX_PACKS: usize = 1024;
 /// all 18 of the old cap busy (debug /metrics).
 pub(crate) const AMPR_EMU_PACK_OPEN_PACK_FD_CAP: u32 = 32;
 /// The whole Cache ledger, the pool's remainder (rt/index_memory.rs
-/// `CACHE_MEMORY_MAX`: 135.77 MiB debug, 137.11 MiB release at the 256 MiB
+/// `CACHE_MEMORY_MAX`: 135.75 MiB debug, 137.09 MiB release at the 256 MiB
 /// layout; debug knob `decoded_mib`): the only pack cache, so the release
 /// cache is about 1% larger than the debug one. Exact reads with 64 MiB
 /// decoded gave 11-14% lower game wait per read than 32 + 32 MiB page reads

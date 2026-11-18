@@ -53,7 +53,9 @@ unsafe fn create_raw(
     arg: *mut c_void,
     name: *const c_char,
 ) -> c_int {
-    unsafe { original_create()(thread, attr, entry, arg, name) }
+    let rc = unsafe { original_create()(thread, attr, entry, arg, name) };
+    census_note(b'a', rc, thread, name);
+    rc
 }
 
 /// libkernel's scePthreadCreate: the detour's trampoline, or with an empty
@@ -159,6 +161,102 @@ pub(crate) unsafe fn create_internal_stack(
     rc
 }
 
+// ---- debug thread census (/threads) ----
+
+/// Debug: every thread created since module_start, the game's (scePthreadCreate
+/// `g`, pthread_create `p`) and the runtime's (`a`), plus the module_start
+/// thread (`m`), so /threads can print each one's priority and cores now
+/// next to ours. Read live with scePthreadGetprio, so a priority a thread
+/// sets after it starts shows too. A thread that exited reads as an error;
+/// one whose handle a newer thread reused shows the newer thread's values
+/// under the old name. Threads past `MAX` are not listed.
+#[cfg(feature = "mem_report")]
+pub(crate) mod census {
+    use super::super::sync::SyncCell;
+    use super::sys;
+    use core::ffi::{c_char, c_int, c_void};
+    use core::sync::atomic::{AtomicU8, AtomicUsize, Ordering::*};
+
+    pub(crate) const MAX: usize = 256;
+    const NAME: usize = 24;
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    static HANDLE: [AtomicUsize; MAX] = [const { AtomicUsize::new(0) }; MAX];
+    static OWNER: [AtomicU8; MAX] = [const { AtomicU8::new(0) }; MAX];
+    static NAMES: SyncCell<[[u8; NAME]; MAX]> = SyncCell::new([[0; NAME]; MAX]);
+    static GET_AFFINITY: sys::LazySym = sys::LazySym::new(c"scePthreadGetaffinity");
+    type GetAffinityFn = unsafe extern "C" fn(*mut c_void, *mut u64) -> c_int;
+
+    pub(crate) fn note(owner: u8, handle: *mut c_void, name: *const c_char) {
+        if handle.is_null() {
+            return;
+        }
+        let i = NEXT.fetch_add(1, Relaxed);
+        if i >= MAX {
+            return;
+        }
+        // The slot is this caller's alone until HANDLE publishes it.
+        let out = unsafe { &mut (*NAMES.get())[i] };
+        let mut n = 0;
+        while !name.is_null() && n < NAME {
+            let b = unsafe { *name.add(n) } as u8;
+            if b == 0 {
+                break;
+            }
+            out[n] = b;
+            n += 1;
+        }
+        OWNER[i].store(owner, Relaxed);
+        HANDLE[i].store(handle as usize, Release);
+    }
+
+    pub(crate) struct Row {
+        pub owner: u8,
+        pub name: [u8; NAME],
+        pub prio: Result<c_int, c_int>,
+        pub affinity: Result<u64, c_int>,
+    }
+
+    pub(crate) fn count() -> usize {
+        NEXT.load(Relaxed).min(MAX)
+    }
+
+    /// Every thread noted, the ones past `MAX` too.
+    pub(crate) fn total() -> usize {
+        NEXT.load(Relaxed)
+    }
+
+    pub(crate) fn row(i: usize) -> Option<Row> {
+        let h = HANDLE[i].load(Acquire) as *mut c_void;
+        if h.is_null() {
+            return None;
+        }
+        let mut prio: c_int = 0;
+        let rc = unsafe { super::super::reactor::scePthreadGetprio(h, &mut prio) };
+        let mut mask = 0u64;
+        let arc = match unsafe { GET_AFFINITY.get::<GetAffinityFn>() } {
+            Some(f) => unsafe { f(h, &mut mask) },
+            None => -1,
+        };
+        Some(Row {
+            owner: OWNER[i].load(Relaxed),
+            name: unsafe { (*NAMES.get())[i] },
+            prio: if rc == 0 { Ok(prio) } else { Err(rc) },
+            affinity: if arc == 0 { Ok(mask) } else { Err(arc) },
+        })
+    }
+}
+
+/// Debug: records a created thread for /threads (`census`); empty in release.
+#[inline(always)]
+fn census_note(owner: u8, rc: c_int, thread: *mut *mut c_void, name: *const c_char) {
+    #[cfg(feature = "mem_report")]
+    if rc == 0 && !thread.is_null() {
+        census::note(owner, unsafe { *thread }, name);
+    }
+    #[cfg(not(feature = "mem_report"))]
+    let _ = (owner, rc, thread, name);
+}
+
 /// Debug: a 'P' event (op letters at `FsEvents` in rt/stats.rs), path
 /// "<call> <thread name>".
 fn log_event(how: u8, rc: i64, call: &[u8], name: *const c_char) {
@@ -244,11 +342,13 @@ pub(crate) unsafe extern "C" fn scePthreadCreate_emul(
     note(b's', rc.into(), b"scePthreadCreate", name);
     // Until it succeeds or the runtime has nothing left to give: games do not
     // expect a creation to fail, and one retry was not always enough.
-    retry_with_room(rc, SCE_KERNEL_ERROR_EAGAIN, || {
+    let rc = retry_with_room(rc, SCE_KERNEL_ERROR_EAGAIN, || {
         let rc = unsafe { f(thread, attr, entry, arg, name) };
         retried(rc == 0, rc.into(), b"scePthreadCreate", name);
         rc
-    })
+    });
+    census_note(b'g', rc, thread, name);
+    rc
 }
 
 /// pthread_create returns a positive errno; it is logged negated.
@@ -263,11 +363,13 @@ pub(crate) unsafe extern "C" fn pthread_create_emul(
     };
     let rc = unsafe { f(thread, attr, entry, arg) };
     note(b'p', -i64::from(rc), b"pthread_create", core::ptr::null());
-    retry_with_room(rc, EAGAIN, || {
+    let rc = retry_with_room(rc, EAGAIN, || {
         let rc = unsafe { f(thread, attr, entry, arg) };
         retried(rc == 0, -i64::from(rc), b"pthread_create", core::ptr::null());
         rc
-    })
+    });
+    census_note(b'p', rc, thread, core::ptr::null());
+    rc
 }
 
 /// Counts the retry after threads were given back, logged as "<call>-retry"
