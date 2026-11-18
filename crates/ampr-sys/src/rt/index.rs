@@ -119,6 +119,18 @@ const UNREADABLE_LOAD_LIMIT: u32 = 3;
 /// Unreadable loads in a row; only the single `loading` thread touches it.
 static UNREADABLE_LOADS: AtomicU32 = AtomicU32::new(0);
 
+/// The name of a load result in the black box (`blackbox::idx`).
+#[cfg(feature = "mem_report")]
+fn load_result_name(r: LoadResult) -> &'static [u8] {
+    match r {
+        LoadResult::Loaded => b"Loaded",
+        LoadResult::Missing => b"Missing",
+        LoadResult::Invalid => b"Invalid",
+        LoadResult::Memory => b"Memory",
+        LoadResult::Unreadable => b"Unreadable",
+    }
+}
+
 /// The Unreadable run length after a load with `result`.
 fn next_unreadable_loads(count: u32, result: LoadResult) -> u32 {
     if result == LoadResult::Unreadable {
@@ -1671,6 +1683,8 @@ pub(crate) unsafe fn ensure_ready_slow(allow_build: bool) -> bool {
         // view (the pack mount and join included).
         let started = stats::now();
         let result = unsafe { load_compact_index(&mut work) };
+        #[cfg(feature = "mem_report")]
+        super::blackbox::idx(load_result_name(result), work.compact.count as u64);
         let unreadable = next_unreadable_loads(UNREADABLE_LOADS.load(Relaxed), result);
         UNREADABLE_LOADS.store(unreadable, Relaxed);
         RETRY_AT_NS.store(
@@ -1688,11 +1702,22 @@ pub(crate) unsafe fn ensure_ready_slow(allow_build: bool) -> bool {
             // replaced.
             LoadResult::Unreadable if build && !packs && unreadable >= UNREADABLE_LOAD_LIMIT => {
                 unsafe { build_app0_index(&mut work, false) };
+                #[cfg(feature = "mem_report")]
+                super::blackbox::idx(b"walk memory", work.compact.count as u64);
                 true
             }
             LoadResult::Unreadable => false,
             LoadResult::Missing | LoadResult::Invalid if build => {
                 unsafe { build_app0_index(&mut work, !packs) };
+                #[cfg(feature = "mem_report")]
+                super::blackbox::idx(
+                    if packs {
+                        b"walk memory"
+                    } else {
+                        b"walk installed"
+                    },
+                    work.compact.count as u64,
+                );
                 true
             }
             _ => false,
@@ -1707,9 +1732,12 @@ pub(crate) unsafe fn ensure_ready_slow(allow_build: bool) -> bool {
                 // may have linked some rows before it failed; none of them
                 // is served, so they go back to loose.
                 Some(b) => {
-                    if !unsafe { ampr_pack_mount_and_join(b) } {
+                    let joined = unsafe { ampr_pack_mount_and_join(b) };
+                    if !joined {
                         b.unlink_all();
                     }
+                    #[cfg(feature = "mem_report")]
+                    super::blackbox::idx_join(joined);
                 }
                 None => {
                     unsafe { ampr_pack_ensure_manifest_ready_safe() };

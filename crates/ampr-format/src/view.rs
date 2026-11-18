@@ -946,6 +946,21 @@ mod tests {
         assert_eq!(build(&idx, mem.bufs()).err(), Some(Error::Invalid));
     }
 
+    /// The pair the old hash mixed to one value, with the other names of the
+    /// same directory: distinct files must build, with each path found.
+    #[test]
+    fn build_accepts_hash_colliding_texture_pair() {
+        let a: &[u8] = b"/app0/psgbzbvom3_6qyn71tel267gsj27it7kox7she/m_8x10x10_o.mtl";
+        let b: &[u8] = b"/app0/psgbzbvom3_6qyn71tel267gsj27it7kox7she/m_4x12x10_o.mtl";
+        let img = image(&[a, b]);
+        let idx = Index::open(&img[..]).unwrap();
+        let mut mem = Mem::new(2, 8, Packs::Zstd);
+        let v = build(&idx, mem.bufs()).unwrap().finish();
+        assert_eq!(v.lookup(&img[..], a).unwrap(), Hit::File(1));
+        assert_eq!(v.lookup(&img[..], b).unwrap(), Hit::File(2));
+        assert!(!v.collides(1) && !v.collides(2));
+    }
+
     #[test]
     fn build_refuses_more_directories_than_its_capacity() {
         let img = image(&[b"/app0/a/x.bin", b"/app0/b/y.bin", b"/app0/c/z.bin"]);
@@ -1203,5 +1218,40 @@ mod tests {
         );
         assert_eq!(v.path(src, 4, &mut buf).err(), Some(Error::Invalid));
         assert_eq!(v.dir_path(src, 99, &mut buf).err(), Some(Error::Invalid));
+    }
+
+    /// A real zstd title's `ampr_emu.index` (242,439 files) that the
+    /// rotate-only hash refused with `Invalid`. Read from the path in
+    /// `AMPR_TEST_INDEX` when set; skipped otherwise so CI does not need
+    /// the file. Every record must build and resolve to its own id.
+    #[test]
+    fn real_index_builds_and_every_path_resolves() {
+        let Some(path) = std::env::var_os("AMPR_TEST_INDEX") else {
+            return;
+        };
+        let bytes = std::fs::read(path).unwrap();
+        let idx = Index::open(&bytes[..]).unwrap();
+        let files = idx.len();
+        let mut dir_cap = files / 8 + 1024;
+        loop {
+            let mut mem = Mem::new(files, dir_cap, Packs::Zstd);
+            let mut needed = 0;
+            match build_sized(&idx, mem.bufs(), &mut needed) {
+                Ok(b) => {
+                    let v = b.finish();
+                    assert_eq!(v.files(), files);
+                    for id in 1..=files {
+                        let rec = idx.record(id).unwrap();
+                        let mut buf = [0u8; PATH_BUF];
+                        let path = idx.path(&rec, &mut buf).unwrap();
+                        assert_eq!(v.lookup(&bytes[..], path).unwrap(), Hit::File(id), "id {id}");
+                    }
+                    return;
+                }
+                Err(Error::OutOfRange) if needed > dir_cap => dir_cap = needed,
+                Err(Error::OutOfRange) => dir_cap *= 2,
+                Err(e) => panic!("build failed: {e:?}"),
+            }
+        }
     }
 }

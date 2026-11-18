@@ -198,8 +198,12 @@ impl ViewHasher {
         }
     }
 
+    /// The xor-shift after the multiply keeps a difference in one word's top
+    /// byte from cancelling in the next word (`m_8x10x10_o.mtl` and
+    /// `m_4x12x10_o.mtl` collided without it: 129 pairs in one real index).
     fn mix(&mut self, w: u64) {
-        self.h = (self.h.rotate_left(23) ^ fold_word(w)).wrapping_mul(VIEW_MUL);
+        let h = (self.h.rotate_left(23) ^ fold_word(w)).wrapping_mul(VIEW_MUL);
+        self.h = h ^ (h >> 29);
     }
 
     fn write(&mut self, mut bytes: &[u8]) {
@@ -315,6 +319,7 @@ pub fn safe_components(path: &[u8]) -> bool {
 
 #[cfg(test)]
 mod tests {
+    extern crate std;
     use super::*;
 
     fn put32(b: &mut [u8], at: usize, value: u32) {
@@ -351,6 +356,32 @@ mod tests {
         assert_ne!(view_hash(b"a"), view_hash(b"a\0"));
         assert_ne!(view_hash(b"/app0/a"), view_hash(b"/app0/b"));
         assert_ne!(view_hash(b""), 0);
+    }
+
+    /// Two paths from a real index that the rotate-only `view_hash` mixed to
+    /// one value (their folded words differ in one top byte and one low byte
+    /// of the next word).
+    #[test]
+    fn view_hash_separates_texture_collision_pair() {
+        let a = b"/app0/psgbzbvom3_6qyn71tel267gsj27it7kox7she/m_8x10x10_o.mtl";
+        let b = b"/app0/psgbzbvom3_6qyn71tel267gsj27it7kox7she/m_4x12x10_o.mtl";
+        assert_ne!(view_hash(a), view_hash(b));
+    }
+
+    /// Directory prefixes (found by search) under which the rotate-only hash
+    /// gave `/m_8x10x10_o.mtl` and `/m_4x12x10_o.mtl` one value: names whose
+    /// digits fall in the same words. Each family must stay separate.
+    #[test]
+    fn view_hash_separates_every_known_texture_collision_family() {
+        for dir in [
+            "/app0/psgbzbvom3_6qyn71tel267gsj27it7kox7she/",
+            "/app0/ns9i11jkn15u26bq9bvu9ynhsmfnypovofv9tn/",
+            "/app0/w6oyxwskoxapk5qmi_472kzqy_zfnygn_xwqty/",
+        ] {
+            let a = std::format!("{dir}m_8x10x10_o.mtl");
+            let b = std::format!("{dir}m_4x12x10_o.mtl");
+            assert_ne!(view_hash(a.as_bytes()), view_hash(b.as_bytes()), "{a}");
+        }
     }
 
     #[test]

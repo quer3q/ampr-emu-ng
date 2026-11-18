@@ -135,6 +135,23 @@ pub(crate) fn pkg(how: &[u8], detail: u64, path: &[u8]) {
     l.s(if path.is_empty() { b"-" } else { path }).emit();
 }
 
+/// One index load (rt/index.rs `ensure_ready_slow`): "idx <how> files=<n>",
+/// `how` the LoadResult or `walk memory`/`walk installed` for a walk build.
+pub(crate) fn idx(how: &[u8], files: u64) {
+    if FD.load(Ordering::Relaxed) < 0 {
+        return;
+    }
+    Line::new().s(b"idx ").s(how).s(b" files=").x(files).emit();
+}
+
+/// The pack join of a title with packs: "idx join ok|fail".
+pub(crate) fn idx_join(ok: bool) {
+    if FD.load(Ordering::Relaxed) < 0 {
+        return;
+    }
+    Line::new().s(b"idx join ").s(if ok { b"ok" } else { b"fail" }).emit();
+}
+
 fn line(op: u8, how: u8, rc: i64, path: *const c_char) {
     let mut l = Line::new();
     l.s(b"fs ").s(&[op, b' ', how, b' ']).x(rc as u64).s(b" ");
