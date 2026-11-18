@@ -1412,7 +1412,6 @@ mod mem_report {
                 b"next launch\n"
             });
         }
-        out.s(b"profile=low|medium|high sets decoded_mib, workers, pipelines\n");
     }
 
     unsafe fn serve(listener: c_int, start_ns: u64) -> ! {
