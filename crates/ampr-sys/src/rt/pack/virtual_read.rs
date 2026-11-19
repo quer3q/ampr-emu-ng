@@ -200,19 +200,23 @@ fn ensure_destination(
         pipeline.dest_checked = true;
         return Ok(());
     }
+    let limit = u64::from(reactor::AMPR_EMU_APR_AIO_AMM_EFAULT_RETRY_LIMIT);
     let deadline = match pipeline.dest_deadline_ns {
         0 => {
             // Counted once per job, not once per task.
             stats::add(stats::Stat::PackDestWaits, 1);
             let deadline = sys::monotonic_ns().saturating_add(
-                reactor::AMPR_EMU_APR_AIO_AMM_EFAULT_RETRY_DELAY_NS
-                    * u64::from(reactor::AMPR_EMU_APR_AIO_AMM_EFAULT_RETRY_LIMIT),
+                reactor::AMPR_EMU_APR_AIO_AMM_EFAULT_RETRY_DELAY_NS * limit,
             );
             pipeline.dest_deadline_ns = deadline;
             deadline
         }
         deadline => deadline,
     };
+    // The deadline bounds the wait when the clock works; the count bounds it
+    // when it does not (monotonic_ns answers 0 on failure, which would keep
+    // `now < deadline` true forever).
+    let mut sleeps = 0u64;
     loop {
         if job.cancel_requested.load(Ordering::Acquire)
             || WORKER_STOP_REQUESTED.load(Ordering::Acquire)
@@ -220,11 +224,12 @@ fn ensure_destination(
             return Err(SCE_KERNEL_ERROR_ECANCELED);
         }
         let now = sys::monotonic_ns();
-        if now >= deadline {
+        if now >= deadline || sleeps >= limit {
             stats::add(stats::Stat::PackDestFaults, 1);
             return Err(SCE_KERNEL_ERROR_EFAULT);
         }
         let sleep_ns = (deadline - now).min(reactor::AMPR_EMU_APR_AIO_AMM_EFAULT_RETRY_DELAY_NS);
+        sleeps += 1;
         unsafe { sceKernelUsleep((sleep_ns / 1000) as _) };
         // A cancel during the last sleep is a cancel, not EFAULT.
         if job.cancel_requested.load(Ordering::Acquire)

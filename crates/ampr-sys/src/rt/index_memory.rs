@@ -715,12 +715,12 @@ mod tests {
         let fixed = INDEX_MEMORY_MAX + BUFFER_MEMORY_MAX + POOL_SITES_BUDGET + STACK_MEMORY_MAX;
         assert_eq!(CACHE_MEMORY_MAX, (STATIC_POOL_SIZE - fixed) / PAGE * PAGE);
         assert_eq!(CACHE_MEMORY_MAX % PAGE, 0);
-        // The debug pool of the 256 MiB layout, 0xf7f0000 (247.94 MiB):
-        // 80 + 28.44 + 1.75 + 2 MiB fixed, the cache 135.75 MiB.
-        assert_eq!(STATIC_POOL_SIZE, 0xf7f_0000);
+        // The debug pool of the 256 MiB layout, 0xf7ec000 (247.92 MiB):
+        // 80 + 28.44 + 1.75 + 2 MiB fixed, the cache 135.73 MiB.
+        assert_eq!(STATIC_POOL_SIZE, 0xf7e_c000);
         assert_eq!(POOL_SITES_BUDGET, 0x1c_0000);
-        assert_eq!(CACHE_MEMORY_MAX, 0xf7f_0000 - fixed);
-        assert_eq!(CACHE_MEMORY_MAX, 142_344_192);
+        assert_eq!(CACHE_MEMORY_MAX, 0xf7e_c000 - fixed);
+        assert_eq!(CACHE_MEMORY_MAX, 142_327_808);
     }
 
     #[test]

@@ -161,8 +161,8 @@ impl AprAioReactor {
     /// on the next poll (only the gap between query and load remains). An
     /// aligned u64 never crosses a page, so the query of `addr` covers all 8
     /// bytes. Without the symbol the check passes, as before it existed. An
-    /// op whose query fails with EACCES passes unchecked when the query is
-    /// blind (see address_query_allows), so for it none of the above holds.
+    /// op whose query fails with EACCES passes unchecked (see
+    /// address_query_allows), so for it none of the above holds.
     fn address_target_check(addr: usize, wait: bool) -> bool {
         let Some(mapping) = crate::rt::sys::query_memory_mapping(addr) else {
             return true;

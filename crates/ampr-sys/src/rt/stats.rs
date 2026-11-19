@@ -242,15 +242,16 @@ stats! {
     PackDestFaults = "pack_dest_faults",
     /// Destination queries sceKernelQueryMemoryProtection refused (EACCES),
     /// answered by probing the page with a kernel copy out instead
-    /// (pack/virtual_read.rs destination_covered). A query that refuses the
-    /// runtime's own memory is probed without asking at all and does not
-    /// count here.
+    /// (pack/virtual_read.rs destination_covered). Once a walk gets one
+    /// refused answer it probes the rest without asking, so this counts that
+    /// first answer per walk; a query refused for the runtime's own memory
+    /// skips the walk's queries entirely and does not count here.
     PackDestQueryDenied = "pack_dest_query_denied",
     /// Software WaitOnAddress / WriteAddress commands failed with an APR
     /// error because sceKernelQueryMemoryProtection found the target
     /// unmapped or without CPU read (wait) or write (write) protection
-    /// (reactor/software.rs address_target_check), or refused to describe it
-    /// (EACCES; see apr_address_query_denied). Each unmapped one would
+    /// (reactor/software.rs address_target_check). EACCES never counts here:
+    /// those targets pass (apr_address_query_denied). Each unmapped one would
     /// otherwise have faulted in the reactor thread.
     AprAddressFaults = "apr_address_faults",
     /// Software WaitOnAddress / WriteAddress target checks the query refused
