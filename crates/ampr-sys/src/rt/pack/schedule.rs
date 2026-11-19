@@ -268,6 +268,10 @@ fn reset_pipeline_native(pipeline: &mut ReadPipelineContext) {
     pipeline.native_io_error = 0;
     pipeline.native_completion_ready = false;
     pipeline.native_accepted = false;
+    // The destination check and its deadline belong to the job that owned
+    // the pipeline.
+    pipeline.dest_checked = false;
+    pipeline.dest_deadline_ns = 0;
     native_submitted(pipeline).store(false, Ordering::Relaxed);
 }
 

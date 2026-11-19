@@ -355,10 +355,6 @@ fn user_ptr(p: usize) -> bool {
     (0x1_0000..0x7fff_ffff_ffff).contains(&p)
 }
 
-static QUERY_PROT: super::sys::LazySym = super::sys::LazySym::new(c"sceKernelQueryMemoryProtection");
-type QueryProtFn =
-    unsafe extern "C" fn(*mut c_void, *mut *mut c_void, *mut *mut c_void, *mut c_int) -> c_int;
-
 /// `[p, p + len)` is mapped and CPU-readable, asked of
 /// sceKernelQueryMemoryProtection, which answers an error for an unmapped
 /// address where a plain read would fault in the game's call. False when
@@ -371,17 +367,18 @@ fn readable(p: usize, len: usize) -> bool {
     if cfg!(test) {
         return true;
     }
-    let Some(query) = (unsafe { QUERY_PROT.get::<QueryProtFn>() }) else {
+    if !super::sys::memory_query_available() {
+        return false;
+    }
+    let Some(mapping) = super::sys::query_memory_mapping(p) else {
         return false;
     };
-    let (mut start, mut end, mut prot) = (core::ptr::null_mut(), core::ptr::null_mut(), 0);
-    let rc = unsafe { query(p as *mut c_void, &mut start, &mut end, &mut prot) };
-    rc == 0
+    mapping.rc == 0
         // CPU_RW is its own bit (0x02), not READ | WRITE: a game's writable
         // memory reports it alone.
-        && prot & (super::sys::SCE_KERNEL_PROT_CPU_READ | super::sys::SCE_KERNEL_PROT_CPU_RW) != 0
-        && (start as usize) <= p
-        && p.saturating_add(len) <= end as usize
+        && mapping.prot & (super::sys::SCE_KERNEL_PROT_CPU_READ | super::sys::SCE_KERNEL_PROT_CPU_RW) != 0
+        && mapping.start <= p
+        && p.saturating_add(len) <= mapping.end_exclusive()
 }
 
 /// Up to `N` bytes of the C string at `p`, zero after its NUL.

@@ -543,6 +543,117 @@ impl LazySym {
     }
 }
 
+// ---- memory mapping queries ----
+
+/// One `sceKernelQueryMemoryProtection` answer for an address.
+pub(crate) struct MemoryMapping {
+    pub rc: c_int,
+    pub start: usize,
+    pub end: usize,
+    pub prot: c_int,
+}
+
+impl MemoryMapping {
+    /// The mapping's end, exclusive. Answers use that form, but a core dump's
+    /// VMEM record uses the inclusive one (an end inside a page), so both are
+    /// accepted (pack/virtual_read.rs).
+    pub(crate) fn end_exclusive(&self) -> usize {
+        if self.end & (SCE_KERNEL_PAGE_SIZE - 1) == 0 {
+            self.end
+        } else {
+            self.end.saturating_add(1)
+        }
+    }
+
+    /// The answered query puts `addr` in this mapping with `need` protection.
+    pub(crate) fn contains(&self, addr: usize, need: c_int) -> bool {
+        self.rc == 0 && self.start <= addr && addr < self.end_exclusive() && self.prot & need != 0
+    }
+}
+
+static QUERY_PROT: LazySym = LazySym::new(c"sceKernelQueryMemoryProtection");
+type QueryProtFn =
+    unsafe extern "C" fn(*mut c_void, *mut *mut c_void, *mut *mut c_void, *mut c_int) -> c_int;
+
+/// Whether libkernel has `sceKernelQueryMemoryProtection`. Resolved once.
+pub(crate) fn memory_query_available() -> bool {
+    unsafe { QUERY_PROT.get::<QueryProtFn>() }.is_some()
+}
+
+/// The mapping of `addr`, or None when libkernel lacks the query. A refused
+/// query (EACCES) is an answer too: `rc` carries it.
+pub(crate) fn query_memory_mapping(addr: usize) -> Option<MemoryMapping> {
+    let query = unsafe { QUERY_PROT.get::<QueryProtFn>() }?;
+    let (mut start, mut end, mut prot) = (core::ptr::null_mut(), core::ptr::null_mut(), 0);
+    let rc = unsafe { query(addr as *mut c_void, &mut start, &mut end, &mut prot) };
+    Some(MemoryMapping {
+        rc,
+        start: start as usize,
+        end: end as usize,
+        prot,
+    })
+}
+
+/// Probe address for `query_protection_is_blind`: this runtime's own .bss,
+/// mapped CPU-writable by definition.
+static BLIND_PROBE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// True when the query refuses a known-mapped address. EACCES then says
+/// nothing about the target. Decided once; false without the symbol.
+pub(crate) fn query_protection_is_blind() -> bool {
+    use core::sync::atomic::Ordering;
+    let seen = BLIND_PROBE.load(Ordering::Relaxed);
+    if seen != 0 {
+        return seen == 2;
+    }
+    let blind = query_memory_mapping(&BLIND_PROBE as *const _ as usize)
+        .is_some_and(|m| m.rc == SCE_KERNEL_ERROR_EACCES);
+    BLIND_PROBE.store(if blind { 2 } else { 1 }, Ordering::Relaxed);
+    blind
+}
+
+/// Probe address for `eacces_is_unmapped`: the null page, which no PS5
+/// process maps (the eboot loads at 0x400000).
+const UNMAPPED_PROBE: usize = 0x1000;
+
+static EACCES_IS_UNMAPPED: core::sync::atomic::AtomicU8 =
+    core::sync::atomic::AtomicU8::new(0);
+
+/// Whether the query also answers EACCES for a known-unmapped address,
+/// which would make an EACCES WaitOnAddress target indistinguishable from an
+/// unmapped one. Asked once, when the first EACCES target arrives, and
+/// published as the debug `apr_address_eacces_unmapped` counter (1) and a
+/// `b'a'` black-box line, so a console run answers the question the review
+/// left open. The waits go ahead either way: on PPSA10665 three refused
+/// waits were the only error before the freeze, while thousands of
+/// WriteAddress stores into EACCES targets landed (they are mapped), and
+/// letting them through fixed it (b934727).
+pub(crate) fn eacces_is_unmapped() -> bool {
+    use core::sync::atomic::Ordering;
+    let seen = EACCES_IS_UNMAPPED.load(Ordering::Relaxed);
+    if seen != 0 {
+        return seen == 2;
+    }
+    let answer = query_memory_mapping(UNMAPPED_PROBE);
+    let unmapped = answer
+        .as_ref()
+        .is_some_and(|m| m.rc == SCE_KERNEL_ERROR_EACCES);
+    EACCES_IS_UNMAPPED.store(if unmapped { 2 } else { 1 }, Ordering::Relaxed);
+    if let Some(mapping) = answer {
+        super::stats::apr_call_error(
+            b'a',
+            mapping.rc as i64,
+            b"addr-probe unmapped-rc=",
+            mapping.rc as u64,
+            b"",
+        );
+    }
+    if unmapped {
+        super::stats::add(super::stats::Stat::AprAddressEaccesUnmapped, 1);
+    }
+    unmapped
+}
+
 /// Crash like `std::abort()` without a plain libc import.
 pub fn abort() -> ! {
     #[cfg(target_arch = "x86_64")]

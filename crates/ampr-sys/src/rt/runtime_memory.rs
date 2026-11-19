@@ -39,7 +39,7 @@ pub(crate) const STATIC_POOL_SIZE: usize = {
 
 /// The Makefile's `AMPR_DEBUG_POOL_SIZE`, the smaller of the two pools, so
 /// host tests check the tighter fit (and the smaller cache).
-pub(crate) const DEFAULT_POOL_SIZE: usize = 0xf7f_0000;
+pub(crate) const DEFAULT_POOL_SIZE: usize = 0xf7e_c000;
 
 /// Compile-time number parser (Makefile knobs); a malformed value fails the build.
 pub(crate) const fn parse_size(s: &[u8]) -> usize {

@@ -232,20 +232,41 @@ stats! {
     /// Failures: pack virtual reads completed with an error, chunk decodes that failed.
     PackJobErrors = "pack_job_errors",
     DecodeErrors = "decode_errors",
+    /// Pack virtual reads whose game destination was not mapped
+    /// CPU-writable when the pass first checked it, so the worker waited for
+    /// it (once per read, not once per task), and those still missing at the
+    /// job's deadline, failed with EFAULT (pack/virtual_read.rs
+    /// ensure_destination). Without the wait the write faulted the worker
+    /// and killed the game (PPSA10665).
+    PackDestWaits = "pack_dest_waits",
+    PackDestFaults = "pack_dest_faults",
+    /// Destination queries sceKernelQueryMemoryProtection refused (EACCES),
+    /// answered by probing the page with a kernel copy out instead
+    /// (pack/virtual_read.rs destination_covered). Once a walk gets one
+    /// refused answer it probes the rest without asking, so this counts that
+    /// first answer per walk; a query refused for the runtime's own memory
+    /// skips the walk's queries entirely and does not count here.
+    PackDestQueryDenied = "pack_dest_query_denied",
     /// Software WaitOnAddress / WriteAddress commands failed with an APR
     /// error because sceKernelQueryMemoryProtection found the target
     /// unmapped or without CPU read (wait) or write (write) protection
-    /// (reactor/software.rs address_target_check), or refused to describe it
-    /// (EACCES, waits only; see apr_address_query_denied). Each unmapped one
-    /// would otherwise have faulted in the reactor thread.
+    /// (reactor/software.rs address_target_check). EACCES never counts here:
+    /// those targets pass (apr_address_query_denied). Each unmapped one would
+    /// otherwise have faulted in the reactor thread.
     AprAddressFaults = "apr_address_faults",
     /// Software WaitOnAddress / WriteAddress target checks the query refused
     /// with EACCES (reactor/software.rs address_query_allows). A write goes
-    /// ahead unchecked; a wait fails at once and also counts in
-    /// apr_address_faults. A title that signals a read batch with a
+    /// ahead unchecked. A wait goes ahead too: on the kstuff title those
+    /// targets are mapped (its stores and its reads use them) and refusing
+    /// the waits froze it. A title that signals a read batch with a
     /// WriteAddress to such a target hung on the loading screen while the
     /// write was refused.
     AprAddressQueryDenied = "apr_address_query_denied",
+    /// 1 when sceKernelQueryMemoryProtection also answers EACCES for a known
+    /// unmapped address (the null page), so EACCES cannot be told apart from
+    /// "not mapped" on this setup; 0 or absent when it can. Asked once, at
+    /// the first EACCES target (sys::eacces_is_unmapped).
+    AprAddressEaccesUnmapped = "apr_address_eacces_unmapped",
     /// Pack volume fds closed for a reopen after a read failed with EBADF,
     /// EIO or ENXIO (pack/leases.rs PackFdReopen; e.g. a USB image remounted
     /// after rest mode).
@@ -553,7 +574,8 @@ pub(crate) fn now() -> u64 {
 /// b'J' an APR call that returned an error (rt/services.rs): lookup b'w'
 /// a wait, path "wait id=<hex> how=<s|n>" (synthetic id, or passed to libkernel);
 /// b'u' a submit, path "submit prio=<n>"; b'n' a native batch submit the
-/// kernel refused, path "native batch lane=<n>". First 64 only.
+/// kernel refused, path "native batch lane=<n>"; b'r' a pack read job that
+/// failed, path "pack-read fid=<hex>". First 64 only.
 /// b'Q' packed-fd/open failures (rt/pack/slots.rs, rt/index.rs): lookup b'H'
 /// a packed open's raw SCE error, b'R' a physical open's errno (ring only,
 /// positive), b'S' the 320-slot synthetic packed-fd table full.

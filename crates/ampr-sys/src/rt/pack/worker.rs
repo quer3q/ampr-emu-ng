@@ -52,6 +52,10 @@ pub(crate) unsafe fn complete_virtual_job(
     stats::max(stats::Stat::PackJobNsMax, job_ns);
     if return_value < 0 {
         stats::add(stats::Stat::PackJobErrors, 1);
+        // Debug black box: a failed pack read (EFAULT from an unmapped
+        // destination, or another error) with its file id, so a run that
+        // dies before /metrics answers still shows it.
+        stats::apr_call_error(b'r', return_value, b"pack-read fid=", job.file_id as u64, b"");
     }
     job.return_value = return_value;
     job.completion_state = completion_state;

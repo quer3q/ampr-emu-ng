@@ -42,7 +42,12 @@ AMPR_MEM_REPORT ?= 0
 # debug /threads census (rt/thread_hooks.rs) grew them to 7030490 B and
 # 8451370 B: release pool 249.28 MiB (cache 137.09), debug 247.94 MiB
 # (cache 135.75), totals 256 MiB minus 14630 B and minus 2774 B, 11856 B
-# apart. Once the index is
+# apart. The destination wait and the address-query diagnostic
+# (rt/pack/virtual_read.rs, rt/sys.rs `eacces_is_unmapped`) grew the
+# non-pool parts to 7031674 B (release) and 8454178 B (debug): release
+# pool 0xf948000 (cache 137.09 MiB), debug 0xf7ec000 (247.92 MiB, cache
+# 135.73), totals 256 MiB minus 13446 B and minus 16350 B, 2904 B apart.
+# Once the index is
 # built the cache grows into the Index ledger's idle room
 # (rt/pack/manifest.rs `grow_cache_from_index`). (The first guess, from the non-pool parts before the removals,
 # 9027282 B and 10452034 B, was 0xf764000 and 0xf608000.) Recompute both
@@ -78,10 +83,10 @@ AMPR_MEM_REPORT ?= 0
 # former direct memory lines).
 AMPR_INTERNAL_POOL_SIZE ?= 0xf948000
 # Debug build pool (passed to it as AMPR_INTERNAL_POOL_SIZE by `dist`):
-# T minus the debug non-pool part, 247.94 MiB, the same fixed caps as
-# release and a cache 1.34 MiB smaller; host tests build with it
+# T minus the debug non-pool part, 247.92 MiB, the same fixed caps as
+# release and a cache 1.36 MiB smaller; host tests build with it
 # (rt/runtime_memory.rs `DEFAULT_POOL_SIZE`).
-AMPR_DEBUG_POOL_SIZE ?= 0xf7f0000
+AMPR_DEBUG_POOL_SIZE ?= 0xf7ec000
 # Pread pool threads: at most 6 (tune::RELEASE_PREAD_THREADS), grown by
 # backlog and kept until pressure mode gives them back, within the
 # runtime-wide budget of 16 worker
