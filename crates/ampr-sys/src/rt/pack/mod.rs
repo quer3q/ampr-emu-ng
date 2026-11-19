@@ -1337,6 +1337,13 @@ pub(crate) struct ReadPipelineContext {
     /// Physical backing reads this pipeline added to PACK_DISK_INFLIGHT
     /// (worker.rs; debug build only, 0 in release).
     pub disk_inflight: u32,
+    /// The game destination was checked in this pass and found mapped
+    /// CPU-writable (pack/virtual_read.rs ensure_destination). Cleared at
+    /// every pass, so a yield rechecks and tasks in one pass share it.
+    pub dest_checked: bool,
+    /// The one deadline for this job's destination walk, 0 before the first
+    /// wait: a wait ends here however many tasks follow (640 ms).
+    pub dest_deadline_ns: u64,
 }
 impl ReadPipelineContext {
     pub(crate) const EMPTY: Self = Self {
@@ -1368,6 +1375,8 @@ impl ReadPipelineContext {
         native_accepted: false,
         native_submitted: false,
         disk_inflight: 0,
+        dest_checked: false,
+        dest_deadline_ns: 0,
     };
 }
 
