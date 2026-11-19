@@ -184,6 +184,9 @@ stats! {
     SaveBusy = "save_busy",
     SaveMountsShared = "save_mounts_shared",
     SaveUmountsShared = "save_umounts_shared",
+    /// Creating sceSaveDataMount3 calls the library refused (0x809F0000)
+    /// that were sent again with systemBlocks 0 (rt/save.rs MOUNT3_BYTES).
+    SaveSystemBlocksZeroed = "save_system_blocks_zeroed",
     /// Read pool size (reactor/pread_pool.rs): threads started, the most
     /// live at once, threads given back to the game, and our own creations
     /// that failed (the pool stops growing). Exits under pressure are

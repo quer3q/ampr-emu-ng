@@ -172,8 +172,12 @@ has mounted with that mount's point, and `sceSaveDataUmount2` counts its
 owners, so only the last owner's unmount reaches the service. An
 interrupted save left a slot the game kept mounted and mounted again: BUSY
 there hung the load forever when passed back, and unmounting the game's
-other points instead made another title hang on close. Every other mount
-and unmount passes through. The debug build adds pass-through probes on 13
+other points instead made another title hang on close. A creating
+`sceSaveDataMount3` the library refuses (0x809F0000) with a nonzero
+systemBlocks is sent once more with systemBlocks 0: below SDK 5.00 the
+library takes only 0, and a title backported to 4.xx still passes the -1
+of its own SDK, so it never saved. Every other mount and unmount passes
+through. The debug build adds pass-through probes on 13
 more save and dialog calls (`probe` in `rt/save.rs`, `fs V` lines).
 CI (`.github/workflows/build.yml`) runs the same commands; a pushed `v*` tag creates a draft release with both `.sprx` and `SHA256SUMS`.
 

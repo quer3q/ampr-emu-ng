@@ -204,6 +204,67 @@ unsafe fn read_into<R>(
 const SAVE_DATA_ERROR_BUSY: c_int = 0x809F_0003u32 as c_int;
 /// SCE_SAVE_DATA_ERROR_NOT_MOUNTED: that point is already gone.
 const SAVE_DATA_ERROR_NOT_MOUNTED: c_int = 0x809F_0004u32 as c_int;
+/// SCE_SAVE_DATA_ERROR_PARAMETER: the library refused the request itself.
+const SAVE_DATA_ERROR_PARAMETER: c_int = 0x809F_0000u32 as c_int;
+
+// A creating sceSaveDataMount3 refused for its systemBlocks. The 13.x
+// libSceSaveData.native checks a mount by the SDK version the title reports
+// (dumped from a game process on a 13.x console: the check is chosen at
+// module offset 0x1ecc0). Creating a save (mode & 0x24) needs blocks >= 48
+// and systemBlocks 0 below SDK 5.00, 0 or -1 from 5.00, -1 or -2 from
+// 12.00. A title backported to firmware 4.xx reports an SDK below 5.00, but
+// its save code still passes the -1 (SCE_SAVE_DATA_SYSTEM_BLOCKS_EQUAL_TO_
+// BLOCKS) of the SDK it was built with: Castlevania: Belmont's Curse
+// (PPSA35399, Unity, SDK 11 backported to 4.00) read its saves, but every
+// creating mount answered 0x809F0000 and it never saved. Such a mount is
+// sent once more with systemBlocks 0, the only value that check takes.
+
+/// `SceSaveDataMount3` as that library checks it: userId @0, dirName* @8,
+/// blocks @0x10, systemBlocks @0x18, mountMode @0x20, reserved bytes up to
+/// 0x4b, 0x50 with the alignment of its u64 fields.
+const MOUNT3_BYTES: usize = 0x50;
+const MOUNT3_SYSTEM_BLOCKS: usize = 0x18;
+const MOUNT3_MODE: usize = 0x20;
+/// SCE_SAVE_DATA_MOUNT_MODE_CREATE (4) and CREATE2 (0x20): the library
+/// checks the sizes only when one of them is set.
+const MOUNT_MODE_CREATE: u32 = 0x24;
+
+/// A copy of a mount request, aligned for the library's u64 reads.
+#[repr(C, align(8))]
+struct Mount3Req([u8; MOUNT3_BYTES]);
+
+/// `req` with systemBlocks 0, when it creates a save and asked for another
+/// value; None otherwise (nothing to change).
+fn system_blocks_zeroed(req: &[u8; MOUNT3_BYTES]) -> Option<[u8; MOUNT3_BYTES]> {
+    let m = MOUNT3_MODE;
+    let mode = u32::from_le_bytes([req[m], req[m + 1], req[m + 2], req[m + 3]]);
+    let sb = MOUNT3_SYSTEM_BLOCKS..MOUNT3_SYSTEM_BLOCKS + 8;
+    if mode & MOUNT_MODE_CREATE == 0 || req[sb.clone()].iter().all(|&b| b == 0) {
+        return None;
+    }
+    let mut out = *req;
+    out[sb].fill(0);
+    Some(out)
+}
+
+/// Copies the game's request into `out` with systemBlocks 0; false when it
+/// is not readable or there is nothing to change.
+#[inline(never)]
+unsafe fn zero_system_blocks(mount: *const c_void, out: &mut Mount3Req) -> bool {
+    if !readable(mount as usize, MOUNT3_BYTES) {
+        return false;
+    }
+    let mut req = [0u8; MOUNT3_BYTES];
+    unsafe { core::ptr::copy_nonoverlapping(mount.cast::<u8>(), req.as_mut_ptr(), MOUNT3_BYTES) };
+    match system_blocks_zeroed(&req) {
+        Some(fixed) => {
+            out.0 = fixed;
+            true
+        }
+        None => false,
+    }
+}
+
 /// `SceSaveDataDirName`, char[32].
 const DIR_BYTES: usize = 32;
 /// `SceSaveDataMountPoint`, char[16], e.g. "/savedata0".
@@ -417,6 +478,19 @@ pub unsafe extern "C" fn mount3_emul(mount: *const c_void, result: *mut c_void) 
     };
     let mut since = passed_seq();
     let mut rc = unsafe { orig(mount, result) };
+    // A creating mount refused for its systemBlocks (see MOUNT3_BYTES) goes
+    // once more with systemBlocks 0, and that request is the one sent again
+    // on BUSY below. Calls the library takes are never changed.
+    let mut fixed = Mount3Req([0; MOUNT3_BYTES]);
+    let mut send = mount;
+    if rc == SAVE_DATA_ERROR_PARAMETER && unsafe { zero_system_blocks(mount, &mut fixed) } {
+        send = fixed.0.as_ptr().cast();
+        since = passed_seq();
+        rc = unsafe { orig(send, result) };
+        stats::add(Stat::SaveSystemBlocksZeroed, 1);
+        #[cfg(feature = "mem_report")]
+        probe::note(b"Mount3 systemBlocks 0", Some(rc));
+    }
     // Debug: the request's words, only once the service took the struct
     // (0 or BUSY), as the release path reads it.
     #[cfg(feature = "mem_report")]
@@ -449,7 +523,7 @@ pub unsafe extern "C" fn mount3_emul(mount: *const c_void, result: *mut c_void) 
                 tries += 1;
                 unsafe { super::sys::sceKernelUsleep(BUSY_WAIT_US) };
                 since = passed_seq();
-                rc = unsafe { orig(mount, result) };
+                rc = unsafe { orig(send, result) };
             }
             if rc == 0 && !shared {
                 unsafe { remember(user, dir, req, result, since) };
@@ -916,5 +990,51 @@ mod tests {
             unsafe { passed_umount_done(old, &point4, true) };
         }
         assert!(!held(unsafe { &*MOUNTED.get() }));
+    }
+
+    /// A request in the 13.x layout: user 1, a dirName pointer word, 0x300
+    /// blocks, the given systemBlocks and mode, a transaction resource id
+    /// as PPSA35399 created them, reserved bytes zero.
+    fn mount3(system_blocks: i64, mode: u32) -> [u8; MOUNT3_BYTES] {
+        let mut r = [0u8; MOUNT3_BYTES];
+        r[0..4].copy_from_slice(&1u32.to_le_bytes());
+        r[8..16].copy_from_slice(&0x1234_5678u64.to_le_bytes());
+        r[0x10..0x18].copy_from_slice(&0x300u64.to_le_bytes());
+        r[0x18..0x20].copy_from_slice(&system_blocks.to_le_bytes());
+        r[0x20..0x24].copy_from_slice(&mode.to_le_bytes());
+        r[0x24..0x28].copy_from_slice(&0xe401u32.to_le_bytes());
+        r
+    }
+
+    #[test]
+    fn a_creating_mount_gets_system_blocks_zero() {
+        for (sb, mode) in [(-1i64, 0x20u32), (-1, 0x04), (-2, 0x24), (96, 0x20)] {
+            let req = mount3(sb, mode);
+            let fixed = system_blocks_zeroed(&req).unwrap();
+            assert_eq!(fixed[0x18..0x20], [0; 8]);
+            // Every other byte is the game's.
+            assert_eq!(fixed[..0x18], req[..0x18]);
+            assert_eq!(fixed[0x20..], req[0x20..]);
+        }
+        // Nothing to change: a mount that does not create, or systemBlocks 0.
+        assert!(system_blocks_zeroed(&mount3(-1, 0x01)).is_none());
+        assert!(system_blocks_zeroed(&mount3(-1, 0x02)).is_none());
+        assert!(system_blocks_zeroed(&mount3(0, 0x20)).is_none());
+    }
+
+    #[test]
+    fn zero_system_blocks_leaves_the_game_request_alone() {
+        let req = Box::new(mount3(-1, 0x20));
+        let mut out = Mount3Req([0xaa; MOUNT3_BYTES]);
+        assert!(unsafe { zero_system_blocks(req.as_ptr().cast(), &mut out) });
+        assert_eq!(out.0[0x18..0x20], [0; 8]);
+        assert_eq!(out.0[0x20..], req[0x20..]);
+        assert_eq!(req[0x18..0x20], (-1i64).to_le_bytes());
+        // A read mount, or no struct: nothing copied, false.
+        let ro = Box::new(mount3(-1, 0x01));
+        let mut untouched = Mount3Req([0xaa; MOUNT3_BYTES]);
+        assert!(!unsafe { zero_system_blocks(ro.as_ptr().cast(), &mut untouched) });
+        assert!(!unsafe { zero_system_blocks(core::ptr::null(), &mut untouched) });
+        assert!(untouched.0.iter().all(|&b| b == 0xaa));
     }
 }
