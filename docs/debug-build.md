@@ -331,9 +331,11 @@ written as events happen, so it survives the crash, and holds:
   line shows what the game did with packed files before it died.
 - the index load (rt/index.rs `ensure_ready_slow`): one `idx <how>
   files=<count>` line per load attempt, `how` one of `Loaded`, `Missing`,
-  `Invalid`, `Memory`, `Unreadable`, or `walk memory`/`walk installed`
-  when a walk build replaced it; then `idx join ok|fail` for the pack join
-  of a title with packs (a failed join unlinks every packed row).
+  `Invalid`, `Memory`, `Unreadable`, or `walk ok`/`walk fail` when a walk
+  build replaced it; then `idx join ok|fail` for the pack join of a title
+  with packs (a failed join unlinks every packed row). The count is the
+  files loaded, in hex, and 0 on a failed load. A run of `Unreadable`
+  loads is written up to its third attempt; later retries are not.
 
 Successful file calls are not written. The file is truncated at each start;
 copy it off before relaunching.

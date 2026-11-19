@@ -131,6 +131,14 @@ fn load_result_name(r: LoadResult) -> &'static [u8] {
     }
 }
 
+/// The black box line of a walk build: whether it left a usable index, not
+/// whether it was installed (a read-only /app0 or a link keeps it in memory).
+#[cfg(feature = "mem_report")]
+fn walk_trace(work: &FileIndexState) {
+    let how: &[u8] = if work.available { b"walk ok" } else { b"walk fail" };
+    super::blackbox::idx(how, work.compact.count as u64);
+}
+
 /// The Unreadable run length after a load with `result`.
 fn next_unreadable_loads(count: u32, result: LoadResult) -> u32 {
     if result == LoadResult::Unreadable {
@@ -1683,10 +1691,14 @@ pub(crate) unsafe fn ensure_ready_slow(allow_build: bool) -> bool {
         // view (the pack mount and join included).
         let started = stats::now();
         let result = unsafe { load_compact_index(&mut work) };
-        #[cfg(feature = "mem_report")]
-        super::blackbox::idx(load_result_name(result), work.compact.count as u64);
         let unreadable = next_unreadable_loads(UNREADABLE_LOADS.load(Relaxed), result);
         UNREADABLE_LOADS.store(unreadable, Relaxed);
+        // A title with packs retries an Unreadable index every 2 s for the
+        // whole session; past the limit the retries stay out of the trace.
+        #[cfg(feature = "mem_report")]
+        if unreadable <= UNREADABLE_LOAD_LIMIT {
+            super::blackbox::idx(load_result_name(result), work.compact.count as u64);
+        }
         RETRY_AT_NS.store(
             next_retry_at(super::sys::monotonic_ns(), unreadable),
             Relaxed,
@@ -1703,21 +1715,14 @@ pub(crate) unsafe fn ensure_ready_slow(allow_build: bool) -> bool {
             LoadResult::Unreadable if build && !packs && unreadable >= UNREADABLE_LOAD_LIMIT => {
                 unsafe { build_app0_index(&mut work, false) };
                 #[cfg(feature = "mem_report")]
-                super::blackbox::idx(b"walk memory", work.compact.count as u64);
+                walk_trace(&work);
                 true
             }
             LoadResult::Unreadable => false,
             LoadResult::Missing | LoadResult::Invalid if build => {
                 unsafe { build_app0_index(&mut work, !packs) };
                 #[cfg(feature = "mem_report")]
-                super::blackbox::idx(
-                    if packs {
-                        b"walk memory"
-                    } else {
-                        b"walk installed"
-                    },
-                    work.compact.count as u64,
-                );
+                walk_trace(&work);
                 true
             }
             _ => false,
