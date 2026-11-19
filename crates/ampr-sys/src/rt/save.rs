@@ -195,10 +195,11 @@ unsafe fn read_into<R>(
 // with more than one owner is answered 0 without unmounting, so no point a
 // title holds ever goes away under it. A BUSY mount of a directory this
 // title has not mounted is passed back unchanged.
-// Shared only for the same user, directory name and request words 2-3.
-// Those words are the mode only if PS5 Mount3 keeps the PS4
-// Mount2 layout; a full check needs
-// the PS5 SceSaveDataMount3 layout (debug /metrics logs both mounts' words).
+// Shared only for the same user, directory name, blocks and systemBlocks
+// (words 2-3 of the 13.x layout at MOUNT3_BYTES), and never a read-only
+// point to a request that writes: its writes would fail on that point. A
+// read-only request may take a writable point, as a load after an
+// interrupted save does (the modes of that case were not logged).
 
 /// SCE_SAVE_DATA_ERROR_BUSY: the save is mounted or in use.
 const SAVE_DATA_ERROR_BUSY: c_int = 0x809F_0003u32 as c_int;
@@ -228,6 +229,13 @@ const MOUNT3_MODE: usize = 0x20;
 /// SCE_SAVE_DATA_MOUNT_MODE_CREATE (4) and CREATE2 (0x20): the library
 /// checks the sizes only when one of them is set.
 const MOUNT_MODE_CREATE: u32 = 0x24;
+/// SCE_SAVE_DATA_MOUNT_MODE_RDWR (2).
+const MOUNT_MODE_RDWR: u32 = 2;
+
+/// Whether a mount of `mode` can write its point.
+fn writes(mode: u64) -> bool {
+    mode as u32 & (MOUNT_MODE_RDWR | MOUNT_MODE_CREATE) != 0
+}
 
 /// A copy of a mount request, aligned for the library's u64 reads.
 #[repr(C, align(8))]
@@ -291,10 +299,10 @@ struct Mounted {
     unmounting: u32,
     user: u32,
     dir: [u8; DIR_BYTES],
-    /// Words 2 and 3 of the request (blocks and mode in the PS4 Mount2
-    /// layout): a BUSY request is shared only when they match, so a mount
-    /// asked with another mode does not get this one's point.
-    req: [u64; 2],
+    /// Blocks, systemBlocks and the mode word of the request: a BUSY request
+    /// is shared only for the same sizes, and a writing one only when this
+    /// mount writes too (see `share`).
+    req: [u64; 3],
     /// The point up to its NUL, zero after: the service reads it as a C
     /// string, so the bytes past the NUL of a game's copy do not count.
     point: [u8; POINT_BYTES],
@@ -312,7 +320,7 @@ const MOUNTED0: Mounted = Mounted {
     unmounting: 0,
     user: 0,
     dir: [0; DIR_BYTES],
-    req: [0; 2],
+    req: [0; 3],
     point: [0; POINT_BYTES],
     result: [0; RESULT_BYTES],
     pending: 0,
@@ -451,13 +459,13 @@ unsafe fn c_name<const N: usize>(p: *const u8) -> [u8; N] {
     out
 }
 
-/// The user id and directory name of a mount struct, as in the PS4
-/// SceSaveDataMount2 layout (userId, pad, dirName*), which the debug probes
-/// read as "slot2" on a console. Read only after the service took the
+/// The user id, directory name and `Mounted::req` of a mount struct
+/// (userId, pad, dirName*, the layout at MOUNT3_BYTES), which the debug
+/// probes read as "slot2" on a console. Read only after the service took the
 /// struct (it answered 0 or BUSY), so a pointer it refused is never read
 /// here. None when the name pointer is not plausible or names nothing.
-unsafe fn mount_dir(mount: *const c_void) -> Option<(u32, [u8; DIR_BYTES], [u64; 2])> {
-    if !readable(mount as usize, 32) {
+unsafe fn mount_dir(mount: *const c_void) -> Option<(u32, [u8; DIR_BYTES], [u64; 3])> {
+    if !readable(mount as usize, MOUNT3_MODE + 4) {
         return None;
     }
     let user = unsafe { core::ptr::read_unaligned(mount as *const u32) };
@@ -467,7 +475,10 @@ unsafe fn mount_dir(mount: *const c_void) -> Option<(u32, [u8; DIR_BYTES], [u64;
     }
     let dir = unsafe { c_name::<DIR_BYTES>(p as *const u8) };
     let w = mount as *const u64;
-    let req = unsafe { [core::ptr::read_unaligned(w.add(2)), core::ptr::read_unaligned(w.add(3))] };
+    let word = |i| unsafe { core::ptr::read_unaligned(w.add(i)) };
+    // The mode is the low half of word 4 (MOUNT3_MODE); the high half is
+    // a transaction resource id that differs per mount.
+    let req = [word(2), word(3), word(MOUNT3_MODE / 8) & 0xffff_ffff];
     (dir[0] != 0).then_some((user, dir, req))
 }
 
@@ -553,7 +564,7 @@ pub unsafe extern "C" fn mount3_emul(mount: *const c_void, result: *mut c_void) 
 unsafe fn remember(
     user: u32,
     dir: [u8; DIR_BYTES],
-    req: [u64; 2],
+    req: [u64; 3],
     result: *const c_void,
     since: u64,
 ) {
@@ -596,18 +607,20 @@ unsafe fn remember(
 /// writes that mount's result head into `result` and counts one more owner.
 /// Only while the unmount hook is in: without it the game's unmounts would
 /// not see the owner count and would take the point from the other owner.
-unsafe fn share(user: u32, dir: &[u8; DIR_BYTES], req: [u64; 2], result: *mut c_void) -> bool {
+unsafe fn share(user: u32, dir: &[u8; DIR_BYTES], req: [u64; 3], result: *mut c_void) -> bool {
     if !cfg!(test) && unsafe { save_original::<Umount2Fn>(SAVE_UMOUNT2) }.is_none() {
         return false;
     }
     let _g = MOUNT_LOCK.lock();
     let t = unsafe { &mut *MOUNTED.get() };
-    let Some(m) = t
-        .iter_mut()
-        .find(|m| {
-            m.owners != 0 && m.unmounting == 0 && m.user == user && m.dir == *dir && m.req == req
-        })
-    else {
+    let Some(m) = t.iter_mut().find(|m| {
+        m.owners != 0
+            && m.unmounting == 0
+            && m.user == user
+            && m.dir == *dir
+            && m.req[..2] == req[..2]
+            && (writes(m.req[2]) || !writes(req[2]))
+    }) else {
         return false;
     };
     m.owners += 1;
@@ -760,15 +773,16 @@ pub(crate) mod probe {
 
     use super::user_ptr;
 
-    /// The first 4 words of the mount struct as hex, and the directory
+    /// The first 5 words of the mount struct as hex (the mode is the low
+    /// half of the 5th), and the directory
     /// name its second word points to in the PS4 Mount2 layout (userId,
     /// pad, dirName*), read only when that word is a plausible pointer.
     #[inline(never)]
     pub(crate) unsafe fn note_mount(m: usize) {
-        if !super::readable(m, 32) {
+        if !super::readable(m, 40) {
             return;
         }
-        let mut buf = [0u8; 96];
+        let mut buf = [0u8; 112];
         let mut n = 0;
         let mut push = |bytes: &[u8]| {
             for &x in bytes {
@@ -779,7 +793,7 @@ pub(crate) mod probe {
             }
         };
         push(b"save Mount3 arg");
-        for i in 0..4 {
+        for i in 0..5 {
             let w = unsafe { core::ptr::read_unaligned((m as *const u64).add(i)) };
             push(b" ");
             for k in (0..16).rev() {
@@ -876,13 +890,13 @@ mod tests {
         let mut first = [0u8; 64];
         first[..10].copy_from_slice(b"/savedata0");
         first[16] = 7; // required blocks, handed on with the point
-        let req = [0x100, 0];
+        let req = [0x100, 0, MOUNT_MODE_RDWR as u64];
         unsafe { remember(7, slot2, req, first.as_ptr().cast(), passed_seq()) };
         // Another directory is not shared: its BUSY goes back to the game.
         let mut out = [0xaau8; 64];
         assert!(!unsafe { share(7, &name(b"slot1"), req, out.as_mut_ptr().cast()) });
-        // A request with other words 2-3 (another mode) is not shared.
-        assert!(!unsafe { share(7, &slot2, [0x100, 1], out.as_mut_ptr().cast()) });
+        // A request with other blocks or systemBlocks is not shared.
+        assert!(!unsafe { share(7, &slot2, [0x100, 1, req[2]], out.as_mut_ptr().cast()) });
         // Another user's mount of the same name is not shared either.
         assert!(!unsafe { share(8, &slot2, req, out.as_mut_ptr().cast()) });
         // The held one gets the same point and one more owner; the bytes
@@ -1036,5 +1050,40 @@ mod tests {
         assert!(!unsafe { zero_system_blocks(ro.as_ptr().cast(), &mut untouched) });
         assert!(!unsafe { zero_system_blocks(core::ptr::null(), &mut untouched) });
         assert!(untouched.0.iter().all(|&b| b == 0xaa));
+    }
+
+    #[test]
+    fn a_read_only_point_is_not_shared_with_a_writing_mount() {
+        // The key comes from the 13.x layout: blocks, systemBlocks and the
+        // mode, not the transaction resource id next to it.
+        let slot7 = name::<DIR_BYTES>(b"slot7");
+        let mut ro = Box::new(mount3(-1, 0x01));
+        ro[8..16].copy_from_slice(&(slot7.as_ptr() as u64).to_le_bytes());
+        let (user, dir, req) = unsafe { mount_dir(ro.as_ptr().cast()) }.unwrap();
+        assert_eq!((user, dir), (1, slot7));
+        assert_eq!(req, [0x300, u64::MAX, 0x01]);
+        let mut point = [0u8; 64];
+        point[..10].copy_from_slice(b"/savedata3");
+        unsafe { remember(user, dir, req, point.as_ptr().cast(), passed_seq()) };
+        let mut out = [0u8; 64];
+        let mode = |m: u64| [req[0], req[1], m];
+        // Writing requests get BUSY back, not the read-only point.
+        for m in [0x02, 0x06, 0x22] {
+            assert!(!unsafe { share(user, &dir, mode(m), out.as_mut_ptr().cast()) });
+        }
+        // Another read-only mount shares it.
+        assert!(unsafe { share(user, &dir, mode(0x01), out.as_mut_ptr().cast()) });
+
+        // A writable point is shared with a writing or a read-only request.
+        let slot8 = name::<DIR_BYTES>(b"slot8");
+        let mut rw = [0u8; 64];
+        rw[..10].copy_from_slice(b"/savedata4");
+        unsafe { remember(user, slot8, mode(0x02), rw.as_ptr().cast(), passed_seq()) };
+        assert!(unsafe { share(user, &slot8, mode(0x06), out.as_mut_ptr().cast()) });
+        assert!(unsafe { share(user, &slot8, mode(0x01), out.as_mut_ptr().cast()) });
+        let t = unsafe { &mut *MOUNTED.get() };
+        t.iter_mut()
+            .filter(|m| m.dir == slot7 || m.dir == slot8)
+            .for_each(|m| *m = MOUNTED0);
     }
 }

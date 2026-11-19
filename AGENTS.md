@@ -168,8 +168,9 @@ hooks: `sceSaveDataSaveIconByPath` hands a packed icon to
 freed after the call (the save service cannot open a packed path, and a
 path to a decoded copy under /data/ampr_cache hung the service call);
 `sceSaveDataMount3` answers a BUSY mount of a directory the game already
-has mounted with that mount's point, and `sceSaveDataUmount2` counts its
-owners, so only the last owner's unmount reaches the service. An
+has mounted with that mount's point (same blocks and systemBlocks, and
+never a read-only point to a mount that writes), and
+`sceSaveDataUmount2` counts its owners, so only the last owner's unmount reaches the service. An
 interrupted save left a slot the game kept mounted and mounted again: BUSY
 there hung the load forever when passed back, and unmounting the game's
 other points instead made another title hang on close. A creating
