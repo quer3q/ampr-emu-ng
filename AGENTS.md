@@ -210,13 +210,13 @@ CI (`.github/workflows/build.yml`) runs the same commands; a pushed `v*` tag cre
   decoder workspaces, one per live zstd worker, taken at its start and
   freed when it retires), and Cache, the rest of the pool
   (`CACHE_MEMORY_MAX` = pool - Index - Buffer - sites budget - stack
-  block, rounded down to 16 KiB; 137.09 MiB release, 135.75 MiB debug).
+  block, rounded down to 16 KiB; 32.00 MiB release, 30.64 MiB debug).
   The cache is one decoded chunk cache carved at the pack mount and carved
   again, still empty, once the index view is finished: the Index cap's idle
-  room above 4 MiB (`INDEX_KEPT_ROOM`) moves to the Cache cap and the cache
+  room above 2 MiB (`INDEX_KEPT_ROOM`, 4 MiB before) moves to the Cache cap and the cache
   takes it in one block (`grow_cache_from_index` in `rt/pack/manifest.rs`,
-  debug `cache_grown_bytes`; about 70 MiB more on a title using 5.6 MiB of
-  Index). Nothing may allocate from the Index ledger after startup beyond
+  debug `cache_grown_bytes`; 76-80 MiB more on three titles, 103-107 MiB
+  of debug cache in all, debug /metrics). Nothing may allocate from the Index ledger after startup beyond
   that kept room; its two uses are the 64 KiB getdents listing window
   (`take_listing_window` in `rt/pack/directories.rs`, taken once on the
   first listing of a packed directory when names are read from the kept
@@ -237,17 +237,22 @@ CI (`.github/workflows/build.yml`) runs the same commands; a pushed `v*` tag cre
   `STATIC_POOL_SIZE` in `rt/runtime_memory.rs` (1.69 MiB used,
   `POOL_SITES_MAX`, the heap block included; a host
   test fails on a new pool call). A build-time assert checks that the
-  caps plus the budget fit the pool. Both PRX builds load to at most
-  256 MiB (PT_LOAD memsz), within a 16 KiB page of it, with no padding:
-  the release pool is 249.28 MiB (`AMPR_INTERNAL_POOL_SIZE` `0xf948000`),
-  the debug one 247.92 MiB (`AMPR_DEBUG_POOL_SIZE` `0xf7ec000`), the gap
-  being the debug build's larger non-pool part (8.06 vs 6.71 MiB; totals
-  268,422,330 and 268,420,530 B, 1,800 B apart, from `dist`). `dist` fails
-  when the two totals differ by more than 64 KiB or exceed 256 MiB
-  (`PRX_TOTAL_LIMIT` in `tools/verify_payload_prx.py --prx-totals`); then
-  recompute both pools, (256 MiB - non-pool) rounded down to 16 KiB, and
-  update the Makefile comment, `DEFAULT_POOL_SIZE` and the host test
-  `cache_is_the_pool_remainder`. Before: 184.44 MiB totals, a 64 MiB
+  caps plus the budget fit the pool. The release pool is the fixed
+  caps plus a 32 MiB cache, 144.19 MiB (`AMPR_INTERNAL_POOL_SIZE`
+  `0x9030000`), and both PRX builds load to its total, 150.89 MiB (PT_LOAD
+  memsz), within a 16 KiB page, with no padding: the debug pool is
+  142.83 MiB (`AMPR_DEBUG_POOL_SIZE` `0x8ED4000`), the gap being the debug
+  build's larger non-pool part (8.06 vs 6.70 MiB; totals 158,221,826 and
+  158,219,474 B, 2,352 B apart, from `dist`). Against the 192 MiB pool it
+  lost no game wait per read on three titles (debug /metrics, one run
+  each; Makefile comment). `dist` fails when the two totals differ by more than 64 KiB or
+  exceed 256 MiB (`PRX_TOTAL_LIMIT` in `tools/verify_payload_prx.py
+  --prx-totals`); then recompute the debug pool, (release total - debug
+  non-pool) rounded down to 16 KiB, and update the Makefile comment,
+  `DEFAULT_POOL_SIZE` and the host test `cache_is_the_pool_remainder`.
+  Before: 198.70 MiB totals, pools `0xC000000` and `0xBEA4000`, caches
+  79.81 and 78.45 MiB at the mount; 256 MiB totals, pools `0xf948000` and
+  `0xf7ec000`, caches 137.09 and 135.73 MiB; before that, 184.44 MiB totals, a 64 MiB
   cache, pools `0xafd4000` and `0xae78000`. A refused allocation degrades
   (index: one notice, packs unserved; cache off). Every I/O window is taken at the
   worker start, after the decode buffers, and the pipeline count is the
@@ -336,7 +341,7 @@ CI (`.github/workflows/build.yml`) runs the same commands; a pushed `v*` tag cre
    0x720 debug), and the save icon's packed read under the icon hook
    (`ICON_READ_CHAIN`, 0xb78 release, 0x7e8 debug), and the module loader
    hook (`LOADER_CHAIN`, `load_resolved` and `observe_loaded` in
-   `rt/hook.rs`; 0x600 release, 0x7c0 debug, was 0xe50 and 0xfe0 before
+   `rt/hook.rs`; 0x640 release, 0x800 debug, was 0xe50 and 0xfe0 before
    the split). A change
    that grows one moves the cold code out of line instead of raising the
    budget.

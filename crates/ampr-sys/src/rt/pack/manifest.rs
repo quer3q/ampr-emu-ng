@@ -374,7 +374,8 @@ pub(crate) unsafe fn initialize_caches(state: *mut PackState) {
 /// ledger's room left over its kept room moves to the Cache cap and the
 /// still-empty cache is carved again as one block at the new size. The
 /// Index ledger takes nothing after startup, so its room was idle: 74 of
-/// 80 MiB on one zstd title (5.6 MiB used, debug /metrics). If the pool has
+/// 80 MiB on one zstd title (5.6 MiB used, debug /metrics), all but the
+/// 2 MiB `INDEX_KEPT_ROOM` of it moved. If the pool has
 /// no block that large, the size steps down by an eighth of the moved room
 /// to the old size; what the cache does not take goes back to the Index cap.
 /// A runtime profile or debug knob that asked a smaller cache keeps it.

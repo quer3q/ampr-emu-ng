@@ -20,11 +20,24 @@ AMPR_MEM_REPORT ?= 0
 # the rest (rt/index_memory.rs `CACHE_MEMORY_MAX`, one decoded chunk cache;
 # chunks are read with exact-size reads and no read pages are kept). A pool
 # that leaves the cache under 16 MiB fails the build.
-# The PRX total T (PT_LOAD memsz) is 256 MiB: the owner states a PRX of
-# this size loads (v0.3.4 loaded at 200.7 MiB). Each pool is T minus its
-# build's non-pool part (code, data, reactor storage), rounded down to a
-# 16 KiB page, with no padding, so both totals are within a page of T and
-# the release cache is 1.34 MiB larger than the debug one (about 1%).
+# The release pool is the fixed caps plus a 32 MiB cache at the mount,
+# 0x9030000 (144.19 MiB), to shrink the runtime's memory: the PRX total T
+# (PT_LOAD memsz) is that pool plus the release non-pool part (code, data,
+# reactor storage), 150.89 MiB. The debug pool is T minus the debug
+# non-pool part, rounded down to a 16 KiB page, so both totals are within
+# a page of T and the release cache is 1.36 MiB larger than the debug one
+# (32.00 vs 30.64 MiB at the mount). The cache then grows into the Index
+# ledger's idle room (76-80 MiB on three titles, 103-107 MiB debug in
+# all). Against the 192 MiB pool (cache 78.45 MiB debug at the mount,
+# 151-155 after growth), debug /metrics, one run each: game wait per read
+# 267 vs 328 us (285 on a rerun) on a zstd title, its hit rate 65.6 vs
+# 67.8% and 7% more disk reads; 2198 vs 2523 us on a second zstd title;
+# 1429 vs 1505 us on a pkg title, hit rates within a point. The faster
+# disk reads came with a console that got faster during the session (the
+# same 192 MiB build: 648 then 497 us per disk read), so this is no loss,
+# not a gain. Before, T was 198.70 MiB (release pool 0xC000000, v0.3.4's)
+# and before that 256 MiB (pools 0xf948000 and 0xf7ec000, caches 137.09
+# and 135.73 MiB), fitted as below.
 # Fitted from a `dist` build after the removals and the read path changes
 # of the 256 MiB change, with the save icon and shared mount hooks (a
 # fifth trampoline page in debug): non-pool parts release 8986754 B
@@ -47,12 +60,17 @@ AMPR_MEM_REPORT ?= 0
 # non-pool parts to 7031994 B (release) and 8455602 B (debug): release
 # pool 0xf948000 (cache 137.09 MiB), debug 0xf7ec000 (247.92 MiB, cache
 # 135.73), totals 256 MiB minus 13126 B and minus 14926 B, 1800 B apart.
+# Rust 1.100.0, ps5-payload-sdk v0.45 and iced-x86 1.22.0 moved them to
+# 7030274 B and 8453330 B, pools unchanged: totals 256 MiB minus 14846 B
+# and minus 17198 B, 2352 B apart. Then the release pool went to
+# 0x9030000 and the debug one to 0x8ED4000 (142.83 MiB): totals 158221826
+# and 158219474 B, 2352 B apart.
 # Once the index is
 # built the cache grows into the Index ledger's idle room
 # (rt/pack/manifest.rs `grow_cache_from_index`). (The first guess, from the non-pool parts before the removals,
 # 9027282 B and 10452034 B, was 0xf764000 and 0xf608000.) Recompute both
-# after a change to the non-pool parts: pool = (256 MiB - non-pool) rounded
-# down to 16 KiB.
+# after a change to the non-pool parts: the debug pool = (release total -
+# debug non-pool) rounded down to 16 KiB.
 # Before (184.44 MiB layout): release 0xafd4000 (175.83 MiB), debug
 # 0xae78000 (174.47 MiB), a 64 MiB cache, the release pool padded by
 # 1.39 MiB so both totals matched.
@@ -72,7 +90,7 @@ AMPR_MEM_REPORT ?= 0
 # 384 B (debug) off them; both totals stayed 168.52 MiB, 472 B apart (728 B
 # before). `dist` checks both totals
 # (tools/verify_payload_prx.py --prx-totals): they must match within 64 KiB
-# and stay at most 256 MiB, else recompute the two pools here.
+# and stay at most 256 MiB, else recompute the debug pool here.
 # The first pool allocation publishes the pool (mprotect), so the startup
 # cache carve can use it; a carve before the pool was published failed
 # (pool_alloc_failed 1, cache off).
@@ -81,12 +99,12 @@ AMPR_MEM_REPORT ?= 0
 # did (a title had 42 MiB of direct memory free during play), and flexible
 # memory had 0-28 MiB free in another title (debug /metrics flex_* and the
 # former direct memory lines).
-AMPR_INTERNAL_POOL_SIZE ?= 0xf948000
+AMPR_INTERNAL_POOL_SIZE ?= 0x9030000
 # Debug build pool (passed to it as AMPR_INTERNAL_POOL_SIZE by `dist`):
-# T minus the debug non-pool part, 247.92 MiB, the same fixed caps as
+# T minus the debug non-pool part, 142.83 MiB, the same fixed caps as
 # release and a cache 1.36 MiB smaller; host tests build with it
 # (rt/runtime_memory.rs `DEFAULT_POOL_SIZE`).
-AMPR_DEBUG_POOL_SIZE ?= 0xf7ec000
+AMPR_DEBUG_POOL_SIZE ?= 0x8ED4000
 # Pread pool threads: at most 6 (tune::RELEASE_PREAD_THREADS), grown by
 # backlog and kept until pressure mode gives them back, within the
 # runtime-wide budget of 16 worker

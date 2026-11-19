@@ -24,8 +24,8 @@ but are untested.
 ### Build
 
 The build needs Docker. The first run builds the toolchain image
-`ampr-emu-ng-ps5:latest` from `ps5/Dockerfile` (Rust 1.99.0, LLVM 19,
-ps5-payload-sdk v0.43); `AMPR_PS5_IMAGE` picks another image.
+`ampr-emu-ng-ps5:latest` from `ps5/Dockerfile` (Rust 1.100.0, LLVM 19,
+ps5-payload-sdk v0.45); `AMPR_PS5_IMAGE` picks another image.
 
 ```sh
 ./ps5/build-docker.sh            # make dist

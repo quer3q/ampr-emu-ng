@@ -10,4 +10,4 @@ name = "ampr_lz4"
 [dependencies]
 ampr-codec = { path = "../ampr-codec" }
 ampr-format = { path = "../ampr-format" }
-lz4_flex = { version = "=0.14.0", default-features = false, features = ["checked-decode"] }
+lz4_flex = { version = "=0.14.2", default-features = false, features = ["checked-decode"] }

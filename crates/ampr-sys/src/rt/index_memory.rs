@@ -60,9 +60,9 @@ pub(crate) const INDEX_MEMORY_MAX: usize = 80 * MIB;
 /// a 16 KiB cache page. The cache is the only part whose size changes
 /// behaviour (more I/O windows, 12 vs 16, and more decode workers, 4 vs 8,
 /// measured flat: 312 vs 315 us game wait per read), so the PRX total is a
-/// round number and the cache takes the rest: 135.75 MiB in the debug pool,
-/// 137.09 MiB in the release one at the 256 MiB layout (pools fitted from
-/// a `dist` build, Makefile).
+/// fixed pool and the cache takes the rest: 30.64 MiB in the debug pool,
+/// 32 MiB in the release one, before it grows into the Index ledger's
+/// idle room (debug pool fitted from a `dist` build, Makefile).
 /// The decoded cache default is this whole cap (rt/pack/mod.rs
 /// `AMPR_EMU_PACK_DECODED_CACHE_BYTES`); a runtime profile or debug knob
 /// asking less gets that (pack/manifest.rs `cache_region`).
@@ -542,9 +542,10 @@ pub(crate) fn cache_room() -> usize {
 }
 
 /// Index room kept when the rest moves to the cache: for any later Index
-/// allocation (debug /bench, the 64 KiB getdents listing window taken on
-/// the first packed listing) and the holes the build left in the pool.
-pub(crate) const INDEX_KEPT_ROOM: usize = 4 * MIB;
+/// allocation (debug /bench, which halves its 8 MiB buffer down to 256 or
+/// 512 KiB, the 64 KiB getdents listing window taken on the first packed
+/// listing) and the holes the build left in the pool. 4 MiB before.
+pub(crate) const INDEX_KEPT_ROOM: usize = 2 * MIB;
 
 /// Once the index is finished (rt/pack/manifest.rs `grow_cache_from_index`):
 /// moves the Index cap's unused room above INDEX_KEPT_ROOM to the Cache cap,
@@ -715,12 +716,12 @@ mod tests {
         let fixed = INDEX_MEMORY_MAX + BUFFER_MEMORY_MAX + POOL_SITES_BUDGET + STACK_MEMORY_MAX;
         assert_eq!(CACHE_MEMORY_MAX, (STATIC_POOL_SIZE - fixed) / PAGE * PAGE);
         assert_eq!(CACHE_MEMORY_MAX % PAGE, 0);
-        // The debug pool of the 256 MiB layout, 0xf7ec000 (247.92 MiB):
-        // 80 + 28.44 + 1.75 + 2 MiB fixed, the cache 135.73 MiB.
-        assert_eq!(STATIC_POOL_SIZE, 0xf7e_c000);
+        // The debug pool next to the 32 MiB-cache release pool, 0x8ed4000
+        // (142.83 MiB): 80 + 28.44 + 1.75 + 2 MiB fixed, the cache 30.64 MiB.
+        assert_eq!(STATIC_POOL_SIZE, 0x8ed_4000);
         assert_eq!(POOL_SITES_BUDGET, 0x1c_0000);
-        assert_eq!(CACHE_MEMORY_MAX, 0xf7e_c000 - fixed);
-        assert_eq!(CACHE_MEMORY_MAX, 142_327_808);
+        assert_eq!(CACHE_MEMORY_MAX, 0x8ed_4000 - fixed);
+        assert_eq!(CACHE_MEMORY_MAX, 32_129_024);
     }
 
     #[test]

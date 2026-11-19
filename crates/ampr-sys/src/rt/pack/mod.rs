@@ -838,9 +838,9 @@ pub(crate) const AMPR_EMU_PACK_MAX_PACKS: usize = 1024;
 /// all 18 of the old cap busy (debug /metrics).
 pub(crate) const AMPR_EMU_PACK_OPEN_PACK_FD_CAP: u32 = 32;
 /// The whole Cache ledger, the pool's remainder (rt/index_memory.rs
-/// `CACHE_MEMORY_MAX`: 135.75 MiB debug, 137.09 MiB release at the 256 MiB
-/// layout; debug knob `decoded_mib`): the only pack cache, so the release
-/// cache is about 1% larger than the debug one. Exact reads with 64 MiB
+/// `CACHE_MEMORY_MAX`: 30.64 MiB debug, 32 MiB release at the mount, then
+/// grown from the Index ledger; debug knob `decoded_mib`): the only pack
+/// cache, so the release cache is 1.36 MiB larger than the debug one. Exact reads with 64 MiB
 /// decoded gave 11-14% lower game wait per read than 32 + 32 MiB page reads
 /// on two zstd titles (debug /metrics). At 16 MiB a zstd title (debug /metrics, 150 s)
 /// re-decoded an evicted chunk in 73% of its misses: 29.9 GB decoded for

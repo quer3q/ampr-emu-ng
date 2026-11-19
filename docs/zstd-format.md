@@ -152,9 +152,9 @@ Contiguous chunks are one byte range in one volume, so a batch is one
 pread whose chunks the decode workers decode in parallel. The pread is
 exact-size: it covers the chunks' stored bytes, not rounded to pages, and
 never past the volume's end. Read bytes are not cached; decoded chunks go
-to the decoded cache, the rest of the runtime pool (137.09 MiB release at
+to the decoded cache, the rest of the runtime pool (32 MiB release at
 the mount, then grown into the Index ledger's idle room once the index is
-built: 204 MiB on a title using 5.6 MiB of Index). A game read spanning several chunks is split
+built: 103 MiB debug on a title using 5.6 MiB of Index). A game read spanning several chunks is split
 into chunk-aligned child jobs (`rt/pack/pack_split.rs`).
 
 ## What is packed

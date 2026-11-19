@@ -8,16 +8,16 @@ with it, then ship the release build.
 
 `./ps5/build-docker.sh` (`make dist`) builds both files. The debug one is
 `make AMPR_MEM_REPORT=1` (Cargo feature `mem_report`) with the pool set to
-`AMPR_DEBUG_POOL_SIZE` (`0xf7f0000`, 247.94 MiB); the release pool is
-`0xf948000` (249.28 MiB). The smaller pool offsets the larger debug code, so
-both PRX files load to 256 MiB (within a 16 KiB page) with the same Index
-and Buffer caps and thread limits. The decoded cache is the rest of the
-pool, so the debug cache is 1.34 MiB (about 1%) smaller: 135.75 vs
-137.09 MiB; debug cache numbers are that much conservative. Those are the
+`AMPR_DEBUG_POOL_SIZE` (`0x8ED4000`, 142.83 MiB); the release pool is
+`0x9030000` (144.19 MiB). The smaller pool offsets the larger debug code,
+so both PRX files load to 150.89 MiB (within a 16 KiB page) with the same
+Index and Buffer caps and thread limits. The decoded cache is the rest of
+the pool, so the debug cache is 1.36 MiB (about 4%) smaller: 30.64 vs
+32.00 MiB; debug cache numbers are that much conservative. Those are the
 sizes carved at the pack mount: once the index is built the cache grows
-into the Index ledger's idle room above 4 MiB (`cache_grown_bytes`; 204 MiB
-on a zstd title using 5.6 MiB of Index, 208 MiB on a pkg title using
-1.4 MiB), and `cache_mem_cap_bytes` shows the cap after the move.
+into the Index ledger's idle room above 2 MiB (`cache_grown_bytes`, 76-80
+MiB on two zstd titles and a pkg title, 103-107 MiB in all), and
+`cache_mem_cap_bytes` shows the cap after the move.
 
 Only the debug build:
 
@@ -117,7 +117,7 @@ Pack chunks are read with exact-size reads, the only read path: one disk
 read covers a chunk's stored bytes, adjacent chunks coalesced.
 `pack_disk_reads` counts those reads and `pack_disk_bytes` their bytes.
 Read bytes are not cached; decoded chunks go to the decoded cache, the
-Cache ledger (135.75 MiB in the debug build).
+Cache ledger (30.64 MiB in the debug build at the mount).
 
 Most runs compare three numbers:
 

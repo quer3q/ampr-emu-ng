@@ -23,12 +23,12 @@ jobs:
     runs-on: ubuntu-latest
     env:
       # Same toolchain as ps5/Dockerfile and crates/ampr-zstd rust-version.
-      RUSTUP_TOOLCHAIN: 1.99.0
+      RUSTUP_TOOLCHAIN: 1.100.0
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install Rust
         run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -43,8 +43,8 @@ jobs:
     name: build sprx
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/cache@v4
+      - uses: actions/checkout@v7
+      - uses: actions/cache@v6
         with:
           path: |
             out/cargo-home/registry
@@ -56,7 +56,7 @@ jobs:
         run: ./ps5/build-docker.sh dist ${{ github.ref == 'refs/heads/main' && 'AMPR_BETA=1' || '' }}
       - name: sha256
         run: sha256sum libSceAmpr.sprx libSceAmpr-debug.sprx | tee SHA256SUMS
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: sprx
           path: |
@@ -73,7 +73,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: sprx
       - name: Create draft release
@@ -107,7 +107,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: sprx
       - name: Update beta pre-release

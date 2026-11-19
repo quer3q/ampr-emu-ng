@@ -53,9 +53,10 @@ def fself_versions(data: bytes) -> tuple[int, int]:
 MIB = 1 << 20
 # The release and debug PRX must have the same size (Makefile
 # AMPR_INTERNAL_POOL_SIZE / AMPR_DEBUG_POOL_SIZE), at most PRX_TOTAL_LIMIT:
-# each pool is 256 MiB minus its build's non-pool part, rounded down to a
-# 16 KiB page, so both totals fall within one page of it. The owner states
-# a PRX of this size loads (v0.3.4 loaded at 200.7 MiB).
+# the release pool is fixed (the caps plus a 32 MiB cache) and the debug pool is the
+# release total minus the debug non-pool part, rounded down to a 16 KiB
+# page, so both totals fall within one page. The owner states a PRX of
+# 256 MiB loads (v0.3.4 loaded at 200.7 MiB).
 PRX_TOTAL_LIMIT = 256 * MIB
 PRX_TOTAL_SLACK = 64 << 10
 
@@ -84,7 +85,7 @@ def check_prx_totals(release: Path, debug: Path) -> int:
         raise ValueError(
             "release and debug PRX totals must match within 64 KiB and stay "
             f"at most {PRX_TOTAL_LIMIT // MIB} MiB: recompute the Makefile "
-            "pools, each (256 MiB - its non-pool part) rounded down to 16 KiB "
+            "debug pool, (release total - debug non-pool part) rounded down to 16 KiB "
             f"(release over by {rel - PRX_TOTAL_LIMIT:+d} B, debug over by "
             f"{dbg - PRX_TOTAL_LIMIT:+d} B)"
         )
