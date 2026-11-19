@@ -367,9 +367,6 @@ fn readable(p: usize, len: usize) -> bool {
     if cfg!(test) {
         return true;
     }
-    if !super::sys::memory_query_available() {
-        return false;
-    }
     let Some(mapping) = super::sys::query_memory_mapping(p) else {
         return false;
     };

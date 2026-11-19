@@ -236,8 +236,7 @@ stats! {
     /// CPU-writable when the pass first checked it, so the worker waited for
     /// it (once per read, not once per task), and those still missing at the
     /// job's deadline, failed with EFAULT (pack/virtual_read.rs
-    /// ensure_destination). Without the wait the write faulted the worker
-    /// and killed the game (PPSA10665).
+    /// ensure_destination). Without the wait the write faulted the worker.
     PackDestWaits = "pack_dest_waits",
     PackDestFaults = "pack_dest_faults",
     /// Destination queries sceKernelQueryMemoryProtection refused (EACCES),
@@ -256,9 +255,9 @@ stats! {
     AprAddressFaults = "apr_address_faults",
     /// Software WaitOnAddress / WriteAddress target checks the query refused
     /// with EACCES (reactor/software.rs address_query_allows). A write goes
-    /// ahead unchecked. A wait goes ahead too: on the kstuff title those
-    /// targets are mapped (its stores and its reads use them) and refusing
-    /// the waits froze it. A title that signals a read batch with a
+    /// ahead unchecked. A wait goes ahead too: on a zstd title those
+    /// targets are mapped (its stores land there) and refusing the waits
+    /// froze it. A title that signals a read batch with a
     /// WriteAddress to such a target hung on the loading screen while the
     /// write was refused.
     AprAddressQueryDenied = "apr_address_query_denied",

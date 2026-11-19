@@ -188,18 +188,12 @@ impl AprAioReactor {
     /// is unmapped: a title that signals a read batch with a WriteAddress to
     /// such a target hung on the loading screen while the op was refused.
     /// A write goes ahead unchecked; if the target is in fact unmapped the
-    /// store faults the reactor thread. A wait goes ahead too. One zstd
-    /// title on the kstuff loader gets EACCES for its mapped address targets
-    /// (issue #84: 3,520 WriteAddress stores landed on EACCES targets in one
-    /// session), and 3 refused WAIT_ON_ADDRESS ops at a late story point were
-    /// the only error before the title stopped submitting reads or waits;
-    /// three earlier runs froze the same way, and letting the waits through
-    /// fixed it (345 s, 248 waits served). A query that works on the same
-    /// console describes the runtime's own memory but still refuses these.
-    /// The risk left is a wait on a target the query refuses to describe and
-    /// that is in fact unmapped, which faults the reactor thread (the
-    /// upstream save-time crash class) instead of answering an error.
-    /// v0.4.1 checked nothing and let both through.
+    /// store faults the reactor thread. A wait goes ahead too: a zstd title
+    /// gets EACCES for mapped targets (3,520 WriteAddress stores to them
+    /// landed in one session), and refusing its waits froze it in every run
+    /// (debug /metrics). The risk left is a wait on a refused target that is
+    /// in fact unmapped, which faults the reactor thread instead of
+    /// answering an error (`sys::eacces_is_unmapped` tells which).
     pub(crate) fn address_query_allows(
         rc: c_int,
         start: usize,

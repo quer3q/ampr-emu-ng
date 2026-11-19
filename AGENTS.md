@@ -237,7 +237,7 @@ CI (`.github/workflows/build.yml`) runs the same commands; a pushed `v*` tag cre
   the release pool is 249.28 MiB (`AMPR_INTERNAL_POOL_SIZE` `0xf948000`),
   the debug one 247.92 MiB (`AMPR_DEBUG_POOL_SIZE` `0xf7ec000`), the gap
   being the debug build's larger non-pool part (8.06 vs 6.71 MiB; totals
-  268,422,010 and 268,419,106 B, 2,904 B apart, from `dist`). `dist` fails
+  268,422,330 and 268,420,530 B, 1,800 B apart, from `dist`). `dist` fails
   when the two totals differ by more than 64 KiB or exceed 256 MiB
   (`PRX_TOTAL_LIMIT` in `tools/verify_payload_prx.py --prx-totals`); then
   recompute both pools, (256 MiB - non-pool) rounded down to 16 KiB, and

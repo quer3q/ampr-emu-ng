@@ -54,8 +54,11 @@ pub(crate) unsafe fn complete_virtual_job(
         stats::add(stats::Stat::PackJobErrors, 1);
         // Debug black box: a failed pack read (EFAULT from an unmapped
         // destination, or another error) with its file id, so a run that
-        // dies before /metrics answers still shows it.
-        stats::apr_call_error(b'r', return_value, b"pack-read fid=", job.file_id as u64, b"");
+        // dies before /metrics answers still shows it. Cancels are left out:
+        // they would use up the 64 lines the wait and submit errors share.
+        if return_value != SCE_KERNEL_ERROR_ECANCELED as i64 {
+            stats::apr_call_error(b'r', return_value, b"pack-read fid=", job.file_id as u64, b"");
+        }
     }
     job.return_value = return_value;
     job.completion_state = completion_state;

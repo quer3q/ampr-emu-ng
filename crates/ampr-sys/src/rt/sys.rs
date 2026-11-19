@@ -623,11 +623,8 @@ static EACCES_IS_UNMAPPED: core::sync::atomic::AtomicU8 =
 /// which would make an EACCES WaitOnAddress target indistinguishable from an
 /// unmapped one. Asked once, when the first EACCES target arrives, and
 /// published as the debug `apr_address_eacces_unmapped` counter (1) and a
-/// `b'a'` black-box line, so a console run answers the question the review
-/// left open. The waits go ahead either way: on PPSA10665 three refused
-/// waits were the only error before the freeze, while thousands of
-/// WriteAddress stores into EACCES targets landed (they are mapped), and
-/// letting them through fixed it (b934727).
+/// `b'a'` black-box line. The waits go ahead either way
+/// (reactor/software.rs `address_query_allows`).
 pub(crate) fn eacces_is_unmapped() -> bool {
     use core::sync::atomic::Ordering;
     let seen = EACCES_IS_UNMAPPED.load(Ordering::Relaxed);

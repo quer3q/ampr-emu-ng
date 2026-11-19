@@ -21,26 +21,24 @@ unsafe fn timed_copy(src: *const u8, dst: *mut u8, len: usize) {
 // decode straight into it, where kernel AIO and retail AMPR write it from
 // the kernel and answer EFAULT for a page that is not mapped. A title that
 // maps its streaming memory with AMM commands, which execute
-// asynchronously, can submit a read before its destination pages exist:
-// Final Fantasy XVI (PPSA10665, zstd packs, v0.4.1 debug) faulted a pack
-// worker in this copy 1.6 ms after submitting a 256 KiB read whose middle
-// 192 KiB was not mapped yet, killing the game (coredump
-// PPSA10665_1794828032: job running, not canceled, the pages on both sides
-// mapped with AMPR protection). The reactor already waits out such a read
-// (reactor/capacity.rs, AMPR_EMU_APR_AIO_AMM_EFAULT_RETRY_*); a pack task
-// now waits the same way before it writes, and fails the read with EFAULT
-// when the destination is still missing after the retries.
+// asynchronously, can submit a read before its destination pages exist: a
+// zstd title faulted a pack worker in this copy 1.6 ms after submitting a
+// 256 KiB read whose middle 192 KiB was not mapped yet (core dump). The
+// reactor already waits out such a read (reactor/capacity.rs,
+// AMPR_EMU_APR_AIO_AMM_EFAULT_RETRY_*); a pack task waits the same way
+// before it writes, and fails the read with EFAULT when the destination is
+// still missing after the retries.
 //
-// The whole read's destination is checked once per pass, before any decoded
-// chunk lease is taken: a wait that runs out must not publish EFAULT into a
-// shared cache entry other jobs wait on. A pass runs until a yield, so the
-// destination is rechecked only after one, and the deadline lives in the
-// pipeline (one per job), so a read of N tasks waits at most 640 ms, not
-// N x 640.
+// The rest of the read's destination, from the current task on, is checked
+// once per pass with no decoded chunk lease held: a wait must not park the
+// jobs waiting on a chunk, and one that runs out must not publish EFAULT
+// into it. Task destinations rise with the task index, so that range holds
+// every later write of the pass. The deadline lives in the pipeline (one
+// per job), so a read of N tasks waits at most 640 ms, not N x 640.
 //
 // The check asks sceKernelQueryMemoryProtection per mapping. A setup whose
-// kernel refuses to describe mappings at all (EACCES for every query: the
-// PPSA10665 kstuff case, `sys::query_protection_is_blind`) probes each page
+// kernel refuses to describe mappings at all (EACCES for every query,
+// `sys::query_protection_is_blind`) probes each page
 // instead with a syscall that copies 16 bytes out into it
 // (sceKernelClockGetres), which returns an error for a page the game cannot
 // write where the CPU copy would fault. A protection is per page, so one
@@ -114,8 +112,8 @@ fn destination_covered(
     let mut addr = dst;
     // A refused answer on this title means the query cannot describe the
     // page, and the next page is likely the same: probe the rest instead of
-    // paying a query per page (PPSA10665 answered EACCES 1.38M times in one
-    // session).
+    // paying a query per page (one zstd title answered EACCES 1.38M times in
+    // one session).
     let mut probe_only = blind;
     while addr < last {
         let step = if probe_only {
@@ -177,7 +175,8 @@ fn destination_mapped(dst: *mut u8, len: usize) -> bool {
     mapped
 }
 
-/// Waits on this worker for the whole read's destination to be mapped, up to
+/// Waits on this worker for `[dst, dst + len)` to be mapped, with no lease
+/// held, up to
 /// one deadline per job: AMPR_EMU_APR_AIO_AMM_EFAULT_RETRY_LIMIT sleeps of
 /// the reactor's AMM retry delay (64 x 10 ms). The deadline lives in the
 /// pipeline, which one job owns. A missing destination is rare (debug
@@ -477,11 +476,16 @@ pub(crate) unsafe fn advance_virtual_read_aio(
                 return fail_virtual_read(pipeline, SCE_KERNEL_ERROR_EIO, error_out);
             }
             let chunk = task.chunk;
+            // The rest of the destination, from this task on (see "game
+            // destinations").
+            let rest = (
+                output.add(task.destination_offset as usize),
+                (length - task.destination_offset as u64) as usize,
+            );
             if pipeline.decoded_lease.entry == INVALID_INDEX {
-                // Before taking a lease: a wait that runs out must not
-                // publish EFAULT into an entry other jobs wait on. The whole
-                // read is one buffer, so one check covers this pass.
-                if let Err(error) = ensure_destination(job, pipeline, output, length as usize) {
+                // Before taking a lease: a wait must not hold an entry other
+                // jobs wait on.
+                if let Err(error) = ensure_destination(job, pipeline, rest.0, rest.1) {
                     return fail_virtual_read(pipeline, error, error_out);
                 }
                 match acquire_task_decoded_chunk(
@@ -504,22 +508,17 @@ pub(crate) unsafe fn advance_virtual_read_aio(
                 }
             }
 
-            let (decode_rc, dest_rc) = decode_task_chunk(
-                job,
-                state,
-                worker,
-                pipeline,
-                &chunk,
-                &task,
-                output,
-                length as usize,
-            );
+            let (decode_rc, copied) =
+                decode_task_chunk(state, worker, pipeline, &chunk, &task, output, rest);
             if decode_rc != 0 {
                 note_decode_error(job.file_id, task.chunk_index, &chunk, decode_rc);
                 return fail_virtual_read(pipeline, decode_rc, error_out);
             }
-            if dest_rc != 0 {
-                return fail_virtual_read(pipeline, dest_rc, error_out);
+            if !copied {
+                // The destination went missing while the lease was held: the
+                // chunk is published, and the task runs again from the top,
+                // where the wait holds no lease and the copy is a cache hit.
+                continue;
             }
             pipeline.task_index += 1;
         }
@@ -743,20 +742,19 @@ unsafe fn prepare_exact_task_window(
 
 /// Decodes the task's chunk from the bound window into the loader lease, the
 /// destination or the worker scratch, publishes a loader lease and copies
-/// the task's bytes out. Returns `(decode_rc, dest_rc)`: a destination that
-/// turned out missing after the decode is `dest_rc`, with the chunk still
-/// published (no other reader gets this job's EFAULT).
+/// the task's bytes out. Returns `(decode_rc, copied)`: `copied` is false
+/// when a loader lease's destination (`rest`, rechecked without a wait) was
+/// missing, so the chunk was published without the copy.
 #[allow(clippy::too_many_arguments)]
 unsafe fn decode_task_chunk(
-    job: &VirtualAioSlot,
     state: *mut PackState,
     worker: &mut WorkerContext,
     pipeline: &mut ReadPipelineContext,
     chunk: &AmprPackChunkView,
     task: &AmprPackBlockReadTask,
     output: *mut u8,
-    length: usize,
-) -> (c_int, c_int) {
+    rest: (*mut u8, usize),
+) -> (c_int, bool) {
     let cache_loader = pipeline.decoded_lease.entry != INVALID_INDEX;
     let decoded = if cache_loader {
         pipeline.decoded_lease.data
@@ -793,22 +791,24 @@ unsafe fn decode_task_chunk(
     } else {
         stats::add(stats::Stat::DecodeErrors, 1);
     }
-    let mut dest_rc = 0;
+    let mut copied = true;
     if cache_loader {
         // Copy out before publishing: the publish drops the loader's pin in
         // the same CACHE_MUTEX section, so the entry may be evicted after
         // it. Readers parked on the chunk wait the copy longer.
         if decode_rc == 0 {
             // The lease was taken before a window read, so the destination
-            // is rechecked here, after the yield. A miss still publishes the
-            // decoded chunk: only this job's copy fails.
-            match ensure_destination(job, pipeline, output, length) {
-                Ok(()) => timed_copy(
+            // is rechecked here, after the yield, without a wait: readers
+            // parked on the chunk must not wait it out too.
+            if !pipeline.dest_checked && !destination_mapped(rest.0, rest.1) {
+                copied = false;
+            } else {
+                pipeline.dest_checked = true;
+                timed_copy(
                     pipeline.decoded_lease.data.add(task.source_offset as usize),
                     output.add(task.destination_offset as usize),
                     task.copy_length as usize,
-                ),
-                Err(error) => dest_rc = error,
+                );
             }
         }
         let waited = cache_publish_and_release(&mut pipeline.decoded_lease, decode_rc);
@@ -830,7 +830,7 @@ unsafe fn decode_task_chunk(
             task.copy_length as usize,
         );
     }
-    (decode_rc, dest_rc)
+    (decode_rc, copied)
 }
 
 // ---- tests --------------------------------------------------------------------
@@ -867,8 +867,8 @@ mod tests {
         }
     }
 
-    /// The same space with every query refused (EACCES), as PPSA10665's
-    /// kernel answered for its software address targets.
+    /// The same space with every query refused (EACCES), as one console
+    /// answered for a title's software address targets.
     fn refusing(_: usize) -> Option<sys::MemoryMapping> {
         Some(sys::MemoryMapping {
             rc: SCE_KERNEL_ERROR_EACCES,
@@ -905,7 +905,7 @@ mod tests {
         )
     }
 
-    /// The PPSA10665 crash shape: a 256 KiB read into a buffer whose middle
+    /// The crash shape from a core dump: a 256 KiB read into a buffer whose middle
     /// 192 KiB was not mapped yet, the pages on both sides mapped.
     #[test]
     fn a_hole_in_the_destination_is_missing() {

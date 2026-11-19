@@ -44,9 +44,9 @@ AMPR_MEM_REPORT ?= 0
 # (cache 135.75), totals 256 MiB minus 14630 B and minus 2774 B, 11856 B
 # apart. The destination wait and the address-query diagnostic
 # (rt/pack/virtual_read.rs, rt/sys.rs `eacces_is_unmapped`) grew the
-# non-pool parts to 7031674 B (release) and 8454178 B (debug): release
+# non-pool parts to 7031994 B (release) and 8455602 B (debug): release
 # pool 0xf948000 (cache 137.09 MiB), debug 0xf7ec000 (247.92 MiB, cache
-# 135.73), totals 256 MiB minus 13446 B and minus 16350 B, 2904 B apart.
+# 135.73), totals 256 MiB minus 13126 B and minus 14926 B, 1800 B apart.
 # Once the index is
 # built the cache grows into the Index ledger's idle room
 # (rt/pack/manifest.rs `grow_cache_from_index`). (The first guess, from the non-pool parts before the removals,
