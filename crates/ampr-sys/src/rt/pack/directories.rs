@@ -375,6 +375,37 @@ fn plain_physical_fd_answers(flags: c_int, real_fd: c_int, packs: bool) -> bool 
     flags & O_DIRECTORY == 0 && real_fd >= 0 && !packs
 }
 
+/// Restores `saved_errno` when `rc >= 0` so internal probes (a failed
+/// physical open, getdents, lseek or overflow-stat that fell back to the pack
+/// overlay) never leave a stale errno on a successful call.
+fn keep_errno_on_success(saved_errno: c_int, rc: c_int) -> c_int {
+    if rc >= 0 {
+        set_errno(saved_errno);
+    }
+    rc
+}
+
+/// Result and errno when the overlay declines an open: a physical hit keeps
+/// the caller's pre-call errno, a physical `-1` keeps the open's own errno
+/// (in case manifest load or index lookup touched errno), and a virtual-only
+/// open returns ENOENT.
+fn open_directory_fallback(
+    allow_physical_open: bool,
+    real_fd: c_int,
+    saved_errno: c_int,
+    open_errno: c_int,
+) -> c_int {
+    if !allow_physical_open {
+        return SCE_KERNEL_ERROR_ENOENT;
+    }
+    if real_fd >= 0 {
+        set_errno(saved_errno);
+    } else if real_fd == -1 {
+        set_errno(open_errno);
+    }
+    real_fd
+}
+
 #[inline(never)]
 pub(crate) unsafe fn ampr_pack_open_directory_impl(
     path: *const c_char,
@@ -390,13 +421,18 @@ pub(crate) unsafe fn ampr_pack_open_directory_impl(
         if path.is_null() || handled.is_null() || !directory_open_flags(flags) {
             return SCE_KERNEL_ERROR_EINVAL;
         }
+        let saved_errno = errno();
         let mut real_fd: c_int = -1;
+        let mut open_errno: c_int = 0;
         if allow_physical_open {
             let Some(open_fn) = real_open() else {
                 return SCE_KERNEL_ERROR_EIO;
             };
             real_fd = open_fn(path, flags, mode as c_int);
             *handled = true;
+            if real_fd < 0 {
+                open_errno = open_failure_errno(real_fd);
+            }
         }
 
         // Read-only overlay: never turn an access/permission error or a
@@ -412,18 +448,11 @@ pub(crate) unsafe fn ampr_pack_open_directory_impl(
         if allow_physical_open && plain_physical_fd_answers(flags, real_fd, packs_present()) {
             return real_fd;
         }
-        if allow_physical_open && real_fd < 0 {
-            let open_errno = open_failure_errno(real_fd);
-            if open_errno != ENOENT && open_errno != ENOTDIR {
-                return real_fd;
-            }
+        if allow_physical_open && real_fd < 0 && open_errno != ENOENT && open_errno != ENOTDIR {
+            return real_fd;
         }
 
-        let fallback = if allow_physical_open {
-            real_fd
-        } else {
-            SCE_KERNEL_ERROR_ENOENT
-        };
+        let fallback = || open_directory_fallback(allow_physical_open, real_fd, saved_errno, open_errno);
         let mut normalized = [0 as c_char; SCE_KERNEL_PATH_MAX];
         let mut normalized_length = 0u16;
         if !normalize_overlay_path(
@@ -432,12 +461,12 @@ pub(crate) unsafe fn ampr_pack_open_directory_impl(
             normalized.len(),
             &mut normalized_length,
         ) {
-            return fallback;
+            return fallback();
         }
         // Held through the listing lookup and the slot allocation: both read
         // the manifest (rt/pack/mod.rs `ManifestReader`).
         let Some(_reader) = ManifestReader::enter() else {
-            return fallback;
+            return fallback();
         };
         let manifest_ready = if allow_physical_open {
             ensure_manifest_ready()
@@ -445,7 +474,7 @@ pub(crate) unsafe fn ampr_pack_open_directory_impl(
             ampr_pack_manifest_is_resident_ready()
         };
         if !manifest_ready {
-            return fallback;
+            return fallback();
         }
         let state = pack_state();
         let mut listing = Cursor::Done;
@@ -455,7 +484,7 @@ pub(crate) unsafe fn ampr_pack_open_directory_impl(
         });
         match found {
             Ok(true) => {}
-            Ok(false) => return fallback,
+            Ok(false) => return fallback(),
             // The index could not be read, so the directory may hold
             // packed entries: EIO, never the physical fd (a listing that
             // omits them) or ENOENT.
@@ -486,7 +515,10 @@ pub(crate) unsafe fn ampr_pack_open_directory_impl(
             close_real_fd(real_fd);
             return SCE_KERNEL_ERROR_EMFILE;
         }
-        encode_virtual_directory_fd(slot)
+        // A packed-only directory's physical probe failed ENOENT above; a
+        // successful open must not leave that errno behind (.NET's PS5
+        // OpenDir/ReadDirR checks errno at EOF without clearing it between calls).
+        keep_errno_on_success(saved_errno, encode_virtual_directory_fd(slot))
     }
 }
 
@@ -915,7 +947,11 @@ pub(crate) unsafe fn ampr_pack_try_directory_read_fd(
     use_getdirentries: bool,
     handled: *mut bool,
 ) -> c_int {
-    let rc = unsafe { directory_read_fd(fd, buffer, size, basep, use_getdirentries, handled) };
+    let saved_errno = errno();
+    let rc = keep_errno_on_success(
+        saved_errno,
+        unsafe { directory_read_fd(fd, buffer, size, basep, use_getdirentries, handled) },
+    );
     #[cfg(feature = "mem_report")]
     if rc < 0 && !handled.is_null() && unsafe { *handled } {
         unsafe { note_directory_read(fd, rc) };
@@ -1359,5 +1395,38 @@ mod tests {
         // its POSIX value, so a failed listing is told apart from a retry.
         assert_eq!(open_failure_errno(SCE_KERNEL_ERROR_EINVAL), EINVAL);
         assert_eq!(open_failure_errno(SCE_KERNEL_ERROR_EIO), EIO);
+    }
+
+    /// Successful overlay opens and directory reads restore the caller's errno
+    /// after an internal probe fails; declined opens keep either the pre-call
+    /// errno (physical hit) or the physical open's errno (miss).
+    #[test]
+    fn directory_overlay_preserves_errno() {
+        set_errno(ENOENT);
+        assert_eq!(keep_errno_on_success(0, 7), 7);
+        assert_eq!(errno(), 0);
+
+        set_errno(EINVAL);
+        assert_eq!(keep_errno_on_success(EAGAIN, 0), 0);
+        assert_eq!(errno(), EAGAIN);
+
+        set_errno(EAGAIN);
+        assert_eq!(keep_errno_on_success(0, -1), -1);
+        assert_eq!(errno(), EAGAIN);
+
+        set_errno(EIO);
+        assert_eq!(open_directory_fallback(true, 5, 0, ENOENT), 5);
+        assert_eq!(errno(), 0);
+
+        set_errno(EIO);
+        assert_eq!(open_directory_fallback(true, -1, 0, ENOENT), -1);
+        assert_eq!(errno(), ENOENT);
+
+        set_errno(EAGAIN);
+        assert_eq!(
+            open_directory_fallback(false, -1, 0, ENOENT),
+            SCE_KERNEL_ERROR_ENOENT
+        );
+        assert_eq!(errno(), EAGAIN);
     }
 }
