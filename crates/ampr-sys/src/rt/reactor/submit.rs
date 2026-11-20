@@ -175,6 +175,11 @@ pub(crate) fn apr_acquire_aio_read_desc(
         if fd == -1 {
             fd = ampr_sce_errno_from_posix(errno());
         }
+        if fd < 0 {
+            // 'L', as the cached open logs it (rt/fd_cache.rs): without it
+            // the black box named no file for a failed single-read open.
+            crate::rt::stats::fs_event(b'L', b'h', fd as i64, directEntry.path);
+        }
         let openErrno = if fd < 0 {
             ampr_posix_errno_from_sce(fd)
         } else {

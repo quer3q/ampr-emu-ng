@@ -1581,6 +1581,7 @@ pub unsafe extern "C" fn module_start(_args: usize, _argp: *const c_void) -> c_i
     {
         unsafe { super::blackbox::open() };
         super::pack::log_discovery();
+        super::blackbox::rw(super::rw::app0_access_errno());
     }
     unsafe { notify_loaded() };
     let rc = unsafe { hook::amprInstallLibkernelHooks() };

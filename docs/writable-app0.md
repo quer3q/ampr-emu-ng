@@ -9,7 +9,8 @@ A game never writes files that are in its packs, so writes only need the
 real filesystem, and packed files stay read-only. On a read-only /app0 the
 runtime behaves as upstream: an index hit is served from the index or the
 pack, an authoritative miss returns ENOENT without touching the
-filesystem, and `access(W_OK)` on a hit returns EROFS.
+filesystem, and `access(W_OK)` on a hit returns EROFS. The one exception
+is an APR resolve of a loose file, which stats it in every mode (below).
 
 ## Detection
 
@@ -19,9 +20,11 @@ hooks install (`module_start` in `rt/exports.rs`). It calls
 yet, and turns the mode on when the call succeeds. On a read-only mount
 the kernel refuses W_OK with EROFS, the same answer `statfs` would give
 through `MNT_RDONLY`; libkernel exports neither `statfs` nor `fstatfs`
-(docs/read-path-tuning.md). Any error counts as read-only.
-`app0_writable()` is one Relaxed load, and every change below depends on
-it.
+(docs/read-path-tuning.md). Any error counts as read-only. A read-only
+exFAT image answered EPERM, not EROFS. The debug black box records the
+answer as `rw on` or `rw off errno=<hex>` ([debug-build.md](debug-build.md)).
+`app0_writable()` is one Relaxed load, and every change below but the APR
+resolve check depends on it.
 
 ## Misses go to the filesystem
 
@@ -52,6 +55,20 @@ miss, and one that cannot be read answers EIO, never ENOENT. Packed hits and
 directories are still answered from the index. A hit is packed when
 `file_id_is_packed` says so; until the pack manifest is ready, every hit in
 a title with packs counts as packed.
+
+An APR resolve (`sceAprResolveFilepathsToIds` and the other resolve
+calls) of a loose hit stats it the same way first, in every mode, not
+only on a writable /app0 (`live_loose_resolve` in `rt/index.rs`): a file
+the index lists but the disk lacks resolves to ENOENT, as it would with
+no index. Without it the resolve handed out an id whose read then failed
+with `SCE_AMPR_ERROR_APR_UNAVAILABLEFILEID`. Demon Slayer -Kimetsu no
+Yaiba- The Hinokami Chronicles (zstd packs, read-only exFAT image) lists
+`apk/saved/config/ps5/gameusersettings.ini` in its `ampr_emu.index`
+while the image lacked it, resolved it and aborted on that read. A
+resolve of a loose file costs one stat; packed files are answered from
+the index. The resolved size is still the index's, because APR reads
+check their range against it, so a loose file whose size differs from
+the index fails its read.
 
 ## Creating a file
 

@@ -22,24 +22,44 @@ pub(crate) fn app0_writable() -> bool {
 const APP0_PREFIX: &[u8] = b"/app0/";
 const CREATE_MODE: sys::SceKernelMode = 0o777;
 
+/// The errno of the module_start `access("/app0", W_OK)`, 0 when it
+/// succeeded, for the debug black box (`rw` line). A read-only exFAT
+/// image answered EPERM, not EROFS.
+static APP0_ACCESS_ERRNO: core::sync::atomic::AtomicI32 = core::sync::atomic::AtomicI32::new(0);
+
 /// module_start, before the hooks: decides the mode.
 pub(crate) unsafe fn init() {
-    if unsafe { app0_access_writable() } {
+    let err = unsafe { probe_app0_access() };
+    APP0_ACCESS_ERRNO.store(err, Ordering::Relaxed);
+    if err == 0 {
         APP0_WRITABLE.store(true, Ordering::Relaxed);
     }
 }
 
-/// access("/app0", W_OK) succeeded: the kernel refuses W_OK with EROFS on
+/// The errno `init` saw, 0 for a writable /app0.
+#[cfg_attr(not(feature = "mem_report"), allow(dead_code))]
+pub(crate) fn app0_access_errno() -> c_int {
+    APP0_ACCESS_ERRNO.load(Ordering::Relaxed)
+}
+
+/// access("/app0", W_OK): 0 when it succeeded, else its errno (EIO when
+/// `access` cannot be resolved). The kernel refuses W_OK with EROFS on
 /// a read-only mount, the same test statfs's MNT_RDONLY would give, and
 /// libkernel exports neither statfs nor fstatfs (docs/read-path-tuning.md).
 /// Any error reads as read-only, today's behaviour. Resolved by name, as
 /// `select_pack_format` resolves stat: no hook is installed yet, so the
 /// symbol is the real call.
-unsafe fn app0_access_writable() -> bool {
+unsafe fn probe_app0_access() -> c_int {
     type AccessFn = unsafe extern "C" fn(*const c_char, c_int) -> c_int;
     const W_OK: c_int = 2;
-    unsafe { sys::resolve_kernel::<AccessFn>(c"access") }
-        .is_some_and(|f| unsafe { f(c"/app0".as_ptr(), W_OK) == 0 })
+    match unsafe { sys::resolve_kernel::<AccessFn>(c"access") } {
+        Some(f) if unsafe { f(c"/app0".as_ptr(), W_OK) } == 0 => 0,
+        Some(_) => match sys::errno() {
+            0 => sys::EIO,
+            e => e,
+        },
+        None => sys::EIO,
+    }
 }
 
 // ---- parents ----

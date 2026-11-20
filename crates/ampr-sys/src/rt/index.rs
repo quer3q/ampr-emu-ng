@@ -3524,6 +3524,10 @@ pub unsafe fn ampr_index_resolve_path_to_id(
     }) else {
         return -ENOENT;
     };
+    let rc = unsafe { live_loose_resolve(path) };
+    if rc != 0 {
+        return rc;
+    }
     unsafe {
         if !out_size.is_null() {
             *out_size = v.size;
@@ -3531,6 +3535,46 @@ pub unsafe fn ampr_index_resolve_path_to_id(
         *out_id = id;
     }
     0
+}
+
+/// A resolve of a loose file hit asks the FS, in every mode, so a file
+/// the index lists but the disk lacks resolves to ENOENT, as retail
+/// sceAprResolveFilepathsToIds answers, instead of an id whose read
+/// fails. Demon Slayer -Kimetsu no Yaiba- The Hinokami Chronicles (zstd
+/// packs, exFAT image) lists `apk/saved/config/ps5/gameusersettings.ini`
+/// in its `ampr_emu.index` while the image lacked it: the game resolved
+/// it and aborted on the read's UNAVAILABLEFILEID (debug black box
+/// `fs E ... indexed-path-missing`, coredump). With this check it got
+/// ENOENT and ran. The mount answered `access("/app0", W_OK)` with
+/// EPERM, so the check cannot be gated on a writable /app0. A resolve
+/// costs one stat only for a loose file; packed files are answered from
+/// the index. 0, -ENOENT, or -EIO when the stored path could not be
+/// read. The size stays the index's: the read checks its range against
+/// it.
+#[inline(never)]
+unsafe fn live_loose_resolve(path: *const c_char) -> c_int {
+    let mut pbuf: EntryPath = [0; PATH_BUF];
+    let mut l = unsafe { lookup_resident(path, &mut pbuf, true) };
+    if l.state != Resident::Hit || unsafe { hit_is_packed(&l) } {
+        return 0;
+    }
+    let mut sb = core::mem::MaybeUninit::<Stat>::uninit();
+    let st = sb.as_mut_ptr().cast();
+    let r = unsafe { hit_call(&mut l, &mut pbuf, path, true, |p| real_posix_stat(p, st)) };
+    live_resolve_rc(r, errno())
+}
+
+/// The resolve answer for the live stat `r` of a loose hit, `err` its
+/// errno: gone (ENOENT, ENOTDIR, or a false hash match) is -ENOENT, an
+/// unreadable stored path -EIO. Any other stat error leaves the hit: the
+/// file is there and its read reports the error.
+fn live_resolve_rc(r: Loose, err: c_int) -> c_int {
+    match r {
+        Loose::Done(rc) if should_try_index_fallback(rc, err) => -ENOENT,
+        Loose::Done(_) => 0,
+        Loose::Miss => -ENOENT,
+        Loose::Io => -EIO,
+    }
 }
 
 /// Size and mtime of one-based file `id`; `out.path` is null (callers that
@@ -4862,6 +4906,18 @@ pub(crate) mod tests {
         let r = loose_call_in(view.as_ref(), &src, &mut l, key, None, &mut pbuf, disk);
         assert_eq!((r, calls.get()), (Loose::Done(3), 1));
         drop_view(&mut idx);
+    }
+
+    /// A resolve of a loose hit: a file missing on disk misses, one that
+    /// is there (or fails some other way) keeps its id.
+    #[test]
+    fn a_live_resolve_misses_only_a_file_that_is_gone() {
+        assert_eq!(live_resolve_rc(Loose::Done(0), 0), 0);
+        assert_eq!(live_resolve_rc(Loose::Done(-1), ENOENT), -ENOENT);
+        assert_eq!(live_resolve_rc(Loose::Done(-1), ENOTDIR), -ENOENT);
+        assert_eq!(live_resolve_rc(Loose::Done(-1), EACCES), 0);
+        assert_eq!(live_resolve_rc(Loose::Miss, 0), -ENOENT);
+        assert_eq!(live_resolve_rc(Loose::Io, 0), -EIO);
     }
 
     /// A lazy lookup's miss is final. Over view fixtures with packed
