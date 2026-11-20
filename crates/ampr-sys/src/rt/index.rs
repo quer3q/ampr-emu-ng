@@ -2483,9 +2483,13 @@ unsafe fn open_with(
     real: RealOpen,
     op: u8,
 ) -> c_int {
+    let saved_errno = errno();
     let mut pbuf: EntryPath = [0; PATH_BUF];
     let mut l = unsafe { lookup_resident(path, &mut pbuf, true) };
     let fd = unsafe { open_resolved(&mut l, &mut pbuf, path, flags, mode, real) };
+    if fd >= 0 {
+        set_errno(saved_errno);
+    }
     // A file hit opened with O_DIRECTORY fails ENOTDIR, as on retail. Not
     // logged: a UE3 title tests every cooked file this way at start (~5000
     // calls on the console), which filled all 96 /fsfail slots.
@@ -2606,6 +2610,7 @@ fn loose_call_in<S: Source + ?Sized>(
     pbuf: &mut EntryPath,
     mut call: impl FnMut(*const c_char) -> c_int,
 ) -> Loose {
+    let saved_errno = errno();
     let mut first = None;
     if let Some(s) = spelling {
         let rc = call(s);
@@ -2629,7 +2634,13 @@ fn loose_call_in<S: Source + ?Sized>(
         Some((s, rc, err)) if unsafe { cstr_bytes(s) } == &pbuf[..n] => {
             Loose::Done(return_direct(rc, err))
         }
-        _ => Loose::Done(call(l.entry.path)),
+        _ => {
+            let rc = call(l.entry.path);
+            if rc >= 0 {
+                set_errno(saved_errno);
+            }
+            Loose::Done(rc)
+        }
     }
 }
 
@@ -2982,9 +2993,13 @@ unsafe fn stat_impl(path: *const c_char, sb: *mut Stat) -> c_int {
 }
 
 unsafe fn stat_with(path: *const c_char, sb: *mut Stat, real: RealStat, op: u8) -> c_int {
+    let saved_errno = errno();
     let mut pbuf: EntryPath = [0; PATH_BUF];
     let mut l = unsafe { lookup_resident(path, &mut pbuf, true) };
     let rc = unsafe { stat_resolved(&mut l, &mut pbuf, path, sb, real) };
+    if rc == 0 {
+        set_errno(saved_errno);
+    }
     stats::fs_event(op, how(&l), rc as i64, path);
     rc
 }
@@ -3036,9 +3051,13 @@ unsafe fn stat_resolved(
 
 /// `sceKernelCheckReachability_impl`.
 unsafe fn reachability_impl(path: *const c_char) -> c_int {
+    let saved_errno = errno();
     let mut pbuf: EntryPath = [0; PATH_BUF];
     let mut l = unsafe { lookup_resident(path, &mut pbuf, true) };
     let rc = unsafe { reachability_resolved(&mut l, &mut pbuf, path) };
+    if rc == 0 {
+        set_errno(saved_errno);
+    }
     stats::fs_event(b'r', how(&l), rc as i64, path);
     rc
 }
@@ -3093,6 +3112,7 @@ fn retry_or(same: bool, rc: c_int, err: c_int, retry: impl FnOnce() -> c_int) ->
 
 /// `posix_unlink_impl`: direct first; on ENOENT/ENOTDIR retry the indexed path.
 unsafe fn unlink_impl(path: *const c_char) -> c_int {
+    let saved_errno = errno();
     let rc = unsafe { real_posix_unlink(path) };
     let err = if rc == -1 { errno() } else { 0 };
     if rc == 0 || !should_try_index_fallback(rc, err) || !unsafe { is_app0_path(path) } {
@@ -3100,21 +3120,28 @@ unsafe fn unlink_impl(path: *const c_char) -> c_int {
     }
     let mut pbuf: EntryPath = [0; PATH_BUF];
     let real = unsafe { maybe_resolve_path(path, &mut pbuf) };
-    if real == path {
+    let rc = if real == path {
         if rw::app0_writable() {
-            return unsafe {
+            unsafe {
                 with_miss_path(path, |p| {
                     retry_or(p == path, rc, err, || real_posix_unlink(p))
                 })
-            };
+            }
+        } else {
+            return return_direct(rc, err);
         }
-        return return_direct(rc, err);
+    } else {
+        unsafe { real_posix_unlink(real) }
+    };
+    if rc == 0 {
+        set_errno(saved_errno);
     }
-    unsafe { real_posix_unlink(real) }
+    rc
 }
 
 /// `posix_rename_impl`: as unlink, resolving either side through the index.
 unsafe fn rename_impl(from: *const c_char, to: *const c_char) -> c_int {
+    let saved_errno = errno();
     let rc = unsafe { real_posix_rename(from, to) };
     let err = if rc == -1 { errno() } else { 0 };
     if rc == 0 {
@@ -3132,20 +3159,24 @@ unsafe fn rename_impl(from: *const c_char, to: *const c_char) -> c_int {
             maybe_resolve_path(to, &mut to_buf),
         )
     };
-    if rw::app0_writable() {
+    let rc = if rw::app0_writable() {
         // A miss on either side takes its indexed parent's spelling.
-        return unsafe {
+        unsafe {
             with_miss_path(rf, |f| {
                 with_miss_path(rt, |t| {
                     retry_or(f == from && t == to, rc, err, || real_posix_rename(f, t))
                 })
             })
-        };
-    }
-    if rf == from && rt == to {
+        }
+    } else if rf == from && rt == to {
         return return_direct(rc, err);
+    } else {
+        unsafe { real_posix_rename(rf, rt) }
+    };
+    if rc == 0 {
+        set_errno(saved_errno);
     }
-    unsafe { real_posix_rename(rf, rt) }
+    rc
 }
 
 // ---- exports ----
@@ -3380,9 +3411,13 @@ unsafe fn posix_access_body(path: *const c_char, mode: c_int) -> c_int {
         unsafe { observe_note(path, b'a', rc) };
         return rc;
     }
+    let saved_errno = errno();
     let mut pbuf: EntryPath = [0; PATH_BUF];
     let mut l = unsafe { lookup_resident(path, &mut pbuf, true) };
     let rc = unsafe { access_resolved(&mut l, &mut pbuf, path, mode) };
+    if rc == 0 {
+        set_errno(saved_errno);
+    }
     stats::fs_event(b'a', how(&l), rc as i64, path);
     rc
 }
@@ -4860,12 +4895,15 @@ pub(crate) mod tests {
         assert_eq!((src.reads.get(), calls.get()), (0, 1));
         assert!(l.unconfirmed && l.entry.path.is_null());
 
-        // Another case: one read, then the stored spelling opens.
+        // Another case: one read, then the stored spelling opens; the failed
+        // first probe must not leave ENOENT in errno once the retry succeeds.
+        set_errno(0);
         let mut l = loose_hit(2);
         assert_eq!(
             run(&mut l, c"/app0/DATA/real.BIN", &mut pbuf),
             Loose::Done(3)
         );
+        assert_eq!(errno(), 0);
         assert_eq!((src.reads.get(), calls.get()), (1, 2));
         assert!(!l.unconfirmed);
         assert_eq!(unsafe { cstr_bytes(l.entry.path) }, b"/app0/Data/Real.bin");
