@@ -828,22 +828,50 @@ fn physical_dirent_bounds(rest: &[u8]) -> Option<(usize, usize)> {
     Some((record_size, name_length))
 }
 
-/// Ends a synthetic batch of `result` bytes: reports `synthetic_base` and
-/// advances the slot's directory offset past it.
-fn finish_synthetic(
+/// Where the bytes of one getdents batch came from: the directory offset
+/// of its first physical record, if it starts with physical records, and
+/// the offset and buffer position where its synthetic records start.
+#[derive(Clone, Copy)]
+struct Batch {
+    physical_base: Option<c_long>,
+    synthetic_base: c_long,
+    synthetic_start: usize,
+}
+
+/// Ends a batch of `output` bytes: reports the batch's base (its first
+/// physical record's, else the synthetic one) and advances the slot's
+/// directory offset past the synthetic records. The physical reads already
+/// moved it past theirs.
+fn finish_batch(
     slot: &mut VirtualDirectorySlot,
     basep: *mut c_long,
-    synthetic_base: c_long,
-    result: c_int,
+    batch: Batch,
+    output: usize,
 ) -> c_int {
-    if result >= 0 {
-        if !basep.is_null() {
-            unsafe { *basep = synthetic_base };
-        }
-        slot.directory_offset = overlay::advance_offset(synthetic_base, result);
+    if !basep.is_null() {
+        unsafe { *basep = batch.physical_base.unwrap_or(batch.synthetic_base) };
     }
-    result
+    let synthetic = (output - batch.synthetic_start) as c_int;
+    slot.directory_offset = overlay::advance_offset(batch.synthetic_base, synthetic);
+    output as c_int
 }
+
+/// Ends a batch of `output` bytes of physical records only, before the
+/// physical directory ended: reports the base of its first record. Each
+/// physical read already moved the slot's directory offset.
+fn finish_physical(basep: *mut c_long, physical_base: Option<c_long>, output: usize) -> c_int {
+    if let Some(base) = physical_base {
+        if !basep.is_null() {
+            unsafe { *basep = base };
+        }
+    }
+    output as c_int
+}
+
+/// Smallest room left in the caller's buffer that a physical read tops up
+/// after the first: FreeBSD's DIRBLKSIZ. A filesystem that wants more
+/// refuses the read, and the batch ends with what it holds.
+const PHYSICAL_TOP_UP_MIN: usize = 512;
 
 /// Emits the `.` or `..` entry once (`emitted`); 0, or the emit error.
 unsafe fn emit_dot(
@@ -1015,19 +1043,38 @@ unsafe fn directory_read_fd(
             return SCE_KERNEL_ERROR_EBADF;
         }
 
+        // Like the kernel's, one call fills the buffer: physical records
+        // first, then, once the physical directory has ended, the packed
+        // ones. A batch that stopped after the physical records made a
+        // title that reads a directory with one getdents never see a
+        // packed file: Marvel's Avengers lists /app0 once for its `.nfo`
+        // archive files, found none, and died on a divide by zero at boot.
+        let mut output = 0usize;
+        let mut batch_physical_base: Option<c_long> = None;
         while !slot.real_exhausted && slot.real_fd >= 0 {
+            let room = size as usize - output;
+            if output != 0 && room < PHYSICAL_TOP_UP_MIN {
+                return finish_physical(basep, batch_physical_base, output);
+            }
+            let target = buffer.add(output);
             let mut physical_base = slot.directory_offset;
             let rc = if use_getdirentries {
                 let Some(f) = getdirentries_fn else {
                     return SCE_KERNEL_ERROR_EIO;
                 };
-                f(slot.real_fd, buffer, size, &mut physical_base)
+                f(slot.real_fd, target, room as c_int, &mut physical_base)
             } else {
                 let Some(f) = getdents_fn else {
                     return SCE_KERNEL_ERROR_EIO;
                 };
-                f(slot.real_fd, buffer, size)
+                f(slot.real_fd, target, room as c_int)
             };
+            // A top-up read that fails consumed nothing: the batch ends
+            // with what it holds and the next call reads with the whole
+            // buffer, where the failure is handled below.
+            if rc < 0 && output != 0 {
+                return finish_physical(basep, batch_physical_base, output);
+            }
             if rc < 0 {
                 let errno = open_failure_errno(rc);
                 if !physical_getdents_failure_is_final(errno) {
@@ -1060,15 +1107,19 @@ unsafe fn directory_read_fd(
             slot.dot_emitted = true;
             slot.dot_dot_emitted = true;
             let total = rc as usize;
+            let start = output;
             let mut input = 0usize;
-            let mut output = 0usize;
             while input < total {
                 let rest =
-                    core::slice::from_raw_parts(buffer.add(input) as *const u8, total - input);
+                    core::slice::from_raw_parts(target.add(input) as *const u8, total - input);
                 let Some((record_size, name_length)) = physical_dirent_bounds(rest) else {
-                    return SCE_KERNEL_ERROR_EIO;
+                    return if start == 0 {
+                        SCE_KERNEL_ERROR_EIO
+                    } else {
+                        finish_physical(basep, batch_physical_base, start)
+                    };
                 };
-                let d_name = buffer.add(input + DIRENT_NAME_OFFSET) as *const c_char;
+                let d_name = target.add(input + DIRENT_NAME_OFFSET) as *const c_char;
                 let hidden = service_name_hidden(
                     state,
                     slot.path.as_ptr(),
@@ -1078,23 +1129,23 @@ unsafe fn directory_read_fd(
                 );
                 if !hidden {
                     directory_record_physical_name(slot, d_name, name_length);
-                    if output != input {
-                        core::ptr::copy(buffer.add(input), buffer.add(output), record_size);
+                    if output != start + input {
+                        core::ptr::copy(target.add(input), buffer.add(output), record_size);
                     }
                     output += record_size;
                 }
                 input += record_size;
             }
-            if output != 0 {
-                if !basep.is_null() {
-                    *basep = physical_base;
-                }
-                return output as c_int;
+            if output != start && batch_physical_base.is_none() {
+                batch_physical_base = Some(physical_base);
             }
         }
 
-        let mut output = 0usize;
-        let synthetic_base = slot.directory_offset;
+        let batch = Batch {
+            physical_base: batch_physical_base,
+            synthetic_base: slot.directory_offset,
+            synthetic_start: output,
+        };
         // A physical directory lists `.` and `..` itself; with none, or one
         // that failed to list, they come from here.
         if slot.real_fd < 0 || slot.real_failed {
@@ -1109,7 +1160,7 @@ unsafe fn directory_read_fd(
                     return if output == 0 {
                         dot_rc
                     } else {
-                        finish_synthetic(slot, basep, synthetic_base, output as c_int)
+                        finish_batch(slot, basep, batch, output)
                     };
                 }
             }
@@ -1154,7 +1205,7 @@ unsafe fn directory_read_fd(
                     return if output == 0 {
                         SCE_KERNEL_ERROR_EIO
                     } else {
-                        finish_synthetic(slot, basep, synthetic_base, output as c_int)
+                        finish_batch(slot, basep, batch, output)
                     };
                 }
             }
@@ -1196,13 +1247,13 @@ unsafe fn directory_read_fd(
                 return if output == 0 {
                     rc
                 } else {
-                    finish_synthetic(slot, basep, synthetic_base, output as c_int)
+                    finish_batch(slot, basep, batch, output)
                 };
             }
             output += rc as usize;
             slot.listing = next_listing;
         }
-        finish_synthetic(slot, basep, synthetic_base, output as c_int)
+        finish_batch(slot, basep, batch, output)
     }
 }
 
