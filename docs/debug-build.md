@@ -326,6 +326,9 @@ written as events happen, so it survives the crash, and holds:
   .pkg size is not pack 0's; detail the .pkg size) or `ok` (detail the
   .pkg size), detail in hex. The path is `/app0/` plus the kraken.image
   line, or `-` before a valid one;
+- one `rw on` or `rw off errno=<hex>` line, the writable /app0 test
+  (`init` in `rt/rw.rs`): the errno of `access("/app0", W_OK)`
+  ([writable-app0.md](writable-app0.md));
 - every failed file event `/fsfail` would keep, and every module load (`K`);
 - probe events once per (op, path), whatever their result; a served `I`
   line shows what the game did with packed files before it died.

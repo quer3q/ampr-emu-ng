@@ -144,6 +144,21 @@ pub(crate) fn idx(how: &[u8], files: u64) {
     Line::new().s(b"idx ").s(how).s(b" files=").x(files).emit();
 }
 
+/// The writable /app0 test at module_start (rt/rw.rs `init`):
+/// "rw on" or "rw off errno=<hex>", the errno of `access("/app0", W_OK)`.
+pub(crate) fn rw(err: c_int) {
+    if FD.load(Ordering::Relaxed) < 0 {
+        return;
+    }
+    let mut l = Line::new();
+    if err == 0 {
+        l.s(b"rw on");
+    } else {
+        l.s(b"rw off errno=").x(err as u32 as u64);
+    }
+    l.emit();
+}
+
 /// The pack join of a title with packs: "idx join ok|fail".
 pub(crate) fn idx_join(ok: bool) {
     if FD.load(Ordering::Relaxed) < 0 {

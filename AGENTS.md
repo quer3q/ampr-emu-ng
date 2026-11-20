@@ -30,7 +30,11 @@ directory uses that directory's indexed spelling, a creating open first
 making it if it exists only in the pack (`rt/rw.rs`, docs/writable-app0.md).
 Files a game writes are never packed, so packed files stay read-only.
 Every such change is gated on `app0_writable()`; a read-only /app0
-behaves as upstream.
+behaves as upstream. The exception: an APR resolve of a loose file stats
+it in every mode (`live_loose_resolve` in `rt/index.rs`), so a file the
+index lists but the disk lacks resolves to ENOENT, not an id whose read
+fails (a zstd title on a read-only exFAT image aborted on that read; the
+image answered `access("/app0", W_OK)` with EPERM, not EROFS).
 
 ## Layout
 
