@@ -16,7 +16,9 @@
 //! sceSaveDataSaveIconByPath Z7z6HXWORJY). sceSaveDataSaveIcon passes
 //! through; it is hooked only for its original entry.
 
-use super::hook::{save_original, SAVE_ICON, SAVE_ICON_PATH, SAVE_MOUNT3, SAVE_UMOUNT2};
+use super::hook::{
+    save_original, SAVE_CREATE_TRANSACTION, SAVE_ICON, SAVE_ICON_PATH, SAVE_MOUNT3, SAVE_UMOUNT2,
+};
 use super::heap::{libc_free, libc_malloc};
 use super::index::posix_open_emul;
 use super::pack::{
@@ -26,6 +28,7 @@ use super::stats::{self, Stat};
 use super::sync::{SpinLock, SyncCell};
 use super::sys::{errno, off_t, EMFILE, ENFILE, ENOMEM, SCE_KERNEL_ERROR_ENOSYS};
 use core::ffi::{c_char, c_int, c_void};
+use core::sync::atomic::{AtomicBool, Ordering};
 
 /// `SceSaveDataIcon` as sceSaveDataSaveIcon reads it (live 13.00 native
 /// disassembly: it copies 0x38 bytes, pointer @0, buffer size @8, data size
@@ -200,6 +203,19 @@ unsafe fn read_into<R>(
 // point to a request that writes: its writes would fail on that point. A
 // read-only request may take a writable point, as a load after an
 // interrupted save does (the modes of that case were not logged).
+//
+// Never in a title that made a save data transaction resource
+// (sceSaveDataCreateTransactionResource): there each mount is prepared
+// (sceSaveDataPrepare, "Update has started" in libSceSaveData's log) and
+// only that mount's unmount ends the update, which blocks the app's suspend
+// until then. Hades (PPSA03355) mounted HadesSaveDirectory read-only and
+// prepared it; another thread's mount of it was BUSY and was shared, its
+// Prepare failed 0x809f8801 (the point was already in an update), and the
+// first thread's unmount was then answered 0 as a shared one. The real
+// mount stayed with its update open ("Update time exceeds 30 sec"), every
+// later mount was BUSY, and closing the game from the PS menu timed out
+// suspending it (SYSTEM_SUSPEND_BLOCK_TIMEOUT, coredump on a 13.x console).
+// The title retries a BUSY mount itself, so it gets BUSY back, as on retail.
 
 /// SCE_SAVE_DATA_ERROR_BUSY: the save is mounted or in use.
 const SAVE_DATA_ERROR_BUSY: c_int = 0x809F_0003u32 as c_int;
@@ -416,6 +432,42 @@ unsafe fn umount_since(since: u64, point: &[u8; POINT_BYTES]) -> Option<u32> {
     Some(in_flight)
 }
 
+/// Set by the title's first sceSaveDataCreateTransactionResource: from then
+/// on no mount is shared (see the shared mounts note).
+static TRANSACTIONS: AtomicBool = AtomicBool::new(false);
+
+/// Whether a BUSY mount may take a point the title already holds.
+fn sharing_allowed() -> bool {
+    !TRANSACTIONS.load(Ordering::Acquire)
+}
+
+/// Every argument passed through in its register: the call takes at most 6
+/// integer or pointer arguments, as the debug probes below.
+type Raw6 = unsafe extern "C" fn(usize, usize, usize, usize, usize, usize) -> c_int;
+
+/// sceSaveDataCreateTransactionResource: passed through; it only marks the
+/// title as one that uses transactions, before the call, so a mount racing
+/// it is not shared either.
+pub unsafe extern "C" fn create_transaction_emul(
+    a: usize,
+    b: usize,
+    c: usize,
+    d: usize,
+    e: usize,
+    f: usize,
+) -> c_int {
+    TRANSACTIONS.store(true, Ordering::Release);
+    let Some(orig) = (unsafe { save_original::<Raw6>(SAVE_CREATE_TRANSACTION) }) else {
+        return SCE_KERNEL_ERROR_ENOSYS;
+    };
+    #[cfg(feature = "mem_report")]
+    probe::note(b"CreateTransactionResource", None);
+    let rc = unsafe { orig(a, b, c, d, e, f) };
+    #[cfg(feature = "mem_report")]
+    probe::note(b"CreateTransactionResource", Some(rc));
+    rc
+}
+
 type MountFn = unsafe extern "C" fn(*const c_void, *mut c_void) -> c_int;
 type Umount2Fn = unsafe extern "C" fn(u32, *const c_void) -> c_int;
 
@@ -522,7 +574,7 @@ pub unsafe extern "C" fn mount3_emul(mount: *const c_void, result: *mut c_void) 
             let mut tries = 0;
             let mut shared = false;
             while rc == SAVE_DATA_ERROR_BUSY {
-                if unsafe { share(user, &dir, req, result) } {
+                if sharing_allowed() && unsafe { share(user, &dir, req, result) } {
                     stats::add(Stat::SaveMountsShared, 1);
                     rc = 0;
                     shared = true;
@@ -743,7 +795,7 @@ pub(crate) mod probe {
     type Raw6 = unsafe extern "C" fn(usize, usize, usize, usize, usize, usize) -> c_int;
 
     /// First save hook index of the probes (rt/hook.rs `SAVE_HOOKS`).
-    pub(crate) const FIRST: usize = 4;
+    pub(crate) const FIRST: usize = 5;
 
     macro_rules! probes {
         ($($f:ident $i:literal $name:literal;)*) => {$(
@@ -761,15 +813,14 @@ pub(crate) mod probe {
         set_param 3 b"SetParam";
         delete 4 b"Delete";
         dir_name_search 5 b"DirNameSearch";
-        create_transaction 6 b"CreateTransactionResource";
-        delete_transaction 7 b"DeleteTransactionResource";
-        dialog_initialize 8 b"DialogInitialize";
-        dialog_open 9 b"DialogOpen";
-        dialog_terminate 10 b"DialogTerminate";
-        msg_dialog_open 11 b"MsgDialogOpen";
-        msg_dialog_terminate 12 b"MsgDialogTerminate";
+        delete_transaction 6 b"DeleteTransactionResource";
+        dialog_initialize 7 b"DialogInitialize";
+        dialog_open 8 b"DialogOpen";
+        dialog_terminate 9 b"DialogTerminate";
+        msg_dialog_open 10 b"MsgDialogOpen";
+        msg_dialog_terminate 11 b"MsgDialogTerminate";
     }
-    pub(crate) const COUNT: usize = 13;
+    pub(crate) const COUNT: usize = 12;
 
     use super::user_ptr;
 

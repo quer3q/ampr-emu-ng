@@ -31,10 +31,10 @@ const LIBKERNEL: SceKernelModule = 0x2001;
 const HOOK_COUNT: usize = id::COUNT;
 /// Save data hooks in loaded system modules (rt/save.rs), not libkernel ids.
 #[cfg(not(feature = "mem_report"))]
-const SAVE_COUNT: usize = 4;
+const SAVE_COUNT: usize = 5;
 /// Debug builds add the save call probes (rt/save.rs `probe`).
 #[cfg(feature = "mem_report")]
-const SAVE_COUNT: usize = 4 + super::save::probe::COUNT;
+const SAVE_COUNT: usize = 5 + super::save::probe::COUNT;
 /// `sceKernelLoadStartModule` and `sceKernelLoadStartModuleForSysmodule`.
 const LOADER_COUNT: usize = 2;
 /// Ids that never install: the removed equeue queue classification hooks.
@@ -51,11 +51,11 @@ const _: () = {
     assert!(POOL_COPY_PAGES <= 64 && TRAMP_PAGES == 4 + cfg!(feature = "mem_report") as usize);
     // 10 game AIO slots 100..=109 and 2 thread-creation slots 110..=111 in
     // both builds, and in debug builds the 8 probe slots 112..=119
-    // (rt/probe.rs). With the 4 save data hooks (rt/save.rs; debug adds 13
-    // save call probes) and the 2 loader hooks that is 118 (release) or 139
+    // (rt/probe.rs). With the 5 save data hooks (rt/save.rs; debug adds 12
+    // save call probes) and the 2 loader hooks that is 119 (release) or 139
     // (debug) trampolines: 4 pages x 32 slots = 128 in release, 5 pages =
     // 160 in debug. Ids 55..=63 never install, nor 96..=99 in release and
-    // 98 and 99 in debug, so at most 105 (release) or 128 (debug) are used.
+    // 98 and 99 in debug, so at most 106 (release) or 128 (debug) are used.
     assert!(HOOK_COUNT == 112 + 8 * cfg!(feature = "mem_report") as usize);
     assert!(HOOK_COUNT + SAVE_COUNT + LOADER_COUNT <= TRAMP_PAGES * SLOTS_PER_PAGE);
 };
@@ -380,6 +380,7 @@ pub(crate) const SAVE_ICON: usize = 0;
 pub(crate) const SAVE_ICON_PATH: usize = 1;
 pub(crate) const SAVE_MOUNT3: usize = 2;
 pub(crate) const SAVE_UMOUNT2: usize = 3;
+pub(crate) const SAVE_CREATE_TRANSACTION: usize = 4;
 
 /// A symbol in a loaded system module: try the NID first (PS5 libraries
 /// export NIDs), then the plain name (debug SDKs and libkernel).
@@ -409,6 +410,11 @@ static SAVE_HOOKS: Table<SaveSpec, SAVE_COUNT> = Table([
         nid: c"uW4vfTwMQVo",
         symbol: c"sceSaveDataUmount2",
         replacement: super::save::umount2_emul as *mut c_void,
+    },
+    SaveSpec {
+        nid: c"gjRZNnw0JPE",
+        symbol: c"sceSaveDataCreateTransactionResource",
+        replacement: super::save::create_transaction_emul as *mut c_void,
     },
     #[cfg(feature = "mem_report")]
     SaveSpec {
@@ -445,12 +451,6 @@ static SAVE_HOOKS: Table<SaveSpec, SAVE_COUNT> = Table([
         nid: c"dyIhnXq-0SM",
         symbol: c"sceSaveDataDirNameSearch",
         replacement: super::save::probe::dir_name_search as *mut c_void,
-    },
-    #[cfg(feature = "mem_report")]
-    SaveSpec {
-        nid: c"gjRZNnw0JPE",
-        symbol: c"sceSaveDataCreateTransactionResource",
-        replacement: super::save::probe::create_transaction as *mut c_void,
     },
     #[cfg(feature = "mem_report")]
     SaveSpec {
