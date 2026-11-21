@@ -166,7 +166,7 @@ upstream. The
 runtime creates its own threads through `create_internal`
 (the pre-detour slot). Save data (`rt/save.rs`) is hooked by NID in a
 loaded `libSceSaveData` module, not through the libkernel table, in every
-title (the loader observer finds it outside `sceKernelGetModuleList`), 4
+title (the loader observer finds it outside `sceKernelGetModuleList`), 5
 hooks: `sceSaveDataSaveIconByPath` hands a packed icon to
 `sceSaveDataSaveIcon` as bytes in a game libc heap buffer of its size,
 freed after the call (the save service cannot open a packed path, and a
@@ -177,12 +177,18 @@ never a read-only point to a mount that writes), and
 `sceSaveDataUmount2` counts its owners, so only the last owner's unmount reaches the service. An
 interrupted save left a slot the game kept mounted and mounted again: BUSY
 there hung the load forever when passed back, and unmounting the game's
-other points instead made another title hang on close. A creating
+other points instead made another title hang on close. No mount is
+shared once the title calls `sceSaveDataCreateTransactionResource` (the
+fifth hook, a pass-through that sets the flag): a transaction title
+prepares each mount, the second owner's Prepare fails, and the first
+owner's unmount answered as shared left the update open, which blocks the
+app's suspend; Hades (PPSA03355) timed out closing from the PS menu
+(SYSTEM_SUSPEND_BLOCK_TIMEOUT). Such a title retries BUSY itself. A creating
 `sceSaveDataMount3` the library refuses (0x809F0000) with a nonzero
 systemBlocks is sent once more with systemBlocks 0: below SDK 5.00 the
 library takes only 0, and a title backported to 4.xx still passes the -1
 of its own SDK, so it never saved. Every other mount and unmount passes
-through. The debug build adds pass-through probes on 13
+through. The debug build adds pass-through probes on 12
 more save and dialog calls (`probe` in `rt/save.rs`, `fs V` lines).
 CI (`.github/workflows/build.yml`) runs the same commands; a pushed `v*` tag creates a draft release with both `.sprx` and `SHA256SUMS`.
 
