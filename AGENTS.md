@@ -167,7 +167,8 @@ runtime creates its own threads through `create_internal`
 (the pre-detour slot). Save data (`rt/save.rs`) is hooked by NID in a
 loaded `libSceSaveData` module, not through the libkernel table, in every
 title (the loader observer finds it outside `sceKernelGetModuleList`), 3
-hooks: `sceSaveDataSaveIconByPath` hands a packed icon to
+hooks: `sceSaveDataSaveIconByPath` hands a packed icon, or a loose one
+whose path the service refuses (0x809f000e, pkg mode), to
 `sceSaveDataSaveIcon` as bytes in a game libc heap buffer of its size,
 freed after the call (the save service cannot open a packed path, and a
 path to a decoded copy under /data/ampr_cache hung the service call;
@@ -198,8 +199,8 @@ CI (`.github/workflows/build.yml`) runs the same commands; a pushed `v*` tag cre
   bump top reached 246,688 B on a console; `realloc` grows or shrinks
   the last block in place) and
   falls back to the game's libc heap only past it (debug `heap_libc_bytes`).
-  The one other use of the game's libc heap is a packed save icon
-  (`read_packed` in `rt/save.rs`): a buffer of the icon's size for the
+  The one other use of the game's libc heap is a save icon handed over as
+  bytes (`read_icon` in `rt/save.rs`): a buffer of the icon's size for the
   one sceSaveDataSaveIcon call, freed when it returns (551,096 B on one
   title; a failed malloc skips the icon). Keep it to these two; zstd decoders use a static DCtx
   in a pool workspace (`ZstdDecoder::init_in` in `crates/ampr-codec`).
@@ -336,7 +337,7 @@ CI (`.github/workflows/build.yml`) runs the same commands; a pushed `v*` tag cre
    stacks; v0.4.0 overflowed a save thread's), and when any function in
    the PRX has a frame of 16 KiB (0x4000) or more, a guard page's size
    (no stack probes). It also sums four chains
-   against 0x1000 each: the packed open (0xcc8 release, 0x940 debug), the
+   against 0x1000 each: the packed open (0x878 release, 0x878 debug), the
    packed POSIX read on the caller's thread (`READ_CHAIN`, 0x720 release,
    0x720 debug), and the save icon's packed read under the icon hook
    (`ICON_READ_CHAIN`, 0xb78 release, 0x7e8 debug), and the module loader
@@ -420,7 +421,7 @@ titles and a zstd title against v0.4.1 with no regression:
   path never ran on a console. A map of a packed file now fails. Stays:
   the debug probes on ids 96 and 97 (`mmap_probe` in `rt/probe.rs`, op
   letters X and Y, `mmap_virtual`), the module_start removal of an old
-  /data/ampr_cache, and `read_packed`, moved to `rt/save.rs`. The 256 KiB
+  /data/ampr_cache, and `read_packed` (now `read_icon`), moved to `rt/save.rs`. The 256 KiB
   went to the cache (fixed sites budget 2 to 1.75 MiB).
 - Loose read classes (`AmprLooseReadClass`, `readClass`, `classActive`,
   the latency escape slots and the class admission limit in the

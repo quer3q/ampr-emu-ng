@@ -164,15 +164,16 @@ stats! {
     LibcPacked93 = "libc_packed_93",
     LibcPacked94 = "libc_packed_94",
     LibcPacked95 = "libc_packed_95",
-    /// Save data icon (rt/save.rs): bytes of packed icons handed over through
-    /// sceSaveDataSaveIcon, and packed icons the runtime could not read or
-    /// the service refused (the call then answers 0: the icon is cosmetic,
-    /// the error stalled a save).
+    /// Save data icon (rt/save.rs): bytes of icons handed over through
+    /// sceSaveDataSaveIcon (packed ones, and loose ones whose path the
+    /// service refused with 0x809f000e), and such icons the runtime could
+    /// not read or the service refused (the call then answers 0: the icon
+    /// is cosmetic, the error stalled a save).
     SaveIconBytes = "save_icon_bytes",
     SaveIconSkipped = "save_icon_skipped",
-    /// What sceSaveDataSaveIcon answered the last packed icon handed over,
-    /// before the hook maps a failure to 0, and the last call forwarded
-    /// unchanged (a loose or missing icon). Set, not summed, and printed as
+    /// What sceSaveDataSaveIcon answered the last icon handed over as bytes,
+    /// before the hook maps a failure to 0, and what the service answered
+    /// the last path forwarded (a loose or missing icon). Set, not summed, and printed as
     /// hex on /metrics (`is_code`); 0 there is also "no such call yet".
     SaveIconLastResult = "save_icon_last_result",
     SaveIconPathLastResult = "save_icon_path_last_result",

@@ -79,12 +79,12 @@ READ_CHAIN = [
 ]
 READ_CHAIN_BUDGET = 0x1000
 
-# The save icon hook reads a packed icon (rt/save.rs `read_packed`):
-# after the open returns, a packed read runs on the game's save thread
+# The save icon hook reads an icon it hands over as bytes (rt/save.rs
+# `read_icon`): after the open returns, a packed read runs on the game's save thread
 # under the hook's own frames, each function once.
 ICON_READ_CHAIN = [
     r"4save22save_icon_by_path_emul",
-    r"4save11read_packed",
+    r"4save9read_icon",
     r"4save12read_to_heap",
 ] + READ_CHAIN
 FRAME_BUDGETS += [

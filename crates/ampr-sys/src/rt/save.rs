@@ -2,9 +2,13 @@
 //! not replace. The save service runs outside the game's mount namespace and
 //! opens the icon path itself, so a packed icon (no physical copy) fails
 //! with 0x809f000e and the game never finishes saving. A packed icon's
-//! decoded bytes go to sceSaveDataSaveIcon instead (`read_packed` below, in
-//! game heap memory freed right after the call). A loose or
-//! missing icon goes to the original call unchanged.
+//! decoded bytes go to sceSaveDataSaveIcon instead (`read_icon` below, in
+//! game heap memory freed right after the call). A loose or missing icon
+//! goes to the original call; a loose one it answers 0x809f000e for goes
+//! as bytes too: in pkg mode the service cannot see the game's /app0, and
+//! a title's every save failed on it (a reporter's debug /metrics:
+//! pack_format pkg, save_icon_path_last_result 0x809f000e, no failed open
+//! of the icon). That retry logs the service's answer, then the hook's.
 //!
 //! Removing the hook made a title's save fail again; handing the service a
 //! path to a decoded copy under /data/ampr_cache hung that save inside the
@@ -23,7 +27,9 @@ use super::pack::{
     ampr_pack_try_pread_fd, posix_close_emul, posix_fstat_emul, virtual_fd_file_id, SceKernelStat,
 };
 use super::stats::{self, Stat};
-use super::sys::{errno, off_t, EMFILE, ENFILE, ENOMEM, SCE_KERNEL_ERROR_ENOSYS};
+use super::sys::{
+    errno, off_t, real_physical_pread, EMFILE, ENFILE, ENOMEM, SCE_KERNEL_ERROR_ENOSYS,
+};
 use core::ffi::{c_char, c_int, c_void};
 
 /// `SceSaveDataIcon` as sceSaveDataSaveIcon reads it (live 13.00 native
@@ -37,6 +43,10 @@ pub(crate) struct SceSaveDataIcon {
     reserved: [u8; 32],
 }
 const _: () = assert!(core::mem::size_of::<SceSaveDataIcon>() == 0x38);
+
+/// The service's answer for an icon path it could not open: a packed icon,
+/// and a loose one in pkg mode, where /app0 is the game's own mount.
+const ICON_PATH_REFUSED: c_int = 0x809F_000Eu32 as c_int;
 
 type SaveIconFn = unsafe extern "C" fn(*const c_void, *const SceSaveDataIcon) -> c_int;
 type SaveIconByPathFn = unsafe extern "C" fn(*const c_void, *const c_char) -> c_int;
@@ -85,10 +95,26 @@ pub unsafe extern "C" fn save_icon_by_path_emul(
     // A packed icon that cannot be read (no game heap memory, a failed read) or
     // handed over is skipped and the call answers 0: an error answer
     // stalled a title's save, and the icon is cosmetic.
-    let rc = match unsafe { read_packed(path, |bytes| save_icon_bytes(mount_point, bytes)) } {
-        None => return unsafe { forward(orig, mount_point, path) },
-        Some(Ok(Some(rc))) => rc,
-        Some(Ok(None)) | Some(Err(())) => -1,
+    let icon = |bytes: &[u8]| unsafe { save_icon_bytes(mount_point, bytes) };
+    let read = match unsafe { read_icon(path, false, icon) } {
+        // Loose or missing: the service opens it. A loose icon it cannot see
+        // goes as bytes too; a missing one keeps the service's answer.
+        None => {
+            let rc = unsafe { forward(orig, mount_point, path) };
+            if rc != ICON_PATH_REFUSED {
+                return rc;
+            }
+            match unsafe { read_icon(path, true, icon) } {
+                // Not opened, or no SaveIcon entry: the service's answer.
+                None | Some(Ok(None)) => return rc,
+                Some(read) => read,
+            }
+        }
+        Some(read) => read,
+    };
+    let rc = match read {
+        Ok(Some(rc)) => rc,
+        Ok(None) | Err(()) => -1,
     };
     if rc != 0 {
         stats::add(Stat::SaveIconSkipped, 1);
@@ -112,7 +138,8 @@ unsafe fn forward(orig: SaveIconByPathFn, mount_point: *const c_void, path: *con
 // ---- packed icon bytes --------------------------------------------------------
 
 /// The save service opens the icon path itself, past the path hooks: when
-/// `path` opens as a packed file, `use_bytes` gets its decoded bytes in a
+/// `path` opens as a packed file (or as any file, with `loose`), `use_bytes`
+/// gets its decoded bytes in a
 /// buffer of its size from the game's libc heap, freed as soon as
 /// `use_bytes` returns: the icon is held only for the one call, outside the
 /// pool, at any size (a title's /app0/images/icon0.png is 551,096 B). A
@@ -121,8 +148,9 @@ unsafe fn forward(orig: SaveIconByPathFn, mount_point: *const c_void, path: *con
 /// missing file, or another failed open. A path handed to the save service
 /// instead (a decoded copy under /data/ampr_cache) hung a title's save
 /// inside the service call.
-unsafe fn read_packed<R>(
+unsafe fn read_icon<R>(
     path: *const c_char,
+    loose: bool,
     use_bytes: impl FnOnce(&[u8]) -> R,
 ) -> Option<Result<R, ()>> {
     let vfd = unsafe { posix_open_emul(path, 0, 0) };
@@ -133,7 +161,7 @@ unsafe fn read_packed<R>(
         // service, which opens a loose icon itself and answers the rest.
         return matches!(errno(), EMFILE | ENFILE | ENOMEM).then_some(Err(()));
     }
-    let out = if unsafe { virtual_fd_file_id(vfd) }.is_some() {
+    let out = if loose || unsafe { virtual_fd_file_id(vfd) }.is_some() {
         Some(unsafe { read_to_heap(vfd, use_bytes) })
     } else {
         None
@@ -169,9 +197,11 @@ unsafe fn read_into<R>(
     while off < len {
         let mut handled = false;
         let want = len - off;
-        let n = unsafe {
-            ampr_pack_try_pread_fd(vfd, buf.add(off).cast(), want, off as off_t, &mut handled)
-        };
+        let dst = unsafe { buf.add(off) }.cast();
+        let mut n = unsafe { ampr_pack_try_pread_fd(vfd, dst, want, off as off_t, &mut handled) };
+        if !handled {
+            n = unsafe { real_physical_pread(vfd, dst, want, off as off_t) };
+        }
         if n <= 0 || n as usize > want {
             rc = Err(());
             break;
