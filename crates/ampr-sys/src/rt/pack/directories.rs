@@ -1030,12 +1030,152 @@ fn note_directory_line(path: &[u8], label: &[u8], mid: &[u8], value: c_int, how:
     crate::rt::stats::fs_note(b'U', how, i64::from(value), buf.as_ptr().cast());
 }
 
+// ---- bounce reads -------------------------------------------------------------
+//
+// A physical getdents needs a buffer of at least the filesystem's block size
+// (st_blksize; the index walk in rt/index.rs sizes its buffer so). A title
+// that passes less gets EINVAL: DIRT 5 (PPSA01552, pkg mode, folder install
+// on the internal SSD) lists with 16 KiB, every physical read behind its
+// virtual directories failed EINVAL (debug `realfail ... errno=22`), the
+// loose entries of those directories were dropped, and the game crashed on
+// a particle emitter whose definition it never found (SIGSEGV reading NULL
+// + 0x10 at eboot 0xc93ea6). On that EINVAL the slot reads the physical
+// directory through the 64 KiB listing window instead and hands its records
+// out as they fit; a batch the caller's buffer cannot take whole is read
+// again on the next call from its offset, skipping the records already
+// handed out (a read-only directory reads the same each time).
+
+/// What a bounce read came to.
+enum Bounce {
+    /// The physical directory has ended.
+    Ended,
+    /// The caller's buffer is full; the rest of the batch waits.
+    Full,
+    /// A failed read (SCE code), or a seek or record that failed (EIO).
+    Failed(c_int),
+}
+
+/// The listing window for a bounce read: waits while another getdents holds
+/// it (each holds it for one call). None when it could not be taken at all.
+fn wait_listing_window() -> Option<&'static mut [u8]> {
+    loop {
+        if let Some(w) = take_listing_window() {
+            return Some(w);
+        }
+        if LISTING_STATE.load(Ordering::Acquire) == 2 {
+            return None;
+        }
+        unsafe { crate::rt::sys::sceKernelUsleep(50) };
+    }
+}
+
+/// Reads `slot`'s physical directory through `win` from `bounce_offset` and
+/// appends the records the caller's buffer `out[*output..size]` takes,
+/// past the `bounce_skip` already handed out, as the direct read does:
+/// runtime names hidden, each name recorded so its packed twin is skipped.
+#[inline(never)]
+unsafe fn bounce_physical(
+    state: *const PackState,
+    slot: &mut VirtualDirectorySlot,
+    win: &mut [u8],
+    out: *mut u8,
+    size: usize,
+    output: &mut usize,
+    batch_physical_base: &mut Option<c_long>,
+) -> Bounce {
+    let (Some(getdents), Some(lseek)) = (unsafe { real_getdents() }, unsafe { real_lseek() })
+    else {
+        return Bounce::Failed(SCE_KERNEL_ERROR_EIO);
+    };
+    // The slot path does not change while the slot mutex is held.
+    let (path, path_length) = (slot.path.as_ptr(), slot.path_length);
+    let hidden = |name: *const c_char, len: usize| unsafe {
+        service_name_hidden(state, path, path_length, name, len)
+    };
+    let io = BounceIo { getdents, lseek };
+    unsafe { bounce_with(&io, &hidden, slot, win, out, size, output, batch_physical_base) }
+}
+
+/// The physical calls of a bounce read (host tests pass fakes).
+struct BounceIo {
+    getdents: KernelGetdentsFn,
+    lseek: KernelLseekFn,
+}
+
+/// `bounce_physical` with its calls and the hidden-name check passed in.
+#[allow(clippy::too_many_arguments)]
+unsafe fn bounce_with(
+    io: &BounceIo,
+    hidden: &dyn Fn(*const c_char, usize) -> bool,
+    slot: &mut VirtualDirectorySlot,
+    win: &mut [u8],
+    out: *mut u8,
+    size: usize,
+    output: &mut usize,
+    batch_physical_base: &mut Option<c_long>,
+) -> Bounce {
+    let (getdents, lseek) = (io.getdents, io.lseek);
+    loop {
+        if unsafe { lseek(slot.real_fd, slot.bounce_offset as off_t, SEEK_SET) } < 0 {
+            return Bounce::Failed(SCE_KERNEL_ERROR_EIO);
+        }
+        let len = win.len().min(c_int::MAX as usize);
+        let rc = unsafe { getdents(slot.real_fd, win.as_mut_ptr().cast(), len as c_int) };
+        if rc < 0 {
+            return Bounce::Failed(rc);
+        }
+        if rc == 0 {
+            slot.real_exhausted = true;
+            return Bounce::Ended;
+        }
+        let next = unsafe { lseek(slot.real_fd, 0, SEEK_CUR) };
+        slot.dot_emitted = true;
+        slot.dot_dot_emitted = true;
+        let total = (rc as usize).min(len);
+        let (mut input, mut record) = (0usize, 0u32);
+        while input < total {
+            let Some((record_size, name_length)) = physical_dirent_bounds(&win[input..total])
+            else {
+                return Bounce::Failed(SCE_KERNEL_ERROR_EIO);
+            };
+            if record >= slot.bounce_skip {
+                let name = unsafe { win.as_ptr().add(input + DIRENT_NAME_OFFSET) }.cast::<c_char>();
+                if !hidden(name, name_length) {
+                    if record_size > size - *output {
+                        slot.bounce_skip = record;
+                        return Bounce::Full;
+                    }
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(
+                            win.as_ptr().add(input),
+                            out.add(*output),
+                            record_size,
+                        );
+                        directory_record_physical_name(slot, name, name_length);
+                    }
+                    batch_physical_base.get_or_insert(slot.bounce_offset);
+                    *output += record_size;
+                }
+            }
+            input += record_size;
+            record += 1;
+        }
+        if next < 0 {
+            return Bounce::Failed(SCE_KERNEL_ERROR_EIO);
+        }
+        slot.bounce_offset = next as c_long;
+        slot.bounce_skip = 0;
+        slot.directory_offset = slot.bounce_offset;
+    }
+}
+
 /// Whether a failed physical `getdents` ends the physical part of the
 /// listing. EINTR and EAGAIN are the caller's to retry and go back to it;
 /// anything else would give the game the same error again (a folder install
 /// on the internal SSD: EINVAL on every call, 67 million calls in 92 s, while
-/// the same listing on USB exFAT worked), so the physical entries are dropped
-/// and the packed ones are listed instead.
+/// the same listing on USB exFAT worked). The first EINVAL switches the slot
+/// to a bounce read (`bounce_physical`); a final failure after that drops
+/// the physical entries and lists the packed ones instead.
 fn physical_getdents_failure_is_final(errno: c_int) -> bool {
     errno != EINTR && errno != EAGAIN
 }
@@ -1087,10 +1227,54 @@ unsafe fn directory_read_fd(
         // archive files, found none, and died on a divide by zero at boot.
         let mut output = 0usize;
         let mut batch_physical_base: Option<c_long> = None;
+        // The listing window, once taken for a bounce read or the packed
+        // names; given back when the call returns.
+        let mut window: Option<&'static mut [u8]> = None;
+        let mut guard = ListingGuard(false);
         while !slot.real_exhausted && slot.real_fd >= 0 {
             let room = size as usize - output;
             if output != 0 && room < PHYSICAL_TOP_UP_MIN {
                 return finish_physical(basep, batch_physical_base, output);
+            }
+            if slot.physical_bounce {
+                if window.is_none() {
+                    window = wait_listing_window();
+                    guard.0 = window.is_some();
+                }
+                let step = match window.as_deref_mut() {
+                    Some(win) => bounce_physical(
+                        state,
+                        slot,
+                        win,
+                        buffer.cast(),
+                        size as usize,
+                        &mut output,
+                        &mut batch_physical_base,
+                    ),
+                    // No window: the physical entries cannot be read.
+                    None => Bounce::Failed(SCE_KERNEL_ERROR_EINVAL),
+                };
+                match step {
+                    Bounce::Ended => break,
+                    // A record that does not fit the caller's whole buffer
+                    // is EINVAL, as from the kernel.
+                    Bounce::Full if output == 0 => return SCE_KERNEL_ERROR_EINVAL,
+                    Bounce::Full => return finish_physical(basep, batch_physical_base, output),
+                    Bounce::Failed(_) if output != 0 => {
+                        return finish_physical(basep, batch_physical_base, output)
+                    }
+                    Bounce::Failed(rc) => {
+                        let errno = open_failure_errno(rc);
+                        if !physical_getdents_failure_is_final(errno) {
+                            return rc;
+                        }
+                        #[cfg(feature = "mem_report")]
+                        note_directory_real_failure(&slot.path[..slot.path_length as usize], errno);
+                        slot.real_failed = true;
+                        slot.real_exhausted = true;
+                        break;
+                    }
+                }
             }
             let target = buffer.add(output);
             let mut physical_base = slot.directory_offset;
@@ -1115,6 +1299,19 @@ unsafe fn directory_read_fd(
                 let errno = open_failure_errno(rc);
                 if !physical_getdents_failure_is_final(errno) {
                     return rc;
+                }
+                // EINVAL: the caller's buffer is below the filesystem's
+                // block size; read the directory through the window.
+                if errno == EINVAL && !slot.physical_bounce {
+                    if let Some(at) = real_lseek()
+                        .map(|f| f(slot.real_fd, 0, SEEK_CUR))
+                        .filter(|&at| at >= 0)
+                    {
+                        slot.physical_bounce = true;
+                        slot.bounce_offset = at as c_long;
+                        slot.bounce_skip = 0;
+                        continue;
+                    }
                 }
                 #[cfg(feature = "mem_report")]
                 note_directory_real_failure(&slot.path[..slot.path_length as usize], errno);
@@ -1207,13 +1404,14 @@ unsafe fn directory_read_fd(
         // One view and one path source for the call; names on the kept
         // index fd go through the listing window (a resident blob needs none).
         let view = listing_view();
-        let window = match view {
-            Some((_, crate::rt::index::Paths::File(_))) if slot.listing != Cursor::Done => {
-                take_listing_window()
-            }
-            _ => None,
-        };
-        let _guard = ListingGuard(window.is_some());
+        let names_on_file = matches!(view, Some((_, crate::rt::index::Paths::File(_))))
+            && slot.listing != Cursor::Done;
+        if names_on_file && window.is_none() {
+            window = take_listing_window();
+            guard.0 = window.is_some();
+        }
+        // A window a bounce read used is refilled on its first path read.
+        let window = if names_on_file { window } else { None };
         let src = view.map(|(v, paths)| (v, Windowed::new(paths, window)));
         while slot.listing != Cursor::Done {
             let mut name = [0u8; 256];
@@ -1380,6 +1578,96 @@ mod tests {
         assert!(!plain_physical_fd_answers(O_DIRECTORY, 3, false));
         // A writable open never reaches the check: the impl answers it with
         // the physical fd first (`O_ACCMODE != O_RDONLY`).
+    }
+
+    // A fake physical directory of three getdents batches, offsets 0, 1000
+    // and 2000, each read whole only with at least 4096 bytes (as a
+    // filesystem whose block size passes the caller's buffer).
+    const FAKE: [&[&str]; 3] = [&[".", "..", "a1", "a2"], &["ampr_x", "b1", "b2"], &["c1"]];
+    thread_local!(static FAKE_POS: core::cell::Cell<off_t> = const { core::cell::Cell::new(0) });
+
+    fn fake_record(name: &str) -> [u8; 16] {
+        let mut r = [0u8; 16];
+        r[4..6].copy_from_slice(&16u16.to_ne_bytes());
+        r[6] = DT_REG;
+        r[7] = name.len() as u8;
+        r[8..8 + name.len()].copy_from_slice(name.as_bytes());
+        r
+    }
+
+    unsafe extern "C" fn fake_getdents(_fd: c_int, buf: *mut c_char, size: c_int) -> c_int {
+        if size < 4096 {
+            return SCE_KERNEL_ERROR_EINVAL;
+        }
+        let pos = FAKE_POS.with(|p| p.get());
+        let Some(batch) = FAKE.get((pos / 1000) as usize) else {
+            return 0;
+        };
+        let mut n = 0usize;
+        for name in *batch {
+            let r = fake_record(name);
+            unsafe { core::ptr::copy_nonoverlapping(r.as_ptr(), buf.cast::<u8>().add(n), 16) };
+            n += 16;
+        }
+        FAKE_POS.with(|p| p.set(pos + 1000));
+        n as c_int
+    }
+
+    unsafe extern "C" fn fake_lseek(_fd: c_int, offset: off_t, whence: c_int) -> off_t {
+        FAKE_POS.with(|p| {
+            if whence == SEEK_SET {
+                p.set(offset);
+            }
+            p.get()
+        })
+    }
+
+    /// Names of the 16-byte fake records in `buf[..len]`.
+    fn fake_names(buf: &[u8]) -> Vec<String> {
+        buf.chunks(16)
+            .map(|r| String::from_utf8(r[8..8 + r[7] as usize].to_vec()).unwrap())
+            .collect()
+    }
+
+    /// A bounce read hands out every visible physical record once, in
+    /// order, through a caller buffer that takes two records a call; a
+    /// buffer that takes none is Full with nothing written.
+    #[test]
+    fn bounce_read_resumes_a_batch_across_small_buffers() {
+        let io = BounceIo {
+            getdents: fake_getdents,
+            lseek: fake_lseek,
+        };
+        let hidden = |name: *const c_char, len: usize| {
+            unsafe { core::slice::from_raw_parts(name.cast::<u8>(), len) }.starts_with(b"ampr_")
+        };
+        let mut slot = Box::new(VirtualDirectorySlot::EMPTY);
+        slot.real_fd = 3;
+        let mut win = vec![0u8; 8192];
+        let mut out = [0u8; 40];
+        let mut listed = Vec::new();
+        FAKE_POS.with(|p| p.set(0));
+        for _ in 0..20 {
+            let (mut output, mut base) = (0usize, None);
+            let step = unsafe {
+                bounce_with(&io, &hidden, &mut slot, &mut win, out.as_mut_ptr(), 40, &mut output, &mut base)
+            };
+            listed.extend(fake_names(&out[..output]));
+            if matches!(step, Bounce::Ended) {
+                break;
+            }
+            assert!(matches!(step, Bounce::Full) && output == 32, "two records a call");
+        }
+        assert_eq!(listed, [".", "..", "a1", "a2", "b1", "b2", "c1"]);
+        assert!(slot.real_exhausted && slot.dot_emitted && slot.dot_dot_emitted);
+
+        let mut slot = Box::new(VirtualDirectorySlot::EMPTY);
+        slot.real_fd = 3;
+        let (mut output, mut base) = (0usize, None);
+        let step = unsafe {
+            bounce_with(&io, &hidden, &mut slot, &mut win, out.as_mut_ptr(), 8, &mut output, &mut base)
+        };
+        assert!(matches!(step, Bounce::Full) && output == 0 && slot.bounce_skip == 0);
     }
 
     /// A physical `getdents` that fails for good ends the physical
