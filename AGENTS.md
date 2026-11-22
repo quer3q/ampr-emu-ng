@@ -166,23 +166,19 @@ upstream. The
 runtime creates its own threads through `create_internal`
 (the pre-detour slot). Save data (`rt/save.rs`) is hooked by NID in a
 loaded `libSceSaveData` module, not through the libkernel table, in every
-title (the loader observer finds it outside `sceKernelGetModuleList`), 4
+title (the loader observer finds it outside `sceKernelGetModuleList`), 3
 hooks: `sceSaveDataSaveIconByPath` hands a packed icon to
 `sceSaveDataSaveIcon` as bytes in a game libc heap buffer of its size,
 freed after the call (the save service cannot open a packed path, and a
-path to a decoded copy under /data/ampr_cache hung the service call);
-`sceSaveDataMount3` answers a BUSY mount of a directory the game already
-has mounted with that mount's point (same blocks and systemBlocks, and
-never a read-only point to a mount that writes), and
-`sceSaveDataUmount2` counts its owners, so only the last owner's unmount reaches the service. An
-interrupted save left a slot the game kept mounted and mounted again: BUSY
-there hung the load forever when passed back, and unmounting the game's
-other points instead made another title hang on close. A creating
+path to a decoded copy under /data/ampr_cache hung the service call;
+`sceSaveDataSaveIcon` passes through, hooked only for its original entry),
+and a creating
 `sceSaveDataMount3` the library refuses (0x809F0000) with a nonzero
 systemBlocks is sent once more with systemBlocks 0: below SDK 5.00 the
 library takes only 0, and a title backported to 4.xx still passes the -1
-of its own SDK, so it never saved. Every other mount and unmount passes
-through. The debug build adds pass-through probes on 13
+of its own SDK, so it never saved. Every other mount, BUSY included,
+passes through, as does every unmount (shared save mounts are under
+"Removed"). The debug build adds pass-through probes on 14
 more save and dialog calls (`probe` in `rt/save.rs`, `fs V` lines).
 CI (`.github/workflows/build.yml`) runs the same commands; a pushed `v*` tag creates a draft release with both `.sprx` and `SHA256SUMS`.
 
@@ -473,6 +469,27 @@ titles and a zstd title against v0.4.1 with no regression:
   264 us; with the ladder back it measured 259 us. On a pkg title with
   1.3 ms pack jobs it changed nothing measurable. Reads that finish in
   tens of us need the short first poll.
+
+Removed after v0.5.0, by the owner's decision from console runs:
+
+- Shared save mounts (the `sceSaveDataUmount2` hook, the mounted-points
+  table, the pass-through unmount log and the BUSY retry in
+  `sceSaveDataMount3`, metrics `save_mounts_shared` and
+  `save_umounts_shared`). A BUSY mount of a directory the title held was
+  answered with the held point and the owners counted. It only rescued a
+  slot left by an interrupted save, which loads once and heals on the next
+  save: the game keeps the slot mounted (mode 0x1) and mounts it again
+  (0x21), BUSY, and never retries. Every such slot seen was made by a
+  build without the icon hook (save hung at the icon, game killed). On a
+  title whose threads race for one directory, each mount prepared for a
+  transaction, the share swallowed the first owner's unmount, its update
+  never ended and closing the game timed out suspending it. The mode check
+  added for writing mounts already kept v0.5.0 from sharing the 0x21
+  mount. Console, one zstd title, debug, slot broken that way: v0.5.0
+  hung on load (save_busy 1, shared 0); the old share build loaded it
+  (5 shared) and its save healed the slot. A slot broken by a crash
+  mid-save now hangs that load, as retail would. The BUSY retry went with
+  it: retail passes BUSY back, and the titles seen retry it themselves.
 
 ## Do not commit
 

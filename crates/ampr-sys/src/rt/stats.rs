@@ -176,14 +176,10 @@ stats! {
     /// hex on /metrics (`is_code`); 0 there is also "no such call yet".
     SaveIconLastResult = "save_icon_last_result",
     SaveIconPathLastResult = "save_icon_path_last_result",
-    /// sceSaveDataMount3 (rt/save.rs): mounts, BUSY answers, BUSY mounts of
-    /// a directory this title already had mounted that were answered with
-    /// that point instead (a second owner), and unmounts of a shared point
-    /// answered without unmounting (an owner left).
+    /// sceSaveDataMount3 (rt/save.rs): mounts and BUSY answers, passed back
+    /// to the game.
     SaveMounts = "save_mounts",
     SaveBusy = "save_busy",
-    SaveMountsShared = "save_mounts_shared",
-    SaveUmountsShared = "save_umounts_shared",
     /// Creating sceSaveDataMount3 calls the library refused (0x809F0000)
     /// that were sent again with systemBlocks 0 (rt/save.rs MOUNT3_BYTES).
     SaveSystemBlocksZeroed = "save_system_blocks_zeroed",
