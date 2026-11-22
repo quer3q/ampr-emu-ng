@@ -1008,6 +1008,13 @@ pub(crate) struct VirtualDirectorySlot {
     /// The physical `getdents` failed for good; the rest of the listing is
     /// the packed entries (directories.rs `directory_read_fd`).
     pub real_failed: bool,
+    /// The physical directory is read through the listing window, not the
+    /// caller's buffer (directories.rs `bounce_physical`): `bounce_offset`
+    /// is the directory offset of the batch being handed out and
+    /// `bounce_skip` the records of it already handed out.
+    pub physical_bounce: bool,
+    pub bounce_skip: u32,
+    pub bounce_offset: c_long,
     pub dot_emitted: bool,
     pub dot_dot_emitted: bool,
     pub physical_hash_overflow: bool,
@@ -1025,6 +1032,9 @@ impl VirtualDirectorySlot {
         active: false,
         real_exhausted: false,
         real_failed: false,
+        physical_bounce: false,
+        bounce_skip: 0,
+        bounce_offset: 0,
         dot_emitted: false,
         dot_dot_emitted: false,
         physical_hash_overflow: false,
