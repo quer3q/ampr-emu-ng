@@ -1096,6 +1096,28 @@ unsafe fn bounce_physical(
     unsafe { bounce_with(&io, &hidden, slot, win, out, size, output, batch_physical_base) }
 }
 
+/// Bytes a bounced record takes in the caller's buffer: what its name needs
+/// (`overlay::dirent_size`, as a synthetic record), never more than the
+/// filesystem gave it. The filesystem pads the last record of each block to
+/// the block's end: DIRT 5's /app0/shaders ended in `efx` with d_reclen
+/// 0xff40 (65,344 B, the listing window in a console coredump), more than
+/// the game's 16 KiB buffer, so every later call answered EINVAL, which the
+/// game retried forever on a black screen.
+fn handed_out_size(record_size: usize, name_length: usize) -> usize {
+    overlay::dirent_size(name_length).min(record_size)
+}
+
+/// Copies physical `record` into `dst` (`handed_out_size` bytes): its
+/// fileno, type, name and NUL, zero padding after, d_reclen set to
+/// `dst.len()`.
+fn copy_trimmed(record: &[u8], name_length: usize, dst: &mut [u8]) {
+    let used = DIRENT_NAME_OFFSET + name_length;
+    dst.fill(0);
+    dst[..used].copy_from_slice(&record[..used]);
+    let (reclen_at, reclen) = (core::mem::offset_of!(Dirent, d_reclen), dst.len() as u16);
+    dst[reclen_at..reclen_at + 2].copy_from_slice(&reclen.to_ne_bytes());
+}
+
 /// The physical calls of a bounce read (host tests pass fakes).
 struct BounceIo {
     getdents: KernelGetdentsFn,
@@ -1141,20 +1163,18 @@ unsafe fn bounce_with(
             if record >= slot.bounce_skip {
                 let name = unsafe { win.as_ptr().add(input + DIRENT_NAME_OFFSET) }.cast::<c_char>();
                 if !hidden(name, name_length) {
-                    if record_size > size - *output {
+                    let given = handed_out_size(record_size, name_length);
+                    if given > size - *output {
                         slot.bounce_skip = record;
                         return Bounce::Full;
                     }
                     unsafe {
-                        core::ptr::copy_nonoverlapping(
-                            win.as_ptr().add(input),
-                            out.add(*output),
-                            record_size,
-                        );
+                        let dst = core::slice::from_raw_parts_mut(out.add(*output), given);
+                        copy_trimmed(&win[input..input + record_size], name_length, dst);
                         directory_record_physical_name(slot, name, name_length);
                     }
                     batch_physical_base.get_or_insert(slot.bounce_offset);
-                    *output += record_size;
+                    *output += given;
                 }
             }
             input += record_size;
@@ -1582,18 +1602,13 @@ mod tests {
 
     // A fake physical directory of three getdents batches, offsets 0, 1000
     // and 2000, each read whole only with at least 4096 bytes (as a
-    // filesystem whose block size passes the caller's buffer).
+    // filesystem whose block size passes the caller's buffer). Records are
+    // 48 bytes, and the last of each batch is padded to 2048, as the
+    // console's filesystem pads the last record of a block to its end.
     const FAKE: [&[&str]; 3] = [&[".", "..", "a1", "a2"], &["ampr_x", "b1", "b2"], &["c1"]];
+    const FAKE_RECORD: usize = 48;
+    const FAKE_LAST: usize = 2048;
     thread_local!(static FAKE_POS: core::cell::Cell<off_t> = const { core::cell::Cell::new(0) });
-
-    fn fake_record(name: &str) -> [u8; 16] {
-        let mut r = [0u8; 16];
-        r[4..6].copy_from_slice(&16u16.to_ne_bytes());
-        r[6] = DT_REG;
-        r[7] = name.len() as u8;
-        r[8..8 + name.len()].copy_from_slice(name.as_bytes());
-        r
-    }
 
     unsafe extern "C" fn fake_getdents(_fd: c_int, buf: *mut c_char, size: c_int) -> c_int {
         if size < 4096 {
@@ -1603,11 +1618,19 @@ mod tests {
         let Some(batch) = FAKE.get((pos / 1000) as usize) else {
             return 0;
         };
+        let out = unsafe { core::slice::from_raw_parts_mut(buf.cast::<u8>(), size as usize) };
         let mut n = 0usize;
-        for name in *batch {
-            let r = fake_record(name);
-            unsafe { core::ptr::copy_nonoverlapping(r.as_ptr(), buf.cast::<u8>().add(n), 16) };
-            n += 16;
+        for (i, name) in batch.iter().enumerate() {
+            let len = if i + 1 == batch.len() { FAKE_LAST } else { FAKE_RECORD };
+            let r = &mut out[n..n + len];
+            r.fill(0xee);
+            r[0..4].copy_from_slice(&(100 + i as u32).to_ne_bytes());
+            r[4..6].copy_from_slice(&(len as u16).to_ne_bytes());
+            r[6] = DT_REG;
+            r[7] = name.len() as u8;
+            r[8..8 + name.len()].copy_from_slice(name.as_bytes());
+            r[8 + name.len()] = 0;
+            n += len;
         }
         FAKE_POS.with(|p| p.set(pos + 1000));
         n as c_int
@@ -1622,16 +1645,29 @@ mod tests {
         })
     }
 
-    /// Names of the 16-byte fake records in `buf[..len]`.
+    /// Names of the records in `buf`, walked by d_reclen as a game does;
+    /// each record must be trimmed to its name's size, NUL-terminated and
+    /// zero-padded.
     fn fake_names(buf: &[u8]) -> Vec<String> {
-        buf.chunks(16)
-            .map(|r| String::from_utf8(r[8..8 + r[7] as usize].to_vec()).unwrap())
-            .collect()
+        let mut names = Vec::new();
+        let mut at = 0;
+        while at < buf.len() {
+            let r = &buf[at..];
+            let reclen = u16::from_ne_bytes([r[4], r[5]]) as usize;
+            let namlen = r[7] as usize;
+            assert_eq!(reclen, overlay::dirent_size(namlen));
+            assert!(r[8 + namlen..reclen].iter().all(|&b| b == 0));
+            assert_eq!(r[6], DT_REG);
+            names.push(String::from_utf8(r[8..8 + namlen].to_vec()).unwrap());
+            at += reclen;
+        }
+        names
     }
 
     /// A bounce read hands out every visible physical record once, in
-    /// order, through a caller buffer that takes two records a call; a
-    /// buffer that takes none is Full with nothing written.
+    /// order, trimmed to its name's size, through a caller buffer far
+    /// smaller than the padded last record of each batch; a buffer that
+    /// takes none is Full with nothing written.
     #[test]
     fn bounce_read_resumes_a_batch_across_small_buffers() {
         let io = BounceIo {
@@ -1656,7 +1692,7 @@ mod tests {
             if matches!(step, Bounce::Ended) {
                 break;
             }
-            assert!(matches!(step, Bounce::Full) && output == 32, "two records a call");
+            assert!(matches!(step, Bounce::Full) && output > 0, "progress every call");
         }
         assert_eq!(listed, [".", "..", "a1", "a2", "b1", "b2", "c1"]);
         assert!(slot.real_exhausted && slot.dot_emitted && slot.dot_dot_emitted);
