@@ -221,7 +221,9 @@ CI (`.github/workflows/build.yml`) runs the same commands; a pushed `v*` tag cre
   that kept room; its two uses are the 64 KiB getdents listing window
   (`take_listing_window` in `rt/pack/directories.rs`, taken once on the
   first listing of a packed directory when names are read from the kept
-  fd, and only while 64 KiB of room is left) and the debug /bench buffer.
+  fd or when a physical getdents fails EINVAL on a caller buffer below the
+  filesystem's block size, and only while 64 KiB of room is left) and the
+  debug /bench buffer.
   The cache holds at most 16384 entries (`AMPR_EMU_PACK_CACHE_ENTRY_CAP`
   in `rt/pack/mod.rs`, 8192 before, 56 B each in .bss outside the pool;
   debug `cache_cap_evictions` counts the evictions the cap forces while

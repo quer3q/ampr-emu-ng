@@ -1034,12 +1034,10 @@ fn note_directory_line(path: &[u8], label: &[u8], mid: &[u8], value: c_int, how:
 //
 // A physical getdents needs a buffer of at least the filesystem's block size
 // (st_blksize; the index walk in rt/index.rs sizes its buffer so). A title
-// that passes less gets EINVAL: DIRT 5 (PPSA01552, pkg mode, folder install
-// on the internal SSD) lists with 16 KiB, every physical read behind its
-// virtual directories failed EINVAL (debug `realfail ... errno=22`), the
-// loose entries of those directories were dropped, and the game crashed on
-// a particle emitter whose definition it never found (SIGSEGV reading NULL
-// + 0x10 at eboot 0xc93ea6). On that EINVAL the slot reads the physical
+// that passes less gets EINVAL: a pkg title on a folder install on the
+// internal SSD lists with 16 KiB, so the loose entries of its virtual
+// directories were dropped and it crashed on a file it never saw (debug
+// `realfail ... errno=22`). On that EINVAL the slot reads the physical
 // directory through the 64 KiB listing window instead and hands its records
 // out as they fit; a batch the caller's buffer cannot take whole is read
 // again on the next call from its offset, skipping the records already
@@ -1099,10 +1097,8 @@ unsafe fn bounce_physical(
 /// Bytes a bounced record takes in the caller's buffer: what its name needs
 /// (`overlay::dirent_size`, as a synthetic record), never more than the
 /// filesystem gave it. The filesystem pads the last record of each block to
-/// the block's end: DIRT 5's /app0/shaders ended in `efx` with d_reclen
-/// 0xff40 (65,344 B, the listing window in a console coredump), more than
-/// the game's 16 KiB buffer, so every later call answered EINVAL, which the
-/// game retried forever on a black screen.
+/// the block's end (65,344 B for one record on a console), more than a
+/// 16 KiB caller buffer, which would get EINVAL on every later call.
 fn handed_out_size(record_size: usize, name_length: usize) -> usize {
     overlay::dirent_size(name_length).min(record_size)
 }
