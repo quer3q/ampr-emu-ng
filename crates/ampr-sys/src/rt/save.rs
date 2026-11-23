@@ -28,7 +28,8 @@ use super::pack::{
 };
 use super::stats::{self, Stat};
 use super::sys::{
-    errno, off_t, real_physical_pread, EMFILE, ENFILE, ENOMEM, SCE_KERNEL_ERROR_ENOSYS,
+    errno, off_t, real_physical_pread, real_posix_open, EMFILE, ENFILE, ENOENT, ENOMEM,
+    SCE_KERNEL_ERROR_ENOSYS,
 };
 use core::ffi::{c_char, c_int, c_void};
 
@@ -153,7 +154,14 @@ unsafe fn read_icon<R>(
     loose: bool,
     use_bytes: impl FnOnce(&[u8]) -> R,
 ) -> Option<Result<R, ()>> {
-    let vfd = unsafe { posix_open_emul(path, 0, 0) };
+    let mut vfd = unsafe { posix_open_emul(path, 0, 0) };
+    // A loose icon the index does not list answers ENOENT without the disk
+    // (pkg mode, a title's sce_sys/save_data.png: debug `fs o m`, every
+    // save failed on M.2 only). The service already refused its path, so
+    // the disk is asked directly.
+    if vfd < 0 && loose && errno() == ENOENT {
+        vfd = unsafe { real_posix_open(path, 0, 0) };
+    }
     if vfd < 0 {
         // Out of fds or memory: the icon may be packed, where the service
         // cannot open it (0x809f000e there stalled a title's save), so it
