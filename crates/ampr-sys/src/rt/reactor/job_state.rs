@@ -421,7 +421,18 @@ impl JobState {
         #[cfg(feature = "mem_report")]
         {
             self.statAcceptNs = crate::rt::stats::now();
+            self.statSubmitNs = self.statAcceptNs;
         }
+    }
+
+    /// The job is released (worker.rs): ends job_total_ns.
+    #[inline(always)]
+    pub(crate) fn stat_released(&mut self) {
+        #[cfg(feature = "mem_report")]
+        let start = core::mem::take(&mut self.statSubmitNs);
+        #[cfg(not(feature = "mem_report"))]
+        let start = 0;
+        stats::span(start, Stat::JobTotals, Stat::JobTotalNs, Stat::JobTotalNsMax);
     }
 
     /// A read slice was accepted by kernel AIO or the pread pool

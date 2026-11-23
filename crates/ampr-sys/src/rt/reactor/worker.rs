@@ -214,6 +214,7 @@ impl AprAioReactor {
             self.erase_active_job_locked(j);
             jr.nativeCompletionAddress = null_mut();
             jr.nativeCommandBuffer = null_mut();
+            jr.stat_released();
             self.publish_job_result(jr);
             notifyWaiters = if jr.syntheticWaitPublished {
                 self.publish_synthetic_wait_completion_locked(jr)

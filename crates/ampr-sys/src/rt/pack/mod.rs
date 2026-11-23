@@ -838,7 +838,7 @@ pub(crate) const AMPR_EMU_PACK_MAX_PACKS: usize = 1024;
 /// all 18 of the old cap busy (debug /metrics).
 pub(crate) const AMPR_EMU_PACK_OPEN_PACK_FD_CAP: u32 = 32;
 /// The whole Cache ledger, the pool's remainder (rt/index_memory.rs
-/// `CACHE_MEMORY_MAX`: 30.64 MiB debug, 32 MiB release at the mount, then
+/// `CACHE_MEMORY_MAX`: 30.61 MiB debug, 32 MiB release at the mount, then
 /// grown from the Index ledger; debug knob `decoded_mib`): the only pack
 /// cache, so the release cache is 1.36 MiB larger than the debug one. Exact reads with 64 MiB
 /// decoded gave 11-14% lower game wait per read than 32 + 32 MiB page reads

@@ -25,8 +25,8 @@ AMPR_MEM_REPORT ?= 0
 # (PT_LOAD memsz) is that pool plus the release non-pool part (code, data,
 # reactor storage), 150.89 MiB. The debug pool is T minus the debug
 # non-pool part, rounded down to a 16 KiB page, so both totals are within
-# a page of T and the release cache is 1.36 MiB larger than the debug one
-# (32.00 vs 30.64 MiB at the mount). The cache then grows into the Index
+# a page of T and the release cache is 1.39 MiB larger than the debug one
+# (32.00 vs 30.61 MiB at the mount). The cache then grows into the Index
 # ledger's idle room (76-80 MiB on three titles, 103-107 MiB debug in
 # all). Against the 192 MiB pool (cache 78.45 MiB debug at the mount,
 # 151-155 after growth), debug /metrics, one run each: game wait per read
@@ -64,7 +64,9 @@ AMPR_MEM_REPORT ?= 0
 # 7030274 B and 8453330 B, pools unchanged: totals 256 MiB minus 14846 B
 # and minus 17198 B, 2352 B apart. Then the release pool went to
 # 0x9030000 and the debug one to 0x8ED4000 (142.83 MiB): totals 158221826
-# and 158219474 B, 2352 B apart.
+# and 158219474 B, 2352 B apart. Lane EOP overlap in release and the debug
+# job_total_ns field moved the debug pool to 0x8ECC000 (142.80 MiB): totals
+# 158216250 and 158230122 B, 13872 B apart.
 # Once the index is
 # built the cache grows into the Index ledger's idle room
 # (rt/pack/manifest.rs `grow_cache_from_index`). (The first guess, from the non-pool parts before the removals,
@@ -101,11 +103,12 @@ AMPR_MEM_REPORT ?= 0
 # former direct memory lines).
 AMPR_INTERNAL_POOL_SIZE ?= 0x9030000
 # Debug build pool (passed to it as AMPR_INTERNAL_POOL_SIZE by `dist`):
-# T minus the debug non-pool part, 142.83 MiB, the same fixed caps as
-# release and a cache 1.36 MiB smaller; host tests build with it
+# T minus the debug non-pool part, 142.80 MiB, the same fixed caps as
+# release and a cache 1.39 MiB smaller; host tests build with it
 # (rt/runtime_memory.rs `DEFAULT_POOL_SIZE`).
-AMPR_DEBUG_POOL_SIZE ?= 0x8ED4000
-# Pread pool threads: at most 6 (tune::RELEASE_PREAD_THREADS), grown by
+AMPR_DEBUG_POOL_SIZE ?= 0x8ECC000
+# Pread pool threads: at most 8 (tune::RELEASE_PREAD_THREADS; 6 before
+# lane EOP overlap, which queues the pool: AGENTS.md), grown by
 # backlog and kept until pressure mode gives them back, within the
 # runtime-wide budget of 16 worker
 # threads (rt/thread_hooks.rs); a zstd title peaked at 5-6, two titles at

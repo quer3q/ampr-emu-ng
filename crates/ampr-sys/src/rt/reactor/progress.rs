@@ -34,6 +34,10 @@ impl AprAioReactor {
                 bytesLeft: crate::rt::tune::read_pass_bytes(),
                 held: false,
             };
+            // Set once an earlier job of this lane was passed with completion
+            // commands left (lane_overlap.rs): later jobs keep the prior read
+            // fence and stay off the native batch and AMM engine.
+            let mut priorLaneOverlap = false;
             let mut job = laneHeads[lane];
             while !job.is_null() {
                 if self.native_batch_wait_pending(lane as u32) {
@@ -47,21 +51,33 @@ impl AprAioReactor {
                     &mut job,
                     priorReadFencePending,
                     priorNativeBatchPending,
+                    priorLaneOverlap,
                     &mut readIssueBudget,
                     &mut admission,
                 );
                 // A synchronously released/failed head is a pass boundary; a
-                // blocked or partially admitted head keeps the lane.
+                // blocked or partially admitted head keeps the lane. With
+                // lane_eop_overlap the released head's successor is the new
+                // head and runs in this pass: only the head is ever released,
+                // so the prior flags are still false here.
                 if job.is_null() {
+                    if lane_overlap::lane_release_cascades() && !next.is_null() {
+                        job = next;
+                        continue;
+                    }
                     break;
                 }
                 let j = unsafe { &mut *job };
                 let nativeSubmitted = j.nativeSubmitted.load(Ordering::Acquire);
+                let mut overlapped = false;
                 if j.sourceOffset != j.sourceBytes {
-                    if !next.is_null() {
-                        Self::note_lane_successor_blocked(j);
+                    overlapped = Self::lane_eop_overlap_allows(j, nativeSubmitted);
+                    if !overlapped {
+                        if !next.is_null() {
+                            Self::note_lane_successor_blocked(j);
+                        }
+                        break;
                     }
-                    break;
                 } else if !Self::job_allows_priority_successor(j, nativeSubmitted) {
                     if !next.is_null() {
                         note_lane_block(LaneBlock::Other);
@@ -69,7 +85,12 @@ impl AprAioReactor {
                     break;
                 }
                 // The successor's EOPs wait while any earlier job still reads.
-                priorReadFencePending |= Self::job_has_outstanding_reads(j);
+                priorLaneOverlap |= overlapped;
+                priorReadFencePending = lane_overlap::lane_successor_prior_fence(
+                    priorReadFencePending,
+                    Self::job_has_outstanding_reads(j),
+                    overlapped,
+                );
                 priorNativeBatchPending |=
                     nativeSubmitted && j.nativeMicroEngine == NativeMicroEngine::AprBatch;
                 job = next;
@@ -631,7 +652,7 @@ pub(crate) fn note_lane_block(kind: LaneBlock) {
 
 impl AprAioReactor {
     /// The decoded command parked at the job's source cursor, if cached.
-    fn lane_cursor_op(j: &JobState) -> Option<&Op> {
+    pub(super) fn lane_cursor_op(j: &JobState) -> Option<&Op> {
         (j.decodedOpCacheBytes != 0 && j.decodedOpCache.buf_offset_bytes == j.sourceOffset)
             .then_some(&j.decodedOpCache)
     }

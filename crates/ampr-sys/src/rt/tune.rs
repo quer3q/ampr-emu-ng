@@ -42,8 +42,11 @@ pub(crate) const RELEASE_PIPELINES: u32 = match option_env!("AMPR_PACK_PIPELINES
 /// thread creation failed once the pool had grown to 24, with never more
 /// than 4 reads in flight; a zstd title peaked at 5-6 threads and its game
 /// wait per read did not change between 8 and 32, and two titles peaked at
-/// 4-5 disk threads (debug /metrics), so 6.
-pub(crate) const RELEASE_PREAD_THREADS: u32 = 6;
+/// 4-5 disk threads (debug /metrics), so 6 then. Those runs had one or two
+/// reads in flight; with lane EOP overlap the pool queues, and a command
+/// buffer on a zstd title took 5.44 ms at 6 threads, 4.10 at 8 and 4.32 at
+/// 12 (submit to release, debug /metrics, one run each), so 8.
+pub(crate) const RELEASE_PREAD_THREADS: u32 = 8;
 /// Most worker threads the runtime grows, all groups together, both builds
 /// (rt/thread_hooks.rs budget); the debug knob `thread_budget` lowers it.
 pub(crate) const THREAD_BUDGET: u32 = 16;
@@ -90,6 +93,7 @@ const REGROW_S: usize = 15;
 const WORKER_STACK_KIB: usize = 16;
 const CACHE_PROTECT_HITS: usize = 17;
 const CACHE_PROTECT_PCT: usize = 18;
+const LANE_EOP_OVERLAP: usize = 19;
 
 // ---- runtime thread lifetime (rt/thread_hooks.rs) ----
 // Release values; the debug knobs of the same names default to them.
@@ -137,7 +141,7 @@ const DECODED_MIB_DEFAULT: u32 = AMPR_EMU_PACK_DECODED_CACHE_BYTES.div_ceil(MIB)
 /// Cache size: 0 turns the decoded cache off (reads bypass it); otherwise it is
 /// cut to the room under the Cache cap, and off when that leaves less than the
 /// smaller of the knob and 16 MiB (pack/manifest.rs `cache_region`).
-pub(crate) static KNOBS: [Knob; 19] = [
+pub(crate) static KNOBS: [Knob; 20] = [
     knob("decoded_mib", false, 0, 512, DECODED_MIB_DEFAULT),
     knob(
         "workers",
@@ -205,6 +209,7 @@ pub(crate) static KNOBS: [Knob; 19] = [
     knob("worker_stack_kib", false, 0, 1024, WORKER_STACK_KIB_DEFAULT),
     knob("cache_protect_hits", true, 0, 255, CACHE_PROTECT_HITS_DEFAULT),
     knob("cache_protect_pct", true, 0, 100, CACHE_PROTECT_PCT_DEFAULT),
+    knob("lane_eop_overlap", true, 0, 1, 1),
 ];
 
 fn get(i: usize) -> u32 {
@@ -277,6 +282,17 @@ pub(crate) fn thread_budget() -> u32 {
         get(THREAD_BUDGET_KNOB)
     } else {
         THREAD_BUDGET
+    }
+}
+/// Lane EOP overlap (reactor/lane_overlap.rs): a lane's next job may parse
+/// while the head has only completion commands left. On in release; the
+/// debug build reads `lane_eop_overlap` (default 1).
+#[inline(always)]
+pub(crate) fn lane_eop_overlap() -> bool {
+    if ON {
+        get(LANE_EOP_OVERLAP) != 0
+    } else {
+        true
     }
 }
 /// Spin window, in us, of an idle runtime thread before it parks; the debug

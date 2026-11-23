@@ -341,6 +341,14 @@ stats! {
     /// reactor's own share (reactor/progress.rs note_successor_order_wait).
     JobOrderWaits = "job_order_waits",
     JobOrderWaitNs = "job_order_wait_ns",
+    /// Submit accept to release of one command buffer, lane wait included:
+    /// what the game waits for a job (reactor/job_state.rs stat_released).
+    JobTotals = "job_totals",
+    JobTotalNs = "job_total_ns",
+    JobTotalNsMax = "job_total_ns_max",
+    /// Completion commands of a head that lane EOP overlap let the
+    /// successor run past, counted once per job (reactor/lane_overlap.rs).
+    EopDeferred = "eop_deferred",
     /// Lane loop (reactor/progress.rs) stops before a job that has a
     /// successor queued in its priority lane, so the successor does not parse
     /// in this pass. Counted once per stop (per lane pass), by what the head
@@ -481,6 +489,7 @@ fn resets_on_read(s: usize) -> bool {
         || s == Stat::PreadReadNsMax as usize
         || s == Stat::PreadPendingMax as usize
         || s == Stat::JobFirstIssueNsMax as usize
+        || s == Stat::JobTotalNsMax as usize
         || s == Stat::JobNotifyNsMax as usize
         || s == Stat::PosixReadNsMax as usize
 }

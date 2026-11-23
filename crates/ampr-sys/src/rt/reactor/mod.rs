@@ -35,6 +35,7 @@ mod external;
 mod flush;
 mod idle;
 mod job_state;
+mod lane_overlap;
 mod limits;
 mod native;
 mod poll_deadline;
@@ -142,7 +143,7 @@ pub(crate) const AMPR_EMU_APR_READ_CREDIT_GRANULE_BYTES: u64 = 0x10000;
 pub(crate) const AMPR_EMU_APR_READ_PASS_MAX_BYTES: u64 = 0x80000;
 /// Blocking pread pool for the pack's physical reads (pread_pool.rs). Kernel AIO on BFS
 /// serves 1-2 requests at a time; 32 parallel preads reached 1.6-2.0 GB/s on
-/// a console (bench). At most 6 threads in both builds, grown by backlog and
+/// a console (bench). At most 8 threads in both builds, grown by backlog and
 /// kept once started; pressure mode after a failed game thread creation
 /// gives idle ones back (`LoadGroup` in rt/thread_hooks.rs;
 /// tune::RELEASE_PREAD_THREADS has the measurements), shared by pack groups
@@ -177,8 +178,8 @@ const _: () = assert!(
     (AMPR_EMU_APR_LOOSE_PREAD_TASKS_MAX as usize) < AMPR_EMU_PACK_PREAD_TASKS,
     "loose reads must leave pread tasks for pack groups"
 );
-/// pread threads loose reads never take: 4 of the 6 threads
-/// (tune::RELEASE_PREAD_THREADS; debug `pread_threads`, default and max 6)
+/// pread threads loose reads never take: 4 of the 8 threads
+/// (tune::RELEASE_PREAD_THREADS; debug `pread_threads`, default and max 8)
 /// stay for pack tasks (console peak was 1.9 busy pack threads). Only a
 /// title that ships packs keeps it (`loose_pread_pack_reserve`).
 pub(crate) const AMPR_EMU_APR_LOOSE_PREAD_PACK_RESERVE: usize = 4;
@@ -1137,11 +1138,21 @@ pub(crate) struct JobState {
     /// Debug metrics only (stats.rs job_*; job_state.rs stat_* helpers):
     /// `stats::now()` at submit accept, cleared when the first read slice
     /// issues; and at the latest observed read completion, cleared when the
-    /// job next tells the game. Absent in release, so JobState stays 392 bytes.
+    /// job next tells the game. Absent in release.
     #[cfg(feature = "mem_report")]
     pub(crate) statAcceptNs: u64,
     #[cfg(feature = "mem_report")]
     pub(crate) statReadDoneNs: u64,
+    /// Debug only: `stats::now()` at submit accept, kept until the job is
+    /// released (job_total_ns, the wait a game sees for one command buffer).
+    #[cfg(feature = "mem_report")]
+    pub(crate) statSubmitNs: u64,
+    /// Lane EOP overlap (lane_overlap.rs): source offset + 1 at which the
+    /// remaining commands were last classified (0: never), and whether they
+    /// were all completion commands. A positive answer holds for every later
+    /// offset; a negative one only at the same offset. +8 B per JobState.
+    pub(crate) laneTailMark: u32,
+    pub(crate) laneTailCompletionOnly: bool,
     /// Debug only (job_state.rs `stat_gs_resolved`, stats.rs gs_retry_*): the
     /// file id and offset the gather/scatter read at the cursor first resolved
     /// to from the lane cursor, compared when a retry re-resolves it. Zeroed

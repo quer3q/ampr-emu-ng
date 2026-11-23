@@ -16,17 +16,18 @@ job (`apr_read_ns` / `job_count`) and last read to notify
 |---|---|---|
 | Loose APR reads through the pread pool | on | `AMPR_EMU_APR_LOOSE_PREAD`, reactor/loose_pread.rs |
 | Loose read split into parallel parts | 64 KiB | `AMPR_EMU_APR_LOOSE_PREAD_PART_KIB` |
-| pread pool threads | at most 6, grown by backlog, kept until pressure mode gives them back | `tune::RELEASE_PREAD_THREADS` |
+| pread pool threads | at most 8, grown by backlog, kept until pressure mode gives them back | `tune::RELEASE_PREAD_THREADS` |
 | Threads kept for pack reads | 4 in a title with packs, 0 without (loose tasks: threads minus that, at least 1) | `AMPR_EMU_APR_LOOSE_PREAD_PACK_RESERVE`, `loose_pread_pack_reserve` |
 | Read pass / per-read active limits | 512 KiB / 4 chunks, 2 MiB | reactor/mod.rs |
 
 The numbers below come from the earlier 32-thread pool: 1.09 ms per read
 against 2.53 ms on kernel AIO (-57%), read time per session 27.9 s instead
 of 61.0 s, about 5.9 ms per job, 0 errors. Game wait per read did not
-change between 8 and 32 threads (Makefile). At 6 threads the loose task
-cap is 2 in a title with packs, so only reads of up to two parts split
+change between 8 and 32 threads (Makefile). At 8 threads the loose task
+cap is 4 in a title with packs, so only reads of up to four parts split
 there; a title without packs keeps no threads for pack reads, so its cap
-is 6 (check: `apr_read_ns / apr_reads` before and after).
+is 8; neither was run on a console at 8, the cap was 2 and 6 at 6
+threads (check: `apr_read_ns / apr_reads` before and after).
 
 ## What helped
 
@@ -46,9 +47,9 @@ AIO stays near 730 MB/s even 32 requests deep.
 | Thing | Result | Decision |
 |---|---|---|
 | 128 / 256 KiB parts | 1.50 / 2.09 ms per read (32 threads) | 64 KiB: under load a 256 KiB part takes 2.4x as long as a 64 KiB one |
-| 256 KiB parts, overlap on | about 12.6 vs 6.4 ms per job | off; lane EOP overlap removed (next row) |
+| 256 KiB parts, overlap on | about 12.6 vs 6.4 ms per job | off |
 | Larger read pass / per-read limits (4 MiB pass, 16 chunks / 8 MiB) | 1.10 vs 1.13 ms per read, first-issue wait unchanged | not the bottleneck; debug knobs remain |
-| Lane EOP overlap (next job in a lane starts while the head has only completion writes left) | about 7.7 ms per job on vs 6.1 off (32 threads); 6.4 vs 6.6 (64 threads) | removed: lane wait dropped from 4.8 to 1.8 ms, but the extra reads queued for the 28 loose tasks (32 threads) and completions still published in lane order (0.5-1 ms). It was never on by default |
+| Lane EOP overlap (next job in a lane starts while the head has only completion writes left) | packed titles, a command buffer submit to release, off vs on: 97.9 vs 5.3 ms (zstd), 6.09 vs 5.51 and 9.78 vs 8.90 ms (pkg). Loose files earlier: about 7.7 ms per job on vs 6.1 off (32 threads) | on in release (`reactor/lane_overlap.rs`), with 8 pool threads; completions still publish in lane order. It was removed once on the loose-file run and brought back on the packed runs (AGENTS.md) |
 | Reading the backing folder instead of `/app0` (`app0_direct`) | about 6.2 vs 6.4 ms per job; 14.8 ms without the split | removed: nullfs costs about 1% (256 KiB x 8 threads: 1,971 vs 2,045 MB/s), and libkernel exports neither `statfs` nor `fstatfs` to detect the folder |
 | Read-ahead (`AMPR_PACK_READAHEAD_CHUNKS`) | load latency 1.62 vs 1.60 ms; worst read 36.2 ms on vs 26.7 off. A lighter game read 1.69 vs 0.78 disk bytes per game byte, worst read 13.4 vs 5.6 ms | removed (it was off by default): earlier runs hit about 46% of prefetched data |
 

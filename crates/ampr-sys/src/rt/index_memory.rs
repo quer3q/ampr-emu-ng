@@ -60,7 +60,7 @@ pub(crate) const INDEX_MEMORY_MAX: usize = 80 * MIB;
 /// a 16 KiB cache page. The cache is the only part whose size changes
 /// behaviour (more I/O windows, 12 vs 16, and more decode workers, 4 vs 8,
 /// measured flat: 312 vs 315 us game wait per read), so the PRX total is a
-/// fixed pool and the cache takes the rest: 30.64 MiB in the debug pool,
+/// fixed pool and the cache takes the rest: 30.61 MiB in the debug pool,
 /// 32 MiB in the release one, before it grows into the Index ledger's
 /// idle room (debug pool fitted from a `dist` build, Makefile).
 /// The decoded cache default is this whole cap (rt/pack/mod.rs
@@ -716,12 +716,12 @@ mod tests {
         let fixed = INDEX_MEMORY_MAX + BUFFER_MEMORY_MAX + POOL_SITES_BUDGET + STACK_MEMORY_MAX;
         assert_eq!(CACHE_MEMORY_MAX, (STATIC_POOL_SIZE - fixed) / PAGE * PAGE);
         assert_eq!(CACHE_MEMORY_MAX % PAGE, 0);
-        // The debug pool next to the 32 MiB-cache release pool, 0x8ed4000
-        // (142.83 MiB): 80 + 28.44 + 1.75 + 2 MiB fixed, the cache 30.64 MiB.
-        assert_eq!(STATIC_POOL_SIZE, 0x8ed_4000);
+        // The debug pool next to the 32 MiB-cache release pool, 0x8ecc000
+        // (142.80 MiB): 80 + 28.44 + 1.75 + 2 MiB fixed, the cache 30.61 MiB.
+        assert_eq!(STATIC_POOL_SIZE, 0x8ec_c000);
         assert_eq!(POOL_SITES_BUDGET, 0x1c_0000);
-        assert_eq!(CACHE_MEMORY_MAX, 0x8ed_4000 - fixed);
-        assert_eq!(CACHE_MEMORY_MAX, 32_129_024);
+        assert_eq!(CACHE_MEMORY_MAX, 0x8ec_c000 - fixed);
+        assert_eq!(CACHE_MEMORY_MAX, 32_096_256);
     }
 
     #[test]
